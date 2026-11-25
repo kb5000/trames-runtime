@@ -292,6 +292,10 @@ impl TaskNamespaces {
         let dumpable = view.dumpable.clone();
         call(&mut view.credentials, &dumpable)
     }
+    pub fn key_resources(&self) -> (Arc<KeyRegistry>, Credentials) {
+        let view = self.view.view.borrow();
+        (view.key_registry(), view.credentials.clone())
+    }
     pub fn with_key_registry<T>(&self, call: impl FnOnce(&KeyRegistry, &Credentials) -> T) -> T {
         let view = self.view.view.borrow();
         call(&view.key_registry(), &view.credentials)

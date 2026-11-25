@@ -1451,6 +1451,7 @@ impl IoRoutes {
                         let mut context = target.context.lock().unwrap();
                         context.mask = mask;
                         context.wait_mask = None;
+                        context.wait_generation = context.wait_generation.wrapping_add(1);
                         target.publish_mask(mask);
                         return Ok(0);
                     }

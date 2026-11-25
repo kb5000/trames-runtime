@@ -15,6 +15,10 @@ const PREEMPT: u32 = 1;
 const SIGNAL: u32 = 2;
 const MIGRATE: u32 = 4;
 const UPDATE: u32 = 8;
+mod call;
+mod resume;
+pub use call::Call;
+pub use resume::{Resume, ResumeError, ResumeProgress};
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -41,6 +45,15 @@ impl Default for Rseq {
 }
 impl Rseq {
     pub fn call(&self, memory: &mut impl CpuMemory, args: [u64; 6]) -> Result<u64, Errno> {
+        Call::new(args)
+            .progress(self, memory)
+            .map(|()| 0)
+            .map_err(|error| match error {
+                ResumeError::Page(_) => Errno(14),
+                ResumeError::Error(error) => error,
+            })
+    }
+    fn prepare_call(&self, args: [u64; 6]) -> Result<Option<Registration>, Errno> {
         let (address, length, flags, signature) =
             (args[0], args[1] as u32, args[2] as u32, args[3] as u32);
         if flags & !1 != 0 {
@@ -57,16 +70,7 @@ impl Rseq {
             if flags == 0 {
                 return Err(Errno(16));
             }
-            for (at, value) in [(0, 0), (4, u32::MAX), (20, 0), (24, 0)] {
-                memory
-                    .write_array(address + at, value.to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-            }
-            *registration = None;
-            self.address.store(0, Relaxed);
-            self.pending.store(0, Relaxed);
-            self.cpu.store(u32::MAX, Relaxed);
-            return Ok(0);
+            return Ok(Some(old));
         }
         if flags != 0 || length < 32 || address & (ALIGN - 1) != 0 {
             return Err(Errno(22));
@@ -81,7 +85,7 @@ impl Rseq {
             return Err(Errno(14));
         }
         if address == 0 {
-            return Ok(0);
+            return Ok(None);
         }
         *registration = Some(Registration {
             address,
@@ -91,7 +95,7 @@ impl Rseq {
         self.cpu.store(u32::MAX, Relaxed);
         self.pending.store(UPDATE, Relaxed);
         self.address.store(address, Relaxed);
-        Ok(0)
+        Ok(None)
     }
     pub fn preempt(&self) {
         if self.address.load(Relaxed) != 0 {
@@ -140,33 +144,13 @@ impl Rseq {
         cpu: u32,
         event: u32,
     ) -> Result<u64, Errno> {
-        if self.address.load(Relaxed) == 0 {
-            return Ok(pc);
-        }
-        let current = self.cpu.load(Relaxed);
-        if event == 0 && current == cpu && self.pending.load(Relaxed) == 0 {
-            return Ok(pc);
-        }
-        let Some(registration) = *self.registration.lock().unwrap() else {
+        let Some(mut resume) = self.begin_resume_event(pc, cpu, event) else {
             return Ok(pc);
         };
-        let migrate = current != u32::MAX && current != cpu;
-        let events = self.pending.swap(0, Relaxed) | event | if migrate { MIGRATE } else { 0 };
-        // The forced fault path may build a signal frame. Do not repeat this
-        // same failed notify before that frame can be delivered.
-        let result = Self::fixup(
-            memory,
-            registration,
-            pc,
-            events & (PREEMPT | SIGNAL | MIGRATE),
-        )?;
-        for (at, value) in [(0, cpu), (4, cpu), (20, 0), (24, cpu)] {
-            memory
-                .write_array(registration.address + at, value.to_le_bytes())
-                .map_err(|_| Errno(14))?;
-        }
-        self.cpu.store(cpu, Relaxed);
-        Ok(result)
+        resume.progress(self, memory).map_err(|error| match error {
+            ResumeError::Page(_) => Errno(14),
+            ResumeError::Error(error) => error,
+        })
     }
     fn fixup(
         memory: &mut impl CpuMemory,
@@ -180,6 +164,9 @@ impl Rseq {
                 .map_err(|_| Errno(14))?,
         );
         if pointer == 0 {
+            memory
+                .write_array(registration.address + 8, 0u64.to_le_bytes())
+                .map_err(|_| Errno(14))?;
             return Ok(pc);
         }
         if pointer >= ADDRESS_LIMIT {
@@ -214,10 +201,13 @@ impl Rseq {
             return Ok(pc);
         }
         // Linux rejects deprecated no-restart flags as well as unknown bits.
+        if bytes[4..8] != [0; 4] {
+            return Err(Errno(22));
+        }
         let flags = memory
             .read_array::<4>(registration.address + 16)
             .map_err(|_| Errno(14))?;
-        if bytes[4..8] != [0; 4] || flags != [0; 4] {
+        if flags != [0; 4] {
             return Err(Errno(22));
         }
         if events == 0 {

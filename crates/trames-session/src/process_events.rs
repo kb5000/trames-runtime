@@ -5,7 +5,8 @@ use super::*;
 impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn timerfd(
-        &self,
+        &mut self,
+        pid: u32,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
@@ -17,20 +18,12 @@ impl<C: Cpu> Kernel<C> {
                 .timerfd(a[0] as u32, a[1] as u32)
                 .map(|fd| Some(fd as u64));
         }
-        let timer = p.linux.vfs.timerfd_resource(a[0] as u32)?;
-        trames_linux::timerfd_control_with_boot(
-            &timer,
-            number,
-            a,
-            &mut p.memory,
-            self.started,
-            Some(p.linux.boot_clock()),
-        )
-        .map(Some)
+        self.metadata_call(pid, p, number, a, None)
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn epoll(
         &mut self,
+        pid: u32,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
@@ -43,7 +36,7 @@ impl<C: Cpu> Kernel<C> {
                 .get(a[0] as u32)
                 .is_some_and(|fd| fd.is_epoll())
         {
-            return self.poll(p, number, a, io);
+            return self.poll(pid, p, number, a, io);
         }
         let timeout = trames_linux::epoll_parameters(&p.memory, number, a)?;
         let mask = if a[4] == 0 {
@@ -146,7 +139,275 @@ impl<C: Cpu> Kernel<C> {
         progress
     }
     #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_child_call(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        call: trames_kernel::children::WaitCall,
+    ) -> Result<Option<u64>, Errno> {
+        let wait = crate::run_queue::ChildWait::accepted(call);
+        wait.bind(
+            &p.children,
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        let result = wait.check(
+            &p.children,
+            &p.signals.io,
+            p.linux.vfs.pid_namespace(),
+            p.group(),
+            &mut p.memory,
+            None,
+        );
+        if p.children.take_reaped() {
+            self.reap_waited();
+        }
+        if let Some(result) = result {
+            return result.map(Some);
+        }
+        p.state = State::Child(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_task_copy_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        mut call: trames_linux::TaskCopyCall,
+    ) -> Result<Option<u64>, Errno> {
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::task_copy(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_fd_control_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        let routes = trames_kernel::signal::IoRoutes {
+            directory: p.signals.io_directory.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            uid: p.linux.vfs.credentials.uid,
+            euid: p.linux.vfs.credentials.euid,
+        };
+        let mut call = trames_kernel::signal::FdControlCall::new(
+            &p.signals.io,
+            routes,
+            &p.linux.vfs.fd_flags_snapshot(),
+            number,
+            args,
+        );
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::fd_control(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_send_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        let routes = trames_kernel::signal::IoRoutes {
+            directory: p.signals.io_directory.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            uid: p.linux.vfs.credentials.uid,
+            euid: p.linux.vfs.credentials.euid,
+        };
+        let mut call = trames_kernel::signal::SendCall::new(
+            p.signals.io.clone(),
+            routes,
+            p.linux.vfs.fd_flags_snapshot(),
+            number,
+            args,
+        );
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::send(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_perf_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        let routes = trames_kernel::signal::IoRoutes {
+            directory: p.signals.io_directory.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            uid: p.linux.vfs.credentials.uid,
+            euid: p.linux.vfs.credentials.euid,
+        };
+        let mut call = trames_kernel::perf::OpenCall::new(
+            p.signals.io.clone(),
+            routes,
+            p.linux.vfs.fd_flags_snapshot(),
+            p.linux.vfs.descriptor_factory(),
+            args,
+            self.cpu_count,
+        );
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::perf(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_query_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        let routes = trames_kernel::signal::IoRoutes {
+            directory: p.signals.io_directory.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            uid: p.linux.vfs.credentials.uid,
+            euid: p.linux.vfs.credentials.euid,
+        };
+        let mut call = trames_kernel::query::Call::new(
+            number,
+            args,
+            self.started,
+            &p.signals.io,
+            &p.children,
+            &routes,
+        )?;
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::query(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn begin_signal_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        p.signals.begin_io();
+        let wait = if matches!(number, 132 | 134..=136 | 293) {
+            let mut call = trames_kernel::signal::ControlCall::new(
+                number,
+                args,
+                p.cpu.sp(),
+                p.signals.actions.shared(),
+                p.signals.io_directory.clone(),
+            );
+            let result = call.check(&p.signals.io, &mut p.memory);
+            p.signals.finish_io();
+            if let Some(result) = result {
+                return result.map(Some);
+            }
+            crate::run_queue::SignalWait::control(call)
+        } else {
+            let mut call = trames_kernel::signal::WaitCall::new(number, args);
+            let result = call.check(&p.signals.io, &mut p.memory, p.linux.vfs.pid_namespace());
+            p.signals.finish_io();
+            if let Some(result) = result {
+                return result.map(Some);
+            }
+            crate::run_queue::SignalWait::accepted(call)
+        };
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
+        if matches!(p.state, State::Delivery(_)) {
+            let pid = p.signals.io.tid();
+            return match self.resume_delivery(pid, p) {
+                Ok(progress) => progress,
+                Err(_) => {
+                    self.exit(pid, p, 11);
+                    true
+                }
+            };
+        }
+        if let State::Child(wait) = &p.state {
+            if !wait.ready(&p.children, p.linux.vfs.pid_namespace(), p.group()) {
+                return false;
+            }
+            let result = wait.check(
+                &p.children,
+                &p.signals.io,
+                p.linux.vfs.pid_namespace(),
+                p.group(),
+                &mut p.memory,
+                None,
+            );
+            if p.children.take_reaped() {
+                self.reap_waited();
+            }
+            if let Some(result) = result {
+                p.cpu.set_x(0, result.unwrap_or_else(error));
+                p.trace.record(p.cpu.x(0));
+                p.state = State::Ready;
+                return true;
+            }
+            return false;
+        }
+        if let State::Signal(wait) = &p.state {
+            if !wait.ready(&p.signals.io) {
+                return false;
+            }
+            let result = wait.check(
+                &p.signals.io,
+                &mut p.memory,
+                p.linux.vfs.pid_namespace(),
+                None,
+            );
+            p.signals.finish_io();
+            if let Some(result) = result {
+                p.cpu.set_x(0, result.unwrap_or_else(error));
+                p.trace.record(p.cpu.x(0));
+                p.state = State::Ready;
+                return true;
+            }
+            return false;
+        }
         if let State::Page(wait) = &p.state {
             if wait.ready() {
                 p.state = State::Ready;
@@ -235,19 +496,34 @@ impl<C: Cpu> Kernel<C> {
                 info,
                 deadline,
             } => {
-                let wait = trames_kernel::signal::SignalWait::Timed {
-                    mask,
-                    info,
-                    deadline,
-                };
-                if let Some(value) =
-                    wait.check(&p.signals.io, &mut p.memory, p.linux.vfs.pid_namespace())
-                {
+                let wait =
+                    crate::run_queue::SignalWait::new(trames_kernel::signal::SignalWait::Timed {
+                        mask,
+                        info,
+                        deadline,
+                    });
+                p.signals.begin_io();
+                let result = wait.check(
+                    &p.signals.io,
+                    &mut p.memory,
+                    p.linux.vfs.pid_namespace(),
+                    None,
+                );
+                p.signals.finish_io();
+                if let Some(value) = result {
                     p.cpu.set_x(0, value.unwrap_or_else(error));
                     p.trace.record(p.cpu.x(0));
                     p.state = State::Ready;
                     true
                 } else {
+                    wait.bind(
+                        &p.signals.io,
+                        &trames_shared::IoSignal::new(
+                            p.signals.io.tid(),
+                            Arc::downgrade(&self.byte_target),
+                        ),
+                    );
+                    p.state = State::Signal(wait);
                     false
                 }
             }
@@ -319,42 +595,30 @@ impl<C: Cpu> Kernel<C> {
                     Ok(Some(effect.total()))
                 }
             }
-            137 => {
-                let trames_kernel::signal::SignalWait::Timed {
-                    mask,
-                    info,
-                    deadline,
-                } = trames_kernel::signal::SignalWait::prepare(number, a, &p.memory)?
-                else {
-                    unreachable!()
-                };
-                p.state = State::Sigwait {
-                    mask,
-                    info,
-                    deadline,
-                };
-                self.resume_event(p);
-                if matches!(p.state, State::Ready) {
-                    Ok(Some(p.cpu.x(0)))
-                } else {
-                    Ok(None)
-                }
-            }
+            137 => self.begin_signal_call(pid, p, number, a),
             102 | 103 | 107..=111 => {
                 if number == 107 || number == 103 {
                     self.publish_io_tasks(Some((pid, p)));
                 }
-                self.timers
-                    .call(
-                        number,
-                        a,
-                        &mut p.memory,
-                        self.started,
-                        &p.signals.io,
-                        &p.signals.io_directory,
-                        p.linux.vfs.pid_namespace(),
-                    )
-                    .map(Some)
+                let mut call = trames_kernel::timers::Call::new(
+                    self.timers.clone(),
+                    number,
+                    a,
+                    self.started,
+                    p.signals.io.clone(),
+                    p.signals.io_directory.clone(),
+                    p.linux.vfs.pid_namespace().clone(),
+                );
+                if let Some(value) = call.check(&mut p.memory) {
+                    return value.map(Some);
+                }
+                let wait = crate::run_queue::SignalWait::timer(call);
+                wait.bind(
+                    &p.signals.io,
+                    &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+                );
+                p.state = State::Signal(wait);
+                Ok(None)
             }
             _ => Err(Errno(38)),
         }

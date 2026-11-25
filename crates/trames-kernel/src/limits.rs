@@ -7,7 +7,9 @@ use std::{
         Arc, Mutex, RwLock, Weak,
     },
 };
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
+mod call;
+pub use call::Call;
 use trames_vfs::{
     capabilities, Credentials, DescriptorLimit, Errno, FileSizeLimit, PidNamespace, Vfs,
 };
@@ -113,39 +115,27 @@ impl Limits {
         fixed: Fixed,
         privileged: bool,
     ) -> Result<u64, Errno> {
-        let (resource, new, old) = if number == 261 {
-            (a[1], a[2], a[3])
-        } else {
-            (
-                a[0],
-                if number == 164 { a[1] } else { 0 },
-                if number == 163 { a[1] } else { 0 },
-            )
-        };
+        let parameters = call::Parameters::new(number, a);
+        let next = parameters.import(memory)?;
+        let previous = self.exchange(parameters.resource, next, fixed, privileged)?;
+        parameters.export(memory, previous)?;
+        Ok(0)
+    }
+    fn exchange(
+        &self,
+        resource: u64,
+        next: Option<Pair>,
+        fixed: Fixed,
+        privileged: bool,
+    ) -> Result<Pair, Errno> {
         let ceiling = if resource == 7 {
             self.nr_open.get() as u64
         } else {
             fixed.value(resource)?
         };
-        if old != 0 {
-            memory
-                .check(old, 16, Access::Write)
-                .map_err(|_| Errno(14))?;
+        if next.is_some_and(|value| value.0 > value.1) {
+            return Err(Errno(22));
         }
-        // Import before copyout: new and old may alias, including raw SVC callers.
-        let next = if new != 0 {
-            let bytes = memory.read_array::<16>(new).map_err(|_| Errno(14))?;
-            let value = (
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            );
-            if value.0 > value.1 {
-                return Err(Errno(22));
-            }
-            Some(value)
-        } else {
-            None
-        };
         let mut values = self.values.lock().unwrap();
         let previous =
             trames_vfs::MutableLimits::index(resource).map_or((ceiling, ceiling), |i| values[i]);
@@ -155,23 +145,17 @@ impl Limits {
             {
                 return Err(Errno(1));
             }
-            if trames_vfs::MutableLimits::index(resource).is_none() && value != previous {
-                return Err(Errno(95));
-            }
+            let Some(index) = trames_vfs::MutableLimits::index(resource) else {
+                return if value == previous {
+                    Ok(previous)
+                } else {
+                    Err(Errno(95))
+                };
+            };
+            values[index] = value;
+            self.enforce(resource, value.0);
         }
-        if old != 0 {
-            let mut bytes = [0; 16];
-            bytes[..8].copy_from_slice(&previous.0.to_le_bytes());
-            bytes[8..].copy_from_slice(&previous.1.to_le_bytes());
-            memory.write_array(old, bytes).map_err(|_| Errno(14))?;
-        }
-        if let Some(value) = next {
-            if let Some(i) = trames_vfs::MutableLimits::index(resource) {
-                values[i] = value;
-                self.enforce(resource, value.0);
-            }
-        }
-        Ok(0)
+        Ok(previous)
     }
 }
 pub use trames_vfs::FixedLimits as Fixed;
@@ -234,14 +218,19 @@ impl Authority {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
-        let pid = if number == 261 && a[0] as u32 != 0 {
-            self.namespace.global(a[0] as u32).ok_or(Errno(3))?
-        } else {
-            self.pid
-        };
-        self.call_resolved(pid, number, a, memory)
+        let parameters = call::Parameters::new(number, a);
+        let next = parameters.import(memory)?;
+        let pid = self.resolve_pid(number, a)?;
+        self.apply(pid, parameters, next, memory)
     }
-    /// The trusted owner has already resolved this global target in its namespace.
+    fn resolve_pid(&self, number: u32, a: [u64; 6]) -> Result<u32, Errno> {
+        if number == 261 && a[0] as u32 != 0 {
+            self.namespace.global(a[0] as u32).ok_or(Errno(3))
+        } else {
+            Ok(self.pid)
+        }
+    }
+    /// The trusted owner has already resolved this global target.
     pub fn call_resolved(
         &self,
         pid: u32,
@@ -249,9 +238,31 @@ impl Authority {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
+        let parameters = call::Parameters::new(number, a);
+        let next = parameters.import(memory)?;
+        self.apply(pid, parameters, next, memory)
+    }
+    fn apply(
+        &self,
+        pid: u32,
+        parameters: call::Parameters,
+        next: Option<Pair>,
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        let target = self.target(pid)?;
+        let previous = target.exchange(
+            parameters.resource,
+            next,
+            self.fixed,
+            self.credentials.has_cap(capabilities::SYS_RESOURCE),
+        )?;
+        parameters.export(memory, previous)?;
+        Ok(0)
+    }
+    fn target(&self, pid: u32) -> Result<Arc<Limits>, Errno> {
         let privileged = self.credentials.has_cap(capabilities::SYS_RESOURCE);
         if pid == self.pid {
-            return self.limits.call(number, a, memory, self.fixed, privileged);
+            return Ok(self.limits.clone());
         }
         let target = {
             let entries = self.directory.0.read().unwrap();
@@ -272,7 +283,7 @@ impl Authority {
             }
             target.limits.upgrade().ok_or(Errno(3))?
         };
-        target.call(number, a, memory, self.fixed, privileged)
+        Ok(target)
     }
 }
 

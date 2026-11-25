@@ -14,17 +14,50 @@ use trames_vfs::{
 };
 pub(crate) mod buffers;
 pub(crate) mod execute;
+pub(crate) mod input;
 pub(crate) mod time;
 type Result<T> = std::result::Result<T, Errno>;
-fn u32_at(bytes: &[u8], i: usize) -> u32 {
+pub(crate) fn u32_at(bytes: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap())
 }
 
-fn u64_at(bytes: &[u8], i: usize) -> u64 {
+pub(crate) fn u64_at(bytes: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())
 }
 fn put(bytes: &mut [u8], i: usize, v: u32) {
     bytes[i..i + 4].copy_from_slice(&v.to_le_bytes());
+}
+pub(crate) struct SoloEnter {
+    ring: Arc<Uring>,
+    args: [u64; 6],
+    wait: SoloWait,
+}
+#[allow(clippy::large_enum_variant)] // The cold accepted enter owns its wait inline.
+enum SoloWait {
+    Io(crate::PendingIo),
+    Checkpoint(crate::FileCheckpoint),
+}
+struct SoloWake;
+impl trames_vfs::IoWake for SoloWake {
+    fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {}
+}
+impl SoloEnter {
+    fn submitted(&self) -> u32 {
+        match &self.wait {
+            SoloWait::Io(wait) => wait
+                .uring_enter()
+                .map(|call| call.submitted())
+                .or_else(|| wait.file_pending()?.uring_input_submitted())
+                .unwrap_or(0),
+            SoloWait::Checkpoint(call) => call.uring_submitted().unwrap_or(0),
+        }
+    }
+    fn cancel(&self) {
+        match &self.wait {
+            SoloWait::Io(wait) => wait.cancel_copies(),
+            SoloWait::Checkpoint(call) => call.cancel(),
+        }
+    }
 }
 impl Linux {
     /// Source io_uring completion and solo VFS operations publish to the
@@ -104,28 +137,6 @@ impl Linux {
             .expect("owner has original Files and pin authority")
     }
 
-    fn uring_request(
-        &self,
-        sqe: UringSqe,
-        state: &mut UringState,
-        memory: &Memory,
-        task: u32,
-        dependency: Option<(u64, bool)>,
-    ) -> UringRequest {
-        state.next += 1;
-        import_request(
-            sqe,
-            state.next,
-            state,
-            memory,
-            task,
-            dependency,
-            self.uring_clock,
-            |fd| Some(self.vfs.retain_uring_file(fd)),
-        )
-        .expect("joined file authority")
-    }
-
     pub fn uring_enter_deadline(&self, a: [u64; 6], memory: &Memory) -> Result<Option<Instant>> {
         time::enter_deadline(a, memory, self.uring_clock)
     }
@@ -137,9 +148,17 @@ impl Linux {
         saved: Option<u32>,
         task: u32,
     ) -> Result<(u32, bool)> {
-        let ring = self.vfs.uring(a[0] as u32)?;
+        let a = saved
+            .and_then(|_| self.uring_enters.get(&task).map(|call| call.args))
+            .map_or_else(|| crate::direct::uring::enter_args(a), Ok)?;
+        let ring = saved
+            .and_then(|_| self.uring_enters.get(&task).map(|call| call.ring.clone()))
+            .map_or_else(|| self.vfs.uring(a[0] as u32), Ok)?;
         self.uring_enter_ring(ring, a, memory, saved, task)
     }
+    /// Embeddings keep one accepted enter per task. A false result retains its
+    /// original inputs and wait; the caller drives readiness or takes that
+    /// exact PendingIo/FileCheckpoint for handoff to an execution-capable host.
     pub fn uring_enter_ring(
         &mut self,
         ring: Arc<Uring>,
@@ -148,128 +167,111 @@ impl Linux {
         saved: Option<u32>,
         task: u32,
     ) -> Result<(u32, bool)> {
-        if saved.is_none() {
-            self.uring_enter_deadline(a, memory)?;
-        }
-        if a[2] > ring.cq_entries as u64 {
-            return Err(Errno(22));
-        }
-        let paths = self.vfs.path_queries();
-        let execution = Arc::new(crate::direct::uring::actor::Execution::new(
-            &paths,
-            &self.vfs.descriptor_factory(),
-            &Default::default(),
-            self.vfs.direct_descriptors(),
-            self.file_executor.clone(),
-            self.file_layouts.clone(),
-            self.vfs.task_signal(),
-        ));
-        let submitted = if let Some(n) = saved {
-            n
+        let a = saved
+            .and_then(|_| self.uring_enters.get(&task).map(|call| call.args))
+            .map_or_else(|| crate::direct::uring::enter_args(a), Ok)?;
+        let old = self.uring_enters.remove(&task);
+        let old = if saved.is_some() {
+            old
         } else {
-            let mut retired_files = Vec::new();
-            let mut retired_graph = Vec::new();
-            let mut retired_requests = Vec::new();
-            let mut state = ring.state.lock().unwrap();
-            let head = ring.cq_head(&state)?;
-            let available = ring.sq_tail().wrapping_sub(state.head);
-            if available > ring.entries {
-                return Err(Errno(22));
+            if let Some(old) = old {
+                old.cancel();
             }
-            let count = available.min(a[1] as u32);
-            let outstanding = state.pending.len()
-                + state.inflight
-                + state.shot_reservations
-                + state.overflow.len()
-                + state.tail.wrapping_sub(head) as usize;
-            if outstanding + count as usize > ring.outstanding_limit() {
-                return Err(Errno(16));
-            }
-            let mut previous = None;
-            let mut consumed = 0;
-            let mut metadata: usize = state.inflight_metadata
-                + state
-                    .pending
-                    .iter()
-                    .map(|r| {
-                        512 + r.parts.as_ref().map_or(0, |p| p.len() * 16)
-                            + r.path.as_ref().map_or(0, Vec::len)
-                    })
-                    .sum::<usize>();
-            for _ in 0..count {
-                let sqe = ring.sqe(state.head);
-                let Some(sqe) = sqe else {
-                    state.head = state.head.wrapping_add(1);
-                    consumed += 1;
-                    state.dropped = state.dropped.wrapping_add(1);
-                    previous = None;
-                    continue;
-                };
-                let mut request = self.uring_request(sqe, &mut state, memory, task, previous);
-                if let Some(file) = request.file.take() {
-                    if request.error.is_some() {
-                        retired_files.push(file);
-                    } else {
-                        let (bound, retired) = ring.bind_file_deferred(&file);
-                        if !retired.is_empty() {
-                            retired_graph.push(retired);
-                        }
-                        match bound {
-                            Ok(bound) => request.file = Some(bound),
-                            Err(error) => {
-                                request.error = Some(error);
-                                retired_files.push(file);
-                            }
-                        }
-                    }
-                }
-                let bytes = 512
-                    + request.parts.as_ref().map_or(0, |p| p.len() * 16)
-                    + request.path.as_ref().map_or(0, Vec::len);
-                if metadata + bytes > 1024 * 1024 {
-                    retired_requests.push(request);
-                    break;
-                }
-                metadata += bytes;
-                state.head = state.head.wrapping_add(1);
-                consumed += 1;
-                previous = if request.sqe.flags() & (4 | 8) != 0 {
-                    Some((request.sequence, request.sqe.flags() & 8 != 0))
-                } else {
-                    None
-                };
-                let actor = self.uring_actor.get_or_init(Arc::default).clone();
-                request.source = Some(Arc::downgrade(
-                    &(actor.clone() as Arc<dyn trames_vfs::UringSource>),
-                ));
-                actor.accept(&ring, &mut request, execution.clone());
-                state.insert(request);
-            }
-            if consumed == 0 && count != 0 {
-                return Err(Errno(16));
-            }
-            ring.publish_head(&state);
-            consumed
+            None
         };
-        self.progress_ring(&ring, memory, task);
-        if ring
-            .state
-            .lock()
-            .unwrap()
-            .pending
-            .iter()
-            .any(|r| r.owner == memory.instruction_identity().0 && r.task == task)
-        {
-            self.uring_actor.get_or_init(Arc::default).track(
-                &ring,
-                memory.instruction_identity().0,
-                task,
-            );
+        let (ring, args, old) = match old {
+            Some(call) => (call.ring, call.args, Some(call.wait)),
+            None => (ring, a, None),
+        };
+        let mut source = crate::DirectSyscalls::new(self.vfs.direct_descriptors())
+            .with_paths(self.vfs.path_queries())
+            .with_resources(self.vfs.descriptor_factory())
+            .with_urings(
+                crate::UringEpoch::default()
+                    .capture(&self.vfs, memory.instruction_identity().0, task)
+                    .with_actor(self.uring_actor_root()),
+            )
+            .with_clock(self.uring_clock);
+        if let Some(reader) = self.vfs.signal_reader() {
+            source = source.with_signal_reader(reader);
         }
-        Ok((
-            submitted,
-            a[3] & 1 == 0 || a[2] == 0 || ring.cq_ready() >= a[2] as u32,
-        ))
+        if let Some(signal) = self.vfs.task_signal() {
+            source = source.with_task_signal(signal);
+        }
+        if let Some(executor) = &self.file_executor {
+            source = source.with_file_executor(executor.clone());
+        }
+        if let Some(layouts) = &self.file_layouts {
+            source = source.with_file_layouts(layouts.clone());
+        }
+        let _actor = trames_vfs::FileActorScope::enter_if_absent(
+            || self.vfs.credentials.clone(),
+            task,
+            source.sync_executor(),
+        );
+        let wake: Arc<dyn trames_vfs::IoWake> = Arc::new(SoloWake);
+        let target = Arc::downgrade(&wake);
+        let attempt = match old {
+            Some(SoloWait::Io(wait)) => source.resume(wait, memory),
+            Some(SoloWait::Checkpoint(call)) => match call.take() {
+                crate::FileBoundary::UringEnter(call) => {
+                    call.resume(&source, memory, task, &target)
+                }
+                crate::FileBoundary::Signal { value } => crate::IoAttempt::Complete(value),
+                _ => unreachable!("original enter capability"),
+            },
+            None if saved.is_some() => crate::direct::uring::EnterInput::accepted(
+                ring.clone(),
+                args,
+                self.uring_clock,
+                saved.unwrap(),
+            )
+            .resume(&source, memory, task, &target),
+            None => source
+                .start(426, args, memory, task, &target, None)
+                .expect("original ring domain"),
+        };
+        let (submitted, wait) = match attempt {
+            crate::IoAttempt::Complete(result) => return result.map(|n| (n as u32, true)),
+            crate::IoAttempt::Blocked(wait) => {
+                let submitted = wait
+                    .uring_enter()
+                    .map(|call| call.submitted())
+                    .or_else(|| wait.file_pending()?.uring_input_submitted())
+                    .unwrap_or(saved.unwrap_or(0));
+                (submitted, SoloWait::Io(wait))
+            }
+            crate::IoAttempt::FileCheckpoint(call) => (
+                call.uring_submitted().unwrap_or(saved.unwrap_or(0)),
+                SoloWait::Checkpoint(call),
+            ),
+            crate::IoAttempt::HostError(_) => return Err(Errno(5)),
+            _ => unreachable!("original enter retains every capability boundary"),
+        };
+        self.uring_enters
+            .insert(task, SoloEnter { ring, args, wait });
+        Ok((submitted, false))
+    }
+    pub fn take_uring_wait(&mut self, task: u32) -> Option<crate::PendingIo> {
+        if !matches!(&self.uring_enters.get(&task)?.wait, SoloWait::Io(_)) {
+            return None;
+        }
+        let SoloWait::Io(wait) = self.uring_enters.remove(&task)?.wait else {
+            unreachable!()
+        };
+        Some(wait)
+    }
+    pub(crate) fn uring_submitted(&self, task: u32) -> Option<u32> {
+        self.uring_enters.get(&task).map(SoloEnter::submitted)
+    }
+    pub fn take_uring_checkpoint(&mut self, task: u32) -> Option<crate::FileCheckpoint> {
+        if !matches!(&self.uring_enters.get(&task)?.wait, SoloWait::Checkpoint(_)) {
+            return None;
+        }
+        let SoloWait::Checkpoint(call) = self.uring_enters.remove(&task)?.wait else {
+            unreachable!()
+        };
+        Some(call)
     }
     pub(crate) fn complete_request(
         state: &mut UringState,
@@ -351,6 +353,9 @@ impl Linux {
         changed
     }
     pub fn cancel_uring(&mut self, memory: &mut Memory, task: u32) {
+        if let Some(call) = self.uring_enters.remove(&task) {
+            call.cancel();
+        }
         let owner = memory.instruction_identity().0;
         let scope = self
             .uring_actor
@@ -390,6 +395,11 @@ impl Linux {
     }
     pub fn uring_rings(&self) -> Vec<Arc<Uring>> {
         let mut rings = self.vfs.urings();
+        for call in self.uring_enters.values() {
+            if !rings.iter().any(|ring| Arc::ptr_eq(ring, &call.ring)) {
+                rings.push(call.ring.clone());
+            }
+        }
         if let Some(actor) = self.uring_actor.get() {
             for ring in actor.rings() {
                 if !rings.iter().any(|r| Arc::ptr_eq(r, &ring)) {
@@ -402,14 +412,17 @@ impl Linux {
 }
 
 pub(crate) fn probe(a: [u64; 6], memory: &mut impl trames_memory::CpuMemory) -> Result<u64> {
-    if a[3] > 256 {
+    let count = (a[3] as u32).min(*URING_OPS.last().unwrap() as u32 + 1) as usize;
+    let size = 16 + count * 8;
+    // io_probe imports and validates the whole zeroed header/ops array before
+    // its first output store. A lazy input page cannot publish half a probe.
+    let mut output = vec![0; size];
+    memory.read(a[2], &mut output).map_err(|_| Errno(14))?;
+    if output.iter().any(|&byte| byte != 0) {
         return Err(Errno(22));
     }
-    let size = 16 + a[3] as usize * 8;
-    Linux::check(memory, a[2], size, Access::Write)?;
-    let mut output = vec![0; size];
     output[0] = *URING_OPS.last().unwrap();
-    output[1] = a[3].min(output[0] as u64 + 1) as u8;
+    output[1] = count as u8;
     for i in 0..output[1] as usize {
         output[16 + i * 8] = i as u8;
         if URING_OPS.contains(&(i as u8)) {
@@ -452,7 +465,7 @@ pub(crate) fn setup_parameters(
         (0, entries),
         (4, cq_entries),
         (8, flags),
-        (20, 1 | 2 | (1 << 8)),
+        (20, 1 | 2 | (1 << 8) | (1 << 15)),
         (40, 0),
         (44, 4),
         (48, 8),
@@ -689,7 +702,7 @@ pub(crate) fn register(
 pub(crate) fn import_request(
     sqe: UringSqe,
     sequence: u64,
-    state: &UringState,
+    state: &impl input::Resources,
     memory: &impl trames_memory::CpuMemory,
     task: u32,
     dependency: Option<(u64, bool)>,
@@ -719,6 +732,8 @@ pub(crate) fn import_request(
         path: None,
         how: None,
         started: false,
+        copy_pending: false,
+        import_pending: false,
         timeout_count: None,
         timeout_target: None,
         timeout_duration: None,
@@ -744,6 +759,7 @@ pub(crate) fn import_request(
         || s.opcode() == 27
             && s.multishot()
             && (s.flags() & 32 == 0 || s.length() != 0 || s.op_flags() & (2 | 0x40 | 0x100) != 0)
+        || matches!(s.opcode(), 26 | 27) && s.offset() != 0
     {
         request.error = Some(Errno(22));
     }
@@ -775,12 +791,7 @@ pub(crate) fn import_request(
     ) || s.opcode() == 14 && s.op_flags() & 2 != 0;
     if takes_file || path_op && s.fd() != -100 && !absolute {
         let file = if s.flags() & 1 != 0 || s.opcode() == 14 && s.op_flags() & 8 != 0 {
-            state
-                .files
-                .as_ref()
-                .and_then(|files| files.get(s.fd() as usize))
-                .and_then(Clone::clone)
-                .ok_or(Errno(9))
+            state.fixed_file(s.fd() as usize).ok_or(Errno(9))
         } else {
             accept(s.fd() as u32)?
         };
@@ -791,18 +802,20 @@ pub(crate) fn import_request(
     } else if s.flags() & 1 != 0 {
         request.error = Some(Errno(22));
     }
+    if request.error.is_some() {
+        return Some(request);
+    }
     if matches!(s.opcode(), 4 | 5) {
         let index = u16::from_le_bytes(s.0[40..42].try_into().unwrap()) as usize;
-        match state
-            .buffers
-            .as_ref()
-            .and_then(|buffers| buffers.get(index))
-        {
+        match state.buffer(index) {
             Some(buffer) if buffer.range(s.address(), s.length() as usize).is_ok() => {
-                request.buffer = Some(buffer.clone())
+                request.buffer = Some(buffer)
             }
             _ => request.error = Some(Errno(14)),
         }
+    }
+    if request.error.is_some() {
+        return Some(request);
     }
     if matches!(s.opcode(), 1 | 2) {
         match Linux::positioned_vector_import(
@@ -1205,7 +1218,7 @@ pub(crate) mod tests {
         l.vfs.write(file, b"data").unwrap();
         add(&mut m, &r, sqe(3, file, 1));
         assert_eq!(
-            l.uring_enter([fd as u64, 1, 0, 4, 0, 0], &mut m, None, 7),
+            l.uring_enter([fd as u64, 1, 0, 64, 0, 0], &mut m, None, 7),
             Err(Errno(22))
         );
         assert_eq!(r.state.lock().unwrap().head, 0);

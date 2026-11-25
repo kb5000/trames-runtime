@@ -34,14 +34,15 @@ mod user_namespace;
 pub use user_namespace::{UserNamespace, CLONE_NEWUSER};
 mod keyrings;
 pub mod landlock;
-pub use keyrings::{KeyOperation, KeyRegistry, KeyResult, SessionKeys};
+pub use keyrings::{KeyLease, KeyOperation, KeyRegistry, KeyResult, SessionKeys};
 mod credentials;
 mod fd_status;
-pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};
-pub use fd_status::DescriptorControl;
+pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal, TemporaryMask};
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
+pub use fd_status::{DescriptorControl, StatusControl};
 mod pipe;
 mod stream_transfer;
+mod transfer_io;
 pub use fd_table::FifoOpen;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
@@ -53,7 +54,7 @@ mod fd_allocator;
 mod fd_table;
 pub mod perf;
 mod resource_limits;
-pub use descriptor_factory::DescriptorFactory;
+pub use descriptor_factory::{DescriptorFactory, PreparedDescriptor, PreparedPair};
 pub use resource_limits::{
     DescriptorCeiling, DescriptorLimit, FileSizeLimit, FixedLimits, MemoryResourceLimits,
     MutableLimits, TaskLimit,
@@ -93,7 +94,7 @@ use direct_io::PipeResource;
 pub use file_io::{DirectFile, DirectFiles, FileAccess, FileEpoch, PreparedFile};
 mod readiness;
 mod timer_io;
-pub use direct_io::{DirectFd, DirectFds, DirectPoll};
+pub use direct_io::{DirectFd, DirectFds, DirectPoll, PollBinding};
 pub use readiness::{IoSignal, IoSubscription, IoWake};
 pub use timer_io::BootTimer;
 mod signal_reader;
@@ -103,6 +104,7 @@ pub use signal_reader::SignalReader;
 pub use timer_io::TimerFd;
 pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness, ReadinessDriver};
 mod epoll;
+pub use epoll::{EpollBlocked, EpollControl, EpollDelivery, EpollObservations, EpollPrepareError};
 mod epoll_graph;
 mod events;
 pub mod sync_file;
@@ -188,7 +190,7 @@ mod storage;
 mod storage_tests;
 pub use credentials::{CredentialState, Credentials, Dumpable, ExecCredentials};
 mod file_actor;
-pub use file_actor::FileActorScope;
+pub use file_actor::{FileActorScope, FileActorSnapshot};
 pub use linux_namespace::{NamespaceProjection, PidfdNamespaces, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
@@ -686,6 +688,24 @@ struct ResolvedInode {
     _image: Option<Arc<ExecutableFile>>,
     _directory: Option<Arc<mounts::MountUse>>,
 }
+impl ResolvedInode {
+    fn fuse_entry(&self) -> Option<Arc<fuse::Entry>> {
+        self.file
+            .as_ref()
+            .and_then(|file| match &file.control {
+                Some(events::SharedControl::FuseFile(file)) => file.named_entry(),
+                _ => None,
+            })
+            .or_else(|| fuse::Entry::directory(&self.node))
+            .or_else(|| {
+                self.mount
+                    .as_ref()
+                    .filter(|mount| Arc::ptr_eq(&mount.root, &self.node))?
+                    .root_entry
+                    .clone()
+            })
+    }
+}
 #[derive(Clone)]
 struct MetadataTarget {
     path: ResolvedPath,
@@ -737,6 +757,7 @@ enum ResolveOperation<'a> {
 // One pathname walk, retained unchanged across a daemon wait. Ordinary paths
 // construct this on the stack; credentials are captured only on suspension.
 struct PathWalk {
+    retry: Option<Box<fuse::PathRetry>>,
     root: ResolvedPath,
     current: ResolvedPath,
     boundary: Option<ResolvedPath>,
@@ -937,6 +958,10 @@ impl ProcRefresh {
 }
 
 pub struct Vfs {
+    // Compatibility embedders retain their source at the original task root.
+    // Resolver/control projections and forks get a fresh empty slot: copying
+    // this into a resolver would close an actor -> Files -> VFS lifetime cycle.
+    compat_uring_source: std::sync::OnceLock<Arc<dyn UringSource>>,
     signal_reader: RefCell<Option<Arc<dyn SignalReader>>>,
     task_namespace_publication: OnceCell<Arc<task_namespace::Publication>>,
     query: Option<path_queries::Authority>,
@@ -1001,6 +1026,9 @@ impl Vfs {
     pub fn task_signal(&self) -> Option<Arc<dyn TaskSignal>> {
         self.signal_reader.borrow().as_ref()?.task_signal()
     }
+    pub fn signal_reader(&self) -> Option<Arc<dyn SignalReader>> {
+        self.signal_reader.borrow().clone()
+    }
     pub fn bind_signal_reader(&self, reader: Arc<dyn SignalReader>) {
         let mut current = self.signal_reader.borrow_mut();
         if current.as_ref().is_none_or(|r| !Arc::ptr_eq(r, &reader)) {
@@ -1028,6 +1056,7 @@ impl Vfs {
     }
     pub fn clone_with_resources(&self, shared_files: bool, shared_fs: bool) -> Self {
         Self {
+            compat_uring_source: Default::default(),
             signal_reader: RefCell::new(self.signal_reader.borrow().clone()),
             task_namespace_publication: OnceCell::new(),
             query: self.query.clone(),
@@ -1096,6 +1125,7 @@ impl Vfs {
         context.paths.registry = mount_registry.clone();
         Self {
             signal_reader: RefCell::new(None),
+            compat_uring_source: Default::default(),
             task_namespace_publication: OnceCell::new(),
             query: None,
             network,
@@ -1641,12 +1671,13 @@ impl Vfs {
         }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
-            let host_mode = if exclusive && !matches!(content, Content::Symlink(_)) {
-                mode & !self.umask()
-            } else {
-                mode
-            };
-            let node = host.create(&filesystem, &path, &content, host_mode)?;
+            let node = host.create(
+                &filesystem,
+                &path,
+                &content,
+                mode,
+                if exclusive { self.umask() } else { 0 },
+            )?;
             self.notification_link(&path, &node, true);
             self.notification_entry(
                 &path,
@@ -1662,6 +1693,7 @@ impl Vfs {
             let i = path.iter().rposition(|b| *b == b'/').ok_or(Errno(2))?;
             let parent = self.node(&ResolvedPath {
                 directory_inode: None,
+                fuse_entry: None,
                 indexed_position: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_position: None,
@@ -2007,6 +2039,7 @@ impl Vfs {
             Ok(MetadataTarget {
                 path: ResolvedPath {
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -2122,6 +2155,42 @@ impl Vfs {
                     Ok(entry)
                 }
             });
+        match operation {
+            Some(ResolveOperation::Fuse(op) | ResolveOperation::ResumeFuse(op, _))
+                if result.is_err() =>
+            {
+                fuse::PathRetry::arm(
+                    self,
+                    dirfd,
+                    path,
+                    follow_final,
+                    retain_magic,
+                    policy,
+                    stop_magic,
+                    op,
+                    accepted,
+                    false,
+                );
+            }
+            Some(ResolveOperation::CaptureFuse(captured)) => {
+                if let Some(plan) = captured.borrow_mut().as_mut() {
+                    plan.arm_retry(|| {
+                        fuse::PathRetry::capture(
+                            self,
+                            dirfd,
+                            path,
+                            follow_final,
+                            retain_magic,
+                            policy,
+                            stop_magic,
+                            fuse::PathOperation::ResolveDirectory,
+                            accepted,
+                        )
+                    });
+                }
+            }
+            _ => (),
+        }
         if let Some(paths) = paths {
             if let Ok(entry) = &result {
                 paths
@@ -2201,6 +2270,7 @@ impl Vfs {
         let trailing = path.last() == Some(&b'/');
         let links = 0;
         Ok(PathWalk {
+            retry: None,
             root,
             current,
             boundary,
@@ -2291,6 +2361,7 @@ impl Vfs {
         mut permission_checked: bool,
     ) -> Result<ResolvedEntry> {
         let PathWalk {
+            retry,
             root,
             mut current,
             boundary,
@@ -2358,6 +2429,7 @@ impl Vfs {
                     let query = self.query.as_ref().unwrap();
                     let continuation = Some(Box::new((
                         PathWalk {
+                            retry,
                             root,
                             current,
                             boundary,
@@ -2419,6 +2491,7 @@ impl Vfs {
                                 fs,
                                 parent_node.clone(),
                                 PathWalk {
+                                    retry,
                                     root,
                                     current: current.clone(),
                                     boundary,
@@ -2531,6 +2604,7 @@ impl Vfs {
                                 let plan = fuse::PathPlan::root(m, fs, names, trailing)
                                     .at_directory(parent_node.clone());
                                 *captured.borrow_mut() = Some(plan.with_walk(PathWalk {
+                                    retry,
                                     root,
                                     current: parent,
                                     boundary,
@@ -2565,6 +2639,7 @@ impl Vfs {
                                     key: m.root_path(),
                                     mount: Some(m.clone()),
                                     directory_inode: None,
+                                    fuse_entry: None,
                                     indexed_position: None,
                                     #[cfg(all(feature = "hostfs", unix))]
                                     host_position: None,
@@ -2598,6 +2673,7 @@ impl Vfs {
                             parent_node.clone(),
                             part,
                             PathWalk {
+                                retry,
                                 root,
                                 current,
                                 boundary,
@@ -2675,6 +2751,7 @@ impl Vfs {
                             &ResolvedPath {
                                 key: Vec::new(),
                                 directory_inode: None,
+                                fuse_entry: None,
                                 indexed_position: None,
                                 #[cfg(all(feature = "hostfs", unix))]
                                 host_position: None,
@@ -2692,6 +2769,7 @@ impl Vfs {
                             &ResolvedPath {
                                 key: file.label.clone(),
                                 directory_inode: None,
+                                fuse_entry: None,
                                 indexed_position: None,
                                 #[cfg(all(feature = "hostfs", unix))]
                                 host_position: None,
@@ -2721,6 +2799,7 @@ impl Vfs {
                             &current,
                             &ResolvedPath {
                                 directory_inode: None,
+                                fuse_entry: None,
                                 indexed_position: None,
                                 #[cfg(all(feature = "hostfs", unix))]
                                 host_position: None,
@@ -2748,6 +2827,7 @@ impl Vfs {
                                 mount: file.mount.clone(),
                                 host_position: Some(hostfs::Position::magic(file)),
                                 directory_inode: None,
+                                fuse_entry: None,
                                 indexed_position: None,
                                 retained_directory: None,
                                 proc_binding: None,
@@ -2793,10 +2873,12 @@ impl Vfs {
                         // mountpoint's parent. Retain that accepted directory,
                         // then let the existing walker anchor its relative work.
                         let mut parent = parent;
+                        parent.fuse_entry = fuse::Entry::directory(&parent_node);
                         parent.directory_inode = Some(parent_node.clone());
                         let mount = current.mount.as_ref().ok_or(Errno(5))?.clone();
                         let fs = mount.fs.fuse.as_ref().ok_or(Errno(5))?;
                         let walk = PathWalk {
+                            retry,
                             root,
                             current,
                             boundary,
@@ -3020,7 +3102,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Readlink)),
             None,
         )?;
-        self.readlink_resolved(&dest)
+        let result = self.readlink_resolved(&dest);
+        fuse::PathRetry::arm(
+            self,
+            dirfd,
+            path,
+            false,
+            false,
+            0,
+            false,
+            fuse::PathOperation::Readlink,
+            None,
+            true,
+        );
+        result
     }
     fn readlink_resolved(&self, dest: &ResolvedPath) -> Result<Vec<u8>> {
         crate::output_resources::OutputScope::path(dest);
@@ -3582,7 +3677,23 @@ impl Vfs {
                 return Err(e);
             }
         };
-        self.open_resolved::<PATH_TRUNCATE>(entry, flags, mode, publication, reservation)
+        let result =
+            self.open_resolved::<PATH_TRUNCATE>(entry, flags, mode, publication, reservation);
+        if !PATH_TRUNCATE {
+            fuse::PathRetry::arm(
+                self,
+                dirfd,
+                path,
+                flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0,
+                true,
+                policy,
+                true,
+                fuse::PathOperation::Open(flags),
+                None,
+                true,
+            );
+        }
+        result
     }
     fn open_resolved<const PATH_TRUNCATE: bool>(
         &mut self,
@@ -3592,29 +3703,40 @@ impl Vfs {
         publication: Option<&DirectFiles>,
         reservation: fd_table::ReservedFd,
     ) -> Result<u32> {
+        self.open_reserved::<PATH_TRUNCATE>(entry, flags, mode, publication, &mut Some(reservation))
+    }
+    fn open_reserved<const PATH_TRUNCATE: bool>(
+        &mut self,
+        entry: ResolvedEntry,
+        flags: u32,
+        mode: u32,
+        publication: Option<&DirectFiles>,
+        reservation: &mut Option<fd_table::ReservedFd>,
+    ) -> Result<u32> {
         let (mut p, target) = entry;
         let magic = match target {
             Some(ResolvedTarget::Inode(file)) => Some(file),
             Some(ResolvedTarget::Descriptor(open)) => {
                 let original = open.borrow();
                 if let Some(events::SharedControl::FuseFile(file)) = &original.control {
-                    if original.node.is_none() {
-                        let file = file.clone();
-                        let path = if let FdKind::Node(path) = &original.kind {
-                            path.clone()
-                        } else {
-                            Vec::new()
-                        };
-                        drop(original);
-                        return self.reopen_fuse_file(
-                            file,
-                            path,
-                            flags,
-                            mode,
-                            publication,
-                            reservation,
-                        );
-                    }
+                    // A cached inode is still daemon-backed. Every FUSE magic
+                    // reopen needs its original GETATTR followed by a new FH;
+                    // generic inode open cannot replace that protocol.
+                    let file = file.clone();
+                    let path = if let FdKind::Node(path) = &original.kind {
+                        path.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    drop(original);
+                    return self.reopen_fuse_file(
+                        file,
+                        path,
+                        flags,
+                        mode,
+                        publication,
+                        reservation,
+                    );
                 }
                 if original.node.is_none() || original.namespace_resource.is_some() {
                     drop(original);
@@ -3633,6 +3755,7 @@ impl Vfs {
                 .unwrap_or(ResolvedPath {
                     key: file.label.clone(),
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -3699,6 +3822,17 @@ impl Vfs {
             .as_ref()
             .filter(|_| flags & O_PATH == 0)
             .and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs)))
+            .filter(|_| {
+                forced_node
+                    .as_ref()
+                    .or(p.directory_inode.as_ref())
+                    .is_none_or(|node| {
+                        matches!(
+                            node.borrow().mode & 0o170000,
+                            0o100000 | 0o040000 | 0o120000
+                        )
+                    })
+            })
         {
             if PATH_TRUNCATE {
                 return Err(Errno(21));
@@ -3733,6 +3867,7 @@ impl Vfs {
                 None
             };
             let mut pending = fuse::Metadata::open_inode(self, mount, fs, flags, inode)?;
+            pending.retain_entry(p.fuse_entry.clone());
             pending.prepare_open(
                 self.open_id(),
                 mount.shared.clone(),
@@ -3745,7 +3880,7 @@ impl Vfs {
                 pending.retain_open_parent(parent);
             }
             pending.reserve_open(
-                reservation,
+                reservation.take().expect("original unpublished open slot"),
                 mode,
                 self.umask_capability(),
                 publication.cloned(),
@@ -3844,7 +3979,7 @@ impl Vfs {
                 let filesystem = p.filesystem(self);
                 let _namespace = filesystem.namespace.lock().unwrap();
                 self.landlock_check_parent(&p, None, landlock::MAKE_REG)?;
-                match host.create_open(&filesystem, &p, flags, mode & !self.umask()) {
+                match host.create_open(&filesystem, &p, flags, mode, self.umask()) {
                     Ok((node, lease)) => {
                         self.notification_link(&p, &node, true);
                         self.notification_entry(&p, inotify::CREATE, 0, false);
@@ -3885,7 +4020,12 @@ impl Vfs {
             };
             self.landlock_open::<PATH_TRUNCATE>(path, &node, flags)?
         };
-        if existed && flags & O_CREAT != 0 {
+        let fuse_special = node.fuse_leaf.get().is_some()
+            && !matches!(
+                node.borrow().mode & 0o170000,
+                0o100000 | 0o040000 | 0o120000
+            );
+        if existed && flags & O_CREAT != 0 && !fuse_special {
             self.check_sticky_create(&p, &node)?;
         }
         {
@@ -3915,6 +4055,7 @@ impl Vfs {
                 return Err(Errno(20));
             }
             if existed
+                && !fuse_special
                 && flags & O_PATH == 0
                 && !network_control
                     .as_ref()
@@ -4189,7 +4330,7 @@ impl Vfs {
                 if let Some(target) = target {
                     query.prepared.borrow_mut().open = Some(file_work::PreparedOpen {
                         _truncate_access: write_access,
-                        reservation,
+                        reservation: reservation.take().expect("original unpublished open slot"),
                         target,
                         cloexec: descriptor.cloexec,
                         publication: publication.cloned(),
@@ -4201,7 +4342,10 @@ impl Vfs {
         if let Some(files) = publication {
             files.publish_open(self, &descriptor.open.borrow());
         }
-        let number = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
+        let number = reservation
+            .take()
+            .expect("original unpublished open slot")
+            .publish(descriptor, self.query.is_none().then_some(&self.fds))?;
         if let (Some(end), Some(task)) = (automatic_terminal, self.terminal_task()) {
             end.pair.bind_signal_route(task.clone());
             let _ = task.acquire(&end.pair, false, fd_can_read(flags), true);
@@ -4429,6 +4573,14 @@ impl Vfs {
             if StreamTransfer::admitted(&source, &dest) {
                 let mut transfer =
                     StreamTransfer::new(source, dest, Ok(from), Ok(to), count as u64, true, 0);
+                if self.query.is_some() && transfer.daemon_backed() {
+                    let target = transfer.output.filesystem_target();
+                    let command = FileCommand::Transfer(Arc::new(std::sync::Mutex::new(transfer)));
+                    return match self.transfer_work(FileWork::from_vfs(self, target, command))? {
+                        FileValue::Transfer { count, .. } => Ok(count as usize),
+                        _ => unreachable!("retained splice result"),
+                    };
+                }
                 return match transfer.execute(self)? {
                     FileValue::Transfer { count, .. } => Ok(count as usize),
                     _ => unreachable!(),
@@ -4501,7 +4653,7 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
-            return Ok(q.read(&o.file_position, count));
+            return q.read(&o.file_position, count);
         }
         if let Some(events::SharedControl::Fuse(file)) = &o.control {
             let file = file.clone();
@@ -4615,7 +4767,7 @@ impl Vfs {
         let n = node.borrow();
         let result = match &n.content {
             Content::Fuse => Err(Errno(95)),
-            Content::MessageQueue(q) => Ok(q.read(&o.file_position, count)),
+            Content::MessageQueue(q) => q.read(&o.file_position, count),
             Content::File(b) => {
                 let mut position = o.file_position.lock().unwrap();
                 if position.pending != 0 {
@@ -5285,6 +5437,7 @@ impl Vfs {
             {
                 let at = ResolvedPath {
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -5336,6 +5489,7 @@ impl Vfs {
                 }
                 let at = ResolvedPath {
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -5403,7 +5557,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Stat)),
             None,
         )?;
-        self.stat_resolved((p, magic))
+        let result = self.stat_resolved((p, magic));
+        fuse::PathRetry::arm(
+            self,
+            dirfd,
+            path,
+            !nofollow,
+            !nofollow,
+            0,
+            !nofollow,
+            fuse::PathOperation::Stat,
+            None,
+            true,
+        );
+        result
     }
     fn stat_resolved(&self, (p, magic): ResolvedEntry) -> Result<([u8; 128], StatMount)> {
         match magic {
@@ -5647,6 +5814,7 @@ impl Vfs {
                 key: Vec::new(),
                 mount: None,
                 directory_inode: None,
+                fuse_entry: None,
                 indexed_position: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_position: None,
@@ -5667,7 +5835,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Chdir)),
             None,
         )?;
-        self.chdir_resolved(entry)
+        let result = self.chdir_resolved(entry);
+        fuse::PathRetry::arm(
+            self,
+            AT_FDCWD,
+            path,
+            true,
+            true,
+            0,
+            true,
+            fuse::PathOperation::Chdir,
+            None,
+            true,
+        );
+        result
     }
     fn chdir_resolved(&mut self, entry: ResolvedEntry) -> Result<()> {
         self.change_directory_resolved(entry, false)
@@ -5689,6 +5870,7 @@ impl Vfs {
                     key: entry.0.key.clone(),
                     mount: self.mount_for_path(open.mount.as_ref()),
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -5702,6 +5884,7 @@ impl Vfs {
                     key: file.label.clone(),
                     mount: file.mount.clone(),
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,

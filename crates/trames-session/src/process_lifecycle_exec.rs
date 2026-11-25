@@ -286,6 +286,18 @@ impl<C: Cpu> Lifecycle<C> {
                 self.tasks.retire(*peer, original);
             }
             self.timers.clear_process(actual, true);
+            if old_memory.coordinator_ownership().1 == 1 {
+                let resources = old_memory.close_resources();
+                if !resources.is_empty() {
+                    let completion = Arc::new(trames_kernel::completion::Completion::default());
+                    p.state = State::Completion(completion.clone());
+                    self.layouts.close_mappings_notify(
+                        resources,
+                        0,
+                        Some(Box::new(move || completion.finish())),
+                    );
+                }
+            }
             Kernel::release_vfork(p);
             if pid != actual {
                 p.linux.vfs.cgroup_exec_rekey(pid, actual);

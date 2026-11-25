@@ -11,8 +11,12 @@ pub(crate) struct File {
     pub(super) directory: bool,
     pub(super) attr: Arc<inode::Attr>,
     pub(super) mount: Arc<mounts::MountData>,
+    // Writable OPEN's original mount reference survives descriptor close while
+    // accepted file/page work still retains this same daemon FH.
+    pub(super) _writer: Option<Arc<mapped::MountWrite>>,
     pub(super) position_busy: std::sync::atomic::AtomicBool,
     pub(super) position_changed: Arc<Readiness>,
+    pub(super) writeback_seen: AtomicU64,
 }
 impl Drop for File {
     fn drop(&mut self) {
@@ -20,6 +24,17 @@ impl Drop for File {
             let r = &self.reference;
             r.fs.connection
                 .release(r.node, r.caller, fh, self.current_flags(), self.directory);
+        }
+    }
+}
+struct ImplicitFlush {
+    file: Arc<File>,
+    owner: u32,
+}
+impl trames_memory::SyncCompletion for ImplicitFlush {
+    fn complete(self: Box<Self>, result: std::result::Result<(), trames_memory::MemoryError>) {
+        if result.is_ok() {
+            self.file.flush_implicit_now(self.owner);
         }
     }
 }
@@ -45,21 +60,31 @@ impl Drop for Position {
     }
 }
 pub(super) enum FileResult {
-    Read(usize, Option<Position>),
-    Write {
+    Read {
         max: usize,
         start: u64,
         file: Arc<File>,
         position: Option<Position>,
+        cached: Option<Vec<u8>>,
+        buffered: Option<SharedFd>,
+    },
+    Write {
+        max: usize,
+        input: Vec<u8>,
+        start: u64,
+        file: Arc<File>,
+        position: Option<Position>,
         sync: Option<bool>,
+        buffered: Option<Arc<writeback::OpenWriter>>,
         _writer: Option<mapped::MountWrite>,
-        _transaction: inode::Write,
+        _transaction: Option<inode::Write>,
     },
     Allocate {
         file: Arc<File>,
         end: Option<u64>,
         offset: u64,
         length: u64,
+        mode: u64,
         _writer: mapped::MountWrite,
         _transaction: inode::Write,
     },
@@ -70,7 +95,7 @@ pub(super) enum FileResult {
         _position: Option<Position>,
         _writer: Option<mapped::MountWrite>,
     },
-    Directory(usize, usize, Option<Position>),
+    Directory(usize, usize, Option<Position>, Option<inode::Read>),
 }
 
 /// A daemon reply retains the OFD's offset transaction until guest copy-out.
@@ -79,6 +104,7 @@ pub struct DirectoryReply {
     bytes: Vec<u8>,
     capacity: usize,
     position: Position,
+    _access: inode::Read,
     consumed: usize,
     copied: usize,
 }
@@ -149,7 +175,25 @@ impl DirectoryReply {
 }
 
 impl FileResult {
+    pub(super) fn file(&self) -> Option<&Arc<File>> {
+        match self {
+            Self::Read { file, .. }
+            | Self::Write { file, .. }
+            | Self::Allocate { file, .. }
+            | Self::Flush(file)
+            | Self::Sync { file, .. } => Some(file),
+            Self::Directory(..) => None,
+        }
+    }
     pub(super) fn local_reply(&mut self) -> Result<FileValue> {
+        if let Self::Read {
+            cached: Some(bytes),
+            ..
+        } = self
+        {
+            let bytes = std::mem::take(bytes);
+            return self.finish(Ok(bytes));
+        }
         self.finish(Ok(if matches!(self, Self::Write { .. }) {
             vec![0; 8]
         } else {
@@ -169,8 +213,14 @@ impl FileResult {
     pub(super) fn take_sync_leases(&mut self) -> (Option<Position>, Option<mapped::MountWrite>) {
         match self {
             Self::Write {
-                position, _writer, ..
-            } => (position.take(), _writer.take()),
+                position,
+                _writer,
+                _transaction,
+                ..
+            } => {
+                _transaction.take();
+                (position.take(), _writer.take())
+            }
             _ => unreachable!("only a completed write can continue with sync"),
         }
     }
@@ -199,6 +249,7 @@ impl FileResult {
                     position.offset.lock().unwrap().value = end;
                 }
             }
+            file.attr.cache.check_error(&file.writeback_seen)?;
             return Ok(FileValue::Count(*count));
         }
         if let Self::Flush(file) = self {
@@ -207,30 +258,59 @@ impl FileResult {
                     .fs
                     .flush_unsupported
                     .store(true, Ordering::Relaxed);
+                file.attr.cache.check_error(&file.writeback_seen)?;
                 return Ok(FileValue::Count(0));
+            }
+        }
+        if let Self::Allocate { file, .. } = self {
+            if matches!(result, Err(Errno(38))) {
+                file.reference
+                    .fs
+                    .allocate_unsupported
+                    .store(true, Ordering::Relaxed);
+                return Err(Errno(95));
             }
         }
         let bytes = result?;
         match self {
-            Self::Directory(max, capacity, position) if bytes.len() <= *max => {
+            Self::Directory(max, capacity, position, access) if bytes.len() <= *max => {
                 Ok(FileValue::Directory(DirectoryReply {
                     bytes,
                     capacity: *capacity,
                     position: position.take().expect("directory offset transaction"),
+                    _access: access.take().expect("original directory read transaction"),
                     consumed: 0,
                     copied: 0,
                 }))
             }
-            Self::Read(max, pos) if bytes.len() <= *max => Ok(match pos.take() {
-                Some(position) => FileValue::Read(ReadReply::new(bytes, position)),
-                None => FileValue::Bytes(bytes),
-            }),
-            Self::Write {
+            Self::Read {
                 max,
                 start,
                 file,
                 position: pos,
+                buffered,
+                ..
+            } if bytes.len() <= *max => {
+                let mut bytes = bytes;
+                if buffered.is_none() && file.open_flags & 1 == 0 {
+                    let size =
+                        u64::from_le_bytes(file.attr.lock().unwrap()[8..16].try_into().unwrap());
+                    let count = (*max as u64).min(size.saturating_sub(*start)) as usize;
+                    file.attr.cache.overlay(*start, count, &mut bytes);
+                }
+                Ok(match pos.take() {
+                    Some(position) => FileValue::Read(ReadReply::new(bytes, position)),
+                    None => FileValue::Bytes(bytes),
+                })
+            }
+            Self::Write {
+                max,
+                input,
+                start,
+                file,
+                position: pos,
                 sync,
+                buffered,
                 ..
             } if bytes.len() == 8 => {
                 let n = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -239,7 +319,11 @@ impl FileResult {
                 }
                 if n != 0 {
                     file.extend_size(*start + n as u64);
-                    file.attr.cache.invalidate(*start, n as u64);
+                    if file.open_flags & 1 != 0 || file.current_flags() & O_DIRECT != 0 {
+                        file.attr.cache.invalidate(*start, n as u64);
+                    } else if buffered.is_none() {
+                        file.attr.cache.written(*start, &input[..n]);
+                    }
                 }
                 if let Some(pos) = pos {
                     let end = *start + n as u64;
@@ -256,6 +340,7 @@ impl FileResult {
                 end,
                 offset,
                 length,
+                mode,
                 ..
             } if bytes.is_empty() => {
                 if let Some(end) = end {
@@ -263,15 +348,85 @@ impl FileResult {
                 } else {
                     file.extend_size(0);
                 }
-                file.attr.cache.invalidate(*offset, *length);
+                if *mode & 18 != 0 {
+                    file.attr.cache.zero(*offset, *length);
+                }
                 Ok(FileValue::Count(0))
             }
-            Self::Flush(_) if bytes.is_empty() => Ok(FileValue::Count(0)),
+            Self::Flush(file) if bytes.is_empty() => {
+                file.attr.cache.check_error(&file.writeback_seen)?;
+                Ok(FileValue::Count(0))
+            }
             _ => Err(Errno(5)),
         }
     }
 }
 impl File {
+    /// A path-only mount descriptor holds the same lookup/name as its source.
+    /// It grants no daemon OPEN and therefore sends no RELEASE on close.
+    pub(crate) fn path_reference(
+        mount: &Arc<mounts::MountData>,
+        node: &NodeRef,
+        entry: Option<Arc<Entry>>,
+        flags: u32,
+    ) -> Option<Arc<Self>> {
+        let fs = mount.fs.fuse.as_ref()?;
+        let attr = node
+            .fuse_directory
+            .get()
+            .map(|directory| directory.attr.clone())
+            .or_else(|| node.fuse_leaf.get().map(|leaf| leaf.attr.clone()))?;
+        let mut reference = LookupRef::retained(fs, node.clone());
+        reference.entry = entry.or(reference.entry);
+        Some(Arc::new(Self {
+            _usage: fs.usage(),
+            reference,
+            fh: None,
+            flags,
+            status: Default::default(),
+            open_flags: 0,
+            directory: node.directory,
+            writeback_seen: AtomicU64::new(attr.cache.error_sequence()),
+            attr,
+            position_busy: Default::default(),
+            position_changed: Default::default(),
+            mount: mount.clone(),
+            _writer: None,
+        }))
+    }
+    pub(crate) fn named_entry(&self) -> Option<Arc<Entry>> {
+        self.reference.entry.clone()
+    }
+    pub(crate) fn mapped_layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        self.attr.cache.mapped().then(|| self.attr.layout.clone())
+    }
+    fn pending(
+        self: &Arc<Self>,
+        v: &Vfs,
+        pending: writeback::Pending,
+        count: u64,
+    ) -> Result<Metadata> {
+        self.local(v, ResultKind::Device(pending, count))
+    }
+    fn local(self: &Arc<Self>, v: &Vfs, kind: ResultKind) -> Result<Metadata> {
+        self.attr.check()?;
+        let fs = &self.reference.fs;
+        fs.check(&v.credentials)?;
+        Ok(Metadata {
+            request: None,
+            kind,
+            _usage: None,
+            resolved: None,
+            resolved_entry: None,
+            reference: None,
+            open: None,
+            mount: StatMount::mounted(self.mount.id, false),
+            dev: self.mount.device(),
+            owner_ns: fs.namespace.clone(),
+            reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
+        })
+    }
     pub(super) fn current_flags(&self) -> u32 {
         self.status
             .get()
@@ -282,6 +437,15 @@ impl File {
     }
     fn nonseekable(&self) -> bool {
         !self.directory && self.open_flags & (4 | 16) != 0
+    }
+    pub(crate) fn regular(&self) -> bool {
+        self.attr.kind_is_regular() && !self.nonseekable()
+    }
+    fn buffered(&self) -> bool {
+        self.regular()
+            && self.open_flags & 1 == 0
+            && self.current_flags() & O_DIRECT == 0
+            && self.reference.fs.connection.option(1 << 16)
     }
     pub(crate) fn waiting_for(&self, command: &FileCommand) -> bool {
         let position = matches!(
@@ -300,7 +464,9 @@ impl File {
                 | FileCommand::WriteSync { .. }
                 | FileCommand::Allocate { .. }
         );
-        position && self.busy() || data && self.attr.writing()
+        position && self.busy()
+            || data && !self.attr.write_ready()
+            || matches!(command, FileCommand::ReadDirectory { .. }) && !self.attr.read_ready()
     }
     pub(crate) fn subscribe_operation(
         &self,
@@ -313,6 +479,7 @@ impl File {
             FileCommand::Write { .. }
                 | FileCommand::WriteSync { .. }
                 | FileCommand::Allocate { .. }
+                | FileCommand::ReadDirectory { .. }
         ) {
             subscriptions.push(self.attr.subscribe_write(signal));
         }
@@ -334,17 +501,52 @@ impl File {
         self.position_changed.subscribe(s)
     }
     pub(super) fn request(
-        &self,
+        self: &Arc<Self>,
         v: &Vfs,
         opcode: u32,
         body: &[u8],
         kind: ResultKind,
     ) -> Result<Metadata> {
+        self.request_with_cache(v, opcode, body, kind, true)
+    }
+    pub(super) fn request_with_cache(
+        self: &Arc<Self>,
+        v: &Vfs,
+        opcode: u32,
+        body: &[u8],
+        kind: ResultKind,
+        flush_mappings: bool,
+    ) -> Result<Metadata> {
         self.attr.check()?;
         let fs = &self.reference.fs;
         fs.check(&v.credentials)?;
+        let kind = if let ResultKind::File(result) = kind {
+            buffered::Io::wrap(result, fs.caller(v))
+        } else {
+            kind
+        };
+        let kind = if flush_mappings && matches!(opcode, 20 | 25) && self.needs_writeback() {
+            let writer = self.attr.cache.writer().ok_or(Errno(5))?;
+            ResultKind::Writeback(Box::new(AfterWriteback {
+                file: self.clone(),
+                pending: writer.flush(fs.caller(v)),
+                opcode,
+                body: body.to_vec(),
+                kind: Some(Box::new(kind)),
+            }))
+        } else {
+            kind
+        };
         Ok(Metadata {
-            request: if matches!(opcode, 15 | 16)
+            request: if matches!(
+                &kind,
+                ResultKind::Writeback(_)
+                    | ResultKind::Buffered(_)
+                    | ResultKind::File(FileResult::Read {
+                        cached: Some(_),
+                        ..
+                    })
+            ) || matches!(opcode, 15 | 16)
                 && body.get(16..20).is_some_and(|bytes| bytes == [0; 4])
                 || matches!(opcode, 20 | 30)
                     && fs.sync_unsupported.load(Ordering::Relaxed)
@@ -374,6 +576,7 @@ impl File {
             dev: self.mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(super) fn sync(
@@ -384,8 +587,11 @@ impl File {
         position: Option<Position>,
         writer: Option<mapped::MountWrite>,
     ) -> Result<Metadata> {
+        if !self.needs_writeback() {
+            self.attr.cache.check_error(&self.writeback_seen)?;
+        }
         let mut body = [0; 16];
-        body[..8].copy_from_slice(&self.fh.ok_or(Errno(9))?.to_le_bytes());
+        body[..8].copy_from_slice(&self.fh.unwrap_or(0).to_le_bytes());
         body[8] = u8::from(data_only);
         self.request(
             v,
@@ -433,22 +639,53 @@ impl File {
             .flush_unsupported
             .store(true, Ordering::Relaxed);
     }
+    fn needs_writeback(&self) -> bool {
+        self.attr.cache.dirty() || self.attr.dirty_times.load(Ordering::Relaxed) != 0
+    }
     // Implicit closes cannot return a daemon error. Keep the open file until
     // FLUSH has completed so RELEASE cannot overtake it.
     pub(crate) fn flush_implicit(self: &Arc<Self>, owner: u32) {
         if self.attr.check().is_err() {
             return;
         }
+        let Some(_) = self.fh else {
+            return;
+        };
+        let r = &self.reference;
+        if self.directory {
+            return;
+        }
+        if self.needs_writeback() {
+            if let Some(writer) = self.attr.cache.writer() {
+                writer.flush_with(
+                    r.caller,
+                    Box::new(ImplicitFlush {
+                        file: self.clone(),
+                        owner,
+                    }),
+                );
+                return;
+            }
+            // An implicit close has no errno recipient. Retain the original
+            // cache error rather than send a FLUSH that skipped dirty data.
+            self.attr.cache.record_error(Errno(5));
+            return;
+        }
+        if self.attr.cache.check_error(&self.writeback_seen).is_err() {
+            return;
+        }
+        self.flush_implicit_now(owner);
+    }
+    fn flush_implicit_now(self: &Arc<Self>, owner: u32) {
+        if self.open_flags & 32 != 0 && !self.reference.fs.connection.option(1 << 16)
+            || self.reference.fs.flush_unsupported.load(Ordering::Relaxed)
+        {
+            return;
+        }
         let Some(fh) = self.fh else {
             return;
         };
         let r = &self.reference;
-        if self.directory
-            || self.open_flags & 32 != 0
-            || r.fs.flush_unsupported.load(Ordering::Relaxed)
-        {
-            return;
-        }
         let mut body = [0; 24];
         body[..8].copy_from_slice(&fh.to_le_bytes());
         body[16..24].copy_from_slice(&u64::from(owner).to_le_bytes());
@@ -457,11 +694,27 @@ impl File {
     }
     pub(crate) fn flush(self: &Arc<Self>, v: &Vfs) -> Result<Option<Metadata>> {
         let Some(fh) = self.fh else { return Ok(None) };
-        if self.directory
-            || self.open_flags & 32 != 0
+        if self.directory {
+            return Ok(None);
+        }
+        if self.open_flags & 32 != 0 && !self.reference.fs.connection.option(1 << 16)
             || self.reference.fs.flush_unsupported.load(Ordering::Relaxed)
         {
-            return Ok(None);
+            return if self.needs_writeback() {
+                let pending = self
+                    .attr
+                    .cache
+                    .writer()
+                    .ok_or(Errno(5))?
+                    .flush(self.reference.fs.caller(v));
+                self.pending(v, pending, 0).map(Some)
+            } else {
+                self.attr.cache.check_error(&self.writeback_seen)?;
+                Ok(None)
+            };
+        }
+        if !self.needs_writeback() {
+            self.attr.cache.check_error(&self.writeback_seen)?;
         }
         let mut body = [0; 24];
         body[..8].copy_from_slice(&fh.to_le_bytes());
@@ -480,6 +733,15 @@ impl File {
         command: &FileCommand,
         original: &SharedFd,
     ) -> Result<Option<Metadata>> {
+        self.operation_with_cache(v, command, original, true)
+    }
+    pub(super) fn operation_with_cache(
+        self: &Arc<Self>,
+        v: &Vfs,
+        command: &FileCommand,
+        original: &SharedFd,
+        flush: bool,
+    ) -> Result<Option<Metadata>> {
         let position = &original.open.file_position;
         self.attr.check()?;
         if matches!(command, FileCommand::Stat) {
@@ -487,6 +749,120 @@ impl File {
         }
         if let FileCommand::Truncate(length) = command {
             return Metadata::file_size(v, self.clone(), *length, false).map(Some);
+        }
+        if flush
+            && (self.open_flags & 1 != 0 || self.current_flags() & O_DIRECT != 0)
+            && matches!(
+                command,
+                FileCommand::Read { .. }
+                    | FileCommand::Write { .. }
+                    | FileCommand::WriteSync { .. }
+            )
+            && self.needs_writeback()
+        {
+            let pending = self
+                .attr
+                .cache
+                .writer()
+                .ok_or(Errno(5))?
+                .flush(self.reference.fs.caller(v));
+            return self
+                .local(
+                    v,
+                    ResultKind::CacheCommand(Box::new(AfterCache {
+                        file: self.clone(),
+                        original: original.clone(),
+                        command: command.clone(),
+                        pending,
+                    })),
+                )
+                .map(Some);
+        }
+        if let FileCommand::SyncRange {
+            offset,
+            length,
+            flags,
+        } = command
+        {
+            if !self.attr.kind_is_regular() {
+                return Err(Errno(29));
+            }
+            if flags & !7 != 0
+                || *offset > i64::MAX as u64
+                || length
+                    .checked_add(*offset)
+                    .is_none_or(|end| end > i64::MAX as u64)
+            {
+                return Err(Errno(22));
+            }
+            let pending = if *flags != 0 && self.attr.cache.dirty() {
+                self.attr.cache.writer().ok_or(Errno(5))?.range(
+                    self.reference.fs.caller(v),
+                    *offset,
+                    *length,
+                    *flags,
+                )
+            } else {
+                writeback::Pending::completed(Ok(()))
+            };
+            return self.pending(v, pending, 0).map(Some);
+        }
+        if let FileCommand::Allocate {
+            mode,
+            offset,
+            length,
+        } = command
+        {
+            if !fd_can_write(self.flags) {
+                return Err(Errno(9));
+            }
+            if self.directory {
+                return Err(Errno(21));
+            }
+            if *mode & !19 != 0
+                || self
+                    .reference
+                    .fs
+                    .allocate_unsupported
+                    .load(Ordering::Relaxed)
+            {
+                return Err(Errno(95));
+            }
+            if *mode & 18 == 18 {
+                return Err(Errno(22));
+            }
+            if *mode & 2 != 0 && *mode & 1 == 0 {
+                return Err(Errno(95));
+            }
+            if *length == 0
+                || offset
+                    .checked_add(*length)
+                    .is_none_or(|end| end > i64::MAX as u64)
+            {
+                return Err(Errno(22));
+            }
+            if *mode & 1 == 0 && offset + length > v.file_size_limit.get() {
+                return Err(Errno(27));
+            }
+            if flush && mode & 18 != 0 && self.attr.cache.dirty() {
+                let pending = self
+                    .attr
+                    .cache
+                    .writer()
+                    .ok_or(Errno(5))?
+                    .flush(self.reference.fs.caller(v));
+                return self
+                    .local(
+                        v,
+                        ResultKind::CacheCommand(Box::new(AfterCache {
+                            file: self.clone(),
+                            original: original.clone(),
+                            command: command.clone(),
+                            pending,
+                        })),
+                    )
+                    .map(Some);
+            }
         }
         let fh = self.fh.ok_or(Errno(9))?;
         let flags = self.current_flags();
@@ -513,6 +889,10 @@ impl File {
                     offset: position.clone(),
                     pending: 0,
                 };
+                let Some(access) = self.attr.try_read() else {
+                    drop(lease);
+                    return Ok(None);
+                };
                 // Uncached Linux READDIR asks for one page independently of
                 // the caller's getdents buffer; cookies commit during copy-out.
                 let mut body = vec![0; 40];
@@ -520,7 +900,11 @@ impl File {
                 body[8..16].copy_from_slice(&position.snapshot().to_le_bytes());
                 body[16..20].copy_from_slice(&4096u32.to_le_bytes());
                 body[32..36].copy_from_slice(&flags.to_le_bytes());
-                (28, body, FileResult::Directory(4096, *count, Some(lease)))
+                (
+                    28,
+                    body,
+                    FileResult::Directory(4096, *count, Some(lease), Some(access)),
+                )
             }
             FileCommand::Read { offset, .. }
             | FileCommand::Write { offset, .. }
@@ -602,12 +986,30 @@ impl File {
                     command
                 {
                     let writer = mapped::MountWrite::new(&self.mount.identity)?;
-                    body.extend_from_slice(&bytes[..len]);
+                    let buffered = if len != 0 && self.buffered() {
+                        let executor = crate::file_actor::sync_executor()
+                            .or_else(|| self.attr.cache.executor())
+                            .ok_or(Errno(95))?;
+                        self.attr.cache.bind_executor(&executor);
+                        Some(writeback::OpenWriter::new(
+                            self.clone(),
+                            original.clone(),
+                            executor,
+                        )?)
+                    } else {
+                        None
+                    };
+                    // Buffered preparation retains its own input; no wire
+                    // WRITE is sent until the later cache snapshot drains.
+                    if buffered.is_none() {
+                        body.extend_from_slice(&bytes[..len]);
+                    }
                     (
                         16,
                         body,
                         FileResult::Write {
                             max: len,
+                            input: bytes[..len].to_vec(),
                             start,
                             file: self.clone(),
                             position: lease,
@@ -619,12 +1021,30 @@ impl File {
                                     None
                                 },
                             ),
+                            buffered,
                             _writer: Some(writer),
-                            _transaction: transaction.unwrap(),
+                            _transaction: transaction,
                         },
                     )
                 } else {
-                    (15, body, FileResult::Read(len, lease))
+                    let size =
+                        u64::from_le_bytes(self.attr.lock().unwrap()[8..16].try_into().unwrap());
+                    let count = (len as u64).min(size.saturating_sub(start)) as usize;
+                    let cached = (self.open_flags & 1 == 0 && len != 0)
+                        .then(|| self.attr.cache.cached(start, count))
+                        .flatten();
+                    (
+                        15,
+                        body,
+                        FileResult::Read {
+                            max: len,
+                            start,
+                            file: self.clone(),
+                            position: lease,
+                            cached,
+                            buffered: (len != 0 && self.buffered()).then(|| original.clone()),
+                        },
+                    )
                 }
             }
             FileCommand::Allocate {
@@ -646,10 +1066,7 @@ impl File {
                 if *length == 0 {
                     return Err(Errno(22));
                 }
-                if *mode > 1 {
-                    return Err(Errno(95));
-                }
-                if *mode == 0 && end > v.file_size_limit.get() {
+                if *mode & 1 == 0 && end > v.file_size_limit.get() {
                     return Err(Errno(27));
                 }
                 let mut body = vec![0; 32];
@@ -662,9 +1079,10 @@ impl File {
                     body,
                     FileResult::Allocate {
                         file: self.clone(),
-                        end: (*mode == 0).then_some(end),
+                        end: (*mode & 1 == 0).then_some(end),
                         offset: *offset,
                         length: *length,
+                        mode: *mode,
                         _writer: writer,
                         _transaction: transaction,
                     },

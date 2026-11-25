@@ -329,8 +329,14 @@ fn registered_descriptor_ring_keeps_original_pin_and_controls_stay_local() {
     m.write_array(0x2000, [0u8; 40]).unwrap();
     m.write_array(0x2000, 7u32.to_le_bytes()).unwrap();
     complete(
-        s.register([fd as u64, 26, 0x2000, 1, 0, 0], &mut m, 7)
-            .unwrap(),
+        s.register(
+            [fd as u64, 26, 0x2000, 1, 0, 0],
+            &mut m,
+            7,
+            &DirectSyscalls::default(),
+            &Arc::downgrade(&target()),
+        )
+        .unwrap(),
         0,
     );
     assert_eq!(
@@ -345,21 +351,42 @@ fn registered_descriptor_ring_keeps_original_pin_and_controls_stay_local() {
     m.write_array(0x2000, [0u8; 40]).unwrap();
     m.write_array(0x2000, 7u32.to_le_bytes()).unwrap();
     complete(
-        s.register([fd as u64, 26, 0x2000, 1, 0, 0], &mut m, 7)
-            .unwrap(),
+        s.register(
+            [fd as u64, 26, 0x2000, 1, 0, 0],
+            &mut m,
+            7,
+            &DirectSyscalls::default(),
+            &Arc::downgrade(&target()),
+        )
+        .unwrap(),
         0,
     );
     assert_eq!(u32::from_le_bytes(m.read_array::<4>(0x2004).unwrap()), 0);
     m.write_array(0x2000, [0u8; 40]).unwrap();
     m.write_array(0x200c, 7u16.to_le_bytes()).unwrap();
     complete(
-        s.register([fd as u64, 23, 0x2000, 1, 0, 0], &mut m, 7)
-            .unwrap(),
+        s.register(
+            [fd as u64, 23, 0x2000, 1, 0, 0],
+            &mut m,
+            7,
+            &DirectSyscalls::default(),
+            &Arc::downgrade(&target()),
+        )
+        .unwrap(),
         0,
     );
+    // PROBE requires its complete input to be zero, including the buffer
+    // group ID left by the preceding UNREGISTER_PBUF_RING control.
+    m.write_array(0x2000, [0u8; 16 + 64 * 8]).unwrap();
     complete(
-        s.register([fd as u64, 8, 0x2000, 64, 0, 0], &mut m, 7)
-            .unwrap(),
+        s.register(
+            [fd as u64, 8, 0x2000, 64, 0, 0],
+            &mut m,
+            7,
+            &DirectSyscalls::default(),
+            &Arc::downgrade(&target()),
+        )
+        .unwrap(),
         0,
     );
     assert_eq!(m.read_array::<2>(0x2000).unwrap(), [57, 58]);
@@ -379,7 +406,14 @@ fn worker_unregister_buffers_keeps_accepted_pin_and_rejects_new_fixed_io() {
     add(&mut m, &r, data(4, reader, 0x3000, 1, 1, 0));
     complete(start(&s, fd, 1, 0, &mut m), 1);
     complete(
-        s.register([fd as u64, 1, 0, 0, 0, 0], &mut m, 7).unwrap(),
+        s.register(
+            [fd as u64, 1, 0, 0, 0, 0],
+            &mut m,
+            7,
+            &DirectSyscalls::default(),
+            &Arc::downgrade(&target()),
+        )
+        .unwrap(),
         0,
     );
     add(&mut m, &r, data(4, reader, 0x3000, 1, 2, 0));

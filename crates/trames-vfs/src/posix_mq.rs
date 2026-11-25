@@ -153,11 +153,14 @@ impl Queue {
         let start = (offset as usize).min(line.len());
         line.as_bytes()[start..start + count.min(line.len() - start)].to_vec()
     }
-    pub(super) fn read(&self, position: &file_data::FilePosition, count: usize) -> Vec<u8> {
+    pub(super) fn read(&self, position: &file_data::FilePosition, count: usize) -> Result<Vec<u8>> {
         let mut p = position.lock().unwrap();
+        if p.pending != 0 {
+            return Err(Errno(11));
+        }
         let data = self.status(p.value, count);
         p.value += data.len() as u64;
-        data
+        Ok(data)
     }
 }
 

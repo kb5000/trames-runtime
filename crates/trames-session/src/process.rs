@@ -107,19 +107,40 @@ enum State {
         began: Instant,
     },
     Blocked(u32, [u64; 6]),
+    #[expect(
+        dead_code,
+        reason = "Legacy state; original child waits use State::Child."
+    )]
     PidfdWait(trames_kernel::children::Wait),
     Sleep(Instant, u64),
     ClockSleep(Arc<crate::clock_sleep::ClockSleep>),
+    #[cfg_attr(
+        not(all(test, trames_interpreter_conformance)),
+        expect(
+            dead_code,
+            reason = "Legacy fixture state; production retains typed Signal waits."
+        )
+    )]
     Suspend(u64),
     Completion(Arc<trames_kernel::completion::Completion>),
     Namespace(Arc<crate::run_queue::NamespaceWait>),
     Policy(Arc<crate::run_queue::PolicyWait>),
     Barrier(Arc<crate::barrier::Wait>),
     Page(Arc<crate::run_queue::PageWait>),
+    Signal(Arc<crate::run_queue::SignalWait>),
+    Child(Arc<crate::run_queue::ChildWait>),
+    Delivery(Arc<crate::run_queue::Delivery>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
     },
+    #[cfg_attr(
+        not(all(test, trames_interpreter_conformance)),
+        expect(
+            dead_code,
+            reason = "Legacy fixture state; production retains typed Signal waits."
+        )
+    )]
     Sigwait {
         mask: u64,
         info: u64,
@@ -148,9 +169,10 @@ pub(crate) struct Process<C: Cpu> {
     children: Arc<trames_kernel::children::Children>,
     poll_deadline: Option<Instant>,
     socket_deadline: Option<Instant>,
-    uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
+    uring_wait: Option<trames_linux::UringEnter>,
     retained_file: Option<trames_linux::FilePending>,
     retained_aio: Option<trames_linux::RetainedAio>,
+    retained_binder: Option<trames_linux::RetainedBinder>,
     retained_message: Option<trames_linux::RetainedMessage>,
     file_checkpoint: Option<trames_linux::FileCheckpoint>,
     file_entry: Option<(u64, u32, [u64; 6])>,
@@ -181,6 +203,12 @@ pub(crate) struct Process<C: Cpu> {
     trace: crate::syscall_trace::Trace,
 }
 impl<C: Cpu> Process<C> {
+    fn aio_must_finish_on_exit(&self) -> bool {
+        self.retained_aio
+            .as_ref()
+            .or_else(|| self.byte_wait.as_ref()?.aio.as_ref())
+            .is_some_and(|call| call.must_finish_on_exit())
+    }
     fn stopped(&self) -> bool {
         self.signals.io.trace_stopped() || self.signals.io.job_stopped()
     }
@@ -196,8 +224,19 @@ impl<C: Cpu> Process<C> {
                 | State::Policy(_)
                 | State::Barrier(_)
                 | State::Page(_)
+                | State::Delivery(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
+            || matches!(&self.state, State::Signal(wait) if !wait.interruptible())
+            || matches!(&self.state, State::Child(wait) if !wait.interruptible())
             || self.exec_pending.is_some()
+            || self
+                .retained_aio
+                .as_ref()
+                .is_some_and(|call| !call.interruptible())
+            || self
+                .retained_binder
+                .as_ref()
+                .is_some_and(|call| !call.interruptible())
             || self.linux.has_pending_mmap()
             || self.file_checkpoint.is_some()
             || self
@@ -218,12 +257,15 @@ impl<C: Cpu> Process<C> {
                 | State::Sleep(..)
                 | State::ClockSleep(_)
                 | State::Sigwait { .. }
+                | State::Signal(_)
+                | State::Child(_)
                 | State::Suspend(_)
                 | State::Completion(_)
                 | State::Namespace(_)
                 | State::Policy(_)
                 | State::Barrier(_)
                 | State::Page(_)
+                | State::Delivery(_)
                 | State::Blocked(95 | 260, _)
                 | State::PidfdWait(_)
         ) || self.worker_io_candidate(id)
@@ -304,11 +346,16 @@ impl<C: Cpu> Process<C> {
     /// Original accepted calls can rearm their actual event source. New calls
     /// still use Snapshot::admit and evaluate policy only at their SVC entry.
     fn worker_event_wait(&self, id: u32) -> bool {
-        if self.byte_wait.as_ref().is_some_and(|w| w.message.is_some()) {
+        if self
+            .byte_wait
+            .as_ref()
+            .is_some_and(|w| w.message.is_some() || w.binder.is_some())
+        {
             return true;
         }
         if self.retained_file.is_some()
             || self.retained_aio.is_some()
+            || self.retained_binder.is_some()
             || self.retained_message.is_some()
         {
             return true;
@@ -322,8 +369,11 @@ impl<C: Cpu> Process<C> {
             return true;
         }
         let owner = self.memory.instruction_identity().0;
-        if let Some((_, ring, deadline)) = &self.uring_wait {
-            return trames_linux::UringEpoch::has_event_wait(ring, owner, id, *deadline);
+        if let Some(call) = &self.uring_wait {
+            return call.result().is_some()
+                || call.ring().is_some_and(|ring| {
+                    trames_linux::UringEpoch::has_event_wait(&ring, owner, id, call.deadline())
+                });
         }
         if let Some(poll) = &self.retained_poll {
             return poll.owner_controls().into_iter().any(|(fd, original)| {
@@ -351,12 +401,20 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
-        if self.byte_wait.as_ref().is_some_and(|w| w.message.is_some()) {
+        if self
+            .byte_wait
+            .as_ref()
+            .is_some_and(|w| w.message.is_some() || w.binder.is_some())
+        {
             return true;
         }
         if matches!(
             self.state,
-            State::Namespace(_) | State::Policy(_) | State::Barrier(_) | State::Page(_)
+            State::Namespace(_)
+                | State::Policy(_)
+                | State::Barrier(_)
+                | State::Page(_)
+                | State::Delivery(_)
         ) {
             return true;
         }
@@ -368,6 +426,7 @@ impl<C: Cpu> Process<C> {
         }
         if self.retained_file.is_some()
             || self.retained_aio.is_some()
+            || self.retained_binder.is_some()
             || self.retained_message.is_some()
         {
             return true;
@@ -411,11 +470,13 @@ impl<C: Cpu> Process<C> {
         }
         if let State::Blocked(426, a) = self.state {
             return self.seccomp.mode() == 0
-                && a[3] & !9 == 0
-                && self
-                    .uring_wait
-                    .as_ref()
-                    .is_some_and(|(_, ring, _)| trames_linux::UringEpoch::can_adopt(ring));
+                && a[3] as u32 & !(1 | 2 | 4 | 8 | 32) == 0
+                && self.uring_wait.as_ref().is_some_and(|call| {
+                    call.result().is_some()
+                        || call
+                            .ring()
+                            .is_some_and(|ring| trames_linux::UringEpoch::can_adopt(&ring))
+                });
         }
         if let State::Blocked(number @ (22 | 72 | 73 | 441), args) = self.state {
             if self.seccomp.mode() == 0
@@ -457,7 +518,10 @@ impl<C: Cpu> Process<C> {
                 args,
                 self.poll_deadline,
             )
-            .is_some();
+            .is_some_and(|prepared| match prepared {
+                Ok(wait) => wait.fully_bound(),
+                Err(_) => true,
+            });
         }
         // Most retained waits are pipes or Unix sockets. Their eligibility
         // never depends on scanning every native TCP socket.
@@ -581,6 +645,7 @@ impl<C: Cpu> Process<C> {
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
+            retained_binder: None,
             retained_message: None,
             file_checkpoint: None,
             file_entry: None,
@@ -1278,10 +1343,48 @@ impl<C: Cpu> Kernel<C> {
         );
     }
     fn cancel_native_task(p: &Process<C>) {
+        // Cold exit/exec paths can publish Zombie before owning the old mm.
+        // Invalidate retained user-copy handoffs before replacing that state.
+        Self::cancel_task_waits(p);
         if let State::Gpu { job, .. } = p.state {
             if let Some(context) = Self::existing_gpu(p) {
                 context.abandon(job);
             }
+        }
+    }
+    fn cancel_task_waits(p: &Process<C>) {
+        match &p.state {
+            State::Signal(wait) => wait.cancel(),
+            State::Delivery(wait) => wait.cancel(),
+            State::Futex { wait, .. } => wait.cancel(),
+            _ => {}
+        }
+        if let Some(call) = p
+            .retained_binder
+            .as_ref()
+            .or_else(|| p.byte_wait.as_ref()?.binder.as_ref())
+        {
+            call.cancel();
+        }
+        if let Some(call) = p
+            .uring_wait
+            .as_ref()
+            .cloned()
+            .or_else(|| p.byte_wait.as_ref()?.uring_enter())
+        {
+            call.cancel();
+        }
+        if let Some(wait) = &p.byte_wait {
+            wait.cancel_copies();
+        }
+        if let Some(call) = &p.retained_aio {
+            call.cancel();
+        }
+        if let Some(file) = &p.retained_file {
+            file.cancel_import();
+        }
+        if let Some(call) = &p.file_checkpoint {
+            call.cancel();
         }
     }
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -1305,6 +1408,10 @@ impl<C: Cpu> Kernel<C> {
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         if p.family.registry().is_none() {
             birth::Birth::capture(self).publish_family(pid, p);
+        }
+        if p.aio_must_finish_on_exit() {
+            self.wait_exit_aio(pid, p, status);
+            return;
         }
         p.signals.io.begin_exit(pid, status);
         {
@@ -1340,6 +1447,7 @@ impl<C: Cpu> Kernel<C> {
         self.collect_exit_projection(pid, p, status);
     }
     fn clear_exit_resources(p: &mut Process<C>) {
+        Self::cancel_task_waits(p);
         p.linux.cancel_pending_mmap();
         p.layout_wait = None;
         p.uring_wait = None;
@@ -1348,6 +1456,7 @@ impl<C: Cpu> Kernel<C> {
         p.byte_wait = None;
         p.retained_file = None;
         p.retained_aio = None;
+        p.retained_binder = None;
         p.retained_message = None;
         p.pending_open = None;
         p.exec_pending = None;
@@ -1418,6 +1527,18 @@ impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     fn exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         p.signals.io.lifecycle().begin_group_exit(status);
+        if p.aio_must_finish_on_exit()
+            || self
+                .processes
+                .values()
+                .any(|peer| peer.tgid == p.tgid && peer.aio_must_finish_on_exit())
+        {
+            let group = p.signals.io.lifecycle().clone();
+            group.request_exit(status);
+            self.queue_exit_group(group);
+            self.exit_one(pid, p, status);
+            return;
+        }
         p.signals.io.begin_exit(pid, status);
 
         let members: Vec<_> = self
@@ -1757,190 +1878,317 @@ impl<C: Cpu> Kernel<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn deliver(&mut self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
-        if let Some(state) = p.signals.io.take_trace_update() {
-            p.cpu.restore_architectural_state(&state);
-        }
-        let stopped = p.stopped();
-        let selected = p
-            .signals
-            .select(stopped, matches!(p.state, State::Gpu { .. }));
-        let Some((sig, shared)) = selected else {
-            return Ok(false);
-        };
-        if stopped && sig != 9 && sig != 18 {
-            return Ok(false);
-        }
-        let action = p.signals.actions.get(sig as usize);
-        if action.handler > 1
-            && matches!(
-                p.state,
-                State::Namespace(_) | State::Policy(_) | State::Barrier(_) | State::Page(_)
-            )
-        {
-            return Ok(false);
-        }
-        // Submitted regular-file work is not restarted from a guest pointer.
-        // Caught signals wait for its accepted result/copyout, like ordinary
-        // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
-        if action.handler > 1
-            && (p.exec_pending.is_some()
-                || p.file_entry.is_some()
-                    && !p
-                        .retained_file
+        loop {
+            if let Some(state) = (!(p.signals.io.has_pending_frame()
+                || matches!(p.state, State::Delivery(_))))
+            .then(|| p.signals.io.take_trace_update())
+            .flatten()
+            {
+                p.cpu.restore_architectural_state(&state);
+            }
+            let stopped = p.stopped();
+            let mut selected = p
+                .signals
+                .select(stopped, matches!(p.state, State::Gpu { .. }));
+            if selected.is_none()
+                && matches!(p.state, State::Ready)
+                && !p.signals.io.has_pending_frame()
+            {
+                if let Some(mask) = p.signals.wait_mask.take() {
+                    p.signals.set_mask(mask);
+                    p.signals.begin_io();
+                    selected = p.signals.select(stopped, false);
+                }
+            }
+            let Some((sig, shared)) = selected else {
+                if matches!(p.state, State::Delivery(_)) {
+                    return self.resume_delivery(pid, p);
+                }
+                return self.resume_signal_frame(pid, p);
+            };
+            if stopped && sig != 9 && sig != 18 {
+                return Ok(false);
+            }
+            let action = p.signals.actions.get(sig as usize);
+            if matches!(p.state, State::Delivery(_))
+                && !matches!(
+                    trames_kernel::signal::disposition(sig, action),
+                    trames_kernel::signal::Disposition::Terminate
+                        | trames_kernel::signal::Disposition::Ignore
+                )
+            {
+                return self.resume_delivery(pid, p);
+            }
+            if p.signals.io.has_pending_frame()
+                && !matches!(
+                    trames_kernel::signal::disposition(sig, action),
+                    trames_kernel::signal::Disposition::Terminate
+                        | trames_kernel::signal::Disposition::Ignore
+                )
+            {
+                return self.resume_signal_frame(pid, p);
+            }
+            if action.handler > 1
+                && matches!(&p.state, State::Signal(wait) if !wait.interruptible())
+            {
+                return Ok(false);
+            }
+            if action.handler > 1 && matches!(&p.state, State::Child(wait) if !wait.interruptible())
+            {
+                return Ok(false);
+            }
+            if action.handler > 1
+                && matches!(
+                    p.state,
+                    State::Namespace(_)
+                        | State::Policy(_)
+                        | State::Barrier(_)
+                        | State::Page(_)
+                        | State::Delivery(_)
+                )
+            {
+                return Ok(false);
+            }
+            // Submitted regular-file work is not restarted from a guest pointer.
+            // Caught signals wait for its accepted result/copyout, like ordinary
+            // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
+            if action.handler > 1
+                && (p.exec_pending.is_some()
+                    || p.file_entry.is_some()
+                        && !p
+                            .retained_file
+                            .as_ref()
+                            .map(trames_linux::FilePending::interruptible)
+                            .or_else(|| {
+                                p.byte_wait
+                                    .as_ref()
+                                    .and_then(trames_linux::PendingIo::interruptible_file_wait)
+                            })
+                            .unwrap_or(false)
+                    || p.retained_aio
                         .as_ref()
-                        .map(trames_linux::FilePending::interruptible)
-                        .or_else(|| {
-                            p.byte_wait
-                                .as_ref()
-                                .and_then(trames_linux::PendingIo::interruptible_file_wait)
-                        })
-                        .unwrap_or(false)
-                || matches!(p.state, State::Blocked(2, _)))
-            && matches!(p.state, State::Blocked(..))
-        {
-            return Ok(false);
-        }
-        if p.stop_held()
-            && trames_kernel::signal::disposition(sig, action)
-                == trames_kernel::signal::Disposition::Stop
-        {
-            return Ok(false);
-        }
-        let disposition = trames_kernel::signal::disposition(sig, action);
-        if sig != 9
-            && !p.stop_held()
-            && p.signals
-                .io
-                .trace_point(sig, Some(shared), || p.cpu.architectural_state())
-        {
-            return Ok(true);
-        }
-        if disposition == trames_kernel::signal::Disposition::Stop {
-            self.publish_io_tasks(Some((pid, p)));
-            if sig == 19 || !p.signals.io_directory.orphaned(&p.signals.io) {
-                return Ok(p
-                    .signals
+                        .is_some_and(|call| !call.interruptible())
+                    || p.retained_binder
+                        .as_ref()
+                        .is_some_and(|call| !call.interruptible())
+                    || p.byte_wait
+                        .as_ref()
+                        .and_then(|wait| wait.aio.as_ref())
+                        .is_some_and(|call| !call.interruptible())
+                    || matches!(p.state, State::Blocked(2, _)))
+                && matches!(p.state, State::Blocked(..))
+            {
+                return Ok(false);
+            }
+            if p.stop_held()
+                && trames_kernel::signal::disposition(sig, action)
+                    == trames_kernel::signal::Disposition::Stop
+            {
+                return Ok(false);
+            }
+            let disposition = trames_kernel::signal::disposition(sig, action);
+            if sig != 9
+                && !p.stop_held()
+                && p.signals
                     .io
-                    .lifecycle()
-                    .consume_stop(sig, || p.signals.io.take(sig, shared).is_some()));
+                    .trace_point(sig, Some(shared), || p.cpu.architectural_state())
+            {
+                return Ok(true);
             }
-            return Ok(p.signals.io.take(sig, shared).is_some());
-        }
-        let Some(info) = p.take_signal(sig, shared) else {
-            return Ok(false);
-        };
-        // Timer-generated signals also reach this queue without queue_one.
-        // Namespace init ignores default dispositions, except forced ancestor
-        // KILL/STOP and synchronous faults, which must still make progress.
-        if p.linux.vfs.pid_namespace().is_nested()
-            && p.linux.vfs.visible_pid(p.tgid) == 1
-            && action.handler == 0
-            && info.fault.is_none()
-            && !(matches!(sig, 9 | 19) && info.timer.is_none())
-        {
-            return Ok(true);
-        }
-        let disposition = trames_kernel::signal::disposition(sig, action);
-        if disposition == trames_kernel::signal::Disposition::Terminate {
-            self.exit(pid, p, sig as i32);
-            return Ok(true);
-        }
-        if disposition == trames_kernel::signal::Disposition::Ignore {
-            return Ok(true);
-        }
-        let interrupted = match p.state.clone() {
-            State::PidfdWait(wait) => State::Blocked(wait.number, wait.args),
-            other => other,
-        };
-        match interrupted {
-            State::Blocked(number, a) => {
-                if let Some(fd) = p.pending_open.take() {
-                    p.linux.vfs.cancel_fifo_open(fd);
+            if disposition == trames_kernel::signal::Disposition::Stop {
+                self.publish_io_tasks(Some((pid, p)));
+                if sig == 19 || !p.signals.io_directory.orphaned(&p.signals.io) {
+                    return Ok(p
+                        .signals
+                        .io
+                        .lifecycle()
+                        .consume_stop(sig, || p.signals.io.take(sig, shared).is_some()));
                 }
-                if let Some(wait) = p.retained_poll.as_ref() {
-                    let _ = wait.finish(&mut p.memory, Err(Errno(4)));
-                }
-                // Signal entry uses the temporary handler mask but records
-                // the pre-wait mask in ucontext for sigreturn.
-                p.poll_deadline = None;
-                p.uring_wait = None;
-                p.flock_wait = None;
-                p.record_wait = None;
-                p.byte_wait = None;
-                p.retained_file = None;
-                p.retained_aio = None;
-                p.retained_message = None;
-                p.file_checkpoint = None;
-                p.file_entry = None;
-                p.retained_socket = None;
-                p.retained_byte = None;
-                p.tcp_liveness = None;
-                p.retained_poll = None;
-                let timed_socket = p.socket_deadline.take().is_some();
-                if !timed_socket
-                    && action.flags & 0x10000000 != 0
-                    && matches!(
-                        number,
-                        25 | 29
-                            | 32
-                            | 56
-                            | 63
-                            | 64
-                            | 65
-                            | 66
-                            | 71
-                            | 76
-                            | 77
-                            | 95
-                            | 260
-                            | 202
-                            | 242
-                            | 206
-                            | 207
-                            | 211
-                            | 212
-                            | 269
-                    )
-                {
-                    p.trace.restart();
-                    put_args(&mut p.cpu, a);
-                    p.cpu.set_pc(p.cpu.pc().wrapping_sub(4));
+                return Ok(p.signals.io.take(sig, shared).is_some());
+            }
+            let (info, action) = if disposition == trames_kernel::signal::Disposition::Handler {
+                let Some((action, info)) =
+                    p.signals.actions.take_handler(&p.signals.io, sig, shared)
+                else {
+                    continue;
+                };
+                (info, action)
+            } else {
+                let Some(info) = p.signals.io.take(sig, shared) else {
+                    return Ok(false);
+                };
+                (info, action)
+            };
+            // Timer-generated signals also reach this queue without queue_one.
+            // Namespace init ignores default dispositions, except forced ancestor
+            // KILL/STOP and synchronous faults, which must still make progress.
+            if p.linux.vfs.pid_namespace().is_nested()
+                && p.linux.vfs.visible_pid(p.tgid) == 1
+                && action.handler == 0
+                && info.fault.is_none()
+                && !(matches!(sig, 9 | 19) && info.timer.is_none())
+            {
+                return Ok(true);
+            }
+            let disposition = trames_kernel::signal::disposition(sig, action);
+            if disposition == trames_kernel::signal::Disposition::Terminate {
+                self.exit(pid, p, sig as i32);
+                return Ok(true);
+            }
+            if disposition == trames_kernel::signal::Disposition::Ignore {
+                return Ok(true);
+            }
+            let (waiting, io) = self.interrupted_delivery(pid, p);
+            let delivery = crate::run_queue::Delivery::new(sig, info, action, waiting, io);
+            if let Some(delivered) = delivery.progress(&mut p.memory) {
+                return self.finish_delivery(pid, p, delivered);
+            }
+            delivery.bind(&trames_shared::IoSignal::new(
+                pid,
+                Arc::downgrade(&self.byte_target),
+            ));
+            p.state = State::Delivery(delivery);
+            return Ok(true);
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn interrupted_delivery(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+    ) -> (
+        Option<crate::run_queue::WaitState>,
+        Option<crate::run_queue::IoCall>,
+    ) {
+        use crate::run_queue::{ChildWait, IoCall, WaitState};
+        let mut io = None;
+        let waiting = match p.state.clone() {
+            State::Child(wait) => Some(WaitState::Child(wait)),
+            State::PidfdWait(request) => Some(WaitState::Child(ChildWait::new(request))),
+            State::Blocked(number @ (95 | 260), args) => Some(WaitState::Child(
+                ChildWait::accepted(trames_kernel::children::WaitCall::prepare(
+                    pid,
+                    number,
+                    args,
+                    &p.linux.vfs.fd_flags_snapshot(),
+                    p.linux.vfs.pid_namespace(),
+                )),
+            )),
+            State::Blocked(number, args) => {
+                io = Some(if let Some(wait) = p.byte_wait.take() {
+                    IoCall::from(&wait)
                 } else {
-                    p.cpu.set_x(0, error(Errno(4)));
-                    p.trace.record(p.cpu.x(0));
-                }
+                    IoCall {
+                        binder: p.retained_binder.take(),
+                        number,
+                        args,
+                        deadline: p.socket_deadline.or(p.poll_deadline),
+                        aio: p.retained_aio.take(),
+                        message: p.retained_message.take(),
+                        retained_byte: p.retained_byte.take(),
+                        retained_socket: p.retained_socket.take(),
+                        retained_poll: p.retained_poll.take(),
+                        tcp_liveness: p.tcp_liveness.take(),
+                        file: p.retained_file.take(),
+                        file_checkpoint: p.file_checkpoint.take(),
+                        flock: p.flock_wait.take().map(|(wait, _)| wait),
+                        record: p.record_wait.take(),
+                        uring: None,
+                    }
+                });
+                None
             }
-            State::Sleep(deadline, remaining) => {
-                let result = crate::clock_sleep::interrupted(
-                    &mut p.memory,
-                    remaining,
-                    deadline.saturating_duration_since(Instant::now()),
-                );
-                p.cpu.set_x(0, result);
-                p.trace.record(result);
-            }
-            State::ClockSleep(ref wait) => {
-                let result = wait.interrupt(&mut p.memory);
-                p.cpu.set_x(0, result);
-                p.trace.record(result);
-            }
+            State::Sleep(deadline, remaining) => Some(WaitState::Sleep {
+                deadline,
+                remaining,
+            }),
+            State::ClockSleep(wait) => Some(WaitState::ClockSleep(wait)),
+            State::Futex { wait, deadline } => Some(WaitState::Futex { wait, deadline }),
+            State::Signal(wait) => Some(WaitState::Signal(wait)),
+            State::Sigwait { .. } => Some(WaitState::OwnerEvent),
             State::Suspend(old) => {
                 p.signals.wait_mask = Some(old);
-                p.cpu.set_x(0, error(Errno(4)));
-                p.trace.record(p.cpu.x(0));
+                Some(WaitState::OwnerEvent)
             }
-            State::Futex { wait, .. } => {
-                wait.cancel();
-                p.cpu.set_x(0, error(Errno(4)));
-                p.trace.record(p.cpu.x(0));
-            }
-            State::Sigwait { .. } => {
-                p.cpu.set_x(0, error(Errno(4)));
-                p.trace.record(p.cpu.x(0));
-            }
-            _ => {}
+            _ => None,
+        };
+        if io.as_ref().is_some_and(|io| {
+            io.retained_poll
+                .as_ref()
+                .is_some_and(|wait| wait.native_mask())
+                || io.uring.as_ref().is_some_and(|call| call.native_mask())
+                || io.aio.as_ref().is_some_and(|call| call.native_mask())
+        }) {
+            p.signals.finish_io();
+        } else {
+            p.signals.begin_io();
         }
-        let mut state = p.cpu.architectural_state();
+        if let Some(fd) = p.pending_open.take() {
+            p.linux.vfs.cancel_fifo_open(fd);
+        }
+        p.poll_deadline = None;
+        p.socket_deadline = None;
+        p.uring_wait = None;
+        p.flock_wait = None;
+        p.record_wait = None;
+        p.byte_wait = None;
+        p.retained_file = None;
+        p.retained_aio = None;
+        p.retained_binder = None;
+        p.retained_message = None;
+        p.file_checkpoint = None;
+        p.file_entry = None;
+        p.retained_socket = None;
+        p.retained_byte = None;
+        p.tcp_liveness = None;
+        p.retained_poll = None;
+        (waiting, io)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn resume_delivery(&self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
+        let State::Delivery(delivery) = &p.state else {
+            return Ok(false);
+        };
+        if !delivery.ready() {
+            return Ok(false);
+        }
+        let delivered = delivery.progress(&mut p.memory);
+        if let Some(delivered) = delivered {
+            self.finish_delivery(pid, p, delivered)
+        } else if !delivery.external() {
+            p.state = State::Ready;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn finish_delivery(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        delivered: crate::run_queue::Delivered,
+    ) -> Result<bool, Errno> {
+        p.signals.finish_io();
+        if let Some(completion) = delivered.completion {
+            if completion.restart {
+                p.trace.restart();
+                put_args(&mut p.cpu, completion.args);
+                p.cpu.set_pc(p.cpu.pc().wrapping_sub(4));
+            } else {
+                if completion.account_io {
+                    p.signals.io.io.complete(
+                        completion.number.expect("original I/O entry"),
+                        completion.args[3],
+                        completion.result,
+                    );
+                }
+                p.cpu.set_x(0, completion.result.unwrap_or_else(error));
+                p.trace.record(p.cpu.x(0));
+            }
+        }
+        let (sig, info, action) = (delivered.sig, delivered.info, delivered.action);
+        let state = p.cpu.architectural_state();
         let sme = p.cpu.sme_config().map(|config| {
             (
                 config,
@@ -1948,34 +2196,202 @@ impl<C: Cpu> Kernel<C> {
                 C::features().hwcap2 & (1 << 37) != 0,
             )
         });
-        p.signals
-            .enter_sme(&mut state, &mut p.memory, sig, info, action, sme)?;
-        let has_sme = sme.is_some();
-        p.cpu.restore_architectural_state(&state);
-        if has_sme {
-            p.cpu.set_sme_state(None);
+        let mut visible_info = *info;
+        if visible_info.fault.is_none() && visible_info.poll.is_none() {
+            visible_info.sender = p.linux.vfs.visible_pid(visible_info.sender);
         }
-        p.state = State::Ready;
+        let progress = p.signals.io.start_frame(
+            p.signals.pending_frame_state(),
+            &state,
+            sig,
+            visible_info,
+            action,
+            sme,
+            p.signals.wait_mask,
+            &mut p.memory,
+        );
+        self.finish_signal_frame(pid, p, progress)?;
         Ok(true)
     }
     #[cfg(all(test, trames_interpreter_conformance))]
+    fn park_signal_frame(&self, pid: u32, p: &mut Process<C>, fault: trames_memory::PageFault) {
+        let wait = crate::run_queue::PageWait::new(fault.wait);
+        wait.bind(&trames_shared::IoSignal::new(
+            pid,
+            Arc::downgrade(&self.byte_target),
+        ));
+        p.state = State::Page(wait);
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn resume_signal_frame(&self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
+        if !p.signals.io.has_pending_frame() {
+            return Ok(false);
+        }
+        if matches!(&p.state, State::Page(wait) if !wait.ready()) {
+            return Ok(false);
+        }
+        let progress = p
+            .signals
+            .io
+            .resume_frame(&mut p.memory)
+            .expect("original signal continuation");
+        self.finish_signal_frame(pid, p, progress)?;
+        Ok(true)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn finish_signal_frame(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        progress: trames_kernel::signal::FrameProgress,
+    ) -> Result<(), Errno> {
+        match progress {
+            trames_kernel::signal::FrameProgress::Page(fault) => {
+                self.park_signal_frame(pid, p, fault)
+            }
+            trames_kernel::signal::FrameProgress::EntryPage { fault, pc } => {
+                if pc != p.cpu.pc() {
+                    p.cpu.clear_exclusive();
+                    p.cpu.set_pc(pc);
+                }
+                self.park_signal_frame(pid, p, fault);
+            }
+            trames_kernel::signal::FrameProgress::Rseq(progress) => {
+                let (pc, fault, failed) = match progress {
+                    trames_kernel::rseq::ResumeProgress::Complete(pc) => (pc, None, false),
+                    trames_kernel::rseq::ResumeProgress::Page { fault, pc } => {
+                        (pc, Some(fault), false)
+                    }
+                    trames_kernel::rseq::ResumeProgress::Error { pc, .. } => (pc, None, true),
+                };
+                if pc != p.cpu.pc() {
+                    p.cpu.clear_exclusive();
+                    p.cpu.set_pc(pc);
+                }
+                if failed {
+                    p.signals.actions.force_frame_signal(
+                        &p.signals.io,
+                        None,
+                        trames_kernel::signal::Fault {
+                            signal: 11,
+                            code: 128,
+                            address: 0,
+                        },
+                    );
+                    p.signals.finish_io();
+                }
+                if let Some(fault) = fault {
+                    self.park_signal_frame(pid, p, fault);
+                } else {
+                    p.state = State::Ready;
+                }
+            }
+            trames_kernel::signal::FrameProgress::ReturnPage { fault, partial } => {
+                p.cpu.restore_architectural_state(&partial.state);
+                if let Some(registers) = partial.restored_sme {
+                    p.cpu.set_sme_state(registers);
+                }
+                p.signals.commit_partial_frame(partial.frame);
+                self.park_signal_frame(pid, p, fault);
+            }
+            trames_kernel::signal::FrameProgress::Error { signal, pc, .. } => {
+                if let Some(pc) = pc {
+                    if pc != p.cpu.pc() {
+                        p.cpu.clear_exclusive();
+                        p.cpu.set_pc(pc);
+                    }
+                }
+                p.signals.actions.failed_frame(&p.signals.io, signal);
+                p.signals.finish_io();
+                p.state = State::Ready;
+            }
+            trames_kernel::signal::FrameProgress::ReturnError { fault, partial, .. } => {
+                p.cpu.restore_architectural_state(&partial.state);
+                if let Some(registers) = partial.restored_sme {
+                    p.cpu.set_sme_state(registers);
+                }
+                p.signals.commit_partial_frame(partial.frame);
+                p.signals
+                    .actions
+                    .force_frame_signal(&p.signals.io, None, fault);
+                p.signals.finish_io();
+                p.cpu.set_x(0, 0);
+                p.trace.record(p.cpu.x(0));
+                p.state = State::Ready;
+            }
+            trames_kernel::signal::FrameProgress::Complete(completed) => {
+                p.cpu.restore_architectural_state(&completed.state);
+                if let Some(registers) = completed.restored_sme {
+                    p.cpu.set_sme_state(registers);
+                } else if completed.clear_sme {
+                    p.cpu.set_sme_state(None);
+                }
+                p.signals.commit_pending_frame(completed.frame);
+                if completed.returned {
+                    p.trace.record(p.cpu.x(0));
+                }
+                p.state = State::Ready;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn sigreturn_pending(&self, pid: u32, p: &mut Process<C>) -> Result<(), Errno> {
+        let progress = p.signals.io.start_frame_return(
+            p.signals.pending_frame_state(),
+            p.cpu.architectural_state(),
+            p.cpu.sme_config(),
+            C::features().hwcap2 & (1 << 37) != 0,
+            p.cpu.sme_state(),
+            &mut p.memory,
+        );
+        self.finish_signal_frame(pid, p, progress)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn sigreturn(p: &mut Process<C>) -> Result<(), Errno> {
-        let mut state = p.cpu.architectural_state();
-        let registers = if let Some(config) = p.cpu.sme_config() {
-            Some(p.signals.restore_sme(
-                &mut state,
-                &p.memory,
-                config,
-                C::features().hwcap2 & (1 << 37) != 0,
-            )?)
-        } else {
-            p.signals.restore(&mut state, &p.memory)?;
-            None
+        p.signals.begin_io();
+        let progress = p.signals.io.start_frame_return(
+            p.signals.pending_frame_state(),
+            p.cpu.architectural_state(),
+            p.cpu.sme_config(),
+            C::features().hwcap2 & (1 << 37) != 0,
+            p.cpu.sme_state(),
+            &mut p.memory,
+        );
+        let (completed, error) = match progress {
+            trames_kernel::signal::FrameProgress::Complete(completed) => (completed, None),
+            trames_kernel::signal::FrameProgress::ReturnError {
+                error,
+                partial,
+                fault,
+            } => {
+                p.cpu.restore_architectural_state(&partial.state);
+                if let Some(registers) = partial.restored_sme {
+                    p.cpu.set_sme_state(registers);
+                }
+                p.signals.commit_partial_frame(partial.frame);
+                p.signals
+                    .actions
+                    .force_frame_signal(&p.signals.io, None, fault);
+                p.signals.finish_io();
+                p.cpu.set_x(0, 0);
+                return Err(error);
+            }
+            trames_kernel::signal::FrameProgress::ReturnPage { fault, partial } => {
+                p.state = State::Page(crate::run_queue::PageWait::new(fault.wait));
+                (partial, Some(Errno(14)))
+            }
+            _ => unreachable!("original sigreturn boundary"),
         };
-        p.cpu.restore_architectural_state(&state);
-        if let Some(registers) = registers {
+        p.cpu.restore_architectural_state(&completed.state);
+        if let Some(registers) = completed.restored_sme {
             p.cpu.set_sme_state(registers);
         }
+        if let Some(error) = error {
+            p.signals.commit_partial_frame(completed.frame);
+            return Err(error);
+        }
+        p.signals.commit_pending_frame(completed.frame);
         p.state = State::Ready;
         Ok(())
     }
@@ -1988,16 +2404,7 @@ impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     fn wait(&mut self, pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         let request = trames_kernel::children::Wait::prepare(pid, 260, a)?;
-        let result = p.children.wait(
-            request,
-            p.linux.vfs.pid_namespace(),
-            p.group(),
-            &mut p.memory,
-        );
-        if p.children.take_reaped() {
-            self.reap_waited();
-        }
-        result
+        self.begin_child_call(pid, p, trames_kernel::children::WaitCall::accepted(request))
     }
     trames_shared::syscall_dispatch! {
         number number, args a;
@@ -2014,17 +2421,8 @@ impl<C: Cpu> Kernel<C> {
         {
             241 => {
                 self.publish_io_tasks(Some((pid, p)));
-                trames_kernel::signal::IoRoutes {
-                    directory: p.signals.io_directory.clone(),
-                    namespace: p.linux.vfs.pid_namespace().clone(),
-                    uid: p.linux.vfs.credentials.uid,
-                    euid: p.linux.vfs.credentials.euid,
-                }.perf_event_open(
-                    &p.signals.io, &p.linux.vfs.fd_flags_snapshot(),
-                    &p.linux.vfs.descriptor_factory(), a, self.cpu_count,
-                    &mut p.memory).map(Some)
+                self.begin_perf_call(pid,p,a)
             },
-            293 => p.signals.io.rseq.call(&mut p.memory, a).map(Some),
             @dynamic number if trames_linux::credential_entry(number, a) => self.credential_call(pid, p, number, a).map(Some),
             444..=446 => {
                 let result = p.linux.vfs.landlock_call(number, a, &p.memory)?;
@@ -2034,28 +2432,15 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(result))
             },
             25 | 29
-                if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
-                    || number == 29 && trames_vfs::DescriptorControl::status_ioctl_request(a[1] as u32) =>
+                if number == 25 && a[1] as u32==4 || trames_kernel::signal::FdControlCall::entry(number,a) =>
             {
-                if number == 25 && matches!(a[1], 8 | 15) || number == 29 && matches!(a[1] as u32, 0x8901 | 0x8902) {
-                    self.publish_io_tasks(Some((pid, p)));
+                if number==25 && a[1] as u32==4 {
+                    return p.linux.vfs.descriptor_control(a[0] as u32)?.short(a[0] as u32,4,a[2],&p.linux.vfs.credentials).map(Some);
                 }
-                let flags = p.linux.vfs.fd_flags_snapshot();
-                let routes = trames_kernel::signal::IoRoutes {
-                    directory: p.signals.io_directory.clone(),
-                    namespace: p.linux.vfs.pid_namespace().clone(),
-                    uid: p.linux.vfs.credentials.uid,
-                    euid: p.linux.vfs.credentials.euid,
-                };
-                let owners = routes.async_owners(&p.linux.vfs.credentials.landlock);
-                let value = if number == 29 {
-                    p.linux.vfs.descriptor_control(a[0] as u32)?.status_ioctl(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &owners)
-                } else if a[1] == 4 {
-                    p.linux.vfs.descriptor_control(a[0] as u32)?.short(a[0] as u32,4,a[2],&p.linux.vfs.credentials)
-                } else {
-                    flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &owners)
-                };
-                value.map(Some)
+                if number==25 && matches!(a[1] as u32,8|15) || number==29 && matches!(a[1] as u32,0x8901|0x8902) {
+                    self.publish_io_tasks(Some((pid,p)));
+                }
+                self.begin_fd_control_call(pid,p,number,a)
             },
             // The joined path uses the same bounded scratch as an existing
             // service call. Keep capacity across syscalls instead of allocating
@@ -2104,34 +2489,7 @@ impl<C: Cpu> Kernel<C> {
                     result => result.map(|()| Some(0)),
                 }
             },
-            426 => {
-                p.linux.set_uring_clock(self.started);
-                p.linux.set_file_executor(self.workers.file_executor());
-                p.linux.set_file_layouts(self.file_layout_work());
-                let (saved, ring, deadline) = match p.uring_wait.take() {
-                    Some((submitted, ring, deadline)) => (Some(submitted), ring, deadline),
-                    None => (
-                        None,
-                        p.linux.vfs.uring(a[0] as u32)?,
-                        p.linux.uring_enter_deadline(a, &p.memory)?,
-                    ),
-                };
-                let (submitted, ready) =
-                    p.linux
-                        .uring_enter_ring(ring.clone(), a, &mut p.memory, saved, pid)?;
-                if ready {
-                    Ok(Some(submitted as u64))
-                } else if deadline.is_some_and(|d| Instant::now() >= d) {
-                    if submitted != 0 {
-                        Ok(Some(submitted as u64))
-                    } else {
-                        Err(Errno(62))
-                    }
-                } else {
-                    p.uring_wait = Some((submitted, ring, deadline));
-                    Ok(None)
-                }
-            },
+            426 => self.uring_call(pid, p, a),
             277 => self.seccomp(p, a).map(Some),
             167 if a[0] == 21 => Ok(Some(p.seccomp.mode() as u64)),
             167 if a[0] == 22 => match a[1] {
@@ -2142,10 +2500,9 @@ impl<C: Cpu> Kernel<C> {
                 _ => Err(Errno(22)),
             },
             @dynamic number if trames_kernel::scheduling::call(number) => {
-                self.scheduling(p, number, a).map(Some)
+                self.scheduling_call(pid,p,number,a)
             },
-            153 => trames_kernel::usage::times(&p.signals.io, &p.children, self.started.elapsed(), a[0], &mut p.memory).map(Some),
-            165 => trames_kernel::usage::getrusage(&p.signals.io, &p.children, a[0] as i32, a[1], &mut p.memory).map(Some),
+            100|153|165=>self.begin_query_call(pid,p,number,a),
             236 => Self::mempolicy(p, a),
             142 => self.reboot_guest(pid, p, a),
             93 | 94 => {
@@ -2198,25 +2555,6 @@ impl<C: Cpu> Kernel<C> {
                         Ok(None)
                     }
                 }
-            },
-            168 => {
-                if a[0] != 0 {
-                    Linux::check(&p.memory, a[0], 4, Access::Write)?;
-                }
-                if a[1] != 0 {
-                    Linux::check(&p.memory, a[1], 4, Access::Write)?;
-                }
-                if a[0] != 0 {
-                    p.memory
-                        .write(a[0], &(p.last_cpu as u32).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                if a[1] != 0 {
-                    p.memory
-                        .write(a[1], &0u32.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                Ok(Some(0))
             },
             number @ (270 | 271 | 117) if number != 117 || matches!(a[0],1|2|4|5) => {
                 let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors());
@@ -2271,42 +2609,34 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(None)
             },
-            98 | 102 | 103 | 107..=111 | 137 | 449 | 454..=456 => self.event_call(pid, p, number, a),
+            98 | 102 | 103 | 107..=111 | 449 | 454..=456 => self.event_call(pid, p, number, a),
             260 => self.wait(pid, p, a),
             95 => self.waitid(pid, p, a),
+            219=>{
+                let call=trames_linux::TaskCopyCall::keys(p.linux.session_keys.clone(),p.linux.vfs.key_registry(),p.linux.vfs.credentials.clone(),a);
+                self.begin_task_copy_call(pid,p,call)
+            },
+            167 if matches!(a[0],2|15|16|37)=>{
+                let call=match a[0] {
+                    2=>trames_linux::TaskCopyCall::scalar(a[1],p.parentage.death_signal()),
+                    37=>trames_linux::TaskCopyCall::scalar(a[1],u32::from(p.family.subreaper())),
+                    _=>trames_linux::TaskCopyCall::name(p.linux.command_name.clone(),a),
+                };
+                self.begin_task_copy_call(pid,p,call)
+            },
             167 if prctl::entry(a) => prctl::call(
                 &mut p.cpu, &p.linux.command_name, Some(&p.parentage), Some(&p.family), (&p.signals.io, p.linux.vfs.pid_namespace()), a, &mut p.memory
             ).expect("original task controls").map(Some),
-            72 | 73 => self.poll(p, number, a, io),
-            22 | 441 => self.epoll(p, number, a, io),
+            72 | 73 => self.poll(pid, p, number, a, io),
+            22 | 441 => self.epoll(pid, p, number, a, io),
             74 => self.signalfd(p, a),
-            85..=87 => self.timerfd(p, number, a),
-            134 => {
-                if a[1] != 0 {
-                    self.publish_io_tasks(Some((pid, p)));
-                }
-                p.signals.action_call(a, &mut p.memory)?;
-                Ok(Some(0))
-            },
-            135 => p.signals.mask_call(a, &mut p.memory).map(Some),
-            136 => p
-                .signals
-                .io
-                .pending_call_mask(p.signals.mask, a, &mut p.memory)
-                .map(Some),
-            133 => {
-                let trames_kernel::signal::SignalWait::Suspend { mask } =
-                    trames_kernel::signal::SignalWait::prepare(number, a, &p.memory)?
-                else {
-                    unreachable!()
-                };
-                let old = p.signals.mask;
-                p.signals.set_mask(mask);
-                p.state = State::Suspend(old);
-                Ok(None)
+            85..=87 => self.timerfd(pid,p, number, a),
+            132..=137 | 293 => {
+                if number == 134 && a[1] != 0 { self.publish_io_tasks(Some((pid, p))); }
+                self.begin_signal_call(pid, p, number, a)
             },
             139 => {
-                Self::sigreturn(p)?;
+                self.sigreturn_pending(pid, p)?;
                 Ok(None)
             },
             129 => self.signal(pid, p, a[0] as i32, a[1] as u32).map(Some),
@@ -2347,43 +2677,32 @@ impl<C: Cpu> Kernel<C> {
                 };
                 Ok(None)
             },
-            99 | 100 => trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }.robust_list(&p.signals.io, number, a, &mut p.memory).map(Some),
-            113 | 114 => if let Some(elapsed) = (trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }).cpu_clock(&p.signals.io, a[0]) {
-                elapsed.and_then(|elapsed| trames_linux::cpu_clock_read(&mut p.memory, number, a[1], elapsed)).map(Some)
-            } else { trames_linux::clock_read(
-                &mut p.memory,
-                number,
-                a[0],
-                a[1],
-                self.started,
-                Some(p.linux.boot_clock()),
-                Some(&p.signals.io.proc_view),
-            ).map(Some) },
+            99 => trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }.robust_list(&p.signals.io, number, a, &mut p.memory).map(Some),
+            113|114|168|169 => self.metadata_call(pid,p,number,a,None),
+            160..=162 | 278 => self.metadata_call(pid,p,number,a,None),
             179 => {
+                if p.byte_wait.is_some() || p.retained_file.is_some() {
+                    return self.metadata_call(pid,p,number,a,None);
+                }
                 let vm_id = p.vm_id;
                 let runnable = p.runnable();
-                trames_linux::sysinfo(&mut p.memory, a[0], |caller| {
-                    if let Some(info) = self.proc_source.as_ref().and_then(|source|
-                        trames_linux::SystemStatistics::observe(&**source)) {
-                        return Some(info);
-                    }
-                    // Genuine legacy embeddings use the same preflight/ABI and
-                    // their existing original caller/host accounting resources.
-                    let used = self.other_memory(vm_id) + caller.resident_bytes();
+                let info = self.proc_source.as_ref().and_then(|source|
+                    trames_linux::SystemStatistics::observe(&**source)).unwrap_or_else(|| {
+                    let used = self.other_memory(vm_id) + p.memory.resident_bytes();
                     let memory = self.memory_limits.reported(used,
                         self.proc_source.as_ref().and_then(|source| source.host.as_ref().map(|host| host())));
-                    Some(trames_linux::SystemInfo {
+                    trames_linux::SystemInfo {
                         uptime: self.started.elapsed(),
                         load: self.load.lock().unwrap().sample(Instant::now(), self.processes.values().filter(|task| task.runnable()).count() + usize::from(runnable)),
                         total: memory.total,
                         free: memory.free,
                         tasks: self.processes.len() + 1,
-                    })
-                }).expect("legacy statistics available").map(Some)
+                    }
+                });
+                self.metadata_call(pid,p,number,a,Some(info))
             },
-            132 => Self::sigaltstack(p, a[0], a[1]).map(Some),
             283 => Self::membarrier(p, a[0], a[1]).map(Some),
-            163 | 164 | 261 => self.rlimit(pid, p, number, a).map(Some),
+            163 | 164 | 261 => self.rlimit_call(pid,p,number,a),
             124 => Ok(Some(0)),
             203 if matches!(p.state, State::Blocked(203, _))
                 && p.linux.vfs.local_socket(a[0] as u32)?.is_none() =>
@@ -2449,9 +2768,17 @@ impl<C: Cpu> Kernel<C> {
                         }
                     }
                 }
-                let outcome = p.linux.dispatch_untraced(&mut p.cpu, &mut p.memory, io);
+                let outcome = p.linux.dispatch_task_untraced(pid, &mut p.cpu, &mut p.memory, io);
                 if let SyscallOutcome::Exit(code) = outcome {
                     self.exit(pid, p, (code as i32) << 8);
+                    return Ok(None);
+                }
+                if outcome == SyscallOutcome::Deferred {
+                    if let Some(call)=p.linux.take_task_copy(pid) {return self.begin_task_copy_call(pid,p,call);}
+                    p.byte_wait = p.linux.take_ioctl_wait(pid).or_else(||p.linux.take_uring_wait(pid));
+                    p.retained_file = p.byte_wait.as_ref().and_then(|wait|wait.file_pending());
+                    p.uring_wait = p.byte_wait.as_ref().and_then(|wait|wait.uring_enter());
+                    p.file_checkpoint = p.linux.take_ioctl_checkpoint(pid).or_else(||p.linux.take_uring_checkpoint(pid));
                     return Ok(None);
                 }
                 let raw = p.cpu.x(0);
@@ -2551,20 +2878,7 @@ impl<C: Cpu> Kernel<C> {
                         .pidfd_open(&p.linux.vfs.descriptor_factory(), a[0] as i32, a[1] as u32)
                         .map(Some);
                 }
-                if number == 424 {
-                    return routes
-                        .pidfd_send(
-                            &p.signals.io,
-                            &p.linux.vfs.fd_flags_snapshot(),
-                            a,
-                            &p.memory,
-                        )
-                        .map(Some);
-                }
-                return routes
-                    .send_queued(&p.signals.io, number, a, &p.memory)
-                    .expect("queued signal route")
-                    .map(Some);
+                return kernel.begin_send_call(pid, p, number, a);
             }
             kernel.syscall(pid, p, number, a, io)
         });
@@ -2580,6 +2894,11 @@ impl<C: Cpu> Kernel<C> {
         io: &mut I,
         syscall: impl FnOnce(&mut Self, u32, &mut Process<C>, &mut I) -> Result<Option<u64>, Errno>,
     ) {
+        let _file_actor = trames_vfs::FileActorScope::enter_with_sync(
+            p.signals.io.credentials().clone(),
+            pid,
+            Some(self.file_layout_work().sync_executor()),
+        );
         p.linux.vfs.sync_task_namespaces();
         if p.byte_wait.as_ref().is_some_and(|wait| {
             !wait.signal.ready()
@@ -2792,19 +3111,31 @@ impl<C: Cpu> Kernel<C> {
             ))
         } else if let Some(file) = retained_file {
             p.byte_wait = None;
-            Some(
+            let event = trames_linux::event_wait(number);
+            if event {
+                p.signals.finish_io();
+            }
+            let direct = if event {
+                trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                    .with_task_signal(p.signals.io.clone())
+            } else {
                 trames_linux::DirectSyscalls::default()
-                    .with_file_executor(self.workers.file_executor())
-                    .with_file_layouts(self.file_layout_work())
-                    .start_retained_file(
-                        file,
-                        number,
-                        a,
-                        &mut p.memory,
-                        pid,
-                        &Arc::downgrade(&self.byte_target),
-                    ),
-            )
+            };
+            let attempt = direct
+                .with_file_executor(self.workers.file_executor())
+                .with_file_layouts(self.file_layout_work())
+                .start_retained_file(
+                    file,
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                );
+            if event {
+                p.signals.finish_io();
+            }
+            Some(attempt)
         } else if owned_file.is_some() {
             owned_file
         } else if let Some(file) = local {
@@ -2898,10 +3229,37 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 )
         } else if number == 29
-            && (p
-                .byte_wait
-                .as_ref()
-                .is_some_and(trames_linux::PendingIo::is_binder)
+            && trames_memory::CpuMemory::async_faults_possible(&p.memory)
+            && !trames_vfs::DescriptorControl::status_ioctl_request(a[1] as u32)
+        {
+            let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                .with_paths(p.linux.vfs.path_queries())
+                .with_resources(p.linux.vfs.descriptor_factory())
+                .with_terminal_task(p.linux.vfs.terminal_task());
+            if let Some(wait) = p.byte_wait.take() {
+                Some(direct.resume(wait, &mut p.memory))
+            } else if let Some(call) = p.retained_binder.take() {
+                Some(direct.start_retained_binder(
+                    call,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ))
+            } else {
+                direct.start(
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                    None,
+                )
+            }
+        } else if number == 29
+            && (p.retained_binder.is_some()
+                || p.byte_wait
+                    .as_ref()
+                    .is_some_and(trames_linux::PendingIo::is_binder)
                 || p.linux
                     .vfs
                     .binder_file(a[0] as u32)
@@ -2913,6 +3271,13 @@ impl<C: Cpu> Kernel<C> {
                 .with_resources(p.linux.vfs.descriptor_factory());
             if let Some(wait) = p.byte_wait.take() {
                 Some(direct.resume(wait, &mut p.memory))
+            } else if let Some(call) = p.retained_binder.take() {
+                Some(direct.start_retained_binder(
+                    call,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ))
             } else {
                 direct.start(
                     number,
@@ -3034,7 +3399,7 @@ impl<C: Cpu> Kernel<C> {
             }
             Some(trames_linux::IoAttempt::WaitCheckpoint(wait)) => {
                 p.retained_poll = Some(wait);
-                self.poll(p, number, a, io)
+                self.poll(pid, p, number, a, io)
             }
             Some(trames_linux::IoAttempt::Checkpoint) => {
                 unreachable!("joined shared byte call")
@@ -3053,6 +3418,13 @@ impl<C: Cpu> Kernel<C> {
         }
         let raw = match result {
             Ok(Some(raw)) => {
+                if trames_linux::event_wait(number) {
+                    p.poll_deadline = None;
+                    p.retained_poll = None;
+                    if let Some(mask) = p.signals.wait_mask.take() {
+                        p.signals.set_mask(mask);
+                    }
+                }
                 p.cpu.set_x(0, raw);
                 p.state = State::Ready;
                 p.socket_deadline = None;
@@ -3073,8 +3445,10 @@ impl<C: Cpu> Kernel<C> {
                     // into a later read, poll, or runnable CPU epoch.
                     p.poll_deadline = None;
                     p.retained_poll = None;
-                    if let Some(mask) = p.signals.wait_mask.take() {
-                        p.signals.set_mask(mask);
+                    if e.0 != 4 {
+                        if let Some(mask) = p.signals.wait_mask.take() {
+                            p.signals.set_mask(mask);
+                        }
                     }
                 }
                 if matches!(e.0, 38 | 95) {
@@ -3165,44 +3539,59 @@ impl<C: Cpu> Kernel<C> {
             _ => false,
         }
     }
-    #[cfg(all(test, trames_interpreter_conformance))]
-    fn readiness(
-        &self,
-        p: &Process<C>,
-        fd: u32,
-        events: u16,
-        io: &mut impl GuestOutput,
-    ) -> Result<u16, Errno> {
-        let kind = p.linux.vfs.fd_kind(fd);
-        let ready = match kind {
-            Ok(FdKind::Stdin) => {
-                if io.stdin_ready().map_err(|_| Errno(5))? {
-                    events & 1
-                } else {
-                    0
-                }
-            }
-            Ok(FdKind::Terminal) => {
-                if let Some(end) = p.linux.vfs.pty(fd)? {
-                    return Ok(end.pair.poll(end.master, events));
-                }
-                return Err(Errno(25));
-            }
-            _ => p.linux.vfs.poll_signals(fd, events, p.pending_bits()),
-        };
-        Ok(ready)
-    }
+
     #[cfg(all(test, trames_interpreter_conformance))]
     fn poll(
         &mut self,
+        pid: u32,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
-        let retained = p.retained_poll.take();
-        let fresh = if retained.is_none() {
-            Some(
+        if p.retained_poll.is_none()
+            && (trames_memory::CpuMemory::async_faults_possible(&p.memory)
+                || trames_linux::WaitInput::masked(number, a))
+        {
+            p.signals.begin_io();
+            let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                .with_task_signal(p.signals.io.clone());
+            let attempt = Box::new(trames_linux::WaitInput::new(number, a, p.poll_deadline))
+                .resume_joined(
+                    &source,
+                    &mut p.linux,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                );
+            p.signals.finish_io();
+            match attempt {
+                trames_linux::IoAttempt::Complete(result) => return result.map(Some),
+                trames_linux::IoAttempt::Blocked(wait) => {
+                    p.retained_file = wait.file_pending();
+                    p.file_entry = Some((p.cpu.pc(), number, a));
+                    p.byte_wait = Some(wait);
+                    return Ok(None);
+                }
+                trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+                    p.retained_poll = Some(wait);
+                }
+                trames_linux::IoAttempt::FileCheckpoint(file) => {
+                    p.file_checkpoint = Some(file);
+                    p.file_entry = Some((p.cpu.pc(), number, a));
+                    return Ok(None);
+                }
+                trames_linux::IoAttempt::HostError(error) => {
+                    self.backend_error = Some(error.to_string());
+                    return Err(Errno(5));
+                }
+                _ => unreachable!("original poll input"),
+            }
+        }
+        let wait = if let Some(retained) = p.retained_poll.take() {
+            retained
+        } else {
+            Arc::new(
                 trames_linux::RetainedWait::prepare_joined(
                     &p.linux.vfs,
                     &p.memory,
@@ -3212,42 +3601,85 @@ impl<C: Cpu> Kernel<C> {
                 )
                 .expect("owner event resource admitted")?,
             )
-        } else {
-            None
         };
-        let wait = retained.as_deref().or(fresh.as_ref()).unwrap();
-        let result = if matches!(wait.number, 22 | 441) {
-            // A shared epoll already owns every admitted interest. Scatter its
-            // original event records directly, just as on a worker, rather
-            // than allocating a second byte vector for joined short waits.
-            wait.check(&mut p.memory)
-        } else {
-            wait.output(true, |fd, original, events| {
-                if !p.linux.vfs.matches_open_description(fd, original) {
-                    return Ok(32);
-                }
-                self.readiness(p, fd, events, io)
+        let pending = p.pending_bits();
+        let result = wait.check_owned(&mut p.memory, &p.linux.vfs, pending, |kind, events| {
+            Ok(if *kind == FdKind::Stdin {
+                Some((
+                    if io.stdin_ready().map_err(|_| Errno(5))? {
+                        events & 1
+                    } else {
+                        0
+                    },
+                    [0; 2],
+                ))
+            } else {
+                None
             })
-            .and_then(|(count, outputs)| wait.copy_output(&mut p.memory, count, outputs))
-        };
+        });
+        if self.park_poll_output(pid, p, &wait) {
+            return Ok(None);
+        }
         if result == Err(Errno(11)) {
-            if let Some(mask) = wait.mask {
+            if let Some(mask) = wait.outer_mask() {
                 if p.signals.wait_mask.is_none() {
                     p.signals.wait_mask = Some(p.signals.mask);
                 }
                 p.signals.set_mask(mask & !UNBLOCKABLE);
             }
             p.poll_deadline = wait.deadline;
-            p.retained_poll = retained.or_else(|| fresh.map(Arc::new));
+            p.retained_poll = Some(wait);
             Ok(None)
         } else {
             let result = wait.finish(&mut p.memory, result);
-            if let Some(mask) = p.signals.wait_mask.take() {
-                p.signals.set_mask(mask);
+            if wait.native_mask() {
+                p.signals.finish_io();
+            }
+            if self.park_poll_output(pid, p, &wait) {
+                return Ok(None);
+            }
+            if result != Err(Errno(4)) {
+                if let Some(mask) = p.signals.wait_mask.take() {
+                    p.signals.set_mask(mask);
+                }
             }
             p.poll_deadline = None;
             result.map(Some)
         }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn park_poll_output(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        call: &Arc<trames_linux::RetainedWait>,
+    ) -> bool {
+        if call.native_mask() {
+            p.signals.finish_io();
+        }
+        let Some(wait) = trames_linux::DirectSyscalls::default().interrupted_page(
+            None,
+            None,
+            Some(call),
+            call.number,
+            call.args,
+            pid,
+            &Arc::downgrade(&self.byte_target),
+        ) else {
+            return false;
+        };
+        if let Some(mask) = call.outer_mask() {
+            if p.signals.wait_mask.is_none() {
+                p.signals.wait_mask = Some(p.signals.mask);
+            }
+            p.signals.set_mask(mask & !UNBLOCKABLE);
+        }
+        p.poll_deadline = None;
+        p.retained_poll = Some(call.clone());
+        p.retained_file = wait.file_pending();
+        p.file_entry = Some((p.cpu.pc(), call.number, call.args));
+        p.byte_wait = Some(wait);
+        true
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn terminal_call(
@@ -3547,7 +3979,7 @@ impl<C: Cpu> Kernel<C> {
             !p.frozen(id)
                 && matches!(
                     p.state,
-                    State::Policy(_) | State::Barrier(_) | State::Page(_)
+                    State::Policy(_) | State::Barrier(_) | State::Page(_) | State::Delivery(_)
                 )
         }) {
             return true;
@@ -3627,10 +4059,10 @@ impl<C: Cpu> Kernel<C> {
                 && (p.stopped()
                     || matches!(&p.state, State::Completion(release)
                         if first.vfork.as_ref().is_some_and(|producer| Arc::ptr_eq(producer, release)))
-                    || matches!(p.state, State::Blocked(95 | 260, _) | State::PidfdWait(_))
+                    || matches!(p.state, State::Blocked(95 | 260, _) | State::PidfdWait(_) | State::Child(_))
                         && first.family.parent() == p.tgid
                     || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
-                    || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
+                    || matches!(p.state, State::Sigwait { .. } | State::Signal(_) | State::Suspend(_))
                     || p.worker_io_candidate(other)
                         && (p
                             .flock_wait
@@ -3781,7 +4213,9 @@ impl<C: Cpu> Kernel<C> {
                             if p.worker_io_candidate(id)
                                 || matches!(
                                     p.state,
-                                    State::Blocked(95 | 260, _) | State::PidfdWait(_)
+                                    State::Blocked(95 | 260, _)
+                                        | State::PidfdWait(_)
+                                        | State::Child(_)
                                 ) =>
                         {
                             // The worker owns the retry; do not perform byte I/O in
@@ -3844,6 +4278,8 @@ impl<C: Cpu> Kernel<C> {
                     || (matches!(
                         p.state,
                         State::Sigwait { .. }
+                            | State::Signal(_)
+                            | State::Child(_)
                             | State::Suspend(_)
                             | State::Blocked(95 | 260, _)
                             | State::PidfdWait(_)
@@ -3852,6 +4288,7 @@ impl<C: Cpu> Kernel<C> {
                             | State::Policy(_)
                             | State::Barrier(_)
                             | State::Page(_)
+                            | State::Delivery(_)
                     ))
                     || p.worker_io_candidate(id))
                 .then_some((id, 0))
@@ -3941,12 +4378,15 @@ impl<C: Cpu> Kernel<C> {
                         | State::Sleep(..)
                         | State::ClockSleep(_)
                         | State::Sigwait { .. }
+                        | State::Signal(_)
+                        | State::Child(_)
                         | State::Suspend(_)
                         | State::Completion(_)
                         | State::Namespace(_)
                         | State::Policy(_)
                         | State::Barrier(_)
                         | State::Page(_)
+                        | State::Delivery(_)
                 )
             })
             .collect();
@@ -4592,6 +5032,8 @@ impl<C: Cpu> Kernel<C> {
                         | State::Sleep(..)
                         | State::ClockSleep(_)
                         | State::Sigwait { .. }
+                        | State::Signal(_)
+                        | State::Child(_)
                 )
             {
                 continue;
@@ -4606,7 +5048,7 @@ impl<C: Cpu> Kernel<C> {
             for deadline in [
                 (!local_wait).then(|| p.linux.uring_deadline()).flatten(),
                 (!local_wait)
-                    .then(|| p.uring_wait.as_ref().and_then(|(_, _, d)| *d))
+                    .then(|| p.uring_wait.as_ref().and_then(|call| call.deadline()))
                     .flatten(),
             ]
             .into_iter()
@@ -4638,6 +5080,11 @@ impl<C: Cpu> Kernel<C> {
                 // live epoch runs; using it here makes control poll forever.
                 if !worker_vms.contains(&p.vm_id) {
                     timeout = timeout.min(d.saturating_duration_since(now));
+                }
+            }
+            if let State::Signal(wait) = &p.state {
+                if let Some(deadline) = wait.deadline() {
+                    timeout = timeout.min(deadline.saturating_duration_since(now));
                 }
             }
             if let State::Sigwait {
@@ -4781,6 +5228,7 @@ pub(super) fn run<C: Cpu>(
         uring_wait: None,
         retained_file: None,
         retained_aio: None,
+        retained_binder: None,
         retained_message: None,
         file_checkpoint: None,
         file_entry: None,
@@ -5444,6 +5892,7 @@ mod tests {
         p.linux.vfs.flock(b, 6).unwrap();
         let (request, file) = p.linux.vfs.retain_flock(a, 2).unwrap();
         let call = crate::run_queue::IoCall {
+            binder: None,
             aio: None,
             message: None,
             file: None,
@@ -6042,6 +6491,7 @@ mod tests {
         let b = p.linux.vfs.open_at(-100, b"/lock", 2, 0).unwrap();
         let (shared, _) = p.linux.vfs.retain_flock(a, 1).unwrap();
         let mut call = crate::run_queue::IoCall {
+            binder: None,
             aio: None,
             message: None,
             file: None,
@@ -6519,6 +6969,7 @@ mod tests {
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
+            retained_binder: None,
             retained_message: None,
             file_checkpoint: None,
             file_entry: None,
@@ -9118,7 +9569,7 @@ mod tests {
         assert_eq!(p.signals.frames, 0);
     }
     #[test]
-    fn malformed_signal_frame_fails_without_partial_register_restoration() {
+    fn malformed_signal_frame_keeps_restored_registers_before_forcing_sigsegv() {
         let mut p = process();
         let mut k = kernel();
         p.signals.actions.set(
@@ -9132,11 +9583,12 @@ mod tests {
         k.deliver(1, &mut p).unwrap();
         let sp = p.cpu.sp;
         p.memory.write(sp + 592, &[0; 4]).unwrap();
-        let old = p.cpu.clone();
-        assert_eq!(Kernel::sigreturn(&mut p), Err(Errno(14)));
-        assert_eq!(p.cpu.pc, old.pc);
-        assert_eq!(p.cpu.sp, old.sp);
-        assert_eq!(p.cpu.x(0), old.x(0));
+        assert_eq!(Kernel::sigreturn(&mut p), Err(Errno(22)));
+        assert_eq!(p.cpu.pc, 0x4000);
+        assert_eq!(p.cpu.sp, 0x9000);
+        assert_eq!(p.cpu.x(0), 0);
+        assert_eq!(p.signals.frames, 1);
+        assert_eq!(p.signals.io.inbox.peek(11).unwrap().fault, Some(0x9000));
     }
     #[test]
     fn stop_continue_preserves_a_blocked_timer() {
@@ -9554,7 +10006,13 @@ mod boundary_tests {
         let mut p = process();
         let (fd, ring) = p.linux.vfs.uring_create(2, 4).unwrap();
         p.state = State::Blocked(426, [fd as u64, 0, 1, 1, 0, 0]);
-        p.uring_wait = Some((0, ring, None));
+        p.uring_wait = Some(trames_linux::UringEnter::retained(
+            ring.clone(),
+            1,
+            [fd as u64, 0, 1, 1, 0, 0],
+            0,
+            None,
+        ));
         assert!(p.worker_io_candidate(1));
         p.linux.trace = true;
         assert!(
@@ -9562,9 +10020,21 @@ mod boundary_tests {
             "logging preserves the original ring admission"
         );
         p.linux.trace = false;
-        p.uring_wait.as_mut().unwrap().2 = Some(Instant::now());
+        p.uring_wait = Some(trames_linux::UringEnter::retained(
+            ring.clone(),
+            1,
+            [fd as u64, 0, 1, 1, 0, 0],
+            0,
+            Some(Instant::now()),
+        ));
         assert!(p.worker_io_candidate(1));
-        p.uring_wait.as_mut().unwrap().2 = None;
+        p.uring_wait = Some(trames_linux::UringEnter::retained(
+            ring.clone(),
+            1,
+            [fd as u64, 0, 1, 1, 0, 0],
+            0,
+            None,
+        ));
         let mut idle = process();
         idle.state = State::Sleep(
             Instant::now() + Duration::from_secs(3600),
@@ -9596,10 +10066,10 @@ mod boundary_tests {
         let args = [fd as u64, 0, 1, 9, 0x1100, 24];
         assert_eq!(k.syscall(1, &mut p, 426, args, &mut io), Ok(None));
         let wait = p.uring_wait.as_mut().unwrap();
-        wait.2 = Some(Instant::now());
+        let original_deadline = wait.deadline();
         p.memory.write(0x1100, &[255; 24]).unwrap();
-        assert_eq!(k.syscall(1, &mut p, 426, args, &mut io), Err(Errno(62)));
-        assert!(p.uring_wait.is_none());
+        assert_eq!(k.syscall(1, &mut p, 426, args, &mut io), Ok(None));
+        assert_eq!(p.uring_wait.as_ref().unwrap().deadline(), original_deadline);
     }
     #[test]
     fn blocked_uring_enter_retains_original_ring_across_fd_close_and_reuse() {

@@ -1,22 +1,52 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Original-thread ioctl admission and retained read half of WRITE_READ.
+//! Original ioctl, command and reply cursors survive faults on user pages.
+use super::input::Reader;
 use super::*;
-use trames_memory::{Access, CpuMemory};
+use trames_memory::{CopiedInput, CopiedOutput, CpuMemory, MemoryError, PageFault};
+mod control;
+mod import;
+mod read;
+mod write;
+use import::Import;
+use read::{Item, Read};
+use write::Command;
 
-// Ready ioctls stay on the caller's stack; only a parked read needs a box.
 #[allow(clippy::large_enum_variant)]
 pub enum Started {
     Complete(u64),
     Read(Ioctl),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Control,
+    Header,
+    Write,
+    Read,
+    ReadDone,
+    Publish,
+    Done,
+}
+enum After {
+    Noop,
+    Item(Item),
 }
 pub struct Ioctl {
     file: SharedFd,
     process: Arc<Connection>,
     factory: DescriptorFactory,
     tid: u32,
+    uid: u32,
+    cmd: u32,
     address: u64,
     header: [u8; 48],
-    process_work: Option<bool>,
+    phase: Phase,
+    input: CopiedInput,
+    output: CopiedOutput,
+    command: Option<Command>,
+    read: Read,
+    after: Option<After>,
+    result: Option<Result<u64>>,
+    fault: Option<PageFault>,
 }
 fn read(memory: &impl CpuMemory, address: u64, len: usize) -> Result<Vec<u8>> {
     if len == 0 {
@@ -50,365 +80,180 @@ impl Ioctl {
         }
         file.open.check_device_ioctl(cmd)?;
         process.check_owner(factory.local_sender_credentials()[0])?;
-        match cmd {
-            VERSION => {
-                memory
-                    .write_array(address, 8u32.to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-            }
-            SET_MAX_THREADS => {
-                let value = memory.read_array::<4>(address).map_err(|_| Errno(14))?;
-                process.state.lock().unwrap().max_threads = u32::from_le_bytes(value);
-            }
-            SET_CONTEXT_MGR | SET_CONTEXT_MGR_EXT => {
-                let (pointer, cookie, flags) = if cmd == SET_CONTEXT_MGR_EXT {
-                    let bytes = memory.read_array::<24>(address).map_err(|_| Errno(14))?;
-                    (word(&bytes, 8), word(&bytes, 16), dword(&bytes, 4))
-                } else {
-                    let _ = memory.read_array::<4>(address).map_err(|_| Errno(14))?;
-                    (0, 0, 0x100)
-                };
-                process.set_manager(
-                    pointer,
-                    cookie,
-                    flags,
-                    factory.local_credentials().euid,
-                    tid,
-                )?;
-            }
-            THREAD_EXIT => process.thread_exit(tid),
-            GET_NODE_DEBUG => {
-                let input = memory.read_array::<24>(address).map_err(|_| Errno(14))?;
-                let node = process
-                    .state
-                    .lock()
-                    .unwrap()
-                    .nodes
-                    .range((
-                        std::ops::Bound::Excluded(word(&input, 0)),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .map(|(_, node)| node.clone());
-                let mut out = [0; 24];
-                if let Some(node) = node {
-                    put(&mut out, 0, node.pointer);
-                    put(&mut out, 8, node.cookie);
-                    let state = node.state.lock().unwrap();
-                    put32(&mut out, 16, u32::from(state.strong != 0));
-                    put32(&mut out, 20, u32::from(state.weak != 0));
-                }
-                memory.write_array(address, out).map_err(|_| Errno(14))?;
-            }
-            GET_NODE_INFO => {
-                let mut out = memory.read_array::<24>(address).map_err(|_| Errno(14))?;
-                if out[4..].iter().any(|b| *b != 0) {
-                    return Err(Errno(22));
-                }
-                let manager = process
-                    .context
-                    .manager
-                    .lock()
-                    .unwrap()
-                    .node
-                    .as_ref()
-                    .and_then(Weak::upgrade);
-                if !manager.is_some_and(|node| node.owner.ptr_eq(&process.myself)) {
-                    return Err(Errno(1));
-                }
-                let node = process.strong_target(dword(&out, 0))?;
-                let state = node.state.lock().unwrap();
-                put32(&mut out, 4, state.strong as u32);
-                put32(&mut out, 8, state.local_weak as u32);
-                drop(state);
-                memory.write_array(address, out).map_err(|_| Errno(14))?;
-            }
-            GET_EXTENDED_ERROR => {
-                let error = process.state.lock().unwrap().last_error;
-                let mut out = [0; 12];
-                put32(&mut out, 0, error.0);
-                put32(&mut out, 4, error.1);
-                put32(&mut out, 8, error.2 as u32);
-                memory.write_array(address, out).map_err(|_| Errno(14))?;
-            }
-            WRITE_READ => {
-                let header = memory.read_array::<48>(address).map_err(|_| Errno(14))?;
-                memory
-                    .check(address, 48, Access::Write)
-                    .map_err(|_| Errno(14))?;
-                let mut request = Self {
-                    file,
-                    process,
-                    factory,
-                    tid,
-                    address,
-                    header,
-                    process_work: None,
-                };
-                let result = request.write(memory);
-                request.publish(memory)?;
-                result?;
-                return Ok(Started::Read(request));
-            }
-            _ => return Err(Errno(22)), // Binder driver uses EINVAL, not success stubs.
+        let uid = factory.local_credentials().euid;
+        let mut request = Self {
+            file,
+            process,
+            factory,
+            tid,
+            uid,
+            cmd,
+            address,
+            header: [0; 48],
+            phase: if cmd == WRITE_READ {
+                Phase::Header
+            } else {
+                Phase::Control
+            },
+            input: CopiedInput::default(),
+            output: CopiedOutput::default(),
+            command: None,
+            read: Read::default(),
+            after: None,
+            result: None,
+            fault: None,
+        };
+        match request.drive(memory, true)? {
+            Some(value) => Ok(Started::Complete(value)),
+            None => Ok(Started::Read(request)),
         }
-        Ok(Started::Complete(0))
     }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.process.subscribe(signal)
     }
-    fn publish(&self, memory: &mut impl CpuMemory) -> Result<()> {
-        memory
-            .write_array(self.address, self.header)
-            .map_err(|_| Errno(14))
+    pub fn take_fault(&mut self) -> Option<PageFault> {
+        self.fault.take()
     }
-    fn write(&mut self, memory: &impl CpuMemory) -> Result<()> {
-        let size = usize::try_from(word(&self.header, 0)).map_err(|_| Errno(22))?;
-        let mut consumed = checked_len(word(&self.header, 8), size)?;
-        let base = word(&self.header, 16);
-        while consumed < size {
-            let address = base.checked_add(consumed as u64).ok_or(Errno(14))?;
-            if size - consumed < 4 {
-                return Err(Errno(22));
-            }
-            let command_bytes = memory.read_array::<4>(address).map_err(|_| Errno(14))?;
-            let cmd = dword(&command_bytes, 0);
-            let len = ((cmd >> 16) & 0x3fff) as usize;
-            if len > size - consumed - 4 {
-                return Err(Errno(22));
-            }
-            let argument = read(memory, address.checked_add(4).ok_or(Errno(14))?, len)?;
-            // Linux consumes the command word even when command execution
-            // fails. Previously accepted commands are never replayed on wake.
-            consumed += 4;
-            put(&mut self.header, 8, consumed as u64);
-            match cmd {
-                TRANSACTION | REPLY | TRANSACTION_SG | REPLY_SG => {
-                    let reply = matches!(cmd, REPLY | REPLY_SG);
-                    let identity = [self.process.owner, self.factory.local_credentials().euid];
-                    let result = match self.import(&argument, memory) {
-                        Ok(packet) => self.process.submit(self.tid, packet, reply, identity),
-                        Err(_) if reply => self.process.reject_reply(self.tid, BR_FAILED_REPLY),
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = result {
-                        let response = if matches!(error.0, 3 | 111) {
-                            BR_DEAD_REPLY
-                        } else {
-                            BR_FAILED_REPLY
-                        };
-                        self.process.state.lock().unwrap().last_error =
-                            (0, response, -(error.0 as i32));
-                        self.process.bytes(self.tid, response);
-                    }
-                }
-                FREE_BUFFER => {
-                    let _ = self.process.free_buffer(word(&argument, 0));
-                }
-                INCREFS | ACQUIRE | RELEASE | DECREFS => {
-                    self.process.ref_command(cmd, dword(&argument, 0))?
-                }
-                INCREFS_DONE | ACQUIRE_DONE => {
-                    let node = self
-                        .process
-                        .state
-                        .lock()
-                        .unwrap()
-                        .nodes
-                        .get(&word(&argument, 0))
-                        .cloned();
-                    if let Some(node) = node {
-                        if node.cookie == word(&argument, 8) {
-                            // Driver user errors do not abort the enclosing
-                            // write/read and kill an otherwise healthy server.
-                            let _ = node.acknowledge(cmd);
-                        }
-                    }
-                }
-                REGISTER_LOOPER | ENTER_LOOPER | EXIT_LOOPER => {
-                    let mut state = self.process.state.lock().unwrap();
-                    if cmd == REGISTER_LOOPER {
-                        if state.requested_threads == 0 {
-                            return Err(Errno(22));
-                        }
-                        state.requested_threads -= 1;
-                    }
-                    let thread = state.threads.entry(self.tid).or_default();
-                    thread.looper = cmd != EXIT_LOOPER;
-                    thread.registered = cmd == REGISTER_LOOPER;
-                }
-                REQUEST_DEATH => self
-                    .process
-                    .request_death(dword(&argument, 0), word(&argument, 4))?,
-                CLEAR_DEATH => self
-                    .process
-                    .clear_death(dword(&argument, 0), word(&argument, 4))?,
-                DEAD_DONE => self.process.death_done(word(&argument, 0))?,
-                _ => return Err(Errno(22)),
-            }
-            consumed += len;
-            put(&mut self.header, 8, consumed as u64);
+    pub fn interruptible(&self) -> bool {
+        self.phase == Phase::Read
+            && self.read.noop
+            && self.output.is_empty()
+            && self.after.is_none()
+            && self.fault.is_none()
+    }
+    pub fn interrupt(&mut self, memory: &mut impl CpuMemory) -> Result<Option<u64>> {
+        if self.interruptible() {
+            self.result = Some(Err(Errno(4)));
+            self.phase = Phase::Publish;
         }
+        self.finish(memory)
+    }
+    pub fn finish(&mut self, memory: &mut impl CpuMemory) -> Result<Option<u64>> {
+        self.drive(memory, false)
+    }
+    fn copied<T, M: CpuMemory>(
+        &mut self,
+        memory: &M,
+        action: impl FnOnce(&mut Self, &Reader<'_, M>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let input = std::mem::take(&mut self.input);
+        let reader = Reader::new(memory, &input);
+        let result = action(self, &reader);
+        self.fault = reader.fault();
+        drop(reader);
+        self.input = input;
+        if self.fault.is_some() {
+            Ok(None)
+        } else {
+            result.map(Some)
+        }
+    }
+    fn failed_output(&mut self) -> Result<()> {
+        self.output = CopiedOutput::default();
+        self.after.take();
+        self.result = Some(Err(Errno(14)));
+        if self.phase == Phase::Done {
+            return Err(Errno(14));
+        }
+        self.phase = Phase::Publish;
         Ok(())
     }
-    fn import(&self, bytes: &[u8], memory: &impl CpuMemory) -> Result<Packet> {
-        let header: [u8; 64] = bytes[..64].try_into().unwrap();
-        let size = checked_len(word(&header, 32), 4 * 1024 * 1024)?;
-        let offset_size = checked_len(word(&header, 40), 4 * 1024 * 1024)?;
-        if offset_size % 8 != 0 {
-            return Err(Errno(22));
-        }
-        let data = read(memory, word(&header, 48), size)?;
-        let raw_offsets = read(memory, word(&header, 56), offset_size)?;
-        let offsets = raw_offsets
-            .chunks_exact(8)
-            .map(|v| checked_len(word(v, 0), size))
-            .collect::<Result<Vec<_>>>()?;
-        let extra_limit = if bytes.len() == 72 {
-            checked_len(word(bytes, 64), 4 * 1024 * 1024)?
-        } else {
-            0
-        };
-        let mut packet = Packet {
-            header,
-            data,
-            offsets,
-            extra: Vec::new(),
-            objects: Vec::new(),
-            relocations: Vec::new(),
-        };
-        let mut previous_end = 0;
-        // SG parent entries index the original offsets array, not a separate
-        // list of buffer objects. Validate bounds and backwards-only ancestry.
-        let mut parents: BTreeMap<usize, (usize, usize, usize, usize)> = BTreeMap::new();
-        let mut last_fixup: Option<(usize, usize)> = None;
-        for (index, &offset) in packet.offsets.iter().enumerate() {
-            if offset % 4 != 0 || offset < previous_end {
-                return Err(Errno(22));
-            }
-            let raw = packet
-                .data
-                .get(offset..offset.checked_add(4).ok_or(Errno(22))?)
-                .ok_or(Errno(22))?;
-            let kind = dword(raw, 0);
-            let object_size = match kind {
-                TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE | TYPE_FD => 24,
-                TYPE_PTR => 40,
-                TYPE_FDA => 32,
-                _ => return Err(Errno(22)),
-            };
-            let object = packet
-                .data
-                .get(offset..offset + object_size)
-                .ok_or(Errno(22))?;
-            previous_end = offset + object_size;
-            match kind {
-                TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
-                    let (node, lease) = if matches!(kind, TYPE_BINDER | TYPE_WEAK_BINDER) {
-                        (
-                            self.process.owned_node(
-                                word(object, 8),
-                                word(object, 16),
-                                dword(object, 4),
-                                self.tid,
-                            )?,
-                            None,
-                        )
-                    } else if kind == TYPE_HANDLE {
-                        let lease = self.process.strong_reference(dword(object, 8))?;
-                        (lease.0.clone(), Some(lease))
-                    } else {
-                        (self.process.reference_node(dword(object, 8))?, None)
-                    };
-                    packet.objects.push(Object::Node {
-                        offset,
-                        node,
-                        strong: matches!(kind, TYPE_BINDER | TYPE_HANDLE),
-                        _lease: lease,
-                    });
-                }
-                TYPE_FD => {
-                    let file = self.capture_fd(dword(object, 8))?;
-                    packet.objects.push(Object::Fd {
-                        extra: false,
-                        offset: offset + 8,
-                        file,
-                        array: false,
-                    });
-                }
-                TYPE_PTR => {
-                    let length = checked_len(word(object, 16), extra_limit)?;
-                    let at = align(packet.extra.len())?;
-                    let end = at
-                        .checked_add(length)
-                        .filter(|end| *end <= extra_limit)
-                        .ok_or(Errno(22))?;
-                    packet.extra.resize(at, 0);
-                    packet
-                        .extra
-                        .extend_from_slice(&read(memory, word(object, 8), length)?);
-                    let parent = checked_len(word(object, 24), index)?;
-                    let parent_offset = usize::try_from(word(object, 32)).map_err(|_| Errno(22))?;
-                    if dword(object, 4) & !1 != 0 {
-                        return Err(Errno(22));
+    fn drive(&mut self, memory: &mut impl CpuMemory, stop_at_read: bool) -> Result<Option<u64>> {
+        self.fault = None;
+        loop {
+            if !self.output.is_empty() {
+                match self.output.progress(memory) {
+                    Err(MemoryError::Pending(fault)) => {
+                        self.fault = Some(fault);
+                        return Ok(None);
                     }
-                    if dword(object, 4) & 1 != 0 {
-                        let (start, len, _, _) = *parents.get(&parent).ok_or(Errno(22))?;
-                        if parent_offset % 8 != 0
-                            || parent_offset.checked_add(8).is_none_or(|v| v > len)
-                        {
-                            return Err(Errno(22));
+                    Err(_) => {
+                        self.failed_output()?;
+                        continue;
+                    }
+                    Ok(()) => {}
+                }
+                self.output = CopiedOutput::default();
+                if let Some(after) = self.after.take() {
+                    let result = match after {
+                        After::Noop => {
+                            self.read.noop = true;
+                            self.read.cursor = self.read.cursor.wrapping_add(4);
+                            Ok(())
                         }
-                        validate_parent(&parents, last_fixup, parent, parent_offset)?;
-                        packet.relocations.push((start + parent_offset, at));
+                        After::Item(item) => item.commit(self),
+                    };
+                    if let Err(error) = result {
+                        self.result = Some(Err(error));
+                        self.phase = Phase::Publish;
                     }
-                    parents.insert(
-                        index,
-                        (
-                            at,
-                            length,
-                            if dword(object, 4) & 1 != 0 {
-                                parent
-                            } else {
-                                usize::MAX
-                            },
-                            parent_offset,
-                        ),
-                    );
-                    packet.objects.push(Object::Buffer { offset, extra: at });
-                    debug_assert_eq!(packet.extra.len(), end);
-                    last_fixup = Some((index, 0));
                 }
-                TYPE_FDA => {
-                    let count = checked_len(word(object, 8), extra_limit / 4)?;
-                    let parent = checked_len(word(object, 16), index)?;
-                    let parent_offset = usize::try_from(word(object, 24)).map_err(|_| Errno(22))?;
-                    let (start, len, _, _) = *parents.get(&parent).ok_or(Errno(22))?;
-                    if parent_offset % 4 != 0
-                        || parent_offset.checked_add(count * 4).is_none_or(|n| n > len)
-                    {
-                        return Err(Errno(22));
+            }
+            match self.phase {
+                Phase::Control => {
+                    match self.copied(memory, |request, reader| request.control(reader))? {
+                        None => return Ok(None),
+                        Some(output) => {
+                            if let Some(output) = output {
+                                self.output
+                                    .push_slice(self.address, &output.bytes[..output.len]);
+                            }
+                            self.result = Some(Ok(0));
+                            self.phase = Phase::Done;
+                        }
                     }
-                    validate_parent(&parents, last_fixup, parent, parent_offset)?;
-                    for i in 0..count {
-                        let at = start + parent_offset + i * 4;
-                        let file = self.capture_fd(dword(&packet.extra, at))?;
-                        packet.objects.push(Object::Fd {
-                            extra: true,
-                            offset: at,
-                            file,
-                            array: true,
-                        });
-                    }
-                    last_fixup = Some((parent, parent_offset + count * 4));
                 }
-                _ => unreachable!(),
+                Phase::Header => {
+                    match self.copied(memory, |request, reader| {
+                        reader
+                            .read_array::<48>(request.address)
+                            .map_err(|_| Errno(14))
+                    })? {
+                        None => return Ok(None),
+                        Some(header) => {
+                            self.header = header;
+                            self.input.clear();
+                            self.phase = Phase::Write;
+                        }
+                    }
+                }
+                Phase::Write => {
+                    match self.copied(memory, |request, reader| request.write_one(reader)) {
+                        Ok(None) => return Ok(None),
+                        Ok(Some(false)) => {}
+                        Ok(Some(true)) => {
+                            self.command = None;
+                            self.phase = Phase::Read;
+                        }
+                        Err(error) => {
+                            put(&mut self.header, 32, 0);
+                            self.command = None;
+                            self.result = Some(Err(error));
+                            self.phase = Phase::Publish;
+                        }
+                    }
+                }
+                Phase::Read => {
+                    if stop_at_read {
+                        return Ok(None);
+                    }
+                    match self.read_one() {
+                        Ok(false) => return Ok(None),
+                        Ok(true) => {}
+                        Err(error) => {
+                            self.result = Some(Err(error));
+                            self.phase = Phase::Publish;
+                        }
+                    }
+                }
+                Phase::ReadDone => self.read_done(),
+                Phase::Publish => {
+                    self.output.push_slice(self.address, &self.header);
+                    self.phase = Phase::Done;
+                }
+                Phase::Done => return self.result.unwrap().map(Some),
             }
         }
-        if align(packet.extra.len())? > extra_limit {
-            return Err(Errno(22));
-        }
-        Ok(packet)
     }
     fn capture_fd(&self, fd: u32) -> Result<SharedFd> {
         let file = self.factory.files.query_lookup(fd).ok_or(Errno(95))??;
@@ -420,174 +265,6 @@ impl Ioctl {
             return Err(Errno(1));
         }
         Ok(file)
-    }
-    pub fn finish(&mut self, memory: &mut impl CpuMemory) -> Result<Option<u64>> {
-        let capacity = usize::try_from(word(&self.header, 24)).map_err(|_| Errno(22))?;
-        let mut consumed = checked_len(word(&self.header, 32), capacity)?;
-        if capacity == 0 {
-            return Ok(Some(0));
-        }
-        let read_base = word(&self.header, 40);
-        // Linux decides this once for the read, before draining thread work.
-        // Recomputing after COMPLETE lets an unrelated process transaction run
-        // inside a non-server caller's waitForResponse and its application locks.
-        let process_work = *self.process_work.get_or_insert_with(|| {
-            let mut state = self.process.state.lock().unwrap();
-            let thread = state.threads.entry(self.tid).or_default();
-            thread.stack.is_empty() && thread.queue.is_empty()
-        });
-        let mut written = false;
-        while capacity - consumed >= 4 {
-            let work = {
-                let mut state = self.process.state.lock().unwrap();
-                if state.closed {
-                    return Err(Errno(111));
-                }
-                let thread = state.threads.entry(self.tid).or_default();
-                thread.waiting = false;
-                let process_queue = thread.queue.is_empty();
-                let candidate = if let Some(work) = thread.queue.front() {
-                    Some(work)
-                } else if process_work {
-                    state.queue.front()
-                } else {
-                    None
-                };
-                let Some(candidate) = candidate else { break };
-                let prefix = if consumed == 0 { 4 } else { 0 };
-                if candidate.size() + prefix > capacity - consumed {
-                    break;
-                }
-                let address = read_base.checked_add(consumed as u64).ok_or(Errno(14))?;
-                memory
-                    .check(address, candidate.size() + prefix, Access::Write)
-                    .map_err(|_| Errno(14))?;
-                if process_queue {
-                    state.queue.pop_front().unwrap()
-                } else {
-                    state
-                        .threads
-                        .get_mut(&self.tid)
-                        .unwrap()
-                        .queue
-                        .pop_front()
-                        .unwrap()
-                }
-            };
-            if consumed == 0 {
-                memory
-                    .write_array(read_base, BR_NOOP.to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-                consumed += 4;
-            }
-            if let Work::Reply(_, call) = &work {
-                self.pop_call(call);
-            }
-            let notice = if let Work::Node(node) = &work {
-                Some(node.clone())
-            } else {
-                None
-            };
-            let (out, stop) = match work {
-                Work::Bytes(out) => (out, false),
-                Work::Node(node) => (node.notices(), false),
-                Work::Death(cookie) => (command(BR_DEAD_BINDER, &cookie.to_le_bytes()), true),
-                Work::ClearDeath(cookie) => (command(BR_CLEAR_DEATH, &cookie.to_le_bytes()), false),
-                Work::Dead(call, error) => {
-                    self.pop_call(&call);
-                    (command(error, &[]), true)
-                }
-                Work::Transaction(buffer) | Work::Reply(buffer, _) => {
-                    let reply = buffer.node.is_none();
-                    if let Err(error) = buffer.install(&self.factory) {
-                        if let Some(call) = &buffer.call {
-                            call.fail();
-                        }
-                        return Err(error);
-                    }
-                    let address = buffer.pool.base + buffer.offset as u64;
-                    let mut state = self.process.state.lock().unwrap();
-                    if state.closed {
-                        return Err(Errno(111));
-                    }
-                    if let Some(call) = &buffer.call {
-                        call.to_tid.store(self.tid as u64, Ordering::Relaxed);
-                        state
-                            .threads
-                            .entry(self.tid)
-                            .or_default()
-                            .stack
-                            .push(call.clone());
-                    }
-                    // Reply work owns the call only until the outgoing frame
-                    // is popped; use a separate match before moving work below.
-                    state.buffers.insert(address, buffer.clone());
-                    let mut header = buffer.header;
-                    let sender = if dword(&header, 20) & ONE_WAY != 0 {
-                        0
-                    } else {
-                        self.factory.local_pid(dword(&header, 24))
-                    };
-                    put32(&mut header, 24, sender);
-                    (
-                        command(if reply { BR_REPLY } else { BR_TRANSACTION }, &header),
-                        true,
-                    )
-                }
-            };
-            memory
-                .write(read_base + consumed as u64, &out)
-                .map_err(|_| Errno(14))?;
-            if let Some(node) = notice {
-                node.notice_delivered();
-            }
-            consumed += out.len();
-            written = true;
-            if stop {
-                break;
-            }
-        }
-        put(&mut self.header, 32, consumed as u64);
-        self.publish(memory)?;
-        if written || consumed != 0 {
-            let spawn = {
-                let mut state = self.process.state.lock().unwrap();
-                let looper = state.threads.get(&self.tid).is_some_and(|t| t.looper);
-                let registered = state.threads.values().filter(|t| t.registered).count() as u32;
-                // Only an idle pool looper can take process work. A thread
-                // blocked on a synchronous reply is not spare server capacity.
-                let waiting = state
-                    .threads
-                    .values()
-                    .any(|t| t.waiting && t.stack.is_empty() && t.queue.is_empty());
-                let spawn = looper
-                    && !waiting
-                    && state.requested_threads == 0
-                    && registered < state.max_threads;
-                if spawn {
-                    state.requested_threads += 1;
-                }
-                spawn
-            };
-            if spawn {
-                memory
-                    .write_array(read_base, BR_SPAWN.to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-            }
-            return Ok(Some(0));
-        }
-        if self.file.open.flags.get() & O_NONBLOCK != 0 {
-            return Err(Errno(11));
-        }
-        self.process
-            .state
-            .lock()
-            .unwrap()
-            .threads
-            .entry(self.tid)
-            .or_default()
-            .waiting = process_work;
-        Ok(None)
     }
     fn pop_call(&self, call: &Arc<Call>) {
         let mut state = self.process.state.lock().unwrap();

@@ -6,6 +6,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct PreparedPath {
+    pub work: Option<std::sync::Mutex<FileWork>>,
     pub open: Option<file_work::PreparedOpen>,
     pub fuse: Option<Box<fuse::Metadata>>,
     pub namespace: Option<Box<fuse::PendingNamespace>>,
@@ -108,6 +109,9 @@ impl Authority {
     }
     pub(super) fn clear_deferred(&self) {
         self.deferred.store(false, Ordering::Relaxed);
+    }
+    pub(super) fn deferred(&self) -> bool {
+        self.deferred.load(Ordering::Relaxed)
     }
     pub(super) fn take_deferred(&self) -> bool {
         self.deferred.swap(false, Ordering::Relaxed)
@@ -357,6 +361,9 @@ impl PathQueries {
     pub fn pending_fifo_open(&self, fd: u32) -> Option<crate::FifoOpen> {
         self.view.borrow().shared_files().pending_fifo_open(fd)
     }
+    pub fn control_factory(&self) -> DescriptorFactory {
+        self.view.borrow().descriptor_factory()
+    }
     /// Short descriptor controls use one original shared OFD, without pathname
     /// or byte-provider admission. No guest-visible descriptor is installed.
     pub fn fd_control<T>(
@@ -546,6 +553,12 @@ impl PathQueries {
             .borrow_mut()
             .uring_create_with_output(entries, cq_entries, output)
             .map(|(fd, _)| fd)
+    }
+    pub fn prepare_uring(&self, entries: u32, cq_entries: u32) -> Result<PreparedDescriptor> {
+        self.view
+            .borrow_mut()
+            .prepare_uring(entries, cq_entries)
+            .map(|(prepared, _)| prepared)
     }
 
     pub fn local_datagram(

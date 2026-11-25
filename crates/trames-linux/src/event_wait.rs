@@ -6,7 +6,7 @@ use crate::{
     RetainedPoll, RetainedSelect,
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use trames_memory::CpuMemory;
@@ -37,7 +37,23 @@ pub struct RetainedWait {
     pub deadline: Option<Instant>,
     pub mask: Option<u64>,
     remaining: u64,
+    timeout_write: bool,
     dynamic_sources: bool,
+    copy: Arc<Mutex<Copy>>,
+}
+#[derive(Default)]
+struct Copy {
+    native_mask: bool,
+    mask_lease: Option<Arc<dyn trames_vfs::TemporaryMask>>,
+    delivery: Option<trames_vfs::EpollDelivery>,
+    blocked: Option<trames_vfs::EpollBlocked>,
+    needs_owner: bool,
+    count: Option<u64>,
+    output: crate::copy_replay::Replay,
+    copied: Option<Result<u64, Errno>>,
+    result: Option<Result<u64, Errno>>,
+    timeout: Option<crate::copy_replay::Replay>,
+    timeout_done: bool,
 }
 pub fn event_wait(number: u32) -> bool {
     matches!(number, 22 | 72 | 73 | 441)
@@ -48,6 +64,14 @@ pub fn wait_mask(
     number: u32,
     args: [u64; 6],
 ) -> Result<Option<u64>, Errno> {
+    let (pointer, length) = mask_descriptor(memory, number, args)?;
+    mask_value(memory, pointer, length)
+}
+pub(crate) fn mask_descriptor(
+    memory: &impl CpuMemory,
+    number: u32,
+    args: [u64; 6],
+) -> Result<(u64, u64), Errno> {
     let (pointer, length) = match number {
         72 if args[5] != 0 => (
             memory.read_u64(args[5]).map_err(|_| Errno(14))?,
@@ -56,8 +80,15 @@ pub fn wait_mask(
         72 => (0, 0),
         73 => (args[3], args[4]),
         22 | 441 => (args[4], args[5]),
-        _ => return Ok(None),
+        _ => return Ok((0, 0)),
     };
+    Ok((pointer, length))
+}
+pub(crate) fn mask_value(
+    memory: &impl CpuMemory,
+    pointer: u64,
+    length: u64,
+) -> Result<Option<u64>, Errno> {
     if pointer == 0 {
         return Ok(None);
     }
@@ -67,20 +98,19 @@ pub fn wait_mask(
     memory.read_u64(pointer).map(Some).map_err(|_| Errno(14))
 }
 impl RetainedWait {
-    fn parameters(
+    pub(crate) fn timeout(
         memory: &impl CpuMemory,
         number: u32,
         args: [u64; 6],
         saved: Option<Instant>,
-    ) -> Result<(Option<Instant>, Option<u64>, u64), Errno> {
-        let remaining = match number {
-            72 => args[4],
-            73 => args[2],
-            _ => 0,
-        };
+    ) -> Result<(Option<Instant>, bool), Errno> {
+        if saved.is_some() {
+            return Ok((saved, Self::remaining(number, args) != 0));
+        }
+        let remaining = Self::remaining(number, args);
         let duration = if matches!(number, 22 | 441) {
-            direct::epoll_parameters(memory, number, args)?
-        } else if remaining != 0 && saved.is_none() {
+            direct::epoll_timeout(memory, number, args)?
+        } else if remaining != 0 {
             let bytes = memory.read_array::<16>(remaining).map_err(|_| Errno(14))?;
             let sec = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             let ns = u64::from_le_bytes(bytes[8..].try_into().unwrap());
@@ -91,14 +121,35 @@ impl RetainedWait {
         } else {
             None
         };
-        let deadline = if saved.is_some() {
-            saved
-        } else {
+        let write = Self::remaining(number, args) != 0
+            && duration.is_some_and(|duration| !duration.is_zero());
+        Ok((
             duration
-                .map(|d| Instant::now().checked_add(d).ok_or(Errno(22)))
-                .transpose()?
-        };
-        Ok((deadline, wait_mask(memory, number, args)?, remaining))
+                .map(|duration| Instant::now().checked_add(duration).ok_or(Errno(22)))
+                .transpose()?,
+            write,
+        ))
+    }
+    pub(crate) fn remaining(number: u32, args: [u64; 6]) -> u64 {
+        match number {
+            72 => args[4],
+            73 => args[2],
+            _ => 0,
+        }
+    }
+    fn parameters(
+        memory: &impl CpuMemory,
+        number: u32,
+        args: [u64; 6],
+        saved: Option<Instant>,
+    ) -> Result<(Option<Instant>, Option<u64>, u64, bool), Errno> {
+        let (pointer, length) = mask_descriptor(memory, number, args)?;
+        let (deadline, timeout_write) = Self::timeout(memory, number, args, saved)?;
+        let mask = mask_value(memory, pointer, length)?;
+        if matches!(number, 22 | 441) {
+            direct::epoll_buffer(memory, args)?;
+        }
+        Ok((deadline, mask, Self::remaining(number, args), timeout_write))
     }
     pub fn prepare_worker(
         fds: &DirectFds,
@@ -107,21 +158,49 @@ impl RetainedWait {
         args: [u64; 6],
         saved: Option<Instant>,
     ) -> Option<Result<Self, Errno>> {
-        let (deadline, mask, remaining) = match Self::parameters(memory, number, args, saved) {
+        let parameters = match Self::parameters(memory, number, args, saved) {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };
+        Self::prepare_parameters(fds, memory, number, args, parameters, None, None)
+    }
+    pub(crate) fn prepare_parameters(
+        fds: &DirectFds,
+        memory: &impl CpuMemory,
+        number: u32,
+        args: [u64; 6],
+        parameters: (Option<Instant>, Option<u64>, u64, bool),
+        owner: Option<&Vfs>,
+        count: Option<u32>,
+    ) -> Option<Result<Self, Errno>> {
+        let (deadline, mask, remaining, timeout_write) = parameters;
         let sources = match number {
-            73 => Sources::Poll(match Poll::prepare(fds, memory, args)? {
-                Ok(p) => p.retain(),
-                Err(e) => return Some(Err(e)),
-            }),
-            72 => Sources::Select(match RetainedSelect::prepare_worker(fds, memory, args)? {
-                Ok(s) => s,
-                Err(e) => return Some(Err(e)),
-            }),
-            22 | 441 => Sources::Epoll(match fds.epoll(args[0] as u32)? {
-                Ok(fd) => fd,
+            73 => Sources::Poll(
+                match if let Some(count) = count {
+                    RetainedPoll::prepare_captured(fds, owner, memory, args, count)
+                } else if let Some(vfs) = owner {
+                    Some(RetainedPoll::prepare_joined(vfs, memory, args))
+                } else {
+                    Poll::prepare(fds, memory, args).map(|result| result.map(Poll::retain))
+                }? {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(e)),
+                },
+            ),
+            72 => Sources::Select(
+                match if let Some(count) = count {
+                    RetainedSelect::prepare_captured(fds, owner, memory, args, count)
+                } else if let Some(vfs) = owner {
+                    Some(RetainedSelect::prepare_joined(vfs, memory, args))
+                } else {
+                    RetainedSelect::prepare_worker(fds, memory, args)
+                }? {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                },
+            ),
+            22 | 441 => Sources::Epoll(match fds.epoll_original(args[0] as u32)? {
+                Ok(fd) => fds.bind_poll(&fd).unwrap_or(fd),
                 Err(error) => return Some(Err(error)),
             }),
             _ => return None,
@@ -134,6 +213,8 @@ impl RetainedWait {
             deadline,
             mask,
             remaining,
+            timeout_write,
+            copy: Default::default(),
         }))
     }
     pub fn prepare_joined(
@@ -143,53 +224,179 @@ impl RetainedWait {
         args: [u64; 6],
         saved: Option<Instant>,
     ) -> Option<Result<Self, Errno>> {
-        if matches!(number, 22 | 441) {
-            return Self::prepare_worker(&vfs.direct_descriptors(), memory, number, args, saved);
+        let parameters = match Self::parameters(memory, number, args, saved) {
+            Ok(p) => p,
+            Err(error) => return Some(Err(error)),
+        };
+        Self::prepare_parameters(
+            &vfs.direct_descriptors(),
+            memory,
+            number,
+            args,
+            parameters,
+            Some(vfs),
+            None,
+        )
+    }
+    pub(crate) fn final_error(
+        number: u32,
+        args: [u64; 6],
+        parameters: (Option<Instant>, Option<u64>, u64, bool),
+        error: Errno,
+    ) -> Self {
+        let (deadline, mask, remaining, timeout_write) = parameters;
+        Self {
+            sources: Sources::Poll(RetainedPoll::empty()),
+            number,
+            args,
+            deadline,
+            mask,
+            remaining,
+            timeout_write,
+            dynamic_sources: false,
+            copy: Arc::new(Mutex::new(Copy {
+                result: Some(Err(error)),
+                ..Default::default()
+            })),
         }
-        Some((|| {
-            let (deadline, mask, remaining) = Self::parameters(memory, number, args, saved)?;
-            let sources = if number == 73 {
-                Sources::Poll(RetainedPoll::prepare_joined(vfs, memory, args)?)
-            } else {
-                Sources::Select(RetainedSelect::prepare_joined(vfs, memory, args)?)
-            };
-            Ok(Self {
-                dynamic_sources: sources.dynamic(),
-                sources,
-                number,
-                args,
-                deadline,
-                mask,
-                remaining,
-            })
-        })())
+    }
+    pub(crate) fn attach_mask(&self, lease: Option<Arc<dyn trames_vfs::TemporaryMask>>) {
+        let mut copy = self.copy.lock().unwrap();
+        copy.native_mask = lease.is_some();
+        copy.mask_lease = lease;
+    }
+    pub fn outer_mask(&self) -> Option<u64> {
+        (!self.copy.lock().unwrap().native_mask)
+            .then_some(self.mask)
+            .flatten()
+    }
+    pub fn native_mask(&self) -> bool {
+        self.copy.lock().unwrap().native_mask
+    }
+    /// Provider admission for this captured wait, before any output effects.
+    /// Interests can still change; execution rechecks the original resources.
+    pub fn fully_bound(&self) -> bool {
+        match &self.sources {
+            Sources::Poll(p) => p.fully_bound(),
+            Sources::Select(s) => s.supports_worker(),
+            Sources::Epoll(fd) => fd.epoll_accepted_revision().is_some(),
+        }
     }
     pub fn output(
         &self,
         joined: bool,
-        owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+        mut owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
     ) -> Result<(u64, PollOutput), Errno> {
+        self.output_inner(
+            joined,
+            |fd, id, _, events| owner(fd, id, events),
+            |delivery, max| delivery.prepare(max),
+        )
+    }
+    fn output_owned(
+        &self,
+        vfs: &Vfs,
+        pending: u64,
+        mut special: impl FnMut(&trames_vfs::FdKind, u16) -> Result<Option<(u16, [u64; 2])>, Errno>,
+    ) -> Result<(u64, PollOutput), Errno> {
+        if matches!(&self.sources, Sources::Epoll(_)) {
+            self.output_inner(
+                true,
+                |_, _, _, _| unreachable!("epoll has its original delivery"),
+                |delivery, max| delivery.prepare_owned(max, vfs, pending, &mut special),
+            )
+        } else {
+            self.output_inner(
+                true,
+                |_, _, file, events| vfs.poll_original(file, events, pending, &mut special),
+                |delivery, max| delivery.prepare(max),
+            )
+        }
+    }
+    fn output_inner(
+        &self,
+        joined: bool,
+        owner: impl FnMut(u32, &OfdIdentity, &trames_vfs::SharedFd, u16) -> Result<u16, Errno>,
+        prepare: impl FnOnce(
+            &mut trames_vfs::EpollDelivery,
+            usize,
+        ) -> Result<(), trames_vfs::EpollPrepareError>,
+    ) -> Result<(u64, PollOutput), Errno> {
+        let mut observations = trames_vfs::EpollObservations::default();
+        let _previous_blocked;
+        let mut copy = self.copy.lock().unwrap();
+        if let Some(result) = copy.result {
+            return result.map(|count| (count, Vec::new()));
+        }
+        if let Some(count) = copy.count {
+            return Ok((count, Vec::new()));
+        }
+        _previous_blocked = copy.blocked.take();
+        copy.needs_owner = false;
         match &self.sources {
-            Sources::Poll(p) => {
-                let rows = p.ready(joined, owner)?;
-                Ok((
+            Sources::Poll(p) => p.observe_epolls(&mut observations),
+            Sources::Select(s) => s.observe_epolls(&mut observations),
+            Sources::Epoll(_) => {}
+        }
+        if let Err(blocked) = observations.admit() {
+            copy.blocked = Some(blocked);
+            return Err(Errno(11));
+        }
+        let ready = match &self.sources {
+            Sources::Poll(p) => p.ready_with(joined, owner).map(|rows| {
+                (
                     rows.iter().filter(|(_, r)| *r != 0).count() as u64,
                     rows.into_iter()
                         .map(|(a, r)| (a, r.to_le_bytes().to_vec()))
                         .collect(),
-                ))
-            }
-            Sources::Select(s) => s.ready(joined, owner),
+                )
+            }),
+            Sources::Select(s) => s.ready_with(joined, owner),
             Sources::Epoll(fd) => {
-                let events = fd.epoll_wait(self.args[2] as usize)?;
-                let mut bytes = Vec::with_capacity(events.len() * 16);
-                for (events, data) in &events {
-                    bytes.extend(events.to_le_bytes());
-                    bytes.extend(0u32.to_le_bytes());
-                    bytes.extend(data.to_le_bytes());
+                if copy.delivery.is_none() {
+                    copy.delivery = Some(fd.epoll_delivery()?);
                 }
-                Ok((events.len() as u64, vec![(self.args[1], bytes)]))
+                let delivery = copy.delivery.as_mut().unwrap();
+                if let Err(error) = prepare(delivery, direct::epoll_count(self.args)?) {
+                    match error {
+                        trames_vfs::EpollPrepareError::Blocked(blocked) => {
+                            copy.blocked = Some(blocked);
+                            return Err(Errno(11));
+                        }
+                        trames_vfs::EpollPrepareError::Owner => {
+                            copy.needs_owner = true;
+                            return Err(Errno(95));
+                        }
+                        trames_vfs::EpollPrepareError::Error(error) => return Err(error),
+                    }
+                }
+                let mut outputs = Vec::with_capacity(delivery.len() * 2);
+                for (i, (events, data)) in delivery.events().enumerate() {
+                    let address = self.args[1] + i as u64 * 16;
+                    outputs.push((address, events.to_le_bytes().to_vec()));
+                    outputs.push((address + 8, data.to_le_bytes().to_vec()));
+                }
+                Ok((delivery.len() as u64, outputs))
             }
+        };
+        let (count, outputs) = match ready {
+            Err(Errno(95)) => {
+                copy.needs_owner = true;
+                return Err(Errno(95));
+            }
+            result => result?,
+        };
+        if count != 0 || self.expired() {
+            for (address, bytes) in &outputs {
+                copy.output.capture(*address, bytes);
+            }
+            copy.count = Some(count);
+            Ok((count, Vec::new()))
+        } else {
+            let delivery = copy.delivery.take();
+            drop(copy);
+            drop(delivery);
+            Ok((count, outputs))
         }
     }
     pub fn expired(&self) -> bool {
@@ -201,50 +408,117 @@ impl RetainedWait {
         count: u64,
         outputs: PollOutput,
     ) -> Result<u64, Errno> {
-        if count == 0 && !self.expired() {
+        let mut copy = self.copy.lock().unwrap();
+        if let Some(result) = copy.result {
+            return result;
+        }
+        if let Some(result) = copy.copied {
+            return result;
+        }
+        if copy.count.is_none() && count == 0 && !self.expired() {
             return Err(Errno(11));
         }
-        for (address, bytes) in outputs {
-            memory.write(address, &bytes).map_err(|_| Errno(14))?;
+        if copy.count.is_none() {
+            for (address, bytes) in outputs {
+                copy.output.capture(address, &bytes);
+            }
+            copy.count = Some(count);
         }
-        Ok(count)
+        let mut result = copy
+            .output
+            .progress(memory)
+            .map(|()| copy.count.unwrap())
+            .map_err(|_| Errno(14));
+        let committed = copy.output.completed_writes() / 2;
+        if let Some(delivery) = &mut copy.delivery {
+            delivery.commit(committed);
+            if result.is_err() && copy.output.fault.is_none() && committed != 0 {
+                result = Ok(committed as u64);
+            }
+        }
+        let delivery = if copy.output.fault.is_none() {
+            copy.copied = Some(result);
+            copy.delivery.take()
+        } else {
+            None
+        };
+        drop(copy);
+        drop(delivery);
+        result
     }
     pub fn check(&self, memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        match &self.sources {
-            Sources::Poll(p) => p.check(memory, self.deadline),
-            Sources::Select(s) => {
-                let (count, outputs) = s.ready(false, |_, _, _| Err(Errno(95)))?;
-                self.copy_output(memory, count, outputs)
-            }
-            Sources::Epoll(fd) => {
-                direct::epoll_buffer(memory, self.args)?;
-                let events = fd.epoll_wait(self.args[2] as usize)?;
-                if events.is_empty() && !self.expired() {
-                    return Err(Errno(11));
-                }
-                direct::epoll_scatter(memory, self.args[1], &events)
-            }
-        }
+        let (count, outputs) = self.output(false, |_, _, _| Err(Errno(95)))?;
+        self.copy_output(memory, count, outputs)
+    }
+    pub fn check_owned(
+        &self,
+        memory: &mut impl CpuMemory,
+        vfs: &Vfs,
+        pending: u64,
+        special: impl FnMut(&trames_vfs::FdKind, u16) -> Result<Option<(u16, [u64; 2])>, Errno>,
+    ) -> Result<u64, Errno> {
+        let (count, output) = self.output_owned(vfs, pending, special)?;
+        self.copy_output(memory, count, output)
+    }
+    pub(crate) fn needs_owner(&self) -> bool {
+        self.copy.lock().unwrap().needs_owner
+    }
+    pub(crate) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        let mut copy = self.copy.lock().unwrap();
+        copy.output
+            .fault
+            .take()
+            .or_else(|| copy.timeout.as_mut()?.fault.take())
+    }
+    pub(crate) fn output_started(&self) -> bool {
+        let copy = self.copy.lock().unwrap();
+        copy.count.is_some()
+            || copy.result.is_some()
+            || copy.delivery.is_some()
+            || copy.blocked.is_some()
+    }
+    pub(crate) fn blocker(&self) -> Option<trames_vfs::EpollBlocked> {
+        self.copy.lock().unwrap().blocked.clone()
     }
     pub fn finish(
         &self,
         memory: &mut impl CpuMemory,
         result: Result<u64, Errno>,
     ) -> Result<u64, Errno> {
-        if self.remaining != 0 {
-            if let Some(deadline) = self.deadline {
-                let d = deadline.saturating_duration_since(Instant::now());
-                // Linux's final raw timeout update is best effort. A timeout
-                // unmapped/read-only after acceptance does not replace the
-                // original readiness/EINTR result with a new guest error.
-                let _ = memory.write_array(self.remaining, d.as_secs().to_le_bytes());
-                let _ =
-                    memory.write_array(self.remaining + 8, (d.subsec_nanos() as u64).to_le_bytes());
+        let mut copy = self.copy.lock().unwrap();
+        let result = *copy.result.get_or_insert(result);
+        if let Some(lease) = copy.mask_lease.take() {
+            if result == Err(Errno(4)) {
+                lease.interrupted();
+            } else {
+                lease.finish();
             }
         }
+        if !copy.timeout_done && self.timeout_write {
+            if let Some(deadline) = self.deadline {
+                if copy.timeout.is_none() {
+                    let d = deadline.saturating_duration_since(Instant::now());
+                    let mut timeout = crate::copy_replay::Replay::default();
+                    timeout.capture(self.remaining, &d.as_secs().to_le_bytes());
+                    timeout.capture(self.remaining + 8, &(d.subsec_nanos() as u64).to_le_bytes());
+                    copy.timeout = Some(timeout);
+                }
+                let timeout = copy.timeout.as_mut().unwrap();
+                let _ = timeout.progress(memory);
+                if timeout.fault.is_some() {
+                    return Err(Errno(14));
+                }
+            }
+        }
+        // A permanent timeout-copy error is best effort. An asynchronous page
+        // wait instead retains this original result and its accepted duration.
+        copy.timeout_done = true;
         result
     }
     pub fn rearm(self: &Arc<Self>, fds: &DirectFds) -> Option<Arc<Self>> {
+        if self.output_started() {
+            return Some(self.clone());
+        }
         let sources = match &self.sources {
             Sources::Epoll(fd) => {
                 let fresh = fds.bind_poll(fd)?;

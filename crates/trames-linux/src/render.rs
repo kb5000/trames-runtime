@@ -22,15 +22,13 @@ impl Linux {
             let address = u64::from_le_bytes(record[offset + 8..offset + 16].try_into().unwrap());
             let count = capacity.min(text.len() as u64) as usize;
             if count != 0 {
-                memory
-                    .write(address, &text[..count])
-                    .map_err(|_| Errno(14))?;
+                crate::time_read::copy_bytes(memory, address, &text[..count])?;
             }
             record[offset..offset + 8].copy_from_slice(&(text.len() as u64).to_le_bytes());
         }
         record[..12].fill(0);
         record[..4].copy_from_slice(&1u32.to_le_bytes());
-        memory.write(at, &record).map_err(|_| Errno(14))?;
+        crate::time_read::copy_bytes(memory, at, &record)?;
         Ok(0)
     }
 }

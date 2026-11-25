@@ -18,6 +18,11 @@ pub(super) struct Message {
 }
 #[derive(Default)]
 struct State {
+    fault: Option<trames_memory::PageFault>,
+    sent: Option<u64>,
+    copy: Option<crate::copy_replay::Replay>,
+    finish_copy: Option<crate::copy_replay::Replay>,
+    input: Option<Box<file_input::Bytes>>,
     completed: u64,
     requested: u64,
     batch_header: Option<u64>,
@@ -25,8 +30,17 @@ struct State {
     terminal: Option<Result<u64, Errno>>,
     finished: bool,
     recheck: bool,
+    partial: Option<Partial>,
+}
+#[derive(Clone, Copy)]
+struct Partial {
+    count: u64,
+    length: Option<(u64, u32)>,
 }
 impl Message {
+    pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        self.state.lock().unwrap().fault.take()
+    }
     pub fn raw(
         number: u32,
         args: [u64; 6],
@@ -96,37 +110,86 @@ impl Message {
     }
     pub fn partial_receive(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
         let mut state = self.state.lock().unwrap();
-        if state.finished {
-            return state.terminal;
-        }
-        let result = self.partial_result(&state, memory)?;
-        state.terminal = Some(result);
-        state.finished = true;
-        Some(result)
+        self.partial_result(&mut state, memory)
     }
     fn partial_result(
         &self,
-        state: &State,
+        state: &mut State,
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        let prefix = state.active.as_ref().and_then(Prepared::partial);
-        if let Some(header) = state.batch_header {
-            let extra = match prefix {
-                Some(n) => match header
-                    .checked_add(56)
-                    .and_then(|at| memory.write(at, &(n as u32).to_le_bytes()).ok())
-                {
-                    Some(()) => 1,
-                    None if state.completed == 0 => return Some(Err(Errno(14))),
-                    None => 0,
-                },
-                None => 0,
-            };
-            let count = state.completed + extra;
-            (count != 0).then(|| self.finish(Ok(count), memory))
-        } else {
-            prefix.map(Ok)
+        if state.finished {
+            return state.terminal;
         }
+        if state.partial.is_none() {
+            let prefix = state.active.as_ref().and_then(Prepared::partial);
+            let partial = if let Some(header) = state.batch_header {
+                let count = state.completed + u64::from(prefix.is_some());
+                if count == 0 {
+                    return None;
+                }
+                Partial {
+                    count,
+                    length: prefix.map(|n| (header, n as u32)),
+                }
+            } else {
+                Partial {
+                    count: prefix?,
+                    length: None,
+                }
+            };
+            state.partial = Some(partial);
+        }
+        if state.terminal.is_none() {
+            let partial = state.partial.unwrap();
+            let copied = if let Some((header, length)) = partial.length {
+                header
+                    .checked_add(56)
+                    .ok_or(trames_memory::MemoryError::InvalidRange)
+                    .and_then(|address| {
+                        if memory.async_faults_possible() || state.copy.is_some() {
+                            crate::copy_replay::Writer::new(
+                                memory,
+                                state.copy.get_or_insert_with(Default::default),
+                            )
+                            .write(address, &length.to_le_bytes())
+                        } else {
+                            memory.write(address, &length.to_le_bytes())
+                        }
+                    })
+            } else {
+                Ok(())
+            };
+            state.terminal = Some(match copied {
+                Ok(()) => Ok(partial.count),
+                Err(trames_memory::MemoryError::Pending(fault)) => {
+                    state.fault = Some(fault);
+                    return Some(Err(Errno(14)));
+                }
+                Err(_) if state.completed != 0 => Ok(state.completed),
+                Err(_) => Err(Errno(14)),
+            });
+        }
+        Some(self.finish_state(state, memory))
+    }
+    fn finish_state(&self, state: &mut State, memory: &mut impl CpuMemory) -> Result<u64, Errno> {
+        let result = state.terminal.expect("accepted terminal transport result");
+        if state.finished {
+            return result;
+        }
+        let result = if memory.async_faults_possible() || state.finish_copy.is_some() {
+            let copies = state.finish_copy.get_or_insert_with(Default::default);
+            let result = self.finish(result, &mut crate::copy_replay::Writer::new(memory, copies));
+            if let Some(fault) = copies.fault.take() {
+                state.fault = Some(fault);
+                return Err(Errno(14));
+            }
+            result
+        } else {
+            self.finish(result, memory)
+        };
+        state.terminal = Some(result);
+        state.finished = true;
+        result
     }
     pub fn pipe_signal(&self) -> bool {
         self.pipe.load(Ordering::Relaxed)
@@ -182,15 +245,11 @@ impl Message {
             1
         };
         loop {
-            if let Some(result) = state.terminal {
-                let result = if !state.finished {
-                    self.finish(result, memory)
-                } else {
-                    result
-                };
-                state.finished = true;
-                state.terminal = Some(result);
-                return result;
+            if state.partial.is_some() {
+                return self.partial_result(&mut state, memory).unwrap();
+            }
+            if state.terminal.is_some() {
+                return self.finish_state(&mut state, memory);
             }
             if state.completed == count {
                 state.terminal = Some(Ok(count));
@@ -202,6 +261,9 @@ impl Message {
                 original_flags
             };
             let result = (|| {
+                if let Some(sent) = state.sent {
+                    return Ok(sent);
+                }
                 let header = if batch {
                     a[1].checked_add(state.completed * 64).ok_or(Errno(14))?
                 } else {
@@ -211,16 +273,48 @@ impl Message {
                     state.batch_header = Some(header);
                 }
                 if state.active.is_none() {
-                    if !receive {
-                        state.requested = crate::network_batch::requested(memory, header)?;
-                    }
-                    state.active = Some(Prepared::new(
-                        if receive { 212 } else { 211 },
-                        [a[0], header, flags as u64, 0, 0, 0],
-                        memory,
-                        socket.address_size(),
-                        socket.datagram_limit(),
-                    )?);
+                    let (prepared, requested) = if memory.async_faults_possible() {
+                        let input = state.input.get_or_insert_with(Default::default);
+                        let reader = file_input::Reader::new(memory, input);
+                        let result = (|| {
+                            let requested = if receive {
+                                0
+                            } else {
+                                crate::network_batch::requested(&reader, header)?
+                            };
+                            let prepared = Prepared::new(
+                                if receive { 212 } else { 211 },
+                                [a[0], header, flags as u64, 0, 0, 0],
+                                &reader,
+                                socket.address_size(),
+                                socket.datagram_limit(),
+                            )?;
+                            Ok((prepared, requested))
+                        })();
+                        if let Some(fault) = reader.fault() {
+                            state.fault = Some(fault);
+                            return Err(Errno(14));
+                        }
+                        result?
+                    } else {
+                        let requested = if receive {
+                            0
+                        } else {
+                            crate::network_batch::requested(memory, header)?
+                        };
+                        (
+                            Prepared::new(
+                                if receive { 212 } else { 211 },
+                                [a[0], header, flags as u64, 0, 0, 0],
+                                memory,
+                                socket.address_size(),
+                                socket.datagram_limit(),
+                            )?,
+                            requested,
+                        )
+                    };
+                    state.requested = requested;
+                    state.active = Some(prepared);
                 }
                 if state.recheck {
                     state.active.as_ref().unwrap().recheck(memory)?;
@@ -242,16 +336,37 @@ impl Message {
                 }?;
                 Ok(sent)
             })();
+            if state.fault.is_some() {
+                return Err(Errno(14));
+            }
+            if let Some(fault) = state.active.as_mut().and_then(Prepared::take_fault) {
+                state.fault = Some(fault);
+                return Err(Errno(14));
+            }
             match result {
                 Ok(sent) if !batch => state.terminal = Some(Ok(sent)),
                 Ok(sent) => {
+                    state.sent = Some(sent);
                     // msg_len copyout follows the transport effect. A failed
                     // copyout must never replay a send or count this item.
                     let header = state.batch_header.unwrap();
-                    if header
+                    let copied = header
                         .checked_add(56)
-                        .is_none_or(|at| memory.write(at, &(sent as u32).to_le_bytes()).is_err())
-                    {
+                        .ok_or(trames_memory::MemoryError::InvalidRange)
+                        .and_then(|at| {
+                            if memory.async_faults_possible() {
+                                let copies = state.copy.get_or_insert_with(Default::default);
+                                crate::copy_replay::Writer::new(memory, copies)
+                                    .write(at, &(sent as u32).to_le_bytes())
+                            } else {
+                                memory.write(at, &(sent as u32).to_le_bytes())
+                            }
+                        });
+                    if let Err(trames_memory::MemoryError::Pending(fault)) = &copied {
+                        state.fault = Some(fault.clone());
+                        return Err(Errno(14));
+                    }
+                    if copied.is_err() {
                         state.terminal = Some(if state.completed == 0 {
                             Err(Errno(14))
                         } else {
@@ -261,6 +376,9 @@ impl Message {
                     }
                     state.completed += 1;
                     state.active = None;
+                    state.sent = None;
+                    state.copy = None;
+                    state.input = None;
                     if !receive && sent < state.requested
                         || self.receive.as_ref().is_some_and(|r| r.expired())
                     {
@@ -278,9 +396,7 @@ impl Message {
                 }
                 Err(error) => {
                     if state.active.as_ref().and_then(Prepared::partial).is_some() {
-                        if let Some(partial) = self.partial_result(&state, memory) {
-                            state.terminal = Some(partial);
-                            state.finished = true;
+                        if let Some(partial) = self.partial_result(&mut state, memory) {
                             return partial;
                         }
                     }
@@ -329,6 +445,176 @@ mod tests {
         let fd = v.socket(2, 2, 0).unwrap();
         let op = v.socket_operation(fd).unwrap();
         (v, fd, op)
+    }
+    fn tcp_pair() -> (
+        Vfs,
+        Arc<trames_vfs::NetSocket>,
+        u32,
+        trames_vfs::SocketOperation,
+    ) {
+        let mut v = Vfs::default();
+        v.configure_local_fabric(NetworkMode::Full).unwrap();
+        let listener = v.socket(2, 1, 0).unwrap();
+        let listening = v.socket_fd(listener).unwrap();
+        listening.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listening.listen(1).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let tx = v.socket_fd(fd).unwrap();
+        v.socket_operation(fd).unwrap().set_option(6, 1, 1).unwrap();
+        assert!(matches!(
+            tx.connect(listening.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (peer, _) = v.accept(listener, 0).unwrap();
+        let rx = v.socket_operation(peer).unwrap();
+        rx.set_option(1, 18, 6).unwrap();
+        (v, tx, peer, rx)
+    }
+    #[test]
+    fn partial_batch_length_copy_keeps_original_progress_through_page_wait_and_failure() {
+        for prior in [false, true] {
+            for failed in [false, true] {
+                let (_vfs, tx, _, rx) = tcp_pair();
+                let mut m = memory();
+                m.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+                m.unmap(0x3000, PAGE_SIZE).unwrap();
+                let page = crate::direct::file::copyout_tests::install(&mut m, 0x3000);
+                // The msghdr ends in resident memory; only its msg_len output
+                // straddles the missing page, after a stream prefix is received.
+                let header = 0x3000 - 56 - 2;
+                let messages: [(u64, u64, u64, u64); 2] = [
+                    (header - 64, 0x1300, 0x1400, 3),
+                    (header, 0x1310, 0x1500, 6),
+                ];
+                for (address, vector, output, count) in messages {
+                    m.write_array(address, [0u8; 56]).unwrap();
+                    m.write_array(address + 16, vector.to_le_bytes()).unwrap();
+                    m.write_array(address + 24, 1u64.to_le_bytes()).unwrap();
+                    m.write_array(vector, output.to_le_bytes()).unwrap();
+                    m.write_array(vector + 8, count.to_le_bytes()).unwrap();
+                }
+                let args = [
+                    0,
+                    if prior { header - 64 } else { header },
+                    if prior { 2 } else { 1 },
+                    0,
+                    0,
+                    0,
+                ];
+                let call = Message::new(243, args, &m, 16, None).unwrap();
+                tx.send(if prior { b"abcWXYZ" } else { b"WXYZ" }, 0, None)
+                    .unwrap();
+                assert_eq!(
+                    call.progress_with(&rx, 243, args, &mut m, |_, _, _| unreachable!()),
+                    Err(Errno(11))
+                );
+                assert_eq!(call.partial_receive(&mut m), Some(Err(Errno(14))));
+                assert!(call.take_fault().is_some());
+                m.write(0x2ffe, b"ZZ").unwrap();
+                tx.send(b"ef", 0, None).unwrap();
+                if failed {
+                    m.unmap(0x3000, PAGE_SIZE).unwrap();
+                } else {
+                    page.finish();
+                }
+                let expected = if failed && !prior {
+                    Err(Errno(14))
+                } else {
+                    Ok(if failed { 1 } else { u64::from(prior) + 1 })
+                };
+                assert_eq!(
+                    call.progress_with(&rx, 243, args, &mut m, |_, _, _| unreachable!()),
+                    expected
+                );
+                assert_eq!(m.read_array::<2>(0x2ffe).unwrap(), *b"ZZ");
+                assert_eq!(m.read_array::<4>(0x1500).unwrap(), *b"WXYZ");
+                assert_eq!(
+                    rx.recv(2, 0).unwrap().data,
+                    b"ef",
+                    "completion never starts another receive"
+                );
+            }
+        }
+    }
+    #[test]
+    fn interrupted_timeout_output_preserves_its_copied_prefix_and_original_message_count() {
+        let (_vfs, tx, _, rx) = tcp_pair();
+        let mut m = memory();
+        m.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write_array(0x1308, 6u64.to_le_bytes()).unwrap();
+        m.write_array(0x2ff8, 30u64.to_le_bytes()).unwrap();
+        m.write_array(0x3000, 0u64.to_le_bytes()).unwrap();
+        let args = [0, 0x1000, 1, 0, 0x2ff8, 0];
+        let call = Message::new(243, args, &m, 16, None).unwrap();
+        m.unmap(0x3000, PAGE_SIZE).unwrap();
+        let page = crate::direct::file::copyout_tests::install(&mut m, 0x3000);
+        tx.send(b"WXYZ", 0, None).unwrap();
+        assert_eq!(
+            call.progress_with(&rx, 243, args, &mut m, |_, _, _| unreachable!()),
+            Err(Errno(11))
+        );
+        assert_eq!(call.partial_receive(&mut m), Some(Err(Errno(14))));
+        assert!(call.take_fault().is_some());
+        assert_eq!(m.read_array::<4>(0x1038).unwrap(), 4u32.to_le_bytes());
+        m.write(0x2ff8, b"KEEPKEEP").unwrap();
+        tx.send(b"ef", 0, None).unwrap();
+        page.finish();
+        assert_eq!(
+            call.progress_with(&rx, 243, args, &mut m, |_, _, _| unreachable!()),
+            Ok(1)
+        );
+        assert_eq!(m.read_array::<8>(0x2ff8).unwrap(), *b"KEEPKEEP");
+        assert!(m.read_u64(0x3000).unwrap() < 1_000_000_000);
+        assert_eq!(rx.recv(2, 0).unwrap().data, b"ef");
+    }
+    #[test]
+    fn interrupted_socket_copy_returns_the_slot_and_resumes_the_original_socket_after_fd_reuse() {
+        struct HostTarget(Arc<trames_vfs::HostEvents>);
+        impl IoWake for HostTarget {
+            fn wake_io(&self, _: &Arc<IoSignal>) {}
+            fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let (mut vfs, tx, peer, rx) = tcp_pair();
+        let mut m = memory();
+        m.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write_array(0x1308, 6u64.to_le_bytes()).unwrap();
+        m.write_array(0x2ff8, 30u64.to_le_bytes()).unwrap();
+        m.write_array(0x3000, 0u64.to_le_bytes()).unwrap();
+        let args = [peer as u64, 0x1000, 1, 0, 0x2ff8, 0];
+        let direct =
+            DirectSyscalls::new(vfs.direct_descriptors()).with_resources(vfs.descriptor_factory());
+        let target: Arc<dyn IoWake> = Arc::new(HostTarget(trames_vfs::HostEvents::new().unwrap()));
+        let wake = Arc::downgrade(&target);
+        tx.send(b"WXYZ", 0, None).unwrap();
+        let IoAttempt::Blocked(wait) = direct
+            .start_socket_control(243, args, &mut m, 7, &wake)
+            .unwrap()
+        else {
+            panic!("original stream receive waits for its remaining low-water mark")
+        };
+        let original = wait.retained_socket.as_ref().unwrap();
+        m.unmap(0x3000, PAGE_SIZE).unwrap();
+        let page = crate::direct::file::copyout_tests::install(&mut m, 0x3000);
+        assert_eq!(original.interrupted(&mut m), Some(Err(Errno(14))));
+        let pending = direct
+            .interrupted_page(None, Some(original), None, 243, args, 7, &wake)
+            .expect("interrupted copy has its own original page continuation");
+        assert!(!pending.file_pending().unwrap().interruptible());
+        drop(wait);
+        vfs.close(peer).unwrap();
+        assert_eq!(vfs.eventfd(72, 0).unwrap(), peer);
+        m.write(0x2ff8, b"KEEPKEEP").unwrap();
+        tx.send(b"ef", 0, None).unwrap();
+        page.finish();
+        assert!(matches!(
+            direct.resume(pending, &mut m),
+            IoAttempt::Complete(Ok(1))
+        ));
+        assert_eq!(m.read_array::<8>(0x2ff8).unwrap(), *b"KEEPKEEP");
+        assert_eq!(rx.recv(2, 0).unwrap().data, b"ef");
+        assert_eq!(vfs.read(peer, 8).unwrap(), 72u64.to_le_bytes());
     }
     #[test]
     fn guest_tcp_retained_reads_preserve_vector_offsets_peeks_and_partial_batches() {

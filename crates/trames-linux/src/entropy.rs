@@ -5,19 +5,22 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub fn getrandom(a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-    // Linux's flags argument is unsigned int. Keep the supported flags and
-    // transfer bound; GRND_INSECURE is not implemented by this userspace kernel.
-    if a[2] as u32 & !3 != 0 {
-        return Err(Errno(22));
-    }
-    let count = a[1].min(crate::MAX_WRITE as u64) as usize;
-    // Preserve the existing whole-output preflight and fault behavior. This is
-    // the same CpuMemory path used by the CPU/native executor's original View.
+    let count = parameters(a)?;
     crate::Linux::check(memory, a[0], count, Access::Write)?;
     let mut bytes = vec![0; count];
     crate::fill_entropy(&mut bytes)?;
     memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
     Ok(count as u64)
+}
+pub(crate) fn parameters(a: [u64; 6]) -> Result<usize, Errno> {
+    // Linux's flags argument is unsigned int. Keep the supported flags and
+    // transfer bound. The host CSPRNG is already initialized, so INSECURE may
+    // use that same generator; RANDOM | INSECURE remains an invalid request.
+    let flags = a[2] as u32;
+    if flags & !7 != 0 || flags & 6 == 6 {
+        return Err(Errno(22));
+    }
+    Ok(a[1].min(crate::MAX_WRITE as u64) as usize)
 }
 
 #[cfg(test)]
@@ -36,7 +39,7 @@ mod tests {
         );
         assert_eq!(memory.read_array::<16>(0x1ff0).unwrap(), [0x55; 16]);
         assert_eq!(
-            getrandom([u64::MAX, 1, 4, 0, 0, 0], &mut memory),
+            getrandom([u64::MAX, 1, 8, 0, 0, 0], &mut memory),
             Err(Errno(22))
         );
         memory.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();

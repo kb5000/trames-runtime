@@ -1157,6 +1157,9 @@ fn fd_control_and_epoll_errors_complete_after_their_original_parameter_preludes(
     let target = t();
     for number in [28, 86, 87] {
         for (fd, expected) in [(u32::MAX, 9), (event, 22)] {
+            // timerfd_settime copies the new itimerspec before fdget; gettime
+            // and inotify_rm_watch accept the original descriptor first.
+            let expected = if number == 86 { 14 } else { expected };
             let args = [fd as u64, u64::MAX, u64::MAX, u64::MAX, 0, 0];
             assert!(direct.supports_call(number, args));
             assert_eq!(
@@ -1190,7 +1193,11 @@ fn fd_control_and_epoll_errors_complete_after_their_original_parameter_preludes(
         for (args, expected) in [
             ([u32::MAX as u64, 0x1000, 1, 0, 0, 0], 9),
             ([event as u64, 0x1000, 1, 0, 0, 0], 22),
-            ([u32::MAX as u64, 0x9000, 1, 0, 0, 0], 14),
+            ([u32::MAX as u64, 0x9000, 1, 0, 0, 0], 9),
+            (
+                [u32::MAX as u64, trames_memory::ADDRESS_LIMIT, 1, 0, 0, 0],
+                14,
+            ),
             ([u32::MAX as u64, 0x1000, 0, 0, 0, 0], 22),
             ([u32::MAX as u64, 0x1000, 1, 0, 0x1200, 7], 22),
         ] {

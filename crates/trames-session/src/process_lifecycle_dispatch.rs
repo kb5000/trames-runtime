@@ -111,6 +111,11 @@ impl<C: Cpu> Lifecycle<C> {
         number: u32,
         args: [u64; 6],
     ) -> Result<Option<crate::worker_syscalls::Exit>, RuntimeError> {
+        let _file_actor = trames_vfs::FileActorScope::enter_with_sync(
+            p.signals.io.credentials().clone(),
+            job.work.pid,
+            Some(self.layouts.sync_executor()),
+        );
         if job.retry.is_none() {
             let resumed = job.seccomp_entry.is_some();
             let step = crate::syscall_dispatch::execute(
@@ -206,6 +211,13 @@ impl<C: Cpu> Lifecycle<C> {
             } else if let Some(message) = call.message {
                 Some(snapshot.direct.start_retained_message(
                     message,
+                    &mut p.memory,
+                    job.work.pid,
+                    &epoch.io_target,
+                ))
+            } else if let Some(binder) = call.binder {
+                Some(snapshot.direct.start_retained_binder(
+                    binder,
                     &mut p.memory,
                     job.work.pid,
                     &epoch.io_target,
@@ -386,6 +398,45 @@ impl<C: Cpu> Lifecycle<C> {
             None => {
                 if let Some(value) = snapshot.invoke(&job.work.cpu, &mut p.memory) {
                     Ok(value)
+                } else if let Some(attempt) = snapshot.direct.start_metadata_copy(
+                    number,
+                    args,
+                    &mut p.memory,
+                    job.work.pid,
+                    &epoch.io_target,
+                ) {
+                    match attempt {
+                        IoAttempt::Complete(value) => value,
+                        IoAttempt::Blocked(wait) => {
+                            job.io = Some(wait);
+                            job.checkpoint = None;
+                            job.seccomp_entry = None;
+                            return Ok(None);
+                        }
+                        IoAttempt::FileCheckpoint(file) => {
+                            match self.file_boundary(epoch, job, p, file, number, args) {
+                                IoAttempt::Complete(value) => value,
+                                IoAttempt::Blocked(wait) => {
+                                    job.io = Some(wait);
+                                    job.checkpoint = None;
+                                    job.seccomp_entry = None;
+                                    return Ok(None);
+                                }
+                                IoAttempt::HostError(error) => {
+                                    return Err(RuntimeError::Backend(error.to_string()))
+                                }
+                                _ => {
+                                    return Err(RuntimeError::Arguments(
+                                        "original timer authority is unavailable",
+                                    ))
+                                }
+                            }
+                        }
+                        IoAttempt::HostError(error) => {
+                            return Err(RuntimeError::Backend(error.to_string()))
+                        }
+                        _ => unreachable!("metadata copies own no structural mutation"),
+                    }
                 } else if number == 179 {
                     return Err(RuntimeError::Configuration(
                         "host-managed statistics require an original shared provider",
@@ -429,7 +480,7 @@ impl<C: Cpu> Lifecycle<C> {
         if p.linux.take_file_size_signal() {
             trames_vfs::TaskSignal::raise(&*snapshot.io_signals, 25);
         }
-        snapshot.finish_wait_mask();
+        snapshot.finish_event_mask(value);
         job.work.trace.finish(&mut job.work.cpu, raw);
         job.stats.syscalls += 1;
         job.checkpoint = None;
@@ -437,7 +488,7 @@ impl<C: Cpu> Lifecycle<C> {
         Ok(None)
     }
 
-    fn file_boundary(
+    pub(super) fn file_boundary(
         &self,
         epoch: &Epoch<C>,
         job: &Job<C>,
@@ -447,6 +498,83 @@ impl<C: Cpu> Lifecycle<C> {
         args: [u64; 6],
     ) -> IoAttempt {
         match file.take() {
+            FileBoundary::WaitInput(call) => call.resume_joined(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &mut p.linux,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::EpollControl {
+                fd,
+                op,
+                target,
+                events,
+                data,
+            } => {
+                let source = &job.work.syscalls.as_ref().unwrap().direct;
+                match p
+                    .linux
+                    .vfs
+                    .prepare_epoll_control(fd, op, target, events, data)
+                {
+                    Ok(call) => source.start_retained_epoll_control(
+                        Box::new(call),
+                        args,
+                        job.work.pid,
+                        &epoch.io_target,
+                    ),
+                    Err(error) => {
+                        source.record_fd_control();
+                        IoAttempt::Complete(Err(error))
+                    }
+                }
+            }
+            FileBoundary::Registration(call) => call.resume(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::UringEnter(call) => call.resume(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::Aio(call) => job
+                .work
+                .syscalls
+                .as_ref()
+                .unwrap()
+                .direct
+                .start_retained_aio(call, &mut p.memory, job.work.pid, &epoch.io_target),
+            FileBoundary::AioLookup(call) => call.resume(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::AioSetup(call) => call.resume(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::TimerFd(call) => call.resume_joined(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &p.linux.vfs,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
+            FileBoundary::Ioctl(call) => call.resume_joined(
+                &job.work.syscalls.as_ref().unwrap().direct,
+                &p.linux.vfs,
+                &mut p.memory,
+                job.work.pid,
+                &epoch.io_target,
+            ),
             FileBoundary::Owner { work, output } => {
                 let target = work.target().cloned();
                 let result = Arc::new(trames_linux::FileResult::wake_joined());

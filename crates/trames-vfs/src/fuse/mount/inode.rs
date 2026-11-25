@@ -13,16 +13,59 @@ pub(super) struct Attr {
     data: std::sync::Mutex<Snapshot>,
     pub(super) validity: permissions::Validity,
     pub(super) cache: cache::Cache,
-    writing: std::sync::atomic::AtomicBool,
+    pub(super) layout: Arc<trames_memory::layout::Layout>,
+    pub(super) dirty_times: AtomicU64,
+    // Writer/waiter bits and four units per shared directory lookup. This is the
+    // original inode transaction, separate from its short metadata mutex.
+    access: std::sync::atomic::AtomicUsize,
+    writers: std::sync::Mutex<usize>,
     changed: Arc<Readiness>,
 }
 /// Linux's original per-inode write/setattr transaction across daemon waits.
 /// Failure to enter parks the guest on readiness, never the host execution slot.
 pub(super) struct Write(Arc<Attr>);
+pub(super) struct Read(Arc<Attr>);
+const WRITER: usize = 1;
+const WAITING: usize = 2;
+const READER: usize = 4;
+pub(super) struct WriteWait(Arc<Attr>);
+impl Drop for WriteWait {
+    fn drop(&mut self) {
+        let notify = {
+            let mut writers = self.0.writers.lock().unwrap();
+            *writers -= 1;
+            *writers == 0 && self.0.access.fetch_and(!WAITING, Ordering::Relaxed) & WRITER == 0
+        };
+        if notify {
+            self.0.changed.notify_atomic();
+        }
+    }
+}
+impl WriteWait {
+    pub(super) fn is_for(&self, attr: &Arc<Attr>) -> bool {
+        Arc::ptr_eq(&self.0, attr)
+    }
+}
+pub(super) enum Access {
+    Read { _lease: Read },
+    Write { _lease: Write },
+}
+impl Write {
+    pub(super) fn is_for(&self, attr: &Arc<Attr>) -> bool {
+        Arc::ptr_eq(&self.0, attr)
+    }
+}
 impl Drop for Write {
     fn drop(&mut self) {
-        self.0.writing.store(false, Ordering::Release);
+        self.0.access.fetch_and(!WRITER, Ordering::Release);
         self.0.changed.notify_atomic();
+    }
+}
+impl Drop for Read {
+    fn drop(&mut self) {
+        if self.0.access.fetch_sub(READER, Ordering::Release) & !WAITING == READER {
+            self.0.changed.notify_atomic();
+        }
     }
 }
 pub(super) struct Snapshot {
@@ -53,18 +96,60 @@ impl Attr {
             data: std::sync::Mutex::new(Snapshot { bytes, version }),
             validity,
             cache: Default::default(),
-            writing: Default::default(),
+            layout: Default::default(),
+            dirty_times: Default::default(),
+            access: Default::default(),
+            writers: Default::default(),
             changed: Default::default(),
         }
     }
     pub(super) fn try_write(self: &Arc<Self>) -> Option<Write> {
-        self.writing
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        self.access
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                (state & !WAITING == 0).then_some(state | WRITER)
+            })
             .ok()
             .map(|_| Write(self.clone()))
     }
     pub(super) fn writing(&self) -> bool {
-        self.writing.load(Ordering::Acquire)
+        self.access.load(Ordering::Acquire) & WRITER != 0
+    }
+    pub(super) fn write_ready(&self) -> bool {
+        self.access.load(Ordering::Acquire) & !WAITING == 0
+    }
+    pub(super) fn read_ready(&self) -> bool {
+        self.access.load(Ordering::Acquire) & (WRITER | WAITING) == 0
+    }
+    pub(super) fn enter_write(self: &Arc<Self>, waiting: &mut Option<WriteWait>) -> Option<Write> {
+        if let Some(lease) = self.try_write() {
+            drop(waiting.take());
+            return Some(lease);
+        }
+        if waiting.as_ref().is_none_or(|wait| !wait.is_for(self)) {
+            {
+                let mut writers = self.writers.lock().unwrap();
+                *writers += 1;
+                self.access.fetch_or(WAITING, Ordering::Relaxed);
+            }
+            *waiting = Some(WriteWait(self.clone()));
+        }
+        // Registration precedes the retry; an unlock between the first try
+        // and subscription cannot leave this original waiter asleep.
+        let lease = self.try_write()?;
+        drop(waiting.take());
+        Some(lease)
+    }
+    pub(super) fn try_read(self: &Arc<Self>) -> Option<Read> {
+        self.access
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                if state & (WRITER | WAITING) == 0 {
+                    state.checked_add(READER)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|_| Read(self.clone()))
     }
     pub(super) fn subscribe_write(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.changed.subscribe(signal)
@@ -85,9 +170,15 @@ impl Attr {
     pub(super) fn read_size(&self, fs: &Mounted, size: u64, version: u64) {
         let mut cached = self.lock().unwrap();
         let current = u64::from_le_bytes(cached[8..16].try_into().unwrap());
-        if version >= cached.version && size < current && !self.writing() {
+        if version >= cached.version
+            && size < current
+            && !self.writing()
+            && !fs.connection.option(1 << 16)
+        {
             cached[8..16].copy_from_slice(&size.to_le_bytes());
             cached.version = fs.connection.next_attr_version();
+            drop(cached);
+            self.cache.resize(current, size);
         }
     }
     pub(super) fn refresh(
@@ -108,11 +199,22 @@ impl Attr {
             self.make_bad();
             return Err(Errno(5));
         }
+        let old_size = u64::from_le_bytes(cached[8..16].try_into().unwrap());
+        // Negotiated writeback gives the original regular inode authority over
+        // size and modification times, including replies newer than a write.
+        let writeback = self.kind_is_regular() && fs.connection.option(1 << 16);
+        if writeback && update != Update::Set {
+            raw[8..16].copy_from_slice(&cached[8..16]);
+            raw[32..48].copy_from_slice(&cached[32..48]);
+            raw[52..60].copy_from_slice(&cached[52..60]);
+        }
         let newer = version != 0 && cached.version > version;
         if newer && update != Update::Set {
             return Ok(false);
         }
-        let size_changed = cached[8..16] != raw[8..16];
+        let size = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let data_changed =
+            old_size != size || cached[32..40] != raw[32..40] || cached[52..56] != raw[52..56];
         normalize(raw);
         cached.copy_from_slice(raw);
         cached.version = fs.connection.next_attr_version();
@@ -121,12 +223,29 @@ impl Attr {
             if newer { 0 } else { valid.1 },
         );
         drop(cached);
-        // Neither WRITEBACK_CACHE nor EXPLICIT_INVAL_DATA is negotiated yet.
-        // In the ordinary mode a changed server size invalidates clean data.
-        if self.kind == 0o100000 && size_changed {
-            self.cache.invalidate_all();
+        // Explicit setattr still resizes the cache in writeback mode.
+        if self.kind == 0o100000 && data_changed {
+            if old_size != size {
+                self.cache.resize(old_size, size);
+            }
+            if !writeback {
+                self.cache.invalidate_all();
+            }
         }
         Ok(true)
+    }
+    pub(super) fn modified(&self, fs: &Mounted) {
+        let now = storage::Timestamp::now();
+        let mut data = self.lock().unwrap();
+        data.version = fs.connection.next_attr_version();
+        data[32..40].copy_from_slice(&now.seconds.to_le_bytes());
+        data[40..48].copy_from_slice(&now.seconds.to_le_bytes());
+        data[52..56].copy_from_slice(&now.nanos.to_le_bytes());
+        data[56..60].copy_from_slice(&now.nanos.to_le_bytes());
+        self.validity.set(0, 0);
+        if self.kind_is_regular() && fs.connection.option(1 << 16) {
+            self.dirty_times.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 fn word(raw: &[u8], at: usize) -> u32 {
@@ -152,12 +271,45 @@ pub(super) fn attr(node: &NodeRef) -> &Arc<Attr> {
         .expect("FUSE inode")
 }
 impl Mounted {
-    pub(in crate::fuse) fn notify_inode(&self, id: u64, offset: i64, length: i64) -> Result<()> {
-        let node = self.attribute_target(id).ok_or(Errno(2))?;
-        let attr = attr(&node);
+    pub(super) fn inode_changed(&self, node: &NodeRef) {
+        let attr = attr(node);
         attr.lock().unwrap().version = self.connection.next_attr_version();
         attr.validity.set(0, 0);
-        self.invalidate_acl(&node);
+        self.invalidate_acl(node);
+    }
+    pub(super) fn entry_unlinked(&self, node: &NodeRef) {
+        let links = {
+            let mut data = node.borrow_mut();
+            data.links = if node.directory {
+                0
+            } else {
+                data.links.saturating_sub(1)
+            };
+            data.links
+        };
+        let attr = attr(node);
+        let mut snapshot = attr.lock().unwrap();
+        snapshot[64..68].copy_from_slice(&links.to_le_bytes());
+        snapshot.version = self.connection.next_attr_version();
+        drop(snapshot);
+        attr.validity.set(0, 0);
+    }
+}
+impl Mounted {
+    pub(in crate::fuse) fn notify_inode(&self, id: u64, offset: i64, length: i64) -> Result<()> {
+        let node = self.attribute_target(id).ok_or(Errno(2))?;
+        self.notify_original_inode(&node, offset, length)
+    }
+    pub(super) fn notify_original_inode(
+        &self,
+        node: &NodeRef,
+        offset: i64,
+        length: i64,
+    ) -> Result<()> {
+        let attr = attr(node);
+        attr.lock().unwrap().version = self.connection.next_attr_version();
+        attr.validity.set(0, 0);
+        self.invalidate_acl(node);
         if offset >= 0 {
             if length <= 0 {
                 attr.cache.invalidate(offset as u64, u64::MAX);
@@ -184,6 +336,24 @@ impl Mounted {
         version: u64,
         set: bool,
     ) {
+        let attr = attr(node);
+        if attr.cache.mapped() {
+            if let Some(executor) = attr.cache.executor() {
+                attr.validity.set(0, 0);
+                let resource = Abandoned {
+                    fs: self.connection.mounted(),
+                    node: node.clone(),
+                    bytes: bytes.to_vec(),
+                    version,
+                    kind: AbandonedKind::Attributes(set),
+                };
+                executor.submit(Arc::new(resource), Box::new(AbandonedDone));
+                return;
+            }
+        }
+        self.apply_abandoned_attributes(node, bytes, version, set);
+    }
+    fn apply_abandoned_attributes(&self, node: &NodeRef, bytes: &[u8], version: u64, set: bool) {
         if bytes.len() != 104 {
             return;
         }
@@ -201,6 +371,37 @@ impl Mounted {
         );
     }
     pub(in crate::fuse) fn abandoned_entry(&self, bytes: &[u8], version: u64, kind: Option<u32>) {
+        if bytes.len() != 128 {
+            return;
+        }
+        let id = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let generation = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let node = self
+            .directories
+            .lock()
+            .unwrap()
+            .get(&(id, generation))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(node) = node {
+            let attr = attr(&node);
+            if attr.cache.mapped() {
+                if let Some(executor) = attr.cache.executor() {
+                    attr.validity.set(0, 0);
+                    let resource = Abandoned {
+                        fs: self.connection.mounted(),
+                        node,
+                        bytes: bytes.to_vec(),
+                        version,
+                        kind: AbandonedKind::Entry(kind),
+                    };
+                    executor.submit(Arc::new(resource), Box::new(AbandonedDone));
+                    return;
+                }
+            }
+        }
+        self.apply_abandoned_entry(bytes, version, kind);
+    }
+    fn apply_abandoned_entry(&self, bytes: &[u8], version: u64, kind: Option<u32>) {
         if bytes.len() != 128 {
             return;
         }
@@ -302,6 +503,40 @@ impl Mounted {
         }
         old.into_iter().map(|(_, node)| node).collect()
     }
+}
+#[derive(Clone, Copy)]
+enum AbandonedKind {
+    Attributes(bool),
+    Entry(Option<u32>),
+}
+struct Abandoned {
+    fs: Option<Arc<Mounted>>,
+    node: NodeRef,
+    bytes: Vec<u8>,
+    version: u64,
+    kind: AbandonedKind,
+}
+impl trames_memory::SyncResource for Abandoned {
+    fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        Some(attr(&self.node).layout.clone())
+    }
+    fn sync(&self) -> std::result::Result<(), trames_memory::MemoryError> {
+        if let Some(fs) = &self.fs {
+            match self.kind {
+                AbandonedKind::Attributes(set) => {
+                    fs.apply_abandoned_attributes(&self.node, &self.bytes, self.version, set)
+                }
+                AbandonedKind::Entry(kind) => {
+                    fs.apply_abandoned_entry(&self.bytes, self.version, kind)
+                }
+            }
+        }
+        Ok(())
+    }
+}
+struct AbandonedDone;
+impl trames_memory::SyncCompletion for AbandonedDone {
+    fn complete(self: Box<Self>, _: std::result::Result<(), trames_memory::MemoryError>) {}
 }
 
 pub(super) fn times(raw: &[u8]) -> [storage::Timestamp; 3] {

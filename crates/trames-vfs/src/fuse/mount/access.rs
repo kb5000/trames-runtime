@@ -124,6 +124,7 @@ impl Metadata {
             dev: mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
             reference: Some(reference),
         }))
     }

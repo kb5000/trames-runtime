@@ -6,8 +6,10 @@ use std::sync::OnceLock;
 mod mount;
 pub(crate) use mount::ConnectionUse;
 pub use mount::DirectoryReply;
+pub(crate) use mount::Entry;
 pub(crate) use mount::Leaf;
 pub(super) use mount::ParentStep;
+pub(crate) use mount::PathRetry;
 pub(crate) use mount::{
     option_fd, prepare, AttributeChange, Directory, File, Metadata, Mounted, PathOperation,
 };
@@ -69,7 +71,7 @@ impl Device {
         }));
         Ok(connection)
     }
-    pub(super) fn attach_clone(self: &Arc<Self>, original: &Self) -> Result<()> {
+    pub fn attach_clone(self: &Arc<Self>, original: &Self) -> Result<()> {
         if self.daemon.get().is_some() || self.namespace != original.namespace {
             return Err(Errno(22));
         }
@@ -83,6 +85,10 @@ impl Device {
             .get()
             .map(|d| d.connection.as_ref())
             .ok_or(Errno(1))
+    }
+    pub(crate) fn notification(&self, v: &Vfs, bytes: &[u8]) -> Result<Option<Metadata>> {
+        let daemon = self.daemon.get().ok_or(Errno(1))?;
+        mount::prepare_notification(v, &daemon.connection, bytes)
     }
     pub(super) fn poll(&self, events: u16) -> (u16, [u64; 2]) {
         self.connection().map_or((8, [0; 2]), |c| c.poll(events))
@@ -118,6 +124,9 @@ impl Vfs {
     ) -> Result<u64> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         open.check_device_ioctl(CLONE)?;
         let Some(events::SharedControl::Fuse(to)) = &open.control else {
             return Err(Errno(25));
@@ -125,7 +134,16 @@ impl Vfs {
         let to = to.clone();
         drop(open);
         let source = u32::from_le_bytes(memory.read_array(address).map_err(|_| Errno(14))?);
-        let from = self.fuse_device(source)?.ok_or(Errno(22))?;
+        let descriptor = self.descriptor(source).map_err(|_| Errno(22))?;
+        let open = descriptor.open.borrow();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(22));
+        }
+        let Some(events::SharedControl::Fuse(from)) = &open.control else {
+            return Err(Errno(22));
+        };
+        let from = from.clone();
+        drop(open);
         to.attach_clone(&from)?;
         Ok(0)
     }

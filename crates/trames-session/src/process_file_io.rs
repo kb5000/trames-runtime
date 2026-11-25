@@ -3,6 +3,150 @@
 //! execution. Native I/O uses the existing disk pool; no process scan or pause.
 use super::*;
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn metadata_call(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+        info: Option<trames_linux::SystemInfo>,
+    ) -> Result<Option<u64>, Errno> {
+        let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+            .with_resources(p.linux.vfs.descriptor_factory())
+            .with_paths(p.linux.vfs.path_queries())
+            .with_clock(self.started)
+            .with_boot_clock(p.linux.boot_clock());
+        let target = Arc::downgrade(&self.byte_target);
+        let attempt = if let Some(wait) = p.byte_wait.take() {
+            source.resume(wait, &mut p.memory)
+        } else if let Some(file) = p.retained_file.take() {
+            source.start_retained_file(file, number, args, &mut p.memory, pid, &target)
+        } else {
+            let result = match number {
+                160..=162 => source.invoke_uts(
+                    &p.linux.vfs.uts_capability(),
+                    &p.linux.personality,
+                    number,
+                    args,
+                    &mut p.memory,
+                ),
+                86 | 87 => source.invoke(number, args, &mut p.memory),
+                113 | 114 => source.invoke_time(
+                    number,
+                    args,
+                    &mut p.memory,
+                    self.started,
+                    (trames_kernel::signal::IoRoutes {
+                        directory: p.signals.io_directory.clone(),
+                        namespace: p.linux.vfs.pid_namespace().clone(),
+                        uid: p.linux.vfs.credentials.uid,
+                        euid: p.linux.vfs.credentials.euid,
+                    })
+                    .cpu_clock(&p.signals.io, args[0]),
+                    Some(&p.signals.io.proc_view),
+                ),
+                168 => source.invoke_getcpu(args, p.last_cpu as u32, &mut p.memory),
+                169 => source.invoke_time(number, args, &mut p.memory, self.started, None, None),
+                179 => source.invoke_statistics(
+                    info.expect("original statistics snapshot"),
+                    args,
+                    &mut p.memory,
+                ),
+                278 => source.invoke_entropy(args, &mut p.memory),
+                _ => unreachable!("metadata entry"),
+            };
+            if let Some(result) = result {
+                return result.map(Some);
+            }
+            source
+                .start_metadata_copy(number, args, &mut p.memory, pid, &target)
+                .expect("original metadata receipt")
+        };
+        match attempt {
+            trames_linux::IoAttempt::Complete(result) => {
+                p.retained_file = None;
+                result.map(Some)
+            }
+            trames_linux::IoAttempt::Blocked(wait) => {
+                p.retained_file = wait.file_pending();
+                p.byte_wait = Some(wait);
+                Ok(None)
+            }
+            trames_linux::IoAttempt::FileCheckpoint(file) => {
+                p.file_checkpoint = Some(file);
+                Ok(None)
+            }
+            trames_linux::IoAttempt::HostError(error) => {
+                self.backend_error = Some(error.to_string());
+                Err(Errno(5))
+            }
+            _ => unreachable!("metadata copies own no structural mutation"),
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn uring_call(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        if p.byte_wait.is_some() || p.uring_wait.is_some() {
+            p.signals.finish_io();
+        } else {
+            p.signals.begin_io();
+        }
+        let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+            .with_paths(p.linux.vfs.path_queries())
+            .with_resources(p.linux.vfs.descriptor_factory())
+            .with_task_signal(p.signals.io.clone())
+            .with_signal_reader(p.signals.reader(p.linux.vfs.pid_namespace()))
+            .with_urings(
+                trames_linux::UringEpoch::default()
+                    .capture(&p.linux.vfs, p.memory.instruction_identity().0, pid)
+                    .with_actor(p.linux.uring_actor_root()),
+            )
+            .with_file_executor(self.workers.file_executor())
+            .with_file_layouts(self.file_layout_work())
+            .with_clock(self.started);
+        let _actor = trames_vfs::FileActorScope::enter_with_sync(
+            p.signals.io.credentials().clone(),
+            pid,
+            source.sync_executor(),
+        );
+        let target = Arc::downgrade(&self.byte_target);
+        let attempt = if let Some(wait) = p.byte_wait.take() {
+            source.resume(wait, &mut p.memory)
+        } else if let Some(call) = p.uring_wait.take() {
+            source.start_retained_uring(call, args, &mut p.memory, pid, &target)
+        } else {
+            source
+                .start(426, args, &mut p.memory, pid, &target, None)
+                .expect("original ring authority")
+        };
+        p.signals.finish_io();
+        match attempt {
+            trames_linux::IoAttempt::Complete(result) => {
+                p.uring_wait = None;
+                result.map(Some)
+            }
+            trames_linux::IoAttempt::Blocked(wait) => {
+                p.uring_wait = wait.uring_enter();
+                p.retained_file = wait.file_pending();
+                p.byte_wait = Some(wait);
+                Ok(None)
+            }
+            trames_linux::IoAttempt::FileCheckpoint(call) => {
+                p.file_checkpoint = Some(call);
+                Ok(None)
+            }
+            trames_linux::IoAttempt::HostError(error) => {
+                self.backend_error = Some(error.to_string());
+                Err(Errno(5))
+            }
+            _ => unreachable!("original accepted enter stays with its caller"),
+        }
+    }
     /// Serial/traced execution uses the same backing publication as source
     /// CPUs. Waiting retains readiness on the task, never a process-wide pause.
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -50,12 +194,146 @@ impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn start_file_checkpoint(
         &mut self,
-        _pid: u32,
+        pid: u32,
         p: &mut Process<C>,
         _number: u32,
         _args: [u64; 6],
     ) -> Result<Option<u64>, Errno> {
         match p.file_checkpoint.take().unwrap().take() {
+            trames_linux::FileBoundary::WaitInput(call) => {
+                if call.has_native_mask() {
+                    p.signals.finish_io();
+                } else {
+                    p.signals.begin_io();
+                }
+                let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                    .with_task_signal(p.signals.io.clone());
+                let attempt = call.resume_joined(
+                    &source,
+                    &mut p.linux,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                );
+                p.signals.finish_io();
+                match attempt {
+                    trames_linux::IoAttempt::Complete(result) => result.map(Some),
+                    trames_linux::IoAttempt::Blocked(wait) => {
+                        p.retained_file = wait.file_pending();
+                        p.byte_wait = Some(wait);
+                        Ok(None)
+                    }
+                    trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+                        p.file_entry = None;
+                        p.poll_deadline = wait.deadline;
+                        p.retained_poll = Some(wait);
+                        Ok(None)
+                    }
+                    trames_linux::IoAttempt::FileCheckpoint(file) => {
+                        p.file_checkpoint = Some(file);
+                        Ok(None)
+                    }
+                    trames_linux::IoAttempt::HostError(error) => {
+                        self.backend_error = Some(error.to_string());
+                        Err(Errno(5))
+                    }
+                    _ => unreachable!("original wait input"),
+                }
+            }
+            trames_linux::FileBoundary::EpollControl {
+                fd,
+                op,
+                target,
+                events,
+                data,
+            } => {
+                let call = p
+                    .linux
+                    .vfs
+                    .prepare_epoll_control(fd, op, target, events, data)?;
+                match trames_linux::DirectSyscalls::default().start_retained_epoll_control(
+                    Box::new(call),
+                    _args,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ) {
+                    trames_linux::IoAttempt::Complete(result) => result.map(Some),
+                    trames_linux::IoAttempt::Blocked(wait) => {
+                        p.retained_file = wait.file_pending();
+                        p.byte_wait = Some(wait);
+                        Ok(None)
+                    }
+                    _ => unreachable!("original epoll control"),
+                }
+            }
+            boundary @ (trames_linux::FileBoundary::Registration(_)
+            | trames_linux::FileBoundary::UringEnter(_)
+            | trames_linux::FileBoundary::Aio(_)
+            | trames_linux::FileBoundary::AioLookup(_)
+            | trames_linux::FileBoundary::AioSetup(_)
+            | trames_linux::FileBoundary::TimerFd(_)
+            | trames_linux::FileBoundary::Ioctl(_)) => {
+                p.signals.finish_io();
+                let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                    .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                    .with_paths(p.linux.vfs.path_queries())
+                    .with_resources(p.linux.vfs.descriptor_factory())
+                    .with_task_signal(p.signals.io.clone())
+                    .with_signal_reader(p.signals.reader(p.linux.vfs.pid_namespace()))
+                    .with_urings(
+                        trames_linux::UringEpoch::default()
+                            .capture(&p.linux.vfs, p.memory.instruction_identity().0, pid)
+                            .with_actor(p.linux.uring_actor_root()),
+                    )
+                    .with_file_executor(self.workers.file_executor())
+                    .with_file_layouts(self.file_layout_work())
+                    .with_clock(self.started);
+                let _actor = trames_vfs::FileActorScope::enter_with_sync(
+                    p.signals.io.credentials().clone(),
+                    pid,
+                    source.sync_executor(),
+                );
+                let target = Arc::downgrade(&self.byte_target);
+                let attempt = match boundary {
+                    trames_linux::FileBoundary::Registration(call) => {
+                        call.resume(&source, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::UringEnter(call) => {
+                        call.resume(&source, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::Aio(call) => {
+                        source.start_retained_aio(call, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::AioLookup(call) => {
+                        call.resume(&source, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::AioSetup(call) => {
+                        call.resume(&source, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::TimerFd(call) => {
+                        call.resume(&source, &mut p.memory, pid, &target)
+                    }
+                    trames_linux::FileBoundary::Ioctl(call) => {
+                        call.resume_joined(&source, &p.linux.vfs, &mut p.memory, pid, &target)
+                    }
+                    _ => unreachable!("accepted control checkpoint"),
+                };
+                p.signals.finish_io();
+                match attempt {
+                    trames_linux::IoAttempt::Complete(value) => value.map(Some),
+                    trames_linux::IoAttempt::Blocked(wait) => {
+                        p.uring_wait = wait.uring_enter();
+                        p.retained_file = wait.file_pending();
+                        p.byte_wait = Some(wait);
+                        Ok(None)
+                    }
+                    trames_linux::IoAttempt::FileCheckpoint(file) => {
+                        p.file_checkpoint = Some(file);
+                        Ok(None)
+                    }
+                    _ => Err(Errno(5)),
+                }
+            }
             trames_linux::FileBoundary::Owner { work, output } => {
                 let target = work.target().cloned();
                 let result = Arc::new(trames_linux::FileResult::wake_joined());

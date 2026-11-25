@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
 use trames_vfs::Errno;
 
 pub const SS_DISABLE: u32 = 2;
@@ -30,28 +30,55 @@ impl AltStack {
     pub fn reported_flags(self, sp: u64) -> u32 {
         self.flags | u32::from(self.on_stack(sp))
     }
-    pub fn restore(memory: &impl CpuMemory, address: u64) -> Result<Self, Errno> {
+    pub(super) fn import(memory: &impl CpuMemory, address: u64) -> Result<Option<Self>, Errno> {
+        if address == 0 {
+            return Ok(None);
+        }
+        Self::read(memory, address).map(Some)
+    }
+    pub(super) fn read(memory: &impl CpuMemory, address: u64) -> Result<Self, Errno> {
         let bytes = memory.read_array::<24>(address).map_err(|_| Errno(14))?;
-        let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if !matches!(flags & !SS_AUTODISARM, 0 | 1 | SS_DISABLE) {
-            return Err(Errno(22));
-        }
-        let flags = flags & !1;
-        if flags & SS_DISABLE != 0 {
-            return Ok(Self {
-                flags,
-                ..Self::default()
-            });
-        }
-        let size = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        if size < 2048 {
-            return Err(Errno(12));
-        }
         Ok(Self {
             sp: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            size,
-            flags,
+            flags: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            size: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         })
+    }
+    pub fn restore(memory: &impl CpuMemory, address: u64) -> Result<Self, Errno> {
+        // Sigreturn's stack address is mandatory, unlike sigaltstack's input.
+        let next = Self::read(memory, address)?;
+        let mut stack = Self::default();
+        stack.exchange(0, Some(next))?;
+        Ok(stack)
+    }
+    pub(super) fn exchange(&mut self, sp: u64, next: Option<Self>) -> Result<Self, Errno> {
+        let old = *self;
+        if let Some(mut next) = next {
+            if old.on_stack(sp) {
+                return Err(Errno(1));
+            }
+            if !matches!(next.flags & !SS_AUTODISARM, 0 | 1 | SS_DISABLE) {
+                return Err(Errno(22));
+            }
+            // SS_ONSTACK is reported from the actual SP. It is accepted on
+            // input without inventing a persistent on-stack status.
+            next.flags &= !1;
+            if next.flags & SS_DISABLE != 0 {
+                next.sp = 0;
+                next.size = 0;
+            } else if next.size < 5120 {
+                return Err(Errno(12));
+            }
+            *self = next;
+        }
+        Ok(old)
+    }
+    pub(super) fn encode(self, sp: u64) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.sp.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.reported_flags(sp).to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.size.to_le_bytes());
+        bytes
     }
     pub fn call(
         &mut self,
@@ -60,29 +87,12 @@ impl AltStack {
         old: u64,
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
+        let next = Self::import(memory, new)?;
+        let previous = self.exchange(sp, next)?;
         if old != 0 {
             memory
-                .check(old, 24, Access::Write)
+                .write_array(old, previous.encode(sp))
                 .map_err(|_| Errno(14))?;
-        }
-        let next = if new != 0 {
-            let next = Self::restore(memory, new)?;
-            if self.on_stack(sp) {
-                return Err(Errno(1));
-            }
-            Some(next)
-        } else {
-            None
-        };
-        if old != 0 {
-            let mut bytes = [0; 24];
-            bytes[..8].copy_from_slice(&self.sp.to_le_bytes());
-            bytes[8..12].copy_from_slice(&self.reported_flags(sp).to_le_bytes());
-            bytes[16..24].copy_from_slice(&self.size.to_le_bytes());
-            memory.write_array(old, bytes).map_err(|_| Errno(14))?;
-        }
-        if let Some(next) = next {
-            *self = next;
         }
         Ok(0)
     }

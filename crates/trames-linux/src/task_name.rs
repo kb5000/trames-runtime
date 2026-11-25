@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Identical comm ABI for source/solo; commit only after the input is imported.
-use crate::Linux;
-use trames_memory::{Access, CpuMemory};
+use trames_memory::{CopiedOutput, CpuMemory};
 use trames_vfs::{Errno, TaskName};
 
 pub fn task_name_call(
@@ -9,12 +8,26 @@ pub fn task_name_call(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
+    let mut output = CopiedOutput::default();
+    let value = prepare(name, a, memory, &mut output)?;
+    output.progress(memory).map_err(|_| Errno(14))?;
+    Ok(value)
+}
+pub(crate) fn prepare(
+    name: &TaskName,
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+    output: &mut CopiedOutput,
+) -> Result<u64, Errno> {
     if a[0] == 15 {
         let mut value = [0; 15];
         let mut count = 0;
         for i in 0..15 {
             memory
-                .read(a[1] + i, &mut value[count..count + 1])
+                .read(
+                    a[1].checked_add(i).ok_or(Errno(14))?,
+                    &mut value[count..count + 1],
+                )
                 .map_err(|_| Errno(14))?;
             if value[count] == 0 {
                 break;
@@ -23,8 +36,7 @@ pub fn task_name_call(
         }
         name.set(&value[..count]);
     } else {
-        Linux::check(memory, a[1], 16, Access::Write)?;
-        memory.write(a[1], &name.bytes()).map_err(|_| Errno(14))?;
+        output.push_slice(a[1], &name.bytes());
     }
     Ok(0)
 }
@@ -32,6 +44,7 @@ pub fn task_name_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Linux;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     #[test]
     fn comm_abi_stops_at_nul_or_fifteen_bytes_and_faults_before_publication() {
@@ -57,12 +70,12 @@ mod tests {
             Ok(0)
         );
         assert_eq!(name.bytes(), *b"123456789012345\0");
-        let before = memory.read_array::<8>(0x1ff8).unwrap();
+        memory.write(0x1ff8, &[0x77; 8]).unwrap();
         assert_eq!(
             task_name_call(&name, [16, 0x1ff8, 0, 0, 0, 0], &mut memory),
             Err(Errno(14))
         );
-        assert_eq!(memory.read_array::<8>(0x1ff8).unwrap(), before);
+        assert_eq!(memory.read_array::<8>(0x1ff8).unwrap(), *b"12345678");
     }
     #[test]
     fn accepted_diagnostics_observe_the_original_name_after_a_later_rename() {

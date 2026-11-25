@@ -28,6 +28,7 @@ struct Wait {
     signal: Arc<trames_vfs::IoSignal>,
     _subscriptions: Vec<trames_vfs::IoSubscription>,
     _target: Arc<dyn trames_vfs::IoWake>,
+    aio: bool,
 }
 #[cfg(all(test, trames_interpreter_conformance))]
 struct Wake<C: Cpu> {
@@ -45,7 +46,34 @@ impl<C: Cpu> trames_vfs::IoWake for Wake<C> {
     }
 }
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn wait_exit_aio(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        if self.exits.waits.contains_key(&pid) {
+            return;
+        }
+        let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
+            events: self.workers.events(),
+            owner: std::thread::current(),
+        });
+        let signal = trames_vfs::IoSignal::new(pid, Arc::downgrade(&target));
+        signal.notify();
+        p.state = State::Zombie(status);
+        self.exits.waits.insert(
+            pid,
+            Wait {
+                task: p.signals.io.clone(),
+                status,
+                signal,
+                _subscriptions: Vec::new(),
+                _target: target,
+                aio: true,
+            },
+        );
+    }
     pub(super) fn memory_retirements(&self) -> Arc<crate::retired_memory::RetiredMemory> {
+        if let Some(layouts) = self.layout_work.get() {
+            self.exits.memory.bind_layouts(layouts);
+        }
         #[cfg(all(test, trames_interpreter_conformance))]
         self.exits.memory.bind_owner(|| {
             Arc::new(Wake {
@@ -113,6 +141,7 @@ impl<C: Cpu> Kernel<C> {
                 signal,
                 _subscriptions: subscriptions,
                 _target: target,
+                aio: false,
             },
         );
     }
@@ -210,6 +239,64 @@ impl<C: Cpu> Kernel<C> {
             return Ok(());
         }
         C::prepare_hardware_view(view.as_mut().unwrap());
+        if let Some(call) = p
+            .retained_aio
+            .as_ref()
+            .or_else(|| p.byte_wait.as_ref()?.aio.as_ref())
+            .filter(|call| call.must_finish_on_exit())
+            .cloned()
+        {
+            let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
+                events: self.workers.events(),
+                owner: std::thread::current(),
+            });
+            let source = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                .with_paths(p.linux.vfs.path_queries())
+                .with_file_executor(self.workers.file_executor())
+                .with_file_layouts(self.file_layout_work())
+                .with_task_signal(p.signals.io.clone());
+            let _actor = trames_vfs::FileActorScope::enter_with_sync(
+                p.signals.io.credentials().clone(),
+                pid,
+                source.sync_executor(),
+            );
+            let (number, args) = call.entry();
+            match source.drain_aio_exit(call, view.as_mut().unwrap(), pid, &Arc::downgrade(&target))
+            {
+                trames_linux::IoAttempt::Complete(result) => {
+                    p.signals.io.io.complete(number, args[3], result);
+                    p.cpu.set_x(0, result.unwrap_or_else(super::error));
+                    p.retained_aio = None;
+                    p.byte_wait = None;
+                }
+                trames_linux::IoAttempt::Blocked(wait) => {
+                    let signal = wait.signal.clone();
+                    p.retained_aio = wait.aio.clone();
+                    p.byte_wait = Some(wait);
+                    self.exits.waits.insert(
+                        pid,
+                        Wait {
+                            task: task.clone(),
+                            status,
+                            signal,
+                            _subscriptions: Vec::new(),
+                            _target: target,
+                            aio: true,
+                        },
+                    );
+                    drop(view);
+                    self.processes.insert(pid, p);
+                    return Ok(());
+                }
+                trames_linux::IoAttempt::HostError(error) => {
+                    drop(view);
+                    self.processes.insert(pid, p);
+                    return Err(RuntimeError::Backend(error.to_string()));
+                }
+                _ => unreachable!("accepted AIO exit owns no structural import"),
+            }
+        }
         if let State::Futex { wait, .. } = &p.state {
             wait.cancel();
         }
@@ -276,7 +363,7 @@ impl<C: Cpu> Kernel<C> {
                 let owned = self.processes.get(&pid).is_some_and(|p| {
                     epoch.is_none_or(|epoch| epoch.memory_owned(p.memory.coordinator_ownership().0))
                 });
-                (wait.signal.ready() || owned).then_some(pid)
+                (wait.signal.ready() || !wait.aio && owned).then_some(pid)
             })
             .collect();
         for pid in ready {
@@ -318,7 +405,9 @@ impl<C: Cpu> Kernel<C> {
                 {
                     // A terminating cold peer is not runnable while its actual
                     // mm completes. Its IoTask stays live until resources retire.
-                    Self::cancel_native_task(&p);
+                    if !p.aio_must_finish_on_exit() {
+                        Self::cancel_native_task(&p);
+                    }
                     p.state = State::Zombie(status);
                     drop(p);
                     self.wait_exit_memory(pid, status);
@@ -351,6 +440,75 @@ mod tests {
     impl trames_vfs::IoWake for Wake {
         fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
             let _ = self.0.send(());
+        }
+    }
+    #[test]
+    fn legacy_individual_and_group_exit_complete_original_aio_before_reaping() {
+        for group in [false, true] {
+            let mut kernel = super::super::tests::kernel();
+            let mut root = super::super::tests::process();
+            let [reader, _writer] = root.linux.vfs.pipe(0).unwrap();
+            let event = root.linux.vfs.eventfd(0, 0x800).unwrap();
+            let mut output = trames_linux::CapturedOutput::default();
+            kernel
+                .syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
+                .unwrap();
+            kernel.publish_io_tasks(Some((1, &root)));
+            let mut child = kernel.processes.checkout(&2).unwrap();
+            let source = trames_linux::DirectSyscalls::new(child.linux.vfs.direct_descriptors())
+                .with_aio(child.linux.aio.clone(), child.linux.vfs.native_events())
+                .with_paths(child.linux.vfs.path_queries());
+            let target = Arc::downgrade(&kernel.byte_target);
+            child
+                .memory
+                .write_array(0x1100, 0u64.to_le_bytes())
+                .unwrap();
+            assert!(matches!(
+                source.start(
+                    0,
+                    [8, 0x1100, 0, 0, 0, 0],
+                    &mut child.memory,
+                    2,
+                    &target,
+                    None
+                ),
+                Some(trames_linux::IoAttempt::Complete(Ok(0)))
+            ));
+            let id = child.memory.read_u64(0x1100).unwrap();
+            let mut cb = [0; 64];
+            cb[20..24].copy_from_slice(&reader.to_le_bytes());
+            cb[24..32].copy_from_slice(&0x1300u64.to_le_bytes());
+            cb[32..40].copy_from_slice(&1u64.to_le_bytes());
+            cb[56..60].copy_from_slice(&1u32.to_le_bytes());
+            cb[60..64].copy_from_slice(&event.to_le_bytes());
+            child.memory.write_array(0x1200, cb).unwrap();
+            child
+                .memory
+                .write_array(0x1180, 0x1200u64.to_le_bytes())
+                .unwrap();
+            let args = [id, 1, 0x1180, 0, 0, 0];
+            let Some(trames_linux::IoAttempt::Blocked(wait)) =
+                source.start(2, args, &mut child.memory, 2, &target, None)
+            else {
+                panic!("original pipe request");
+            };
+            child.retained_aio = wait.aio.clone();
+            child.byte_wait = Some(wait);
+            child.state = State::Blocked(2, args);
+            let family = child.family.clone();
+            if group {
+                kernel.exit(2, &mut child, 9);
+            } else {
+                kernel.exit_one(2, &mut child, 9);
+            }
+            assert!(child.signals.io.live());
+            assert_eq!(family.status(), None);
+            assert_eq!(root.linux.vfs.read(event, 8), Err(Errno(11)));
+            kernel.processes.insert(2, child);
+            kernel.process_exits(None).unwrap();
+            assert_eq!(root.linux.vfs.read(event, 8).unwrap(), 1u64.to_le_bytes());
+            assert_eq!(family.status(), Some(9));
+            assert!(!kernel.processes.read(&2).signals.io.live());
         }
     }
     #[test]

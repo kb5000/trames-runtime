@@ -27,23 +27,27 @@ pub(super) struct Attributes {
     phase: Phase,
     check: Option<posix::Check>,
     transaction: Option<inode::Write>,
+    waiting: Option<inode::WriteWait>,
     _file: Option<Arc<File>>,
     lock_owner: u64,
     _writer: mapped::MountWrite,
     link: Option<Arc<inotify::Link>>,
 }
 impl Attributes {
+    pub(super) fn node(&self) -> &NodeRef {
+        &self.node
+    }
     pub(super) fn waiting_lock(&self) -> bool {
         matches!(self.phase, Phase::Lock)
     }
     pub(super) fn lock_ready(&self) -> bool {
-        !inode::attr(&self.node).writing()
+        inode::attr(&self.node).write_ready()
     }
     pub(super) fn subscribe_lock(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         inode::attr(&self.node).subscribe_write(signal)
     }
     fn begin(&mut self, node: u64) -> Result<Option<Arc<Request>>> {
-        let Some(transaction) = inode::attr(&self.node).try_write() else {
+        let Some(transaction) = inode::attr(&self.node).enter_write(&mut self.waiting) else {
             self.phase = Phase::Lock;
             return Ok(None);
         };
@@ -242,6 +246,23 @@ impl Attributes {
         Ok(body)
     }
     fn refresh(&self, bytes: &mut [u8], version: u64, set: bool) -> Result<()> {
+        if set
+            && bytes.len() == 104
+            && self.fs.connection.option(1 << 16)
+            && inode::attr(&self.node).kind_is_regular()
+        {
+            let attr = inode::attr(&self.node).lock().unwrap();
+            if !matches!(self.change, AttributeChange::Size { .. }) {
+                bytes[24..32].copy_from_slice(&attr[8..16]);
+            }
+            if !matches!(
+                self.change,
+                AttributeChange::Size { .. } | AttributeChange::Times(_)
+            ) {
+                bytes[48..56].copy_from_slice(&attr[32..40]);
+                bytes[68..72].copy_from_slice(&attr[52..56]);
+            }
+        }
         self.fs
             .refresh_permission_attr(&self.node, bytes, version, set)
     }
@@ -343,6 +364,7 @@ impl Metadata {
             phase: Phase::Set,
             check: None,
             transaction: None,
+            waiting: None,
             change,
             node,
             fs: fs.clone(),
@@ -368,6 +390,7 @@ impl Metadata {
             dev: mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(super) fn advance_attributes(

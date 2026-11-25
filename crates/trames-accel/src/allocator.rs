@@ -283,6 +283,9 @@ mod tests {
         raced: bool,
     }
     impl CpuMemory for Conflict {
+        fn mapped_at_or_after(&self, address: u64) -> bool {
+            self.memory.mapped_at_or_after(address)
+        }
         fn read(&self, a: u64, b: &mut [u8]) -> Result<(), MemoryError> {
             self.memory.read(a, b)
         }

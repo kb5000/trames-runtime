@@ -116,6 +116,7 @@ impl Metadata {
             dev: mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(super) fn local_access(
@@ -157,7 +158,7 @@ impl Metadata {
         mount: &mounts::MountData,
         fs: &Arc<Mounted>,
         node: NodeRef,
-        walk: PathWalk,
+        mut walk: PathWalk,
         operation: PathOperation,
         native: bool,
     ) -> Result<Self> {
@@ -170,13 +171,16 @@ impl Metadata {
             pending._usage = Some(mounts::MountUse::new(mount.identity.clone()));
             return Ok(pending);
         }
-        Self::permission_metadata(
+        let retry = walk.retry.take();
+        let mut pending = Self::permission_metadata(
             v,
             mount,
             LookupRef::retained(fs, node.clone()),
             posix::Check::new(node, v.credentials.clone(), 1),
             After::Search(Box::new((walk, operation, native))),
-        )
+        )?;
+        pending.retry = retry;
+        Ok(pending)
     }
     pub(super) fn begin_permission(
         &mut self,

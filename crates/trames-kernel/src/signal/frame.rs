@@ -3,6 +3,57 @@ use super::*;
 use trames_execution::{Aarch64State, Registers, SmeConfig, SmeState};
 
 const FRAME_SIZE: usize = 4688;
+/// A frame is serialized once, then copied page by page on the original task.
+/// Its architectural changes commit only after copyout.
+pub struct PreparedFrame {
+    frame: FrameState,
+    state: Aarch64State,
+    address: u64,
+    bytes: Vec<u8>,
+    copied: usize,
+    pub clear_sme: bool,
+}
+impl PreparedFrame {
+    pub fn progress(
+        &mut self,
+        memory: &mut impl CpuMemory,
+    ) -> Result<(), trames_memory::MemoryError> {
+        while self.copied < self.bytes.len() {
+            let address = self
+                .address
+                .checked_add(self.copied as u64)
+                .ok_or(trames_memory::MemoryError::InvalidRange)?;
+            let count = (self.bytes.len() - self.copied)
+                .min((trames_memory::PAGE_SIZE - address % trames_memory::PAGE_SIZE) as usize);
+            memory.write(address, &self.bytes[self.copied..self.copied + count])?;
+            self.copied += count;
+        }
+        Ok(())
+    }
+    pub(super) fn interrupted_pc(&mut self, pc: u64) {
+        debug_assert_eq!(self.copied, 0);
+        self.bytes[568..576].copy_from_slice(&pc.to_le_bytes());
+    }
+    pub fn commit(self, frame: &mut FrameState, state: &mut Aarch64State) {
+        let completed = self.finish();
+        *frame = completed.frame;
+        *state = completed.state;
+    }
+    pub(super) fn finish(self) -> super::FrameCommit {
+        assert_eq!(
+            self.copied,
+            self.bytes.len(),
+            "complete original signal frame"
+        );
+        super::FrameCommit {
+            frame: self.frame,
+            state: self.state,
+            clear_sme: self.clear_sme,
+            restored_sme: None,
+            returned: false,
+        }
+    }
+}
 pub struct FrameState {
     pub actions: Actions,
     pub mask: u64,
@@ -10,6 +61,122 @@ pub struct FrameState {
     pub alt_stack: AltStack,
 }
 impl Signals {
+    pub fn pending_frame_state(&self) -> FrameState {
+        self.frame_state()
+    }
+    pub fn commit_pending_frame(&mut self, frame: FrameState) {
+        self.wait_mask = None;
+        self.commit_frame(frame);
+        self.begin_io();
+    }
+    pub fn commit_partial_frame(&mut self, frame: FrameState) {
+        self.commit_frame(frame);
+        let mut context = self.io.context.lock().unwrap();
+        context.mask = self.mask;
+        context.frames = self.frames;
+        context.alt_stack = self.alt_stack;
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn enter_sme_pending(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &mut impl CpuMemory,
+        sig: u32,
+        info: Info,
+        action: Action,
+        sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
+        self.actions.accept_handler(sig, action);
+        self.begin_io();
+        let progress = self.io.start_frame(
+            self.frame_state(),
+            state,
+            sig,
+            info,
+            action,
+            sme,
+            self.wait_mask,
+            memory,
+        );
+        self.apply_pending_frame(state, progress)
+    }
+    pub fn resume_frame(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &mut impl CpuMemory,
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
+        let progress = self
+            .io
+            .resume_frame(memory)
+            .expect("accepted original handler frame");
+        self.apply_pending_frame(state, progress)
+    }
+    fn apply_pending_frame(
+        &mut self,
+        state: &mut Aarch64State,
+        progress: super::FrameProgress,
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
+        match progress {
+            super::FrameProgress::Complete(completed) => {
+                *state = completed.state;
+                self.commit_pending_frame(completed.frame);
+                Ok(None)
+            }
+            super::FrameProgress::Page(fault) => Ok(Some(fault)),
+            super::FrameProgress::EntryPage { fault, pc } => {
+                state.pc = pc;
+                Ok(Some(fault))
+            }
+            super::FrameProgress::Rseq(progress) => match progress {
+                crate::rseq::ResumeProgress::Complete(pc) => {
+                    state.pc = pc;
+                    Ok(None)
+                }
+                crate::rseq::ResumeProgress::Page { fault, pc } => {
+                    state.pc = pc;
+                    Ok(Some(fault))
+                }
+                crate::rseq::ResumeProgress::Error { error, pc } => {
+                    state.pc = pc;
+                    self.actions.force_frame_signal(
+                        &self.io,
+                        None,
+                        Fault {
+                            signal: 11,
+                            code: 128,
+                            address: 0,
+                        },
+                    );
+                    self.finish_io();
+                    Err(error)
+                }
+            },
+            super::FrameProgress::ReturnPage { fault, partial } => {
+                *state = partial.state;
+                self.commit_partial_frame(partial.frame);
+                Ok(Some(fault))
+            }
+            super::FrameProgress::Error { error, signal, pc } => {
+                if let Some(pc) = pc {
+                    state.pc = pc;
+                }
+                self.actions.failed_frame(&self.io, signal);
+                self.finish_io();
+                Err(error)
+            }
+            super::FrameProgress::ReturnError {
+                error,
+                fault,
+                partial,
+            } => {
+                *state = partial.state;
+                self.commit_partial_frame(partial.frame);
+                self.actions.force_frame_signal(&self.io, None, fault);
+                self.finish_io();
+                Err(error)
+            }
+        }
+    }
     fn frame_state(&self) -> FrameState {
         FrameState {
             actions: self.actions.shared(),
@@ -42,13 +209,31 @@ impl Signals {
         action: Action,
         sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
     ) -> Result<(), Errno> {
+        self.actions.accept_handler(sig, action);
         let mut frame = self.frame_state();
-        let original_pc = state.pc;
-        state.pc = self.io.rseq.signal(memory, state.pc)?;
-        if let Err(error) =
-            frame.enter_sme_restoring(state, memory, sig, info, action, sme, self.wait_mask)
-        {
-            state.pc = original_pc;
+        let rseq = if let Some(mut resume) = self.io.rseq.begin_signal(state.pc) {
+            let result = resume.progress(&self.io.rseq, memory);
+            state.pc = resume.pc();
+            result.map(|_| ()).map_err(|error| match error {
+                crate::rseq::ResumeError::Page(_) => Errno(14),
+                crate::rseq::ResumeError::Error(error) => error,
+            })
+        } else {
+            Ok(())
+        };
+        let result = rseq
+            .and_then(|()| {
+                frame.prepare_sme_restoring(state, sig, info, action, sme, self.wait_mask)
+            })
+            .and_then(|mut prepared| {
+                prepared.progress(memory).map_err(|_| Errno(14))?;
+                prepared.commit(&mut frame, state);
+                Ok(())
+            });
+        if let Err(error) = result {
+            self.begin_io();
+            self.actions.failed_frame(&self.io, sig);
+            self.finish_io();
             return Err(error);
         }
         self.wait_mask = None;
@@ -61,9 +246,9 @@ impl Signals {
         memory: &impl CpuMemory,
     ) -> Result<(), Errno> {
         let mut frame = self.frame_state();
-        frame.restore(state, memory)?;
+        let result = frame.restore(state, memory);
         self.commit_frame(frame);
-        Ok(())
+        result
     }
     pub fn restore_sme(
         &mut self,
@@ -73,9 +258,9 @@ impl Signals {
         sme2: bool,
     ) -> Result<Option<Box<SmeState>>, Errno> {
         let mut frame = self.frame_state();
-        let result = frame.restore_sme(state, memory, config, sme2)?;
+        let result = frame.restore_sme(state, memory, config, sme2);
         self.commit_frame(frame);
-        Ok(result)
+        result
     }
 }
 impl FrameState {
@@ -112,6 +297,30 @@ impl FrameState {
         sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
         restore_mask: Option<u64>,
     ) -> Result<(), Errno> {
+        self.actions.accept_handler(sig, action);
+        let mut prepared =
+            self.prepare_sme_restoring(state, sig, info, action, sme, restore_mask)?;
+        prepared.progress(memory).map_err(|_| Errno(14))?;
+        prepared.commit(self, state);
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_sme_restoring(
+        &self,
+        state: &Aarch64State,
+        sig: u32,
+        info: Info,
+        action: Action,
+        sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
+        restore_mask: Option<u64>,
+    ) -> Result<PreparedFrame, Errno> {
+        let mut state = state.clone();
+        let mut next = FrameState {
+            actions: self.actions.shared(),
+            mask: self.mask,
+            frames: self.frames,
+            alt_stack: self.alt_stack,
+        };
         let records = sme.map(|(config, registers, sme2)| {
             sme_records(config, registers, sme2, state.tpidr2_el0)
         });
@@ -122,8 +331,6 @@ impl FrameState {
         let size = records
             .as_ref()
             .map_or(FRAME_SIZE, |r| FRAME_SIZE.max(start + r.len()));
-        // A nonlocal unwind can bypass rt_sigreturn. This diagnostic count is
-        // not a stack limit; the actual frame copy enforces guest stack access.
         if !(1..=64).contains(&sig) {
             return Err(Errno(14));
         }
@@ -140,9 +347,6 @@ impl FrameState {
         if (use_alt || old_alt.contains(state.sp)) && sp < old_alt.sp {
             return Err(Errno(14));
         }
-        memory
-            .check(sp, size, Access::Write)
-            .map_err(|_| Errno(14))?;
         let mut frame = vec![0; size];
         write_siginfo(&mut frame[..128], sig, info);
         frame[144..152].copy_from_slice(&old_alt.sp.to_le_bytes());
@@ -171,21 +375,17 @@ impl FrameState {
             }
             frame[start..start + records.len()].copy_from_slice(&records);
         }
-        memory.write(sp, &frame).map_err(|_| Errno(14))?;
         if sme.is_some() {
             state.tpidr2_el0 = 0;
         }
         if old_alt.flags & SS_AUTODISARM != 0 {
-            self.alt_stack = AltStack::default();
+            next.alt_stack = AltStack::default();
         }
-        self.mask |= action.mask;
+        next.mask |= action.mask;
         if action.flags & 0x40000000 == 0 {
-            self.mask |= 1u64 << (sig - 1);
+            next.mask |= 1u64 << (sig - 1);
         }
-        self.mask &= !UNBLOCKABLE;
-        if action.flags & 0x80000000 != 0 {
-            self.actions.set(sig as usize, Action::default());
-        }
+        next.mask &= !UNBLOCKABLE;
         state.set_x(0, sig as u64);
         state.set_x(1, sp);
         state.set_x(2, sp + 128);
@@ -199,11 +399,27 @@ impl FrameState {
         );
         state.sp = sp;
         state.pc = action.handler;
-        self.frames = self.frames.saturating_add(1);
+        next.frames = next.frames.saturating_add(1);
+        Ok(PreparedFrame {
+            frame: next,
+            state,
+            address: sp,
+            bytes: frame,
+            copied: 0,
+            clear_sme: sme.is_some(),
+        })
+    }
+    pub(super) fn validate_return_address(sp: u64) -> Result<(), Errno> {
+        let address = sp & 0x00ff_ffff_ffff_ffff;
+        if sp & 15 != 0
+            || address
+                .checked_add(FRAME_SIZE as u64)
+                .is_none_or(|end| end > trames_memory::ADDRESS_LIMIT)
+        {
+            return Err(Errno(14));
+        }
         Ok(())
     }
-    /// Validate optional extension records before the existing atomic base
-    /// restore. The bounded context profile caps even guest-edited extra data.
     pub fn restore_sme(
         &mut self,
         state: &mut Aarch64State,
@@ -211,73 +427,70 @@ impl FrameState {
         config: SmeConfig,
         sme2: bool,
     ) -> Result<Option<Box<SmeState>>, Errno> {
-        let (mut registers, tpidr2) = read_sme_records(memory, state.sp, config, sme2)?;
-        self.restore(state, memory)?;
-        state.tpidr2_el0 = tpidr2;
-        if let Some(registers) = registers.as_mut().filter(|r| r.svcr & 1 != 0) {
-            for (index, vector) in state.vectors.iter().enumerate() {
-                let offset = index * config.vl as usize;
-                registers.z[offset..offset + 16].copy_from_slice(&vector.to_le_bytes());
-            }
-        }
-        Ok(registers)
+        let address = state.sp;
+        Self::restore_scalar(self, state, memory, address)?;
+        let registers = self.restore_floating(state, memory, address, Some(config), sme2)?;
+        self.restore_stack(state, memory, address)?;
+        Ok(registers.flatten())
     }
-    /// Decode and validate the complete frame before restoring registers. TLS
-    /// is not part of Linux's signal frame and remains the current task's TLS.
     pub fn restore(
         &mut self,
         state: &mut Aarch64State,
         memory: &impl CpuMemory,
     ) -> Result<(), Errno> {
-        if self.frames == 0 {
-            return Err(Errno(14));
-        }
-        let sp = state.sp;
-        memory
-            .check(sp, FRAME_SIZE, Access::Read)
-            .map_err(|_| Errno(14))?;
-        let mut frame = vec![0; FRAME_SIZE];
-        memory.read(sp, &mut frame).map_err(|_| Errno(14))?;
-        let word = |i| u64::from_le_bytes(frame[i..i + 8].try_into().unwrap());
-        let field = |i| u32::from_le_bytes(frame[i..i + 4].try_into().unwrap());
-        let new_sp = word(560);
-        let new_pc = word(568);
-        // Interrupted leaf assembly need not have a call-boundary aligned SP.
-        if new_sp >= 1 << 48
-            || new_pc & 3 != 0
-            || new_pc >= 1 << 48
-            || field(592) != 0x46508001
-            || field(596) != 528
-        {
-            return Err(Errno(14));
-        }
-        let restored_alt = AltStack::restore(memory, sp + 144)?;
-        for r in 0..31 {
-            state.set_x(r, word(312 + r * 8));
-        }
-        state.sp = new_sp;
-        state.pc = new_pc;
-        state.nzcv = (word(576) as u32) & 0xf0000000;
-        // Linux copies both complete user registers. The execution backend handles
-        // architectural RES0 bits; an old mask here would discard AFP/EBF16 state.
-        state.fpsr = field(600);
-        state.fpcr = field(604);
-        for r in 0..32 {
-            state.vectors[r] =
-                u128::from_le_bytes(frame[608 + r * 16..624 + r * 16].try_into().unwrap());
-        }
-        self.mask = word(168) & !UNBLOCKABLE;
-        self.alt_stack = restored_alt;
-        self.frames -= 1;
+        let address = state.sp;
+        Self::restore_scalar(self, state, memory, address)?;
+        self.restore_floating(state, memory, address, None, false)?;
+        self.restore_stack(state, memory, address)
+    }
+    fn restore_scalar(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &impl CpuMemory,
+        address: u64,
+    ) -> Result<(), Errno> {
+        super::return_gprs::Gprs::new(address)
+            .progress(self, state, None, memory)
+            .map_err(|error| match error {
+                crate::user_copy::CopyError::Page(_) => Errno(14),
+                crate::user_copy::CopyError::Error(error) => error,
+            })
+    }
+    fn restore_floating(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &impl CpuMemory,
+        address: u64,
+        config: Option<SmeConfig>,
+        sme2: bool,
+    ) -> Result<Option<Option<Box<SmeState>>>, Errno> {
+        let mut floating = super::return_fp::Floating::new(address, config, sme2, None);
+        floating
+            .progress(state, memory)
+            .map_err(|error| match error {
+                crate::user_copy::CopyError::Page(_) => Errno(14),
+                crate::user_copy::CopyError::Error(error) => error,
+            })?;
+        Ok(floating.take_result())
+    }
+    pub(super) fn restore_stack(
+        &mut self,
+        state: &Aarch64State,
+        memory: &impl CpuMemory,
+        address: u64,
+    ) -> Result<(), Errno> {
+        let saved_alt = AltStack::read(memory, address + 144)?;
+        let _ = self.alt_stack.exchange(state.sp, Some(saved_alt));
+        self.frames = self.frames.saturating_sub(1);
         Ok(())
     }
 }
 
-const SVE_MAGIC: u32 = 0x53564501;
-const ZA_MAGIC: u32 = 0x54366345;
-const ZT_MAGIC: u32 = 0x5a544e01;
-const TPIDR2_MAGIC: u32 = 0x54504902;
-const EXTRA_MAGIC: u32 = 0x45585401;
+pub(super) const SVE_MAGIC: u32 = 0x53564501;
+pub(super) const ZA_MAGIC: u32 = 0x54366345;
+pub(super) const ZT_MAGIC: u32 = 0x5a544e01;
+pub(super) const TPIDR2_MAGIC: u32 = 0x54504902;
+pub(super) const EXTRA_MAGIC: u32 = 0x45585401;
 fn aligned(n: usize) -> usize {
     (n + 15) & !15
 }
@@ -325,128 +538,6 @@ fn sme_records(
     out.resize(out.len() + 16, 0);
     out
 }
-fn read_sme_records(
-    memory: &impl CpuMemory,
-    sp: u64,
-    config: SmeConfig,
-    sme2: bool,
-) -> Result<(Option<Box<SmeState>>, u64), Errno> {
-    let mut registers = Box::new(SmeState {
-        vl: config.vl as u64,
-        ..Default::default()
-    });
-    let mut data = vec![0; 4096];
-    memory
-        .read(sp.checked_add(592).ok_or(Errno(14))?, &mut data)
-        .map_err(|_| Errno(14))?;
-    let vl = config.vl as usize;
-    let mut offset = 0;
-    let mut seen = 0u32;
-    let mut extra = false;
-    let mut tpidr2 = 0;
-    loop {
-        if offset + 8 > data.len() {
-            return Err(Errno(14));
-        }
-        let field = |i| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
-        let magic = field(offset);
-        let size = field(offset + 4) as usize;
-        if magic == 0 && size == 0 {
-            break;
-        }
-        if size < 16 || size % 16 != 0 || size > data.len() - offset {
-            return Err(Errno(14));
-        }
-        let d = &data[offset..offset + size];
-        let bit = match magic {
-            0x46508001 => 1,
-            SVE_MAGIC => 2,
-            ZA_MAGIC => 4,
-            ZT_MAGIC => 8,
-            TPIDR2_MAGIC => 16,
-            EXTRA_MAGIC => 32,
-            0x45535201 => 64,
-            _ => return Err(Errno(14)),
-        };
-        if seen & bit != 0 {
-            return Err(Errno(14));
-        }
-        seen |= bit;
-        let half = |i| u16::from_le_bytes(d[i..i + 2].try_into().unwrap()) as usize;
-        match magic {
-            0x46508001 if size != 528 || extra => return Err(Errno(14)),
-            0x45535201 if size != 16 || extra => return Err(Errno(14)),
-            TPIDR2_MAGIC => {
-                if size != 16 {
-                    return Err(Errno(14));
-                }
-                tpidr2 = u64::from_le_bytes(d[8..16].try_into().unwrap());
-            }
-            SVE_MAGIC => {
-                if half(8) != vl || half(10) & !1 != 0 {
-                    return Err(Errno(14));
-                }
-                if size != 16 {
-                    let n = vl * 32;
-                    let predicates = vl / 8 * 16;
-                    if half(10) != 1 || size != aligned(16 + n + predicates + vl / 8) {
-                        return Err(Errno(14));
-                    }
-                    registers.svcr |= 1;
-                    registers.z[..n].copy_from_slice(&d[16..16 + n]);
-                    registers.p[..predicates].copy_from_slice(&d[16 + n..16 + n + predicates]);
-                }
-            }
-            ZA_MAGIC => {
-                if half(8) != vl || size != 16 && size != 16 + vl * vl {
-                    return Err(Errno(14));
-                }
-                if size > 16 {
-                    registers.svcr |= 2;
-                    registers.za[..vl * vl].copy_from_slice(&d[16..]);
-                }
-            }
-            ZT_MAGIC => {
-                if !sme2 || size != 80 || half(8) != 1 {
-                    return Err(Errno(14));
-                }
-                registers.zt.copy_from_slice(&d[16..80]);
-            }
-            EXTRA_MAGIC => {
-                if extra
-                    || size != 32
-                    || offset + 48 > data.len()
-                    || data[offset + 32..offset + 40] != [0; 8]
-                {
-                    return Err(Errno(14));
-                }
-                let address = u64::from_le_bytes(d[8..16].try_into().unwrap());
-                let bytes = u32::from_le_bytes(d[16..20].try_into().unwrap()) as usize;
-                if address
-                    != sp
-                        .checked_add((592 + offset + 48) as u64)
-                        .ok_or(Errno(14))?
-                    || !(16..=8192).contains(&bytes)
-                    || bytes % 16 != 0
-                {
-                    return Err(Errno(14));
-                }
-                data.resize(bytes, 0);
-                memory.read(address, &mut data).map_err(|_| Errno(14))?;
-                extra = true;
-                offset = 0;
-                continue;
-            }
-            _ => {}
-        }
-        offset += size;
-    }
-    if seen & 1 == 0 || seen & 8 != 0 && registers.svcr & 2 == 0 {
-        return Err(Errno(14));
-    }
-    Ok(((registers.svcr != 0).then_some(registers), tpidr2))
-}
-
 #[cfg(test)]
 mod sme_tests {
     use super::*;
@@ -519,11 +610,11 @@ mod sme_tests {
         }
     }
     #[test]
-    fn sme_frame_validation_is_atomic_for_bad_vl_extra_and_zt() {
+    fn sme_frame_failure_keeps_prior_native_restore_stages() {
         for bad in 0..3 {
             let (mut signals, mut memory, mut state, registers) = setup(3);
             enter(&mut signals, &mut memory, &mut state, &registers);
-            let saved = state.clone();
+            let frame = state.sp;
             match bad {
                 0 => memory
                     .write_array(state.sp + 1168 + 16 + 8, 32u16.to_le_bytes())
@@ -538,7 +629,12 @@ mod sme_tests {
             assert!(signals
                 .restore_sme(&mut state, &memory, SmeConfig::default(), true)
                 .is_err());
-            assert_eq!(state, saved);
+            assert_eq!(state.pc, 0x4000);
+            assert_eq!(state.sp, 0x30000);
+            assert_ne!(state.sp, frame);
+            // Bad SVE metadata and bad EXTRA fail before FPSIMD/TPIDR2;
+            // bad ZA VL is checked after both have already committed.
+            assert_eq!(state.tpidr2_el0, if bad == 2 { 0x713 } else { 0 });
             assert_eq!(signals.frames, 1);
         }
     }

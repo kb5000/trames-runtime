@@ -29,6 +29,7 @@ pub(super) fn publish<C: Cpu>(
     p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
     p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
     p.retained_aio = done.io.as_ref().and_then(|call| call.aio.clone());
+    p.retained_binder = done.io.as_ref().and_then(|call| call.binder.clone());
     p.retained_message = done.io.as_ref().and_then(|call| call.message.clone());
     p.file_checkpoint = done
         .io
@@ -51,7 +52,7 @@ pub(super) fn publish<C: Cpu>(
         }
     } else if let Some(call) = done.io.take() {
         if let Some(uring) = call.uring {
-            p.uring_wait = Some((uring.submitted, uring.ring, uring.deadline));
+            p.uring_wait = Some(uring);
         }
         if matches!(call.number, 63..=66 | 202 | 203 | 242) {
             p.socket_deadline = call.deadline;
@@ -72,28 +73,9 @@ pub(super) fn publish<C: Cpu>(
                 deadline,
                 remaining,
             } => State::Sleep(deadline, remaining),
-            crate::run_queue::WaitState::Signal(wait) => match wait.request {
-                trames_kernel::signal::SignalWait::Timed {
-                    mask,
-                    info,
-                    deadline,
-                } => State::Sigwait {
-                    mask,
-                    info,
-                    deadline,
-                },
-                trames_kernel::signal::SignalWait::Suspend { .. } => {
-                    State::Suspend(p.signals.wait_mask.take().expect("suspend restore mask"))
-                }
-            },
-            crate::run_queue::WaitState::Child(wait)
-                if wait.request.number == 95 && wait.request.args[0] as u32 == 3 =>
-            {
-                State::PidfdWait(wait.request)
-            }
-            crate::run_queue::WaitState::Child(wait) => {
-                State::Blocked(wait.request.number, wait.request.args)
-            }
+            crate::run_queue::WaitState::Signal(wait) => State::Signal(wait),
+            crate::run_queue::WaitState::Child(wait) => State::Child(wait),
+            crate::run_queue::WaitState::Delivery(wait) => State::Delivery(wait),
             crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
             crate::run_queue::WaitState::Policy(wait) => State::Policy(wait),
             crate::run_queue::WaitState::Barrier(wait) => State::Barrier(wait),

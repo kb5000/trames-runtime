@@ -4,9 +4,23 @@
 mod actions;
 mod alt_stack;
 mod control;
+mod control_call;
+#[cfg(test)]
+mod control_copy_tests;
+pub use control_call::ControlCall;
 mod fault;
 mod frame;
-pub use frame::FrameState;
+#[cfg(test)]
+mod frame_failure_tests;
+pub use frame::{FrameState, PreparedFrame};
+mod frame_entry;
+mod return_fp;
+mod return_gprs;
+#[cfg(test)]
+mod return_tests;
+pub use frame_entry::{FrameCommit, FrameProgress};
+#[cfg(test)]
+pub(crate) mod frame_copy_tests;
 mod info;
 mod io;
 mod pending;
@@ -14,16 +28,23 @@ mod pending;
 mod pid_identity;
 mod reader;
 mod wait;
+mod wait_call;
+#[cfg(test)]
+mod wait_copy_tests;
 pub use actions::{Action, Actions};
 pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
-pub use io::{ExecPeerExit, Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
+pub use io::{
+    ExecPeerExit, FdControlCall, Inbox, IoContext, IoDirectory, IoRoutes, IoTask, SchedulingCall,
+    SendCall, TimerTarget,
+};
 pub use pending::{Pending, RetainedInfo};
 pub use reader::TaskReader;
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
 use trames_vfs::Errno;
 pub use wait::SignalWait;
+pub use wait_call::WaitCall;
 
 pub const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
 
@@ -63,6 +84,7 @@ impl Signals {
         child
     }
     pub fn exec(&mut self) {
+        self.io.discard_frame();
         self.io.rseq.clear();
         self.io.proc_view.exec_perf();
         // Preserve the current mask, but no abandoned pselect/suspend restore
@@ -122,9 +144,12 @@ impl Signals {
         self.io.publish_mask(mask);
     }
     pub fn mask_call(&mut self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        if let Some(mask) = control::update_mask(self.mask, a, memory)? {
+        let old = self.mask;
+        let input = control::MaskInput::import(a, memory)?;
+        if let Some(mask) = input.apply(self.mask) {
             self.set_mask(mask);
         }
+        control::export_mask(old, a[2], memory)?;
         // Context custody is transferred only at begin_io/finish_io. An owner
         // query needs neither a context mutex nor a redundant mask publication.
         Ok(0)

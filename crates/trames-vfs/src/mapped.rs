@@ -1126,6 +1126,14 @@ impl MappingFile {
                 .cpu_pages(offset, len)
                 .map_err(|e| Errno(e.raw_os_error().unwrap_or(5) as u32));
         }
+        if let Some(events::SharedControl::FuseFile(file)) = &o.control {
+            let file = file.clone();
+            let original = SharedFd {
+                open: o.shared.clone(),
+            };
+            drop(o);
+            return file.mapping_pages(original, offset, len, shared, writable);
+        }
         let node = o.data_node().ok_or(Errno(19))?;
         let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());
         if shared && writable && readonly {

@@ -476,6 +476,9 @@ impl DirectSyscalls {
         if self.file_prepared(number, args) {
             return None;
         }
+        if memory.async_faults_possible() {
+            return self.invoke_path_input(number, args, memory);
+        }
         let paths = self.paths.as_ref()?;
         let (call, output) = match import(number, args, memory, || paths.check_mount_admin()) {
             Ok(call) => call,

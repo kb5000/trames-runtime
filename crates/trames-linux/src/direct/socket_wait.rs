@@ -21,8 +21,30 @@ pub struct RetainedSocket {
     accepted_address: Option<Vec<u8>>,
     message: Option<Arc<ip_message::Message>>,
     post_sync: Option<(trames_vfs::SharedFd, bool)>,
+    preparing: Option<Arc<std::sync::Mutex<SocketInput>>>,
+}
+#[derive(Default)]
+struct SocketInput {
+    bytes: file_input::Bytes,
+    raw: bool,
+    fault: Option<trames_memory::PageFault>,
+    accept: Option<AcceptedOutput>,
+    finished: Option<Result<u64, Errno>>,
+    control: Option<(Result<u64, Errno>, crate::copy_replay::Replay)>,
+}
+struct AcceptedOutput {
+    descriptor: Option<trames_vfs::PreparedDescriptor>,
+    address: Option<crate::network::AddressOutput>,
+    peer: Vec<u8>,
+    copies: crate::copy_replay::Replay,
 }
 impl RetainedSocket {
+    pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        self.preparing
+            .as_ref()
+            .and_then(|input| input.lock().unwrap().fault.take())
+            .or_else(|| self.message.as_ref()?.take_fault())
+    }
     pub(super) fn uring(
         factory: &trames_vfs::DescriptorFactory,
         request: &trames_vfs::UringRequest,
@@ -56,7 +78,9 @@ impl RetainedSocket {
                 },
             };
             let message = match &socket {
-                Control::Network(socket) if matches!(number, 206 | 207) => {
+                Control::Network(socket)
+                    if matches!(number, 206 | 207) && !memory.async_faults_possible() =>
+                {
                     Some(Arc::new(ip_message::Message::new(
                         number,
                         args,
@@ -77,6 +101,9 @@ impl RetainedSocket {
                 accepted_address: request.path.clone(),
                 message,
                 post_sync: None,
+                preparing: (memory.async_faults_possible()
+                    && matches!(number, 202 | 242 | 206 | 207))
+                .then(Arc::default),
             })
         })())
     }
@@ -176,6 +203,188 @@ impl RetainedSocket {
         memory: &mut impl CpuMemory,
         paths: Option<&trames_vfs::PathQueries>,
     ) -> Option<Result<u64, Errno>> {
+        if let Some(preparing) = self.preparing.clone() {
+            let mut input = preparing.lock().unwrap();
+            if matches!(self.number, 204 | 205 | 208 | 209) {
+                if let Some(result) = input.finished {
+                    return Some(result);
+                }
+                if input.control.is_none() {
+                    let mut outputs = crate::copy_replay::Replay::default();
+                    let mut capture = file_input::Capture {
+                        reader: file_input::Reader::new(memory, &input.bytes),
+                        outputs: &mut outputs,
+                    };
+                    let result = match &self.socket {
+                        Control::Network(socket) => {
+                            if crate::network::control_publishes(self.number, self.args) {
+                                socket.with_tcp_publication(|| {
+                                    crate::network::control(
+                                        &self.factory,
+                                        socket,
+                                        self.number,
+                                        self.args,
+                                        &mut capture,
+                                    )
+                                    .unwrap()
+                                })
+                            } else {
+                                crate::network::control(
+                                    &self.factory,
+                                    socket,
+                                    self.number,
+                                    self.args,
+                                    &mut capture,
+                                )
+                                .unwrap()
+                            }
+                        }
+                        Control::Unix { socket, .. } => crate::network::unix::control(
+                            &self.factory,
+                            socket,
+                            self.number,
+                            self.args,
+                            &mut capture,
+                        )?,
+                    };
+                    if let Some(fault) = capture.reader.fault() {
+                        input.fault = Some(fault);
+                        return Some(Err(Errno(14)));
+                    }
+                    input.control = Some((result, outputs));
+                }
+                let (result, outputs) = input.control.as_mut().unwrap();
+                let result = if result.is_ok() {
+                    outputs
+                        .progress(memory)
+                        .map(|()| *result)
+                        .unwrap_or_else(|_| Err(Errno(14)))
+                } else {
+                    *result
+                };
+                if let Some(fault) = outputs.fault.take() {
+                    input.fault = Some(fault);
+                    return Some(Err(Errno(14)));
+                }
+                input.finished = Some(result);
+                return Some(result);
+            }
+            if matches!(self.number, 202 | 242) {
+                if let Some(result) = input.finished {
+                    return Some(result);
+                }
+                if input.accept.is_none() {
+                    let mut reader = file_input::Reader::new(memory, &input.bytes);
+                    let flags = if self.number == 242 {
+                        self.args[3] as u32
+                    } else {
+                        0
+                    };
+                    let prepared = match &self.socket {
+                        Control::Network(socket) => (|| {
+                            let address = crate::network::AddressOutput::prepare(
+                                &reader,
+                                self.args[1],
+                                self.args[2],
+                                socket.address_size(),
+                            )?;
+                            let (descriptor, peer) =
+                                self.factory.prepare_accept_socket(socket, flags)?;
+                            Ok((descriptor, trames_net::encode_address(peer), address))
+                        })(),
+                        Control::Unix { socket, .. } => self.factory.prepare_accept_local(
+                            socket,
+                            flags,
+                            &mut reader,
+                            |memory, size| {
+                                crate::network::AddressOutput::prepare(
+                                    memory,
+                                    self.args[1],
+                                    self.args[2],
+                                    size,
+                                )
+                            },
+                        ),
+                    };
+                    if let Some(fault) = reader.fault() {
+                        input.fault = Some(fault);
+                        return Some(Err(Errno(14)));
+                    }
+                    let (descriptor, peer, address) = match prepared {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    input.accept = Some(AcceptedOutput {
+                        descriptor: Some(descriptor),
+                        address,
+                        peer,
+                        copies: Default::default(),
+                    });
+                }
+                let accepted = input.accept.as_mut().unwrap();
+                let mut output = crate::copy_replay::Writer::new(memory, &mut accepted.copies);
+                let result = accepted.address.map_or(Ok(()), |address| {
+                    address.write_bytes(&mut output, &accepted.peer)
+                });
+                if let Some(fault) = accepted.copies.fault.take() {
+                    input.fault = Some(fault);
+                    return Some(Err(Errno(14)));
+                }
+                let result = result
+                    .and_then(|()| accepted.descriptor.take().unwrap().publish().map(u64::from));
+                input.accept = None;
+                input.finished = Some(result);
+                return Some(result);
+            }
+            let reader = file_input::Reader::new(memory, &input.bytes);
+            let parsed = (|| {
+                let address = matches!(self.number, 200 | 203)
+                    .then(|| crate::network::address(&reader, self.args[1], self.args[2]))
+                    .transpose()?;
+                let message = if let Control::Network(socket) = &self.socket {
+                    if input.raw {
+                        Some(Arc::new(ip_message::Message::raw(
+                            byte_number(self.number),
+                            self.args,
+                            &reader,
+                            socket,
+                        )?))
+                    } else if ip_message::number(self.number) {
+                        Some(Arc::new(ip_message::Message::new(
+                            self.number,
+                            self.args,
+                            &reader,
+                            socket.address_size(),
+                            socket.datagram_limit(),
+                        )?))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok((address, message))
+            })();
+            if let Some(fault) = reader.fault() {
+                input.fault = Some(fault);
+                return Some(Err(Errno(14)));
+            }
+            let (address, message) = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => return Some(Err(error)),
+            };
+            if let Control::Unix {
+                address: destination,
+                ..
+            } = &mut self.socket
+            {
+                *destination = address;
+            } else {
+                self.accepted_address = address;
+            }
+            self.message = message;
+            self.preparing = None;
+        }
         match &mut self.socket {
             Control::Network(socket) => {
                 if let Some(message) = &self.message {
@@ -310,9 +519,15 @@ impl DirectSyscalls {
             return None;
         }
         let socket = self.raw_ip_socket(args[0] as u32)?;
-        let message = match ip_message::Message::raw(number, args, memory, &socket) {
-            Ok(message) => Arc::new(message),
-            Err(error) => return Some(self.complete_socket(Err(error))),
+        let message = if memory.async_faults_possible() {
+            None
+        } else {
+            Some(
+                match ip_message::Message::raw(number, args, memory, &socket) {
+                    Ok(message) => Arc::new(message),
+                    Err(error) => return Some(self.complete_socket(Err(error))),
+                },
+            )
         };
         let deadline = socket
             .io_timeout(matches!(number, 63 | 65))
@@ -326,8 +541,14 @@ impl DirectSyscalls {
                 deadline,
                 connecting: false,
                 accepted_address: None,
-                message: Some(message),
+                message,
                 post_sync: None,
+                preparing: memory.async_faults_possible().then(|| {
+                    Arc::new(std::sync::Mutex::new(SocketInput {
+                        raw: true,
+                        ..Default::default()
+                    }))
+                }),
             },
             memory,
             pid,
@@ -344,7 +565,16 @@ impl DirectSyscalls {
         let socket = file.socket_operation()?;
         let factory = self.resources.as_ref()?;
         Some((|| {
-            let message = ip_message::Message::raw(byte_number(number), args, memory, &socket)?;
+            let message = if memory.async_faults_possible() {
+                None
+            } else {
+                Some(Arc::new(ip_message::Message::raw(
+                    byte_number(number),
+                    args,
+                    memory,
+                    &socket,
+                )?))
+            };
             let deadline = socket
                 .io_timeout(number == 286)
                 .and_then(|duration| Instant::now().checked_add(duration));
@@ -356,8 +586,14 @@ impl DirectSyscalls {
                 deadline,
                 connecting: false,
                 accepted_address: None,
-                message: Some(Arc::new(message)),
+                message,
                 post_sync: (number == 287 && args[5] & 6 != 0).then_some((file, args[5] & 4 == 0)),
+                preparing: memory.async_faults_possible().then(|| {
+                    Arc::new(std::sync::Mutex::new(SocketInput {
+                        raw: true,
+                        ..Default::default()
+                    }))
+                }),
             })
         })())
     }
@@ -386,7 +622,9 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Option<Result<RetainedSocket, Errno>> {
-        if !(matches!(number, 200 | 202 | 203 | 242) || ip_message::number(number))
+        if !(matches!(number, 200 | 202 | 203 | 242)
+            || ip_message::number(number)
+            || memory.async_faults_possible() && matches!(number, 204 | 205 | 208 | 209))
             || !self.supports_socket_control(number)
         {
             return None;
@@ -413,7 +651,7 @@ impl DirectSyscalls {
                 trames_vfs::SocketControlOperation::Network(socket) => Control::Network(socket),
                 trames_vfs::SocketControlOperation::Unix(socket) => Control::Unix {
                     socket,
-                    address: if matches!(number, 200 | 203) {
+                    address: if matches!(number, 200 | 203) && !memory.async_faults_possible() {
                         Some(crate::network::address(memory, args[1], args[2])?)
                     } else {
                         None
@@ -430,7 +668,9 @@ impl DirectSyscalls {
                     .and_then(|d| Instant::now().checked_add(d)),
             };
             let message = match &socket {
-                Control::Network(socket) if ip_message::number(number) => {
+                Control::Network(socket)
+                    if ip_message::number(number) && !memory.async_faults_possible() =>
+                {
                     Some(Arc::new(ip_message::Message::new(
                         number,
                         args,
@@ -451,6 +691,7 @@ impl DirectSyscalls {
                 accepted_address: None,
                 message,
                 post_sync: None,
+                preparing: memory.async_faults_possible().then(Arc::default),
             })
         })())
     }
@@ -511,6 +752,9 @@ impl DirectSyscalls {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(call);
         };
+        if let Some(fault) = call.take_fault() {
+            return self.park_socket_page(call, fault, pid, target);
+        }
         if call.pipe_signal() {
             return IoAttempt::SocketCheckpoint(call);
         }
@@ -520,6 +764,9 @@ impl DirectSyscalls {
             } else {
                 result
             };
+            if let Some(fault) = call.take_fault() {
+                return self.park_socket_page(call, fault, pid, target);
+            }
             return self.finish_socket(call, result);
         }
         let mut pending = self.socket_wait(call, pid, target);
@@ -600,6 +847,14 @@ impl DirectSyscalls {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
         };
+        if let Some(fault) = call.take_fault() {
+            return self.park_socket_page(
+                pending.retained_socket.take().unwrap(),
+                fault,
+                pending.signal.pid,
+                &pending.target,
+            );
+        }
         if call.pipe_signal() {
             IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap())
         } else if call.waits(&result) {
@@ -610,6 +865,14 @@ impl DirectSyscalls {
             } else {
                 result
             };
+            if let Some(fault) = call.take_fault() {
+                return self.park_socket_page(
+                    pending.retained_socket.take().unwrap(),
+                    fault,
+                    pending.signal.pid,
+                    &pending.target,
+                );
+            }
             self.finish_socket(pending.retained_socket.take().unwrap(), result)
         }
     }
@@ -677,6 +940,9 @@ impl DirectSyscalls {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(call);
         };
+        if let Some(fault) = call.take_fault() {
+            return self.park_socket_page(call, fault, pid, target);
+        }
         if !call.waits(&result) {
             let result = if result == Err(Errno(11)) {
                 call.interrupted(memory).unwrap_or(result)

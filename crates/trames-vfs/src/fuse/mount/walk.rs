@@ -17,7 +17,9 @@ impl Metadata {
         if let Some(mut accepted) = self.open.take() {
             if let Some(next) = &mut pending.open {
                 next.id = accepted.id;
-                next.slot = accepted.slot.take();
+                if accepted.slot.is_some() {
+                    next.slot = accepted.slot.take();
+                }
                 next.mode = accepted.mode;
                 next.link_credentials = accepted.link_credentials.clone();
                 next.umask = accepted.umask;
@@ -26,7 +28,7 @@ impl Metadata {
                 pending.open = Some(accepted);
             }
         }
-        *self = *pending;
+        self.adopt(*pending);
     }
     pub(super) fn resume_walk(
         &mut self,
@@ -92,6 +94,9 @@ impl Metadata {
         let previous = std::mem::replace(&mut v.credentials, credentials);
         let restore = RestoreCredentials { view: v, previous };
         let v = &mut *restore.view;
+        if self.retry.is_none() {
+            self.retry = walk.retry.take();
+        }
         let result = {
             v.query.as_ref().unwrap().clear_deferred();
             let resolved = v.resolve_walk_permission(
@@ -144,6 +149,9 @@ impl Metadata {
         operation: PathOperation,
         native: bool,
     ) -> Result<Option<FileValue>> {
+        if let Some(retry) = &mut self.retry {
+            retry.looked_up();
+        }
         if !native && v.entry_native_work(&entry) {
             let mount = match &entry.1 {
                 Some(ResolvedTarget::Descriptor(open)) => {
@@ -188,16 +196,16 @@ impl Metadata {
                 .prepare_path_truncate(entry, length)
                 .map(|_| FileValue::Count(0)),
             PathOperation::Open(flags) => {
-                let mut plan = self.open.take().expect("accepted open reservation");
+                let plan = self.open.as_mut().expect("accepted open reservation");
                 // The retained final entry and reservation cross the
                 // cold admission boundary; no pathname is looked up again.
                 let open = |v: &mut Vfs| {
-                    v.open_resolved::<false>(
+                    v.open_reserved::<false>(
                         entry,
                         flags,
                         plan.mode & 0o7777,
                         plan.publication.as_ref(),
-                        plan.slot.take().unwrap(),
+                        &mut plan.slot,
                     )
                 };
                 let result = if v.query.as_ref().unwrap().original {

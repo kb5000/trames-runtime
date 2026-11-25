@@ -327,7 +327,18 @@ pub struct UringResource {
 /// Lifetime hook for source-task execution state. The ring never owns the task,
 /// Files root, path island or factory; only this weak cleanup token crosses it.
 pub trait UringExecutionLease: Send + Sync {}
-pub trait UringSource: Send + Sync {}
+pub trait UringSource: std::any::Any + Send + Sync {}
+impl Vfs {
+    /// One compatibility source per original task. Production workers bind
+    /// their existing Linux task source and leave this slot uninitialized.
+    /// This root is never copied into a resolver, Files table or ring.
+    pub fn uring_source(
+        &self,
+        create: impl FnOnce() -> Arc<dyn UringSource>,
+    ) -> Arc<dyn UringSource> {
+        self.compat_uring_source.get_or_init(create).clone()
+    }
+}
 #[derive(Clone)]
 pub struct UringRequest {
     pub owner: u64,
@@ -349,6 +360,12 @@ pub struct UringRequest {
     pub path: Option<Vec<u8>>,
     pub how: Option<(u32, u32, u64)>,
     pub started: bool,
+    /// An accepted operation is finishing a user copy, independently of the
+    /// SQE's nonblocking transport/file policy.
+    pub copy_pending: bool,
+    /// Pure SQE metadata import is waiting on its original user pages. It has
+    /// already accepted its file/buffer capabilities but has issued no I/O.
+    pub import_pending: bool,
     pub timeout_count: Option<u64>,
     pub timeout_target: Option<u64>,
     pub timeout_duration: Option<std::time::Duration>,
@@ -423,6 +440,7 @@ pub struct UringState {
     pub dropped: u32,
     pub next: u64,
     pub completion_count: u64,
+    pub timeout_completions: u32,
     pub pending: VecDeque<UringRequest>,
     pub completed: BTreeMap<u64, bool>,
     pub overflow: VecDeque<(u64, i32, u32)>,
@@ -713,6 +731,20 @@ impl Vfs {
         cq_entries: u32,
         output: impl FnOnce() -> Result<()>,
     ) -> Result<(u32, Arc<Uring>)> {
+        let (prepared, ring) = self.prepare_uring(entries, cq_entries)?;
+        output()?;
+        let PreparedDescriptor {
+            reservation,
+            descriptor,
+        } = prepared;
+        let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
+        Ok((fd, ring))
+    }
+    pub fn prepare_uring(
+        &mut self,
+        entries: u32,
+        cq_entries: u32,
+    ) -> Result<(PreparedDescriptor, Arc<Uring>)> {
         if entries == 0
             || entries > URING_MAX_ENTRIES
             || !entries.is_power_of_two()
@@ -766,9 +798,13 @@ impl Vfs {
             open: OpenHandle::new(open),
             cloexec: true.into(),
         };
-        output()?;
-        let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
-        Ok((fd, ring))
+        Ok((
+            PreparedDescriptor {
+                reservation,
+                descriptor,
+            },
+            ring,
+        ))
     }
     pub fn uring(&self, fd: u32) -> Result<Arc<Uring>> {
         match &self.descriptor(fd)?.open.borrow().anonymous {

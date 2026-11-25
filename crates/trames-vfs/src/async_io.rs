@@ -11,7 +11,22 @@ pub trait AsyncOwners {
     fn resolve(&self, kind: u32, pid: u32) -> Result<Arc<dyn AsyncOwner>>;
     fn visible(&self, pid: u32) -> u32;
 }
+/// One accepted temporary task mask. Logical completion releases it once;
+/// retained snapshots cannot later restore a mask belonging to a newer call.
+pub trait TemporaryMask: Send + Sync {
+    /// Pending state belongs to the same task whose mask this lease changed.
+    fn signal_pending(&self) -> bool;
+    fn finish(&self);
+    /// Signal entry saves the original mask in its frame; a return without a
+    /// handler restores it at the task's next actual user boundary instead.
+    fn interrupted(&self) {
+        self.finish();
+    }
+}
 pub trait TaskSignal: Send + Sync {
+    fn temporary_mask(self: Arc<Self>, _mask: u64) -> Option<Arc<dyn TemporaryMask>> {
+        None
+    }
     fn raise(&self, signal: u32);
     fn cpu_elapsed(&self) -> std::time::Duration {
         std::time::Duration::ZERO
@@ -38,6 +53,7 @@ pub(super) struct AsyncState {
 #[derive(Default)]
 struct Settings {
     owner: Option<Arc<dyn AsyncOwner>>,
+    kind: u32,
     signal: u32,
     fd: u32,
 }
@@ -169,12 +185,19 @@ impl fd_status::StatusFlags {
                 } else {
                     Some(owners.resolve(kind, pid)?)
                 };
-                state.settings.lock().unwrap().owner = owner;
+                let mut settings = state.settings.lock().unwrap();
+                settings.owner = owner;
+                settings.kind = kind;
                 Ok(0)
             }
             9 | 16 => {
-                let settings = state.settings.lock().unwrap();
-                let (kind, pid) = settings.owner.as_ref().map_or((1, 0), |o| o.identity());
+                let (kind, pid) = {
+                    let settings = state.settings.lock().unwrap();
+                    settings
+                        .owner
+                        .as_ref()
+                        .map_or((settings.kind, 0), |owner| owner.identity())
+                };
                 let pid = owners.visible(pid);
                 if command == 9 {
                     return Ok(if kind == 2 {
@@ -190,10 +213,11 @@ impl fd_status::StatusFlags {
                 Ok(0)
             }
             10 => {
-                if argument > 64 {
+                let signal = argument as u32;
+                if signal > 64 {
                     return Err(Errno(22));
                 }
-                state.settings.lock().unwrap().signal = argument as u32;
+                state.settings.lock().unwrap().signal = signal;
                 Ok(0)
             }
             11 => Ok(state.settings.lock().unwrap().signal as u64),

@@ -38,29 +38,41 @@ fn mounting_through_a_fuse_symlink_uses_the_resolved_target() {
 
 #[test]
 fn identical_source_and_target_spellings_remain_separate_accepted_operands() {
-    let (v, dev) = mounted();
-    let c = dev.connection().unwrap();
-    let paths = v.path_queries();
-    let work = waiting(paths.namespace_work(NamespaceCall::Mount {
-        source: Some(b"/mnt/directory".to_vec()),
-        target: b"/mnt/directory".to_vec(),
-        kind: None,
-        flags: 4096,
-        data: None,
-    }));
-    answer(c, &receive(c, 1, 1), &entry(70, 170, 0o40755));
-    let work = waiting(work);
-    // Equal bytes do not merge Linux's target and source lookups. The name
-    // may select a different inode when the second operand is reached.
-    answer(c, &receive(c, 1, 1), &entry(72, 172, 0o40755));
-    assert!(matches!(finish(work), Ok(FileValue::Count(0))));
-    let table = v.mounts.as_ref().unwrap().0.borrow();
-    let mount = table.mounts.last().unwrap();
-    assert_eq!(mount.root.borrow().inode, 172);
-    assert_eq!(
-        mount.parent.borrow().as_ref().unwrap().node.borrow().inode,
-        170
-    );
+    for replaced in [false, true] {
+        let (v, dev) = mounted();
+        let c = dev.connection().unwrap();
+        let before = v.mounts.as_ref().unwrap().0.borrow().mounts.len();
+        let paths = v.path_queries();
+        let work = waiting(paths.namespace_work(NamespaceCall::Mount {
+            source: Some(b"/mnt/directory".to_vec()),
+            target: b"/mnt/directory".to_vec(),
+            kind: None,
+            flags: 4096,
+            data: None,
+        }));
+        answer(c, &receive(c, 1, 1), &entry(70, 170, 0o40755));
+        let work = waiting(work);
+        // Equal bytes still reach the source's own LOOKUP. A replacement
+        // unhashes the accepted target, so d_set_mounted must reject it rather
+        // than silently substituting the source's now-current name.
+        let node = if replaced { 72 } else { 70 };
+        answer(c, &receive(c, 1, 1), &entry(node, node + 100, 0o40755));
+        let result = finish(work);
+        let table = v.mounts.as_ref().unwrap().0.borrow();
+        if replaced {
+            assert!(matches!(result, Err(Errno(2))));
+            assert_eq!(table.mounts.len(), before);
+        } else {
+            assert!(matches!(result, Ok(FileValue::Count(0))));
+            assert_eq!(table.mounts.len(), before + 1);
+            let mount = table.mounts.last().unwrap();
+            assert_eq!(mount.root.borrow().inode, 170);
+            assert_eq!(
+                mount.parent.borrow().as_ref().unwrap().node.borrow().inode,
+                170
+            );
+        }
+    }
 }
 
 #[test]

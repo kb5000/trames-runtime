@@ -134,7 +134,10 @@ fn binder_call_reply_parks_original_workers_with_one_or_many_cpu_slots() {
         }
         wr(&mut service, 0x1200, 0, 0, 256);
         wr(&mut service, 0x1280, 0x1500, 68, 0);
-        wr(&mut client, 0x1200, 0x1500, 68, 8);
+        // Native Binder reserves room for its largest transaction record even
+        // before dequeuing a short notice. NOOP + 76 bytes admits COMPLETE;
+        // the remaining 72 bytes keep the reply for the second original call.
+        wr(&mut client, 0x1200, 0x1500, 68, 80);
         wr(&mut client, 0x1280, 0, 0, 256);
         let mut serve = Vec::new();
         invoke(&mut serve, service_fd, 0x1200);
@@ -175,6 +178,11 @@ fn binder_call_reply_parks_original_workers_with_one_or_many_cpu_slots() {
         );
         assert_eq!(k.processes.read(&1).cpu.x(19), 0);
         assert_eq!(k.processes.read(&2).cpu.x(19), 0);
+        assert_eq!(k.processes.read(&2).memory.read_u64(0x1220).unwrap(), 8);
+        assert_eq!(
+            k.processes.read(&2).memory.read_array::<4>(0x2004).unwrap(),
+            b::BR_REPLY.to_le_bytes()
+        );
         assert_eq!(k.service_requests, 0);
         assert_eq!(k.vm_checkpoint_spaces, 0);
         assert!(

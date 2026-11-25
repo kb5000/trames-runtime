@@ -31,6 +31,19 @@ impl Fault {
         );
         true
     }
+    pub fn bad_frame(address: u64, memory: &impl CpuMemory) -> Self {
+        // arm64_notify_segfault uses find_vma, so a hole below a later
+        // mapping is ACCERR too. This metadata observation never loads pages.
+        Self {
+            signal: 11,
+            code: if memory.mapped_at_or_after(address) {
+                2
+            } else {
+                1
+            },
+            address: address & 0x00ff_ffff_ffff_ffff,
+        }
+    }
     pub fn memory(pc: u64, error: &MemoryError) -> Self {
         use MemoryError as M;
         let (signal, code, address) = match error {

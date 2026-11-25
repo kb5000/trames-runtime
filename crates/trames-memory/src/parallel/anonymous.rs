@@ -58,6 +58,18 @@ impl Additions {
     }
 }
 impl Anonymous {
+    pub(super) fn mapped_at_or_after(&self, address: u64) -> bool {
+        self.ranges
+            .last_key_value()
+            .is_some_and(|(_, range)| address < range.end)
+            || self
+                .live
+                .ranges
+                .lock()
+                .unwrap()
+                .last_key_value()
+                .is_some_and(|(_, range)| address < range.end)
+    }
     fn freeze_range(source: &crate::anonymous::Range, previous: Option<&Range>) -> Range {
         #[cfg(test)]
         crate::anonymous::note_index_visit();

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared POSIX/interval timers. Existing executors drive the original deadline
 //! index; no timer thread, guest pointer retention or syscall RPC is required.
+mod call;
 mod cpu;
 use crate::signal::{Info, IoDirectory, IoTask, TimerTarget};
+pub use call::Call;
 use cpu::CpuClock;
 pub(crate) use cpu::CpuSchedule;
 pub use cpu::CpuSleep;
@@ -14,7 +16,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
 use trames_vfs::{Errno, PidNamespace};
 
 pub fn timer_call(number: u32) -> bool {
@@ -79,9 +81,10 @@ impl Timer {
 struct Registry {
     next_id: i32,
     timers: BTreeMap<i32, Arc<Timer>>,
+    reserved: BTreeSet<i32>,
 }
 pub struct Timers {
-    registry: RwLock<Registry>,
+    registry: Arc<RwLock<Registry>>,
     schedule: Mutex<BTreeSet<(Instant, i32)>>,
     origin: Instant,
     next: AtomicU64,
@@ -90,29 +93,17 @@ pub struct Timers {
 impl Default for Timers {
     fn default() -> Self {
         Self {
-            registry: RwLock::new(Registry {
+            registry: Arc::new(RwLock::new(Registry {
                 next_id: 1,
                 timers: BTreeMap::new(),
-            }),
+                reserved: Default::default(),
+            })),
             schedule: Default::default(),
             origin: Instant::now(),
             next: AtomicU64::new(u64::MAX),
             wake: Default::default(),
         }
     }
-}
-fn duration(memory: &impl CpuMemory, address: u64, micros: bool) -> Result<Duration, Errno> {
-    let b = memory.read_array::<16>(address).map_err(|_| Errno(14))?;
-    let sec = u64::from_le_bytes(b[..8].try_into().unwrap());
-    let sub = u64::from_le_bytes(b[8..].try_into().unwrap());
-    let limit = if micros { 1_000_000 } else { 1_000_000_000 };
-    if sec > i64::MAX as u64 || sub >= limit {
-        return Err(Errno(22));
-    }
-    Ok(Duration::new(
-        sec,
-        sub as u32 * if micros { 1000 } else { 1 },
-    ))
 }
 fn export(
     memory: &mut impl CpuMemory,
@@ -358,240 +349,238 @@ impl Timers {
         directory: &IoDirectory,
         namespace: &PidNamespace,
     ) -> Result<u64, Errno> {
-        let tgid = caller.tgid();
-        if matches!(number, 102 | 103) {
-            let which = a[0] as u32;
-            if which > 2 {
-                return Err(Errno(22));
-            }
-            let id = -(tgid as i32);
-            let output = if number == 102 { a[1] } else { a[2] };
-            if number == 102 || output != 0 {
-                memory
-                    .check(output, 32, Access::Write)
-                    .map_err(|_| Errno(14))?;
-            }
-            let times = match (number, a[1]) {
-                (102, _) => None,
-                (103, 0) => Some((Duration::ZERO, Duration::ZERO)),
-                (_, at) => Some((
-                    duration(memory, at, true)?,
-                    duration(memory, at.checked_add(16).ok_or(Errno(14))?, true)?,
-                )),
-            };
-            if which != 0 {
-                let group = caller.lifecycle();
-                return group.cpu_intervals.call(
-                    (which - 1) as usize,
-                    || group.cpu_time(),
-                    times,
-                    (number == 102 || output != 0).then_some(output),
-                    memory,
-                );
-            }
-            let new = if let Some((interval, value)) = times {
-                let deadline = if value.is_zero() {
-                    None
-                } else {
-                    Some(Instant::now().checked_add(value).ok_or(Errno(22))?)
-                };
-                Some((
-                    if value.is_zero() {
-                        Duration::ZERO
-                    } else {
-                        interval
-                    },
-                    deadline,
-                ))
-            } else {
-                None
-            };
-            let timer = if number == 103 {
-                let target = Some(directory.timer_target(tgid, None)?);
-                let mut registry = self.registry.write().unwrap();
-                registry
-                    .timers
-                    .entry(id)
-                    .or_insert_with(|| {
-                        Arc::new(Timer {
-                            tgid,
-                            clock: 1,
-                            cpu: None,
-                            signal: 14,
-                            value: 0,
-                            target,
-                            state: Default::default(),
-                        })
-                    })
-                    .clone()
-            } else {
-                match self.lookup(tgid, id) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        export(memory, output, &State::default(), true, false)?;
-                        return Ok(0);
-                    }
-                }
-            };
-            let mut state = timer.state.lock().unwrap();
-            if state.deleted {
-                return Err(Errno(22));
-            }
-            if number == 102 || output != 0 {
-                export(memory, output, &state, true, false)?;
-            }
-            if let Some((interval, deadline)) = new {
-                let old = state.deadline;
-                state.interval = interval;
-                state.deadline = deadline;
-                state.overrun = 0;
-                self.reschedule(id, old, deadline);
-            }
-            return Ok(0);
+        let input = call::Input::import(number, a, memory)?;
+        let mut prepared = self.prepare(number, a, input, started, caller, directory, namespace)?;
+        prepared.output.progress(memory).map_err(|_| Errno(14))?;
+        if let Some(create) = prepared.create.take() {
+            create.publish(caller, directory)?;
         }
-        if number == 107 {
-            let clock = a[0] as u32;
-            if clock > 3 {
-                return Err(Errno(22));
-            }
-            memory
-                .check(a[2], 4, Access::Write)
-                .map_err(|_| Errno(14))?;
-            let mut registry = self.registry.write().unwrap();
-            let id = registry.next_id;
-            let (signal, value, thread) = if a[1] == 0 {
-                (14, id as u64, None)
-            } else {
-                let b = memory.read_array::<64>(a[1]).map_err(|_| Errno(14))?;
-                let value = u64::from_le_bytes(b[..8].try_into().unwrap());
-                let signal = u32::from_le_bytes(b[8..12].try_into().unwrap());
-                let notify = u32::from_le_bytes(b[12..16].try_into().unwrap());
-                if notify != 1 && (signal == 0 || signal > 64) {
+        Ok(prepared.value)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        input: call::Input,
+        started: Instant,
+        caller: &IoTask,
+        directory: &IoDirectory,
+        namespace: &PidNamespace,
+    ) -> Result<call::Prepared, Errno> {
+        let tgid = caller.tgid();
+        let mut output = crate::user_copy::Output::default();
+        match input {
+            call::Input::Interval(times) => {
+                let which = a[0] as u32;
+                if which > 2 {
                     return Err(Errno(22));
                 }
-                let thread = match notify {
-                    // SIGEV_THREAD at the raw Linux ABI targets the process.
-                    // libc implements callbacks with its own helper thread.
-                    0..=2 => None,
-                    4 => {
-                        let tid = u32::from_le_bytes(b[16..20].try_into().unwrap());
-                        Some(namespace.global(tid).ok_or(Errno(22))?)
-                    }
-                    _ => return Err(Errno(22)),
-                };
-                (if notify == 1 { 0 } else { signal }, value, thread)
-            };
-            let target = if signal == 0 {
-                None
-            } else {
-                Some(directory.timer_target(tgid, thread)?)
-            };
-            if registry.timers.keys().filter(|id| **id > 0).count() >= 32 {
-                return Err(Errno(11));
-            }
-            let cpu = if clock >= 2 {
-                Some(CpuClock::new(clock, signal != 0, caller, directory)?)
-            } else {
-                None
-            };
-            let next = id.checked_add(1).ok_or(Errno(11))?;
-            memory
-                .write_array(a[2], id.to_le_bytes())
-                .map_err(|_| Errno(14))?;
-            registry.next_id = next;
-            registry.timers.insert(
-                id,
-                Arc::new(Timer {
-                    tgid,
-                    clock,
-                    cpu,
-                    signal,
-                    value,
-                    target,
-                    state: Default::default(),
-                }),
-            );
-            return Ok(0);
-        }
-        let id = a[0] as i32;
-        if id < 1 {
-            return Err(Errno(22));
-        }
-        let timer = self.lookup(tgid, id)?;
-        let mut state = timer.state.lock().unwrap();
-        if state.deleted {
-            return Err(Errno(22));
-        }
-        match number {
-            109 => Ok(state.overrun as u64),
-            111 => {
-                self.retire(id, &timer, &mut state);
-                drop(state);
-                self.registry.write().unwrap().timers.remove(&id);
-                Ok(0)
-            }
-            108 | 110 => {
-                let output = if number == 108 { a[1] } else { a[3] };
-                if number == 108 || output != 0 {
-                    memory
-                        .check(output, 32, Access::Write)
-                        .map_err(|_| Errno(14))?;
-                }
-                let new = if number == 110 {
-                    let interval = duration(memory, a[2], false)?;
-                    let value = duration(memory, a[2].checked_add(16).ok_or(Errno(14))?, false)?;
-                    Some((interval, value))
+                let address = if number == 102 {
+                    Some(a[1])
                 } else {
-                    None
+                    (a[2] != 0).then_some(a[2])
                 };
-                if let Some(cpu) = &timer.cpu {
-                    return cpu.update(
-                        id,
-                        &timer,
-                        &mut state,
-                        new.map(|(interval, value)| (interval, value, a[1] & 1 != 0)),
-                        (number == 108 || output != 0).then_some(output),
-                        memory,
-                    );
-                }
-                let new = if let Some((interval, value)) = new {
-                    let deadline = if value.is_zero() {
-                        None
+                if which != 0 {
+                    let group = caller.lifecycle();
+                    group.cpu_intervals.call(
+                        (which - 1) as usize,
+                        || group.cpu_time(),
+                        times,
+                        address,
+                        &mut output,
+                    )?;
+                } else {
+                    let id = -(tgid as i32);
+                    let new = times
+                        .map(|(interval, value)| -> Result<_, Errno> {
+                            let value = call::ktime(value);
+                            let interval = call::ktime(interval);
+                            Ok((
+                                if value.is_zero() {
+                                    Duration::ZERO
+                                } else {
+                                    interval
+                                },
+                                if value.is_zero() {
+                                    None
+                                } else {
+                                    Some(Instant::now().checked_add(value).ok_or(Errno(22))?)
+                                },
+                            ))
+                        })
+                        .transpose()?;
+                    let timer = if number == 103 {
+                        let target = Some(directory.timer_target(tgid, None)?);
+                        let mut registry = self.registry.write().unwrap();
+                        Some(
+                            registry
+                                .timers
+                                .entry(id)
+                                .or_insert_with(|| {
+                                    Arc::new(Timer {
+                                        tgid,
+                                        clock: 1,
+                                        cpu: None,
+                                        signal: 14,
+                                        value: 0,
+                                        target,
+                                        state: Default::default(),
+                                    })
+                                })
+                                .clone(),
+                        )
                     } else {
-                        let duration = if a[1] & 1 == 0 {
-                            value
-                        } else {
-                            let now = if timer.clock == 0 {
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map_err(|_| Errno(5))?
-                            } else {
-                                started.elapsed()
-                            };
-                            value.saturating_sub(now)
-                        };
-                        Some(Instant::now().checked_add(duration).ok_or(Errno(22))?)
+                        self.lookup(tgid, id).ok()
                     };
-                    Some((interval, deadline))
-                } else {
-                    None
-                };
-                if number == 108 || output != 0 {
-                    export(memory, output, &state, false, timer.signal == 0)?;
-                }
-                if let Some((interval, deadline)) = new {
-                    let old = state.deadline;
-                    state.interval = interval;
-                    state.deadline = deadline;
-                    state.overrun = 0;
-                    if timer.signal != 0 {
-                        self.reschedule(id, old, deadline);
+                    if let Some(timer) = timer {
+                        let mut state = timer.state.lock().unwrap();
+                        if state.deleted {
+                            return Err(Errno(22));
+                        }
+                        if let Some(address) = address {
+                            export(&mut output, address, &state, true, false)?;
+                        }
+                        if let Some((interval, deadline)) = new {
+                            let old = state.deadline;
+                            state.interval = interval;
+                            state.deadline = deadline;
+                            state.overrun = 0;
+                            self.reschedule(id, old, deadline);
+                        }
+                    } else if let Some(address) = address {
+                        export(&mut output, address, &State::default(), true, false)?;
                     }
                 }
-                Ok(0)
             }
-            _ => Err(Errno(38)),
+            call::Input::Create(event) => {
+                let clock = a[0] as u32;
+                if clock > 3 {
+                    return Err(Errno(22));
+                }
+                let mut create = call::Create::reserve(self.registry.clone(), clock, tgid)?;
+                let (signal, value, thread) = if let Some(event) = event {
+                    let value = u64::from_le_bytes(event[..8].try_into().unwrap());
+                    let signal = u32::from_le_bytes(event[8..12].try_into().unwrap());
+                    let notify = u32::from_le_bytes(event[12..16].try_into().unwrap());
+                    if notify != 1 && (signal == 0 || signal > 64) {
+                        return Err(Errno(22));
+                    }
+                    let thread = match notify {
+                        0..=2 => None,
+                        4 => Some(
+                            namespace
+                                .global(u32::from_le_bytes(event[16..20].try_into().unwrap()))
+                                .ok_or(Errno(22))?,
+                        ),
+                        _ => return Err(Errno(22)),
+                    };
+                    (if notify == 1 { 0 } else { signal }, value, thread)
+                } else {
+                    (14, create.id as u64, None)
+                };
+                create.signal = signal;
+                create.value = value;
+                create.target = if signal == 0 {
+                    None
+                } else {
+                    Some(directory.timer_target(tgid, thread)?)
+                };
+                output
+                    .write_array(a[2], create.id.to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(call::Prepared {
+                    output,
+                    create: Some(create),
+                    value: 0,
+                });
+            }
+            call::Input::Posix(new) => {
+                let id = a[0] as i32;
+                if id < 1 {
+                    return Err(Errno(22));
+                }
+                let timer = self.lookup(tgid, id)?;
+                let mut state = timer.state.lock().unwrap();
+                if state.deleted {
+                    return Err(Errno(22));
+                }
+                match number {
+                    109 => {
+                        return Ok(call::Prepared {
+                            output,
+                            create: None,
+                            value: state.overrun as u64,
+                        })
+                    }
+                    111 => {
+                        self.retire(id, &timer, &mut state);
+                        drop(state);
+                        self.registry.write().unwrap().timers.remove(&id);
+                    }
+                    108 | 110 => {
+                        let address = if number == 108 {
+                            Some(a[1])
+                        } else {
+                            (a[3] != 0).then_some(a[3])
+                        };
+                        let new = new
+                            .map(|(interval, value)| (call::ktime(interval), call::ktime(value)));
+                        if let Some(cpu) = &timer.cpu {
+                            cpu.update(
+                                id,
+                                &timer,
+                                &mut state,
+                                new.map(|(i, v)| (i, v, a[1] as u32 & 1 != 0)),
+                                address,
+                                &mut output,
+                            )?;
+                        } else {
+                            let new = new
+                                .map(|(interval, value)| -> Result<_, Errno> {
+                                    let deadline = if value.is_zero() {
+                                        None
+                                    } else {
+                                        let delta = if a[1] as u32 & 1 == 0 {
+                                            value
+                                        } else {
+                                            let now = if timer.clock == 0 {
+                                                SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .map_err(|_| Errno(5))?
+                                            } else {
+                                                started.elapsed()
+                                            };
+                                            value.saturating_sub(now)
+                                        };
+                                        Some(Instant::now().checked_add(delta).ok_or(Errno(22))?)
+                                    };
+                                    Ok((interval, deadline))
+                                })
+                                .transpose()?;
+                            if let Some(address) = address {
+                                export(&mut output, address, &state, false, timer.signal == 0)?;
+                            }
+                            if let Some((interval, deadline)) = new {
+                                let old = state.deadline;
+                                state.interval = interval;
+                                state.deadline = deadline;
+                                state.overrun = 0;
+                                if timer.signal != 0 {
+                                    self.reschedule(id, old, deadline);
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(Errno(38)),
+                }
+            }
         }
+        Ok(call::Prepared {
+            output,
+            create: None,
+            value: 0,
+        })
     }
 }
 
@@ -703,12 +692,13 @@ mod tests {
             Err(Errno(22))
         );
         m.write_array(0x1118, 0u64.to_le_bytes()).unwrap();
+        m.write_array(0x1110, 120u64.to_le_bytes()).unwrap();
         assert_eq!(
             call(&t, &d, &mut m, 110, [id as u64, 0, 0x1100, 0x1ff8, 0, 0]),
             Err(Errno(14))
         );
         call(&t, &d, &mut m, 108, [id as u64, 0x1200, 0, 0, 0, 0]).unwrap();
-        assert!(m.read_u64(0x1210).unwrap() >= 59);
+        assert!(m.read_u64(0x1210).unwrap() >= 119);
         assert!(t.next_deadline().is_some());
         call(&t, &d, &mut m, 111, [id as u64, 0, 0, 0, 0, 0]).unwrap();
         assert!(t.next_deadline().is_none());

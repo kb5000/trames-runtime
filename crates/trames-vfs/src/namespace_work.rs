@@ -133,6 +133,24 @@ pub enum NamespaceCall {
     },
 }
 impl NamespaceCall {
+    fn stale_retry(&self) -> bool {
+        matches!(
+            self,
+            Self::Mkdir { .. }
+                | Self::Mknod { .. }
+                | Self::Symlink { .. }
+                | Self::Unlink { .. }
+                | Self::Link { .. }
+                | Self::Rename { .. }
+                | Self::Chmod { empty: true, .. }
+                | Self::Chown { empty: true, .. }
+        ) || matches!(self, Self::Times { path: Some(path), flags, .. } if path.is_empty() && flags & 0x1000 != 0)
+            || self.metadata()
+                && self
+                    .paths()
+                    .iter()
+                    .any(|(_, path, _)| path.is_some_and(|p| !p.is_empty()))
+    }
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
             Self::MountFd(call) => call.operands(),
@@ -178,11 +196,26 @@ impl NamespaceCall {
                 ..
             } => vec![(*oldfd, Some(old), false), (*newfd, Some(new), false)],
             Self::Chmod {
-                fd, path, nofollow, ..
+                fd,
+                path,
+                nofollow,
+                empty,
+                ..
             }
             | Self::Chown {
-                fd, path, nofollow, ..
-            } => vec![(*fd, path.as_deref(), !nofollow)],
+                fd,
+                path,
+                nofollow,
+                empty,
+                ..
+            } => {
+                let path = if *empty && *fd == AT_FDCWD && path.is_none() {
+                    Some(b".".as_slice())
+                } else {
+                    path.as_deref()
+                };
+                vec![(*fd, path, !nofollow)]
+            }
             Self::Times { times: Some(t), .. } if t.iter().all(|pair| pair[1] == UTIME_OMIT) => {
                 Vec::new()
             }
@@ -351,6 +384,9 @@ impl NamespaceCall {
                 empty,
             } => match path {
                 Some(path) => v.chmod_at_flags(*fd, path, *mode, *nofollow)?,
+                None if *empty && *fd == AT_FDCWD => {
+                    v.chmod_at_flags(*fd, b".", *mode, *nofollow)?
+                }
                 None if *empty => v.chmod_fd_at(*fd as u32, *mode)?,
                 None => v.chmod_fd(*fd as u32, *mode)?,
             },
@@ -363,6 +399,9 @@ impl NamespaceCall {
                 empty,
             } => match path {
                 Some(path) => v.chown_at(*fd, path, *uid, *gid, *nofollow)?,
+                None if *empty && *fd == AT_FDCWD => {
+                    v.chown_at(*fd, b".", *uid, *gid, *nofollow)?
+                }
                 None if *empty => v.chown_fd_at(*fd as u32, *uid, *gid)?,
                 None => v.chown_fd(*fd as u32, *uid, *gid)?,
             },
@@ -410,6 +449,7 @@ impl NamespaceCall {
 }
 pub(super) struct NamespaceWork {
     call: NamespaceCall,
+    revalidated: bool,
     host_work: bool,
     waiting: Option<Arc<mounts::admin::Admin>>,
     fuse: Option<Box<fuse::Metadata>>,
@@ -603,6 +643,7 @@ impl PathQueries {
                 .then(|| Arc::new(SharedCell::default()));
             let mut work = NamespaceWork {
                 call,
+                revalidated: false,
                 paths,
                 host_work,
                 waiting: None,
@@ -643,6 +684,7 @@ impl PathQueries {
             paths,
             NamespaceWork {
                 call,
+                revalidated: false,
                 paths: accepted_paths,
                 host_work,
                 waiting: None,
@@ -653,6 +695,73 @@ impl PathQueries {
     }
 }
 impl NamespaceWork {
+    fn complete(
+        &mut self,
+        view: &mut Vfs,
+        value: Result<FileValue>,
+        stale_retry: bool,
+    ) -> NamespaceRun {
+        if matches!(value, Err(Errno(116)))
+            && stale_retry
+            && !self.revalidated
+            && self.call.stale_retry()
+        {
+            self.revalidated = true;
+            // An explicit native revalidation starts another pathname attempt.
+            // Waiting, page copy and daemon interruption never enter here.
+            self.fuse = None;
+            self.parents = None;
+            self.waiting = None;
+            if let Some(paths) = &self.paths {
+                *paths.borrow_mut() = AcceptedPaths::default();
+            }
+            view.query
+                .as_ref()
+                .unwrap()
+                .metadata_entry
+                .borrow_mut()
+                .take();
+            if let Some(namespace) = view.mounts.as_ref().and_then(MountNamespace::original) {
+                // root/cwd and the live registry name these original mount
+                // objects. A fresh projection cannot follow their attachments.
+                view.mounts = Some(namespace);
+            }
+            let aliases: BTreeMap<_, _> = view
+                .query
+                .as_ref()
+                .unwrap()
+                .accepted
+                .as_ref()
+                .into_iter()
+                .flat_map(|files| files.iter())
+                .filter(|(fd, _)| **fd >= MAX_FDS)
+                .map(|(fd, file)| (*fd, file.clone()))
+                .collect();
+            self.host_work = prepare_namespace(view, &self.call);
+            view.query
+                .as_mut()
+                .unwrap()
+                .accepted
+                .as_mut()
+                .unwrap()
+                .extend(aliases);
+            // Owner-only numeric operands also need their new admission. Fixed
+            // retained/peer aliases still override these observation slots.
+            let query = view.query.as_ref().unwrap();
+            for (&fd, file) in query.accepted.as_ref().unwrap() {
+                if file.is_none() {
+                    if let Ok(descriptor) = query.files.observation_descriptor(fd) {
+                        view.fds.insert(fd, descriptor);
+                    } else {
+                        view.fds.remove(&fd);
+                    }
+                }
+            }
+            view.query.as_ref().unwrap().clear_deferred();
+            return self.execute(view);
+        }
+        NamespaceRun::Complete(value)
+    }
     pub(super) fn fuse_request(&self) -> Option<&fuse::Metadata> {
         self.parents
             .as_ref()
@@ -773,11 +882,14 @@ impl NamespaceWork {
                 if FileResources::needed(&value) {
                     f.retain_output();
                 }
-                return NamespaceRun::Complete(value);
+                let stale_retry = f.namespace_stale_retry();
+                return self.complete(view, value, stale_retry);
             }
-            return f
-                .take(view)
-                .map_or(NamespaceRun::Waiting, NamespaceRun::Complete);
+            let Some(value) = f.take(view) else {
+                return NamespaceRun::Waiting;
+            };
+            let stale_retry = f.namespace_stale_retry();
+            return self.complete(view, value, stale_retry);
         }
         self.waiting = None;
         let admin = if self.call.topology() {
@@ -908,6 +1020,48 @@ impl NamespaceWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_chmod_and_chown_at_fdcwd_use_the_live_cwd_instead_of_a_numeric_descriptor() {
+        let mut owner = Vfs::default();
+        owner.mkdir_at(AT_FDCWD, b"/before", 0o755).unwrap();
+        owner.mkdir_at(AT_FDCWD, b"/after", 0o755).unwrap();
+        owner.chdir(b"/before").unwrap();
+        let paths = owner.path_queries();
+        owner.chdir(b"/after").unwrap();
+        assert_eq!(
+            count(paths.namespace_work(NamespaceCall::Chmod {
+                fd: AT_FDCWD,
+                path: None,
+                mode: 0o711,
+                nofollow: false,
+                empty: true,
+            })),
+            Ok(0)
+        );
+        assert_eq!(
+            count(paths.namespace_work(NamespaceCall::Chown {
+                fd: AT_FDCWD,
+                path: None,
+                uid: 42,
+                gid: 43,
+                nofollow: false,
+                empty: true,
+            })),
+            Ok(0)
+        );
+        let before = owner.stat_at(AT_FDCWD, b"/before").unwrap();
+        let after = owner.stat_at(AT_FDCWD, b"/after").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(before[16..20].try_into().unwrap()) & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            u32::from_le_bytes(after[16..20].try_into().unwrap()) & 0o7777,
+            0o711
+        );
+        assert_eq!(u32::from_le_bytes(after[24..28].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(after[28..32].try_into().unwrap()), 43);
+    }
     #[test]
     fn executing_namespace_io_pins_only_walked_mounts_until_completion() {
         use std::time::{Duration, Instant};

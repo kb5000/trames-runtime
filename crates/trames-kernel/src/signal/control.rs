@@ -6,11 +6,13 @@ impl IoTask {
         self.inbox.bits() | self.process().bits()
     }
     pub fn mask_call(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        let new = update_mask(self.mask(), a, memory)?;
-        if let Some(mask) = new {
+        let old = self.mask();
+        let input = MaskInput::import(a, memory)?;
+        if let Some(mask) = input.apply(self.mask()) {
             self.context.lock().unwrap().mask = mask;
             self.publish_mask(mask);
         }
+        export_mask(old, a[2], memory)?;
         Ok(0)
     }
     pub fn pending_call(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
@@ -22,12 +24,17 @@ impl IoTask {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
-        if a[1] != 8 {
+        if a[1] > 8 {
             return Err(Errno(22));
         }
-        memory
-            .write_array(a[0], (self.pending_bits() & mask).to_le_bytes())
-            .map_err(|_| Errno(14))?;
+        if a[1] != 0 {
+            memory
+                .write(
+                    a[0],
+                    &(self.pending_bits() & mask).to_le_bytes()[..a[1] as usize],
+                )
+                .map_err(|_| Errno(14))?;
+        }
         Ok(0)
     }
     pub fn alt_stack_call(
@@ -36,11 +43,14 @@ impl IoTask {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
-        self.context
-            .lock()
-            .unwrap()
-            .alt_stack
-            .call(sp, a[0], a[1], memory)
+        let next = AltStack::import(memory, a[0])?;
+        let previous = self.context.lock().unwrap().alt_stack.exchange(sp, next)?;
+        if a[1] != 0 {
+            memory
+                .write_array(a[1], previous.encode(sp))
+                .map_err(|_| Errno(14))?;
+        }
+        Ok(0)
     }
     pub fn dequeue(&self, mask: u64) -> Option<(u32, RetainedInfo)> {
         self.inbox
@@ -58,37 +68,50 @@ impl IoTask {
     }
 }
 
-/// One transactional ABI, independent of which executor currently owns the task.
-pub(super) fn update_mask(
-    old: u64,
-    a: [u64; 6],
-    memory: &mut impl CpuMemory,
-) -> Result<Option<u64>, Errno> {
-    if a[3] != 8 {
-        return Err(Errno(22));
+/// Parsed input contains no borrowed memory. Its actual owner chooses the
+/// current mask at the single state mutation, retaining the entry predecessor.
+pub(super) struct MaskInput {
+    how: u32,
+    bits: Option<u64>,
+}
+impl MaskInput {
+    pub fn import(a: [u64; 6], memory: &impl CpuMemory) -> Result<Self, Errno> {
+        if a[3] != 8 {
+            return Err(Errno(22));
+        }
+        let bits = if a[1] == 0 {
+            None
+        } else {
+            Some(u64::from_le_bytes(
+                memory.read_array::<8>(a[1]).map_err(|_| Errno(14))?,
+            ))
+        };
+        let how = a[0] as u32;
+        if bits.is_some() && how > 2 {
+            return Err(Errno(22));
+        }
+        Ok(Self { how, bits })
     }
-    if a[2] != 0 {
-        memory
-            .check(a[2], 8, trames_memory::Access::Write)
-            .map_err(|_| Errno(14))?;
-    }
-    let new = if a[1] != 0 {
-        let bits = u64::from_le_bytes(memory.read_array::<8>(a[1]).map_err(|_| Errno(14))?);
-        Some(
-            match a[0] {
-                0 => old | bits,
-                1 => old & !bits,
+    pub fn apply(&self, current: u64) -> Option<u64> {
+        self.bits.map(|bits| {
+            (match self.how {
+                0 => current | bits,
+                1 => current & !bits,
                 2 => bits,
-                _ => return Err(Errno(22)),
-            } & !UNBLOCKABLE,
-        )
-    } else {
-        None
-    };
-    if a[2] != 0 {
+                _ => unreachable!(),
+            }) & !UNBLOCKABLE
+        })
+    }
+}
+pub(super) fn export_mask(
+    old: u64,
+    address: u64,
+    memory: &mut impl CpuMemory,
+) -> Result<(), Errno> {
+    if address != 0 {
         memory
-            .write_array(a[2], old.to_le_bytes())
+            .write_array(address, old.to_le_bytes())
             .map_err(|_| Errno(14))?;
     }
-    Ok(new)
+    Ok(())
 }

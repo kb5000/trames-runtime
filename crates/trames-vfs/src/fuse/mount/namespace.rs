@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Accepted namespace operands and daemon-owned directory mutations.
 use super::*;
+pub(super) mod locks;
 
 pub(crate) struct PathPlan {
     pub(super) mount: Arc<mounts::MountData>,
@@ -101,11 +102,19 @@ impl Frame {
             _reference: Some(reference),
         })
     }
-    fn lookup(fs: &Arc<Mounted>, caller: Caller, bytes: &[u8], version: u64) -> Result<Self> {
+    fn lookup(
+        fs: &Arc<Mounted>,
+        caller: Caller,
+        bytes: &[u8],
+        version: u64,
+        parent: (&NodeRef, &[u8]),
+    ) -> Result<Self> {
         if bytes.len() == 128 && bytes[..8] == [0; 8] {
             return Err(Errno(2));
         }
-        Self::entry(fs, caller, bytes, version, None)
+        let mut frame = Self::entry(fs, caller, bytes, version, None)?;
+        frame.retain_inode(fs, parent.0, parent.1)?;
+        Ok(frame)
     }
     fn retain_directory(&mut self, fs: &Mounted, parent: &NodeRef, name: &[u8]) -> Result<NodeRef> {
         if let Some(node) = &self.directory {
@@ -119,6 +128,27 @@ impl Frame {
             self.version,
             self.validity,
         )?;
+        self.directory = Some(node.clone());
+        Ok(node)
+    }
+    fn retain_inode(&mut self, fs: &Mounted, parent: &NodeRef, name: &[u8]) -> Result<NodeRef> {
+        if self.kind() == 0o040000 {
+            return self.retain_directory(fs, parent, name);
+        }
+        if let Some(node) = &self.directory {
+            return Ok(node.clone());
+        }
+        let node = fs.leaf_inode(
+            self._reference.as_ref().unwrap(),
+            self.generation,
+            parent,
+            &mut self.attr,
+            self.version,
+            self.validity,
+        )?;
+        let reference = self._reference.as_mut().unwrap();
+        reference.leaf = Some(node.clone());
+        reference.entry = Some(fs.entries.bind(&node, parent, name));
         self.directory = Some(node.clone());
         Ok(node)
     }
@@ -228,6 +258,7 @@ enum ParentAfter {
 }
 #[derive(Clone, Copy)]
 enum Phase {
+    Lock(AfterLock),
     ParentPermission(bool, u32, ParentAfter),
     LinkPermission,
     MovePermission(bool),
@@ -239,11 +270,20 @@ enum Phase {
     EmptyReply,
     EntryReply(u32),
 }
+#[derive(Clone, Copy)]
+enum AfterLock {
+    Start,
+    Create,
+    SourceFound,
+    Rename,
+}
 pub(super) enum Step {
+    Blocked,
     Waiting(Arc<Request>),
     Complete(FileValue),
 }
 pub(super) struct Mutation {
+    locks: locks::Locks,
     _writer: mapped::MountWrite,
     source: MutationParent,
     dest: Option<MutationParent>,
@@ -260,6 +300,65 @@ pub(super) struct Mutation {
     pending_check: Option<posix::Check>,
 }
 impl Mutation {
+    pub(super) fn stale_retry(&self) -> bool {
+        match self.action {
+            Action::Unlink { .. } | Action::Rename { .. } => true,
+            // filename_create errors leave mkdir/mknod/symlink/link before
+            // their outer retry label. Only the admitted mutation may retry.
+            _ => matches!(
+                self.phase,
+                Phase::EmptyReply
+                    | Phase::EntryReply(_)
+                    | Phase::LinkPermission
+                    | Phase::ParentPermission(_, _, ParentAfter::Create)
+            ),
+        }
+    }
+    fn blocked(&mut self, after: AfterLock) -> Step {
+        self.phase = Phase::Lock(after);
+        Step::Blocked
+    }
+    pub(super) fn waiting_lock(&self) -> bool {
+        matches!(self.phase, Phase::Lock(_))
+    }
+    pub(super) fn lock_ready(&self) -> bool {
+        self.locks.ready()
+    }
+    pub(super) fn subscribe_lock(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
+        self.locks.subscribe(signal)
+    }
+    pub(super) fn resume_lock(&mut self) -> Result<Step> {
+        let Phase::Lock(after) = self.phase else {
+            unreachable!()
+        };
+        match after {
+            AfterLock::Start => self.start(),
+            AfterLock::Create => self.create(),
+            AfterLock::SourceFound => self.source_found(),
+            AfterLock::Rename => self.rename(),
+        }
+    }
+    fn start(&mut self) -> Result<Step> {
+        if !self.locks.parents(
+            &self.source.path.fs,
+            &self.source.path.start_directory,
+            self.dest.as_ref().map(|dest| &dest.path.start_directory),
+        )? {
+            return Ok(self.blocked(AfterLock::Start));
+        }
+        self.phase = Phase::SourceParent;
+        match self.source.start()? {
+            Some(request) => Ok(Step::Waiting(request)),
+            None => self.source_ready(),
+        }
+    }
+    pub(super) fn reply_inode(&self, id: u64) -> Option<NodeRef> {
+        self.source
+            .path
+            .fs
+            .attribute_target(id)
+            .or_else(|| self.dest.as_ref()?.path.fs.attribute_target(id))
+    }
     fn frame_permission(&self, frame: &Frame, mask: u32) -> Result<bool> {
         let word = |i| u32::from_le_bytes(frame.attr[i..i + 4].try_into().unwrap());
         let ns = &self.source.path.fs.namespace;
@@ -500,12 +599,18 @@ impl Mutation {
                     return Err(Errno(2));
                 }
                 let id = source.node.fuse_leaf.get().ok_or(Errno(18))?.node;
+                let kind = node.mode & 0o170000;
+                let inode = source.node.clone();
+                drop(node);
+                if !self.locks.child(&inode) {
+                    return Ok(self.blocked(AfterLock::Create));
+                }
                 // VFS source checks precede the daemon's cached capability.
                 if self.source.path.fs.link_unsupported.load(Ordering::Relaxed) {
                     return Err(Errno(1));
                 }
                 body.extend(id.to_le_bytes());
-                (13, node.mode & 0o170000)
+                (13, kind)
             }
             Action::Unlink { .. } | Action::Rename { .. } => {
                 unreachable!()
@@ -535,6 +640,16 @@ impl Mutation {
                 let is_directory = target.kind() == 0o040000;
                 if directory != is_directory {
                     return Err(Errno(if is_directory { 21 } else { 20 }));
+                }
+                let parent = self.source.path.start_directory.clone();
+                let name = self.source.name.clone();
+                let target = self.source_entry.as_mut().unwrap().retain_inode(
+                    &self.source.path.fs,
+                    &parent,
+                    &name,
+                )?;
+                if !self.locks.child(&target) {
+                    return Ok(self.blocked(AfterLock::SourceFound));
                 }
                 let mut body = self.source.name.clone();
                 body.push(0);
@@ -639,6 +754,47 @@ impl Mutation {
         {
             return Err(Errno(22));
         }
+        // Linux locks moved subdirectories source first, then regular inodes
+        // in pointer order. A same-parent rename need not lock its source dir.
+        let cross = !Arc::ptr_eq(
+            &self.source.path.start_directory,
+            &dest.path.start_directory,
+        );
+        let source_needed = source.kind() != 0o040000 || cross;
+        let dest_needed =
+            dest_entry.is_some_and(|entry| entry.kind() != 0o040000 || cross || flags != 2);
+        let mut nodes = Vec::new();
+        if source_needed {
+            nodes.push(self.source_entry.as_mut().unwrap().retain_inode(
+                &self.source.path.fs,
+                &self.source.path.start_directory,
+                &self.source.name,
+            )?);
+        }
+        if dest_needed {
+            let dest = self.dest.as_ref().unwrap();
+            nodes.push(self.dest_entry.as_mut().unwrap().retain_inode(
+                &self.source.path.fs,
+                &dest.path.start_directory,
+                &dest.name,
+            )?);
+        }
+        nodes.sort_by_key(|node| {
+            (
+                !node.directory,
+                if node.directory {
+                    0
+                } else {
+                    Arc::as_ptr(node) as usize
+                },
+            )
+        });
+        for node in &nodes {
+            if !self.locks.child(node) {
+                return Ok(self.blocked(AfterLock::Rename));
+            }
+        }
+        let dest = self.dest.as_ref().unwrap();
         let mut body = dest.frame().node.to_le_bytes().to_vec();
         if flags != 0 {
             body.extend(flags.to_le_bytes());
@@ -655,24 +811,35 @@ impl Mutation {
             &body,
         )
     }
-    fn publish_directory_changes(&self) {
+    fn publish_directory_changes(&self) -> Result<()> {
         let Some(source) = &self.source_entry else {
-            return;
+            return Ok(());
         };
         let fs = &self.source.path.fs;
+        fs.inode_changed(&self.source.path.start_directory);
+        if let Some(dest) = &self.dest {
+            if !Arc::ptr_eq(
+                &self.source.path.start_directory,
+                &dest.path.start_directory,
+            ) {
+                fs.inode_changed(&dest.path.start_directory);
+            }
+        }
         let source_node = fs.known_directory(source.node, source.generation);
         let unlink = |node: NodeRef, parent: &NodeRef| {
             let _ = node.removed_directory_parent.set(parent.clone());
             node.fuse_directory.get().unwrap().unlink();
+            fs.entry_unlinked(&node);
         };
         match &self.action {
             Action::Unlink { directory: false } => {
                 if let Some(node) = fs.known_leaf(source.node, source.generation) {
-                    let mut value = node.borrow_mut();
-                    value.links = value.links.saturating_sub(1);
-                    let mut attr = node.fuse_leaf.get().unwrap().attr.lock().unwrap();
-                    attr[64..68].copy_from_slice(&value.links.to_le_bytes());
-                    attr.version = fs.connection.next_attr_version();
+                    fs.entries.unlink(
+                        self.source.frame().directory.as_ref().unwrap(),
+                        &self.source.name,
+                        &node,
+                    );
+                    fs.entry_unlinked(&node);
                 }
             }
             Action::Unlink { directory: true } => {
@@ -682,33 +849,85 @@ impl Mutation {
             }
             Action::Rename { flags } => {
                 let dest = self.dest.as_ref().unwrap();
+                if let Some(node) = source
+                    .directory
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| fs.known_directory(source.node, source.generation))
+                {
+                    fs.inode_changed(&node);
+                }
                 let dest_node = self
                     .dest_entry
                     .as_ref()
                     .and_then(|entry| fs.known_directory(entry.node, entry.generation));
-                if let Some(node) = source_node {
-                    node.fuse_directory.get().unwrap().rename(
-                        dest.frame().directory.as_ref().unwrap().clone(),
-                        dest.name.clone(),
-                    );
-                }
+                let source_hint = source_node
+                    .as_ref()
+                    .map(|node| node.fuse_directory.get().unwrap().entry.clone())
+                    .or_else(|| {
+                        fs.known_leaf(source.node, source.generation)
+                            .and_then(|node| {
+                                fs.entries.matching(
+                                    self.source.frame().directory.as_ref().unwrap(),
+                                    &self.source.name,
+                                    &node,
+                                )
+                            })
+                    });
+                let dest_hint = dest_node
+                    .as_ref()
+                    .map(|node| node.fuse_directory.get().unwrap().entry.clone())
+                    .or_else(|| {
+                        self.dest_entry
+                            .as_ref()
+                            .and_then(|entry| fs.known_leaf(entry.node, entry.generation))
+                            .and_then(|node| {
+                                fs.entries.matching(
+                                    dest.frame().directory.as_ref().unwrap(),
+                                    &dest.name,
+                                    &node,
+                                )
+                            })
+                    });
+                fs.entries.rename(
+                    (
+                        self.source.frame().directory.as_ref().unwrap(),
+                        &self.source.name,
+                        source_hint,
+                    ),
+                    (
+                        dest.frame().directory.as_ref().unwrap(),
+                        &dest.name,
+                        dest_hint,
+                    ),
+                    *flags == 2,
+                    false,
+                )?;
                 if let Some(node) = dest_node {
-                    let parent = self.source.frame().directory.as_ref().unwrap();
-                    if *flags == 2 {
-                        node.fuse_directory
-                            .get()
-                            .unwrap()
-                            .rename(parent.clone(), self.source.name.clone());
-                    } else {
+                    if *flags != 2 {
                         unlink(node, dest.frame().directory.as_ref().unwrap());
+                    } else {
+                        fs.inode_changed(&node);
+                    }
+                } else if let Some(node) = self
+                    .dest_entry
+                    .as_ref()
+                    .and_then(|entry| fs.known_leaf(entry.node, entry.generation))
+                {
+                    if *flags != 2 {
+                        fs.entry_unlinked(&node);
+                    } else {
+                        fs.inode_changed(&node);
                     }
                 }
             }
             _ => {}
         }
+        Ok(())
     }
     pub(super) fn advance(&mut self, result: Result<Vec<u8>>, version: u64) -> Result<Step> {
         match self.phase {
+            Phase::Lock(_) => unreachable!("inode admission has no daemon reply"),
             Phase::ParentPermission(dest, mask, after) => {
                 let parent = if dest {
                     self.dest.as_ref().unwrap()
@@ -791,6 +1010,7 @@ impl Mutation {
                     self.source.caller,
                     &result?,
                     version,
+                    (&self.source.path.start_directory, &self.source.name),
                 )?);
                 self.source_found()
             }
@@ -804,6 +1024,7 @@ impl Mutation {
                             self.source.caller,
                             &bytes,
                             version,
+                            (&self.source.path.start_directory, &self.source.name),
                         )?);
                         return Err(Errno(17));
                     }
@@ -819,12 +1040,15 @@ impl Mutation {
             Phase::DestEntry => {
                 self.dest_entry = match result {
                     Ok(bytes) if bytes.len() == 128 && bytes[..8] == [0; 8] => None,
-                    Ok(bytes) => Some(Frame::entry(
+                    Ok(bytes) => Some(Frame::lookup(
                         &self.source.path.fs,
                         self.source.caller,
                         &bytes,
                         version,
-                        None,
+                        (
+                            &self.dest.as_ref().unwrap().path.start_directory,
+                            &self.dest.as_ref().unwrap().name,
+                        ),
                     )?),
                     Err(Errno(2)) => None,
                     Err(error) => return Err(error),
@@ -845,7 +1069,7 @@ impl Mutation {
                 if !result?.is_empty() {
                     return Err(Errno(5));
                 }
-                self.publish_directory_changes();
+                self.publish_directory_changes()?;
                 Ok(Step::Complete(FileValue::Count(0)))
             }
             Phase::EntryReply(kind) => {
@@ -884,6 +1108,7 @@ impl Mutation {
                         entry.validity,
                     )?;
                 }
+                self.source.path.fs.inode_changed(parent);
                 Ok(Step::Complete(FileValue::Count(0)))
             }
         }
@@ -908,9 +1133,9 @@ impl Metadata {
         let dev = path.mount.device();
         let owner_ns = path.fs.namespace.clone();
         let writer = mapped::MountWrite::new(&path.mount.identity)?;
-        let mut source = MutationParent::new(path, caller);
-        let request = source.start()?;
+        let source = MutationParent::new(path, caller);
         let mut mutation = Box::new(Mutation {
+            locks: Default::default(),
             _writer: writer,
             source,
             dest: dest.map(|d| MutationParent::new(d, caller)),
@@ -926,15 +1151,13 @@ impl Metadata {
             parent_grants: 0,
             pending_check: None,
         });
-        let request = match request {
-            Some(request) => request,
-            None => match mutation.source_ready()? {
-                Step::Waiting(request) => request,
-                Step::Complete(_) => unreachable!("initial namespace stage must resolve its leaf"),
-            },
+        let request = match mutation.start()? {
+            Step::Waiting(request) => Some(request),
+            Step::Blocked => None,
+            Step::Complete(_) => unreachable!("initial namespace stage must resolve its leaf"),
         };
         Ok(Self {
-            request: Some(request),
+            request,
             kind: ResultKind::Mutation(mutation),
             _usage: None,
             resolved: None,
@@ -945,6 +1168,7 @@ impl Metadata {
             dev,
             owner_ns,
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
 }

@@ -984,12 +984,16 @@ mod tests {
                 (0x1800, 64, 1, 64),
                 (0x1800, 64, 2, 64),
                 (0x1800, 64, 3, 64),
+                (0x1800, 64, 4, 64),
+                (0x1800, 64, 5, 64),
                 (0x1800, 64, 1u64 << 32, 64),
                 (u64::MAX, 0, 0, -14),
                 (0, 0, 0, 0),
                 (0, 1, 0, -14),
                 (u64::MAX, 1, 0, -14),
-                (u64::MAX, 1, 4, -22),
+                (u64::MAX, 1, 4, -14),
+                (u64::MAX, 1, 6, -22),
+                (u64::MAX, 1, 8, -22),
                 (0x4000, 32, 0, -14),
             ] {
                 let mut p = super::super::tests::process();
@@ -2761,7 +2765,7 @@ mod tests {
                     timers: None,
 
                     saved_wait_mask: Default::default(),
-                    io_signals: Default::default(),
+                    io_signals: p.signals.io.clone(),
                     io_routes: Default::default(),
                     io_wake: None,
                     seccomp: p.seccomp.clone(),
@@ -2777,7 +2781,8 @@ mod tests {
                     program_break: p.linux.program_break(),
                     uts: None,
                     futex: Default::default(),
-                    direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors()),
+                    direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                        .with_task_signal(p.signals.io.clone()),
                 };
                 let task = snapshot.io_signals.clone();
                 let control = Arc::new(crate::workers::Control::new(1000));
@@ -4636,9 +4641,26 @@ mod tests {
                     direct: Default::default(),
                     futex: Default::default(),
                 };
-                assert_eq!(snapshot.admit(&p.cpu), allowed);
-                if allowed {
-                    assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
+                if number == 29 {
+                    // Status ioctls now retain their own entry decision and
+                    // input-copy cursor instead of the legacy scalar route.
+                    let entry = snapshot.task_entry(&p.cpu).unwrap();
+                    assert_eq!(entry.allowed(), allowed);
+                    if allowed {
+                        let mut call = trames_kernel::signal::FdControlCall::new(
+                            &snapshot.io_signals,
+                            snapshot.io_routes.clone(),
+                            &snapshot.fd_flags,
+                            number as u32,
+                            [fd as u64, command, argument, 0, 0, 0],
+                        );
+                        assert_eq!(call.check(&mut p.memory), Some(Ok(0)));
+                    }
+                } else {
+                    assert_eq!(snapshot.admit(&p.cpu), allowed);
+                    if allowed {
+                        assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
+                    }
                 }
                 assert_eq!(p.linux.vfs.flags(fd).unwrap() & bit != 0, allowed);
             }

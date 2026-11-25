@@ -153,6 +153,7 @@ fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
     let caps = files.capture(&l.vfs, true);
     let mut epoch = UringEpoch::default();
     let d = direct(&l, &m, &mut epoch, &caps);
+    let t = target();
     m.write(0x2100, b"x").unwrap();
     m.write(0x2200, &0x2100u64.to_le_bytes()).unwrap();
     m.write(0x2208, &1u64.to_le_bytes()).unwrap();
@@ -201,9 +202,22 @@ fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
                     &mut m,
                     &mut crate::CapturedOutput::default(),
                 );
+                let actual = match d.invoke(number, args, &mut m) {
+                    Some(value) => value,
+                    None => {
+                        // The inline hint can retain a typed byte/file entry
+                        // even when this fixture's destination is resident.
+                        let Some(IoAttempt::Complete(value)) =
+                            d.start(number, args, &mut m, 7, &Arc::downgrade(&t), None)
+                        else {
+                            panic!("resident device ABI must finish its original continuation")
+                        };
+                        value
+                    }
+                };
                 assert_eq!(
-                    d.invoke(number, args, &mut m),
-                    Some(expected),
+                    actual,
+                    expected,
                     "{} syscall {number} args {args:?}",
                     String::from_utf8_lossy(path)
                 );
@@ -285,7 +299,7 @@ fn native_device_opens_and_bridge_requests_use_original_source_resources() {
     }
 }
 #[test]
-fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancellation() {
+fn mapped_layout_sqe_uses_source_resource_and_cancels_before_host_restart() {
     struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
     impl FileExecutor for Queue {
         fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
@@ -346,17 +360,26 @@ fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancella
         m.commit_parallel().unwrap();
         let request = driver.take_ready().pop().unwrap();
         assert!(layouts.try_submit(request).is_ok());
-        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        result.complete(work.run());
         if !cancel {
+            let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            result.complete(work.run());
             assert!(matches!(
                 enter(&d, ring_fd, 0, 0, &mut m, &t),
                 IoAttempt::Complete(Ok(0))
             ));
             assert_eq!(cq(&mut m, &ring), (991, 0));
+        } else {
+            assert!(
+                receive.try_recv().is_err(),
+                "cancelled layout cannot start another host job"
+            );
+            assert_eq!(cq(&mut m, &ring), (991, -125));
         }
         let original = l.vfs.open_at(-100, b"/mapped", 0, 0).unwrap();
-        assert_eq!(l.vfs.read(original, 32).unwrap(), [7]);
+        assert_eq!(
+            l.vfs.read(original, 32).unwrap(),
+            if cancel { vec![7; 32] } else { vec![7] }
+        );
         assert!(!layouts.pending());
         assert!(receive.try_recv().is_err());
         drop(d);
@@ -539,8 +562,13 @@ fn registrations_remain_live_across_snapshots_and_source_fd_reuse() {
     let t = target();
     m.write_array(0x2000, a.to_le_bytes()).unwrap();
     assert!(matches!(
-        d.urings
-            .register([fd as u64, 2, 0x2000, 1, 0, 0], &mut m, 7),
+        d.urings.register(
+            [fd as u64, 2, 0x2000, 1, 0, 0],
+            &mut m,
+            7,
+            &d,
+            &Arc::downgrade(&t)
+        ),
         Some(IoAttempt::Complete(Ok(0)))
     ));
     let mut read = scalar(22, 0, 0x2200, 1, 1);
@@ -554,8 +582,13 @@ fn registrations_remain_live_across_snapshots_and_source_fd_reuse() {
     m.write_array(0x2108, 0x2000u64.to_le_bytes()).unwrap();
     m.write_array(0x2000, b.to_le_bytes()).unwrap();
     assert!(matches!(
-        d.urings
-            .register([fd as u64, 6, 0x2100, 1, 0, 0], &mut m, 7),
+        d.urings.register(
+            [fd as u64, 6, 0x2100, 1, 0, 0],
+            &mut m,
+            7,
+            &d,
+            &Arc::downgrade(&t)
+        ),
         Some(IoAttempt::Complete(Ok(1)))
     ));
     l.vfs.close(a).unwrap();
@@ -672,7 +705,7 @@ fn retained_enter_survives_cohort_stop_close_reuse_and_unmapped_queue() {
     let (replacement, new_ring) = l.vfs.uring_create(4, 8).unwrap();
     assert_eq!(fd, replacement);
     l.vfs.write(writer, b"r").unwrap();
-    let old_ring = call.ring.clone();
+    let old_ring = call.ring().unwrap();
     let mut next = UringEpoch::default();
     let d = direct(&l, &m, &mut next, &Default::default());
     assert!(matches!(
@@ -761,14 +794,20 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
             close.upgrade().is_some(),
             "queued host work lost its original OFD"
         );
-        result.complete(job.run());
+        let outcome = job.run();
         assert!(matches!(
-            result.take(),
-            Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+            &outcome,
+            trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
                 result: Ok(trames_vfs::FileValue::Count(0)),
                 ..
-            }))
+            })
         ));
+        result.complete(outcome);
+        assert!(result.finished());
+        assert!(
+            result.take().is_none(),
+            "closed ring cannot publish a late result"
+        );
         drop(result);
         assert!(
             close.upgrade().is_none(),
@@ -824,7 +863,13 @@ fn proc_control_registered_files_keep_original_resource_and_complete_on_source()
     assert_eq!(completion.1, 2);
     assert_eq!(m.read_array::<2>(0x2200).unwrap(), *b"0\n");
     assert!(matches!(
-        d.urings.register([fd as u64, 3, 0, 0, 0, 0], &mut m, 7),
+        d.urings.register(
+            [fd as u64, 3, 0, 0, 0, 0],
+            &mut m,
+            7,
+            &d,
+            &Arc::downgrade(&t)
+        ),
         Some(IoAttempt::Complete(Ok(0)))
     ));
     assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
@@ -849,6 +894,7 @@ fn shared_volatile_registered_file_completes_its_original_body_on_source() {
     assert!(files.capture_uring(&l.vfs, true).is_empty());
     let mut epoch = UringEpoch::default();
     let d = direct(&l, &m, &mut epoch, &Default::default());
+    let t = target();
     let mut read = scalar(22, 0, 0x2200, 512, 77);
     read[1] = 1;
     add(&mut m, &r, read);
@@ -862,7 +908,13 @@ fn shared_volatile_registered_file_completes_its_original_body_on_source() {
     assert!(completion.1 > 0);
     assert_eq!(&m.read_array::<5>(0x2200).unwrap(), b"Linux");
     assert!(matches!(
-        d.urings.register([fd as u64, 3, 0, 0, 0, 0], &mut m, 7),
+        d.urings.register(
+            [fd as u64, 3, 0, 0, 0, 0],
+            &mut m,
+            7,
+            &d,
+            &Arc::downgrade(&t)
+        ),
         Some(IoAttempt::Complete(Ok(0)))
     ));
     assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
@@ -896,7 +948,7 @@ fn capability_less_embedding_defers_before_import_and_original_caller_can_comple
     let t = target();
     assert!(matches!(
         enter(&d, fd, 1, 1, &mut m, &t),
-        IoAttempt::Checkpoint
+        IoAttempt::FileCheckpoint(_)
     ));
     assert_eq!(ring.load_queue(0), 0);
     assert_eq!(ring.cq_ready(), 0);
@@ -1218,7 +1270,7 @@ fn credential_drop_keeps_accepted_sqe_authority_but_rejects_future_opens() {
 }
 
 #[test]
-fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump() {
+fn corrupt_cq_during_accepted_enter_preserves_submissions_without_replay_or_owner_pump() {
     for complete_before_repair in [false, true] {
         let (mut l, mut m, fd, ring) = setup(8);
         let [reader, writer] = l.vfs.pipe(0).unwrap();
@@ -1235,7 +1287,9 @@ fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump()
         }
         assert!(matches!(
             d.urings.resume(wait, &mut m),
-            IoAttempt::Complete(Err(Errno(22)))
+            // The wait-side error cannot replace an already positive native
+            // submission result. The CQ itself still needs repair below.
+            IoAttempt::Complete(Ok(1))
         ));
         assert_eq!(ring.load_queue(0), 1);
         assert!(!ring.state.lock().unwrap().waits.contains_key(&7));

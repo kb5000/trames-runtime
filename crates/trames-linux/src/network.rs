@@ -420,13 +420,13 @@ pub(super) fn address(memory: &impl CpuMemory, pointer: u64, length: u64) -> Res
     Ok(bytes)
 }
 #[derive(Clone, Copy)]
-struct AddressOutput {
+pub(crate) struct AddressOutput {
     pointer: u64,
     length_pointer: u64,
     capacity: usize,
 }
 impl AddressOutput {
-    fn prepare(
+    pub(crate) fn prepare(
         memory: &impl CpuMemory,
         pointer: u64,
         length_pointer: u64,
@@ -456,7 +456,7 @@ impl AddressOutput {
         let bytes = address.map_or_else(Vec::new, encode_address);
         self.write_bytes(memory, &bytes)
     }
-    fn write_bytes(self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_bytes(self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
         memory
             .write(self.pointer, &bytes[..bytes.len().min(self.capacity)])
             .map_err(|_| Errno(14))?;
@@ -737,15 +737,12 @@ impl Linux {
             }
         }
         if request != 0x5421 {
-            let devices = vfs.network_devices();
             if request == 0x8912 {
                 // SIOCGIFCONF: AArch64 ifconf and two IPv4 ifreq entries.
-                let capacity = u32_at(memory, a[2])?;
-                if capacity > i32::MAX as u32 {
-                    return Err(Errno(22));
-                }
-                let pointer = u64_at(memory, a[2] + 8)?;
-                Self::check(memory, a[2], 16, Access::Write)?;
+                let header = memory.read_array::<16>(a[2]).map_err(|_| Errno(14))?;
+                let capacity = i32::from_le_bytes(header[..4].try_into().unwrap()).max(0) as usize;
+                let pointer = u64::from_le_bytes(header[8..16].try_into().unwrap());
+                let devices = vfs.network_devices();
                 let interfaces: Vec<_> = devices
                     .iter()
                     .flat_map(|d| {
@@ -761,20 +758,19 @@ impl Linux {
                 let size = if pointer == 0 {
                     interfaces.len() * 40
                 } else {
-                    (capacity as usize / 40).min(interfaces.len()) * 40
+                    (capacity / 40).min(interfaces.len()) * 40
                 };
                 if pointer != 0 {
-                    Self::check(memory, pointer, size, Access::Write)?;
                     let mut entries = vec![0; size];
                     for (i, (name, ip)) in interfaces.into_iter().take(size / 40).enumerate() {
                         let e = &mut entries[i * 40..(i + 1) * 40];
                         e[..name.len()].copy_from_slice(name);
                         e[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
                     }
-                    memory.write(pointer, &entries).map_err(|_| Errno(14))?;
+                    crate::time_read::copy_bytes(memory, pointer, &entries)?;
                 }
                 memory
-                    .write(a[2], &(size as u32).to_le_bytes())
+                    .write_array(a[2], (size as u32).to_le_bytes())
                     .map_err(|_| Errno(14))?;
                 return Ok(0);
             }
@@ -797,18 +793,9 @@ impl Linux {
             ) {
                 return Err(Errno(25));
             }
-            Self::check(
-                memory,
-                a[2],
-                40,
-                if matches!(request, 0x8914 | 0x8916 | 0x891c | 0x8922 | 0x8923 | 0x8946) {
-                    Access::Read
-                } else {
-                    Access::Write
-                },
-            )?;
             let mut entry = [0; 40];
             memory.read(a[2], &mut entry).map_err(|_| Errno(14))?;
+            let devices = vfs.network_devices();
             let device = if request == 0x8910 {
                 let index = u32::from_le_bytes(entry[16..20].try_into().unwrap());
                 devices.iter().find(|d| d.index == index)
@@ -862,7 +849,7 @@ impl Linux {
                     let mut info = [0; 44];
                     info[..4].copy_from_slice(&command.to_le_bytes());
                     info[8..12].copy_from_slice(&(-1i32).to_le_bytes());
-                    memory.write(pointer, &info).map_err(|_| Errno(14))?;
+                    crate::time_read::copy_bytes(memory, pointer, &info)?;
                     return Ok(0);
                 }
                 0x8942 => entry[16..20].copy_from_slice(&device.master.unwrap_or(0).to_le_bytes()),
@@ -934,7 +921,7 @@ impl Linux {
                 0x8933 => entry[16..20].copy_from_slice(&device.index.to_le_bytes()),
                 _ => unreachable!(),
             }
-            memory.write(a[2], &entry).map_err(|_| Errno(14))?;
+            crate::time_read::copy_bytes(memory, a[2], &entry)?;
             return Ok(0);
         }
         let enabled = u32_at(memory, a[2])? != 0;

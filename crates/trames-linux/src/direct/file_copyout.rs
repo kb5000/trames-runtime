@@ -10,6 +10,7 @@ struct Part {
     bytes: Bytes,
     range: Range<usize>,
     copied: usize,
+    scalar: bool,
 }
 enum Bytes {
     Owned(Vec<u8>),
@@ -86,9 +87,26 @@ pub(in crate::direct) struct FileCopyout {
     read_position: Option<trames_vfs::ReadPosition>,
     copied: usize,
     partial_read: bool,
+    continue_errors: bool,
     resources: trames_vfs::FileResources,
 }
 impl FileCopyout {
+    pub(in crate::direct) fn append(&mut self, address: u64, bytes: Vec<u8>) {
+        self.push(address, bytes);
+    }
+    pub(in crate::direct) fn append_scalar(&mut self, address: u64, bytes: Vec<u8>) {
+        let len = bytes.len();
+        self.parts.push_back(Part {
+            address,
+            bytes: Bytes::Owned(bytes),
+            range: 0..len,
+            copied: 0,
+            scalar: true,
+        });
+    }
+    pub(in crate::direct) fn continue_errors(&mut self) {
+        self.continue_errors = true;
+    }
     pub fn new(output: &FileOutput, result: Result<trames_vfs::FileValue, Errno>) -> Self {
         let mut copy = Self {
             parts: Parts::default(),
@@ -100,6 +118,7 @@ impl FileCopyout {
             read_position: None,
             copied: 0,
             partial_read: false,
+            continue_errors: false,
             resources: Default::default(),
         };
         let value = match result {
@@ -175,6 +194,7 @@ impl FileCopyout {
                                     bytes: Bytes::Shared(bytes.clone()),
                                     range: offset..offset + take,
                                     copied: 0,
+                                    scalar: false,
                                 });
                             }
                             offset += take;
@@ -242,6 +262,7 @@ impl FileCopyout {
                 bytes,
                 range: 0..len,
                 copied: 0,
+                scalar: false,
             });
         }
     }
@@ -254,15 +275,34 @@ impl FileCopyout {
         Ok(result)
     }
     fn failed(&mut self, error: Errno) -> Result<Result<u64, Errno>, PageFault> {
+        self.finish(self.failed_result(error))
+    }
+    fn failed_result(&self, error: Errno) -> Result<u64, Errno> {
         let prefix = self.directory.as_ref().map_or_else(
             || if self.partial_read { self.copied } else { 0 },
             |(_, reply)| reply.copied(),
         );
-        self.finish(if prefix != 0 {
+        if prefix != 0 {
             Ok(prefix as u64)
         } else {
             Err(error)
-        })
+        }
+    }
+    pub(in crate::direct) fn faulted(&mut self) -> Result<u64, Errno> {
+        self.waiting = None;
+        self.failed(Errno(14))
+            .expect("finishing an accepted copy cannot fault")
+    }
+    /// Invalidate every snapshot's cursor while returning its old resources
+    /// for release outside the caller's copy mutex. Successful fragments keep
+    /// their original position commit; no further guest store can be replayed.
+    pub fn cancel(&mut self) -> Self {
+        let result = self
+            .finished
+            .unwrap_or_else(|| self.failed_result(Errno(4)));
+        let mut finished = Self::new(&FileOutput::None, Err(Errno(4)));
+        finished.finished = Some(result);
+        std::mem::replace(self, finished)
     }
     pub fn progress(
         &mut self,
@@ -316,9 +356,18 @@ impl FileCopyout {
             }
             let part = self.parts.front_mut().unwrap();
             let Some(at) = part.address.checked_add(part.copied as u64) else {
+                if self.continue_errors {
+                    self.outcome = Err(Errno(14));
+                    self.parts.pop_front();
+                    continue;
+                }
                 return self.failed(Errno(14));
             };
-            let count = (part.range.len() - part.copied).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
+            let count = if part.scalar {
+                part.range.len() - part.copied
+            } else {
+                (part.range.len() - part.copied).min((PAGE_SIZE - at % PAGE_SIZE) as usize)
+            };
             let offset = part.range.start + part.copied;
             match memory.write(at, &part.bytes.as_slice()[offset..offset + count]) {
                 Ok(()) => {
@@ -338,7 +387,13 @@ impl FileCopyout {
                     self.waiting = Some(fault.wait.clone());
                     return Err(fault);
                 }
-                Err(_) => return self.failed(Errno(14)),
+                Err(_) => {
+                    if !self.continue_errors {
+                        return self.failed(Errno(14));
+                    }
+                    self.outcome = Err(Errno(14));
+                    self.parts.pop_front();
+                }
             }
         }
     }

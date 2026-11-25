@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Imported poll requests retain shared OFDs; owner controls stay explicit.
-use crate::state::Linux;
 use std::sync::Arc;
 use std::time::Instant;
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
 use trames_vfs::{DirectFd, DirectFds, Errno, IoSignal, IoSubscription, OfdIdentity, Vfs};
 
 #[derive(Clone)]
@@ -14,6 +13,14 @@ enum Source {
     Owner(OfdIdentity, trames_vfs::SharedFd),
 }
 impl Source {
+    fn binding(binding: trames_vfs::PollBinding) -> Self {
+        match binding {
+            trames_vfs::PollBinding::Direct(fd) => Self::Direct(fd),
+            trames_vfs::PollBinding::Original(file) => {
+                Self::Owner(file.clone().retained().ofd_identity(), file)
+            }
+        }
+    }
     fn owner(vfs: &Vfs, fd: u32) -> Self {
         vfs.poll_binding(fd).map_or(Self::Invalid, |file| {
             Self::Owner(file.clone().retained().ofd_identity(), file)
@@ -28,30 +35,37 @@ struct Entry {
     source: Source,
 }
 impl Entry {
-    fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
+    fn native_wait_fds(&self, _vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
         match &self.source {
             Source::Direct(fd) => fd.native_wait_fds(),
-            Source::Owner(id, _) if vfs.matches_open_description(self.fd, id) => {
-                vfs.native_wait_fds_for(self.fd)
-            }
+            Source::Owner(_, file) => file.clone().retained().native_wait_fds(),
             _ => Vec::new(),
         }
     }
     fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
-        matches!(&self.source, Source::Owner(id, _)
-            if vfs.matches_open_description(self.fd, id)
-                && vfs.fd_kind(self.fd).ok() == Some(trames_vfs::FdKind::Stdin))
+        let _ = vfs;
+        matches!(&self.source, Source::Owner(_, file) if file.waits_for_stdin())
     }
     fn ready(
         &self,
-        _joined: bool,
-        owner: &mut impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+        joined: bool,
+        owner: &mut impl FnMut(u32, &OfdIdentity, &trames_vfs::SharedFd, u16) -> Result<u16, Errno>,
     ) -> Result<u16, Errno> {
         Ok(match &self.source {
             Source::Ignored => 0,
             Source::Invalid => 32,
-            Source::Owner(id, _) => owner(self.fd, id, self.events)?,
-            Source::Direct(fd) => fd.poll_ready(self.events).expect("pollable resource"),
+            Source::Owner(id, file) => owner(self.fd, id, file, self.events)?,
+            Source::Direct(fd) => {
+                if joined && fd.is_epoll() {
+                    if let Some(file) = fd.shared_file() {
+                        return owner(self.fd, &fd.ofd_identity(), &file, self.events);
+                    }
+                }
+                if !fd.poll_has_providers() {
+                    return Err(Errno(95));
+                }
+                fd.poll_ready(self.events).expect("pollable resource")
+            }
         })
     }
 }
@@ -82,25 +96,23 @@ impl Poll {
         memory: &impl CpuMemory,
         a: [u64; 6],
     ) -> Option<Result<Self, Errno>> {
-        Self::prepare_inner(fds, None, memory, a)
+        Self::prepare_inner(fds, None, memory, a, None)
     }
     fn prepare_inner(
         fds: &DirectFds,
         owner: Option<&Vfs>,
         memory: &impl CpuMemory,
         a: [u64; 6],
+        admitted: Option<u32>,
     ) -> Option<Result<Self, Errno>> {
-        let count = a[1] as u32;
-        if count > fds.descriptor_limit() {
+        let count = admitted.unwrap_or(a[1] as u32);
+        if admitted.is_none() && count > fds.descriptor_limit() {
             return Some(Err(Errno(22)));
         }
         if count == 0 {
             return Some(Ok(Self {
                 entries: Vec::new(),
             }));
-        }
-        if let Err(e) = Linux::check(memory, a[0], count as usize * 8, Access::Write) {
-            return Some(Err(e));
         }
         let mut entries = Vec::new();
         if entries
@@ -117,15 +129,6 @@ impl Poll {
             };
             let fd = i32::from_le_bytes(bytes[..4].try_into().unwrap());
             let events = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-            let source = if fd < 0 {
-                Source::Ignored
-            } else {
-                match fds.polling(fd as u32) {
-                    Some(Ok(resource)) => Source::Direct(resource),
-                    Some(Err(_)) => Source::Invalid,
-                    None => Source::owner(owner?, fd as u32),
-                }
-            };
             if entries.len() == entries.capacity() && entries.try_reserve(1).is_err() {
                 return Some(Err(Errno(12)));
             }
@@ -133,8 +136,20 @@ impl Poll {
                 address: address + 6,
                 fd: fd as u32,
                 events,
-                source,
+                source: Source::Ignored,
             });
+        }
+        // Native do_sys_poll copies every input row before any fdget/poll.
+        // A missing later input page therefore accepts no earlier OFD yet.
+        for entry in &mut entries {
+            if (entry.fd as i32) < 0 {
+                continue;
+            }
+            entry.source = match fds.capture_poll(entry.fd) {
+                Some(Ok(binding)) => Source::binding(binding),
+                Some(Err(_)) => Source::Invalid,
+                None => Source::owner(owner?, entry.fd),
+            };
         }
         Some(Ok(Self { entries }))
     }
@@ -145,6 +160,13 @@ impl Poll {
         &self,
         joined: bool,
         mut owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+    ) -> Result<Vec<(u64, u16)>, Errno> {
+        self.ready_with(joined, |fd, id, _, events| owner(fd, id, events))
+    }
+    fn ready_with(
+        &self,
+        joined: bool,
+        mut owner: impl FnMut(u32, &OfdIdentity, &trames_vfs::SharedFd, u16) -> Result<u16, Errno>,
     ) -> Result<Vec<(u64, u16)>, Errno> {
         self.entries
             .iter()
@@ -175,7 +197,14 @@ impl Poll {
         })
     }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
-        self.direct().flat_map(|fd| fd.subscribe(signal)).collect()
+        self.entries
+            .iter()
+            .flat_map(|entry| match &entry.source {
+                Source::Direct(fd) => fd.subscribe(signal),
+                Source::Owner(_, file) => file.subscribe_poll(signal),
+                _ => Vec::new(),
+            })
+            .collect()
     }
     pub fn poll_resources(&self) -> Vec<Arc<dyn trames_vfs::DirectPoll>> {
         self.direct().flat_map(|fd| fd.poll_resources()).collect()
@@ -209,6 +238,11 @@ fn revisions<'a>(fds: impl Iterator<Item = &'a DirectFd>, accepted: bool) -> Opt
     result
 }
 impl RetainedPoll {
+    pub(crate) fn empty() -> Self {
+        Self(Poll {
+            entries: Vec::new(),
+        })
+    }
     pub(crate) fn dynamic_sources(&self) -> bool {
         self.0.direct().any(DirectFd::dynamic_poll_sources)
     }
@@ -242,16 +276,35 @@ impl RetainedPoll {
         memory: &impl CpuMemory,
         args: [u64; 6],
     ) -> Result<Self, Errno> {
-        Poll::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args)
+        Poll::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args, None)
             .expect("joined poll has an owner fallback")
             .map(Poll::retain)
     }
-    pub(crate) fn ready(
+    pub(crate) fn prepare_captured(
+        fds: &DirectFds,
+        owner: Option<&Vfs>,
+        memory: &impl CpuMemory,
+        args: [u64; 6],
+        count: u32,
+    ) -> Option<Result<Self, Errno>> {
+        Poll::prepare_inner(fds, owner, memory, args, Some(count))
+            .map(|result| result.map(Poll::retain))
+    }
+    pub(crate) fn ready_with(
         &self,
         joined: bool,
-        owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+        owner: impl FnMut(u32, &OfdIdentity, &trames_vfs::SharedFd, u16) -> Result<u16, Errno>,
     ) -> Result<Vec<(u64, u16)>, Errno> {
-        self.0.ready(joined, owner)
+        self.0.ready_with(joined, owner)
+    }
+    pub(crate) fn observe_epolls(&self, observations: &mut trames_vfs::EpollObservations) {
+        for entry in &self.0.entries {
+            match &entry.source {
+                Source::Direct(fd) => fd.observe_epolls(observations),
+                Source::Owner(_, file) => file.observe_epolls(observations),
+                _ => {}
+            }
+        }
     }
     pub fn ready_joined(
         &self,
@@ -304,6 +357,7 @@ impl RetainedPoll {
             .collect::<Option<Vec<_>>>()?;
         Some(Poll { entries }.retain())
     }
+    #[cfg(test)]
     pub(crate) fn check(
         &self,
         memory: &mut impl CpuMemory,
@@ -357,7 +411,7 @@ impl RetainedSelect {
         memory: &impl CpuMemory,
         args: [u64; 6],
     ) -> Result<Self, Errno> {
-        Self::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args)
+        Self::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args, None)
             .expect("joined select has owner controls")
     }
     pub(crate) fn prepare_worker(
@@ -365,21 +419,32 @@ impl RetainedSelect {
         memory: &impl CpuMemory,
         args: [u64; 6],
     ) -> Option<Result<Self, Errno>> {
-        Self::prepare_inner(fds, None, memory, args)
+        Self::prepare_inner(fds, None, memory, args, None)
+    }
+    pub(crate) fn prepare_captured(
+        fds: &DirectFds,
+        owner: Option<&Vfs>,
+        memory: &impl CpuMemory,
+        args: [u64; 6],
+        count: u32,
+    ) -> Option<Result<Self, Errno>> {
+        Self::prepare_inner(fds, owner, memory, args, Some(count))
     }
     fn prepare_inner(
         fds: &DirectFds,
         owner: Option<&Vfs>,
         memory: &impl CpuMemory,
         args: [u64; 6],
+        admitted: Option<u32>,
     ) -> Option<Result<Self, Errno>> {
         let count = args[0] as i32;
         if count < 0 {
             return Some(Err(Errno(22)));
         }
-        let count = fds.select_count(count as u32);
+        let count = admitted.unwrap_or_else(|| fds.select_count(count as u32));
         let size = count.div_ceil(64) as usize * 8;
         let mut sets = Vec::new();
+        let mut imported = Vec::new();
         for (index, events) in [
             (1, trames_vfs::poll_mask::READ_NORMAL | 0x80 | 8 | 16),
             (2, trames_vfs::poll_mask::WRITE_NORMAL | 0x200 | 8),
@@ -388,17 +453,18 @@ impl RetainedSelect {
             if args[index] == 0 || count == 0 {
                 continue;
             }
-            if let Err(e) = Linux::check(memory, args[index], size, Access::Write) {
-                return Some(Err(e));
-            }
             let mut bits = vec![0; size];
             if memory.read(args[index], &mut bits).is_err() {
                 return Some(Err(Errno(14)));
             }
+            imported.push((args[index], events, bits));
+        }
+        // All three sets are copied before descriptor validation/observation.
+        for (address, events, bits) in imported {
             let mut entries = Vec::new();
             for fd in (0..count).filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0) {
-                let source = match fds.polling(fd) {
-                    Some(Ok(resource)) => Source::Direct(resource),
+                let source = match fds.capture_poll(fd) {
+                    Some(Ok(binding)) => Source::binding(binding),
                     Some(Err(_)) => Source::Invalid,
                     None => Source::owner(owner?, fd),
                 };
@@ -410,7 +476,7 @@ impl RetainedSelect {
                 });
             }
             sets.push(SelectSet {
-                address: args[index],
+                address,
                 events,
                 entries,
             });
@@ -423,6 +489,15 @@ impl RetainedSelect {
     fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.sets.iter().flat_map(|s| &s.entries)
     }
+    pub(crate) fn observe_epolls(&self, observations: &mut trames_vfs::EpollObservations) {
+        for entry in self.entries() {
+            match &entry.source {
+                Source::Direct(fd) => fd.observe_epolls(observations),
+                Source::Owner(_, file) => file.observe_epolls(observations),
+                _ => {}
+            }
+        }
+    }
     fn direct(&self) -> impl Iterator<Item = &DirectFd> {
         self.entries().filter_map(|e| {
             if let Source::Direct(fd) = &e.source {
@@ -433,7 +508,13 @@ impl RetainedSelect {
         })
     }
     pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
-        self.direct().flat_map(|fd| fd.subscribe(signal)).collect()
+        self.entries()
+            .flat_map(|entry| match &entry.source {
+                Source::Direct(fd) => fd.subscribe(signal),
+                Source::Owner(_, file) => file.subscribe_poll(signal),
+                _ => Vec::new(),
+            })
+            .collect()
     }
     pub(crate) fn poll_resources(&self) -> Vec<Arc<dyn trames_vfs::DirectPoll>> {
         self.direct().flat_map(|fd| fd.poll_resources()).collect()
@@ -525,6 +606,13 @@ impl RetainedSelect {
         &self,
         joined: bool,
         mut owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+    ) -> Result<(u64, PollOutput), Errno> {
+        self.ready_with(joined, |fd, id, _, events| owner(fd, id, events))
+    }
+    pub(crate) fn ready_with(
+        &self,
+        joined: bool,
+        mut owner: impl FnMut(u32, &OfdIdentity, &trames_vfs::SharedFd, u16) -> Result<u16, Errno>,
     ) -> Result<(u64, PollOutput), Errno> {
         let mut count = 0;
         let mut outputs = Vec::with_capacity(self.sets.len());

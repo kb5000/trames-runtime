@@ -110,7 +110,9 @@ fn time_observations_complete_on_source_with_faults_nulls_overlap_and_filter() {
         }
         assert_eq!(root.memory.read_array::<16>(0x1100).unwrap(), [0; 16]);
         assert_eq!(root.memory.read_array::<8>(0x1218).unwrap(), [0; 8]);
-        assert_eq!(root.memory.read_array::<16>(0x1800).unwrap(), [0xa7; 16]);
+        // The later call has a valid timeval and invalid timezone. Native
+        // gettimeofday retains its first store even when the second fails.
+        assert!(root.memory.read_u64(0x1800).unwrap() > 1_700_000_000);
         for (i, id) in [0, 1, 4, 5, 6, 7].into_iter().enumerate() {
             let at = 0x1500 + i as u64 * 32;
             let sec = u64::from_le_bytes(root.memory.read_array::<8>(at).unwrap());

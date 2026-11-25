@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Linux sync_file and software timelines, on the original files_struct.
 //! Points notify existing waiters after the timeline unlocks. No thread, polling
-//! loop, copied FD number or guest memory borrow survives an ioctl.
+//! loop or guest memory borrow is retained; accepted OFDs replace FD relookup.
 use super::*;
 use std::sync::{Mutex, OnceLock, Weak};
-use trames_memory::CpuMemory;
+use trames_memory::{CopiedOutput, CpuMemory};
 #[cfg(test)]
 #[path = "sync_file_tests.rs"]
 mod tests;
@@ -54,6 +54,45 @@ pub struct File {
     kind: Kind,
     ready: Arc<Readiness>,
     links: OnceLock<(Arc<IoSignal>, Vec<IoSubscription>)>,
+}
+/// An original unused slot and unpublished fence, retained across actual copyout.
+pub struct Control {
+    reserved: Option<fd_table::ReservedFd>,
+    factory: DescriptorFactory,
+    publish: Option<Arc<File>>,
+    secondary: Option<SharedFd>,
+}
+impl Control {
+    pub fn new(file: &File, factory: &DescriptorFactory, cmd: u32) -> Result<Self> {
+        let creates = matches!(
+            (&file.kind, cmd),
+            (Kind::Timeline(_), CREATE) | (Kind::Fence(_), MERGE)
+        );
+        Ok(Self {
+            reserved: if creates {
+                Some(factory.files.reserve()?)
+            } else {
+                None
+            },
+            factory: factory.clone(),
+            publish: None,
+            secondary: None,
+        })
+    }
+    pub fn finish(mut self) -> Result<u64> {
+        if let Some(reserved) = self.reserved.take() {
+            let file = self.publish.take().expect("prepared fence");
+            reserved.publish(
+                events::anonymous_descriptor(
+                    self.factory.open_id(),
+                    O_CLOEXEC,
+                    events::Anonymous::Sync(file),
+                ),
+                None,
+            )?;
+        }
+        Ok(0)
+    }
 }
 impl File {
     pub(super) fn timeline(origin: std::time::Instant) -> Arc<Self> {
@@ -186,24 +225,31 @@ impl File {
         address: u64,
         memory: &mut impl CpuMemory,
     ) -> Result<u64> {
+        let mut control = Control::new(self, factory, cmd)?;
+        let mut output = CopiedOutput::default();
+        self.prepare_ioctl(&mut control, cmd, address, memory, &mut output)?;
+        output.progress(memory).map_err(|_| Errno(14))?;
+        control.finish()
+    }
+    pub fn prepare_ioctl(
+        &self,
+        control: &mut Control,
+        cmd: u32,
+        address: u64,
+        memory: &impl CpuMemory,
+        output: &mut CopiedOutput,
+    ) -> Result<u64> {
         match (&self.kind, cmd) {
             (Kind::Timeline(_), CREATE) => {
-                let reserved = factory.files.reserve()?;
+                let reserved = control.reserved.as_ref().expect("accepted unused slot");
                 let mut data = memory.read_array::<40>(address).map_err(|_| Errno(14))?;
                 let point = self.point(u32::from_le_bytes(data[..4].try_into().unwrap()));
                 let mut name: [u8; 32] = data[4..36].try_into().unwrap();
                 name[31] = 0;
                 let file = Self::fence(name, vec![point]);
                 data[36..40].copy_from_slice(&(reserved.number() as i32).to_le_bytes());
-                memory.write(address, &data).map_err(|_| Errno(14))?;
-                reserved.publish(
-                    events::anonymous_descriptor(
-                        factory.open_id(),
-                        O_CLOEXEC,
-                        events::Anonymous::Sync(file),
-                    ),
-                    None,
-                )?;
+                output.push_slice(address, &data);
+                control.publish = Some(file);
             }
             (Kind::Timeline(_), INC) => {
                 self.increment(u32::from_le_bytes(
@@ -211,25 +257,29 @@ impl File {
                 ));
             }
             (Kind::Fence(points), MERGE) => {
-                let reserved = factory.files.reserve()?;
+                let reserved = control.reserved.as_ref().expect("accepted unused slot");
                 let mut data = memory.read_array::<48>(address).map_err(|_| Errno(14))?;
                 if data[40..48] != [0; 8] {
                     return Err(Errno(22));
                 }
                 let fd = u32::from_le_bytes(data[32..36].try_into().unwrap());
-                let other = factory
+                let other = control
+                    .factory
                     .files
                     .lookup(fd)
-                    .unwrap_or(Err(Errno(22)))
-                    .map_err(|_| Errno(22))?;
-                let Some(events::SharedControl::Sync(other)) = &other.open.control else {
-                    return Err(Errno(22));
+                    .unwrap_or(Err(Errno(2)))
+                    .map_err(|_| Errno(2))?;
+                if other.open.flags.get() & O_PATH != 0 {
+                    return Err(Errno(2));
+                }
+                let Some(events::SharedControl::Sync(peer)) = &other.open.control else {
+                    return Err(Errno(2));
                 };
-                let Kind::Fence(other) = &other.kind else {
-                    return Err(Errno(22));
+                let Kind::Fence(peer) = &peer.kind else {
+                    return Err(Errno(2));
                 };
                 let mut merged = BTreeMap::<u64, Arc<Point>>::new();
-                for point in points.iter().chain(other) {
+                for point in points.iter().chain(peer) {
                     if point.status() != 0 {
                         continue;
                     }
@@ -247,15 +297,9 @@ impl File {
                 name[31] = 0;
                 let file = Self::fence(name, points);
                 data[36..40].copy_from_slice(&(reserved.number() as i32).to_le_bytes());
-                memory.write(address, &data).map_err(|_| Errno(14))?;
-                reserved.publish(
-                    events::anonymous_descriptor(
-                        factory.open_id(),
-                        O_CLOEXEC,
-                        events::Anonymous::Sync(file),
-                    ),
-                    None,
-                )?;
+                output.push_slice(address, &data);
+                control.publish = Some(file);
+                control.secondary = Some(other);
             }
             (Kind::Fence(points), INFO) => {
                 let mut data = memory.read_array::<56>(address).map_err(|_| Errno(14))?;
@@ -263,27 +307,33 @@ impl File {
                     return Err(Errno(22));
                 }
                 let count = u32::from_le_bytes(data[40..44].try_into().unwrap()) as usize;
+                let mut status = if count == 0 { self.status() } else { 1 };
                 if count != 0 {
                     if count < points.len() {
                         return Err(Errno(22));
                     }
                     let pointer = u64::from_le_bytes(data[48..56].try_into().unwrap());
-                    for (i, point) in points.iter().enumerate() {
+                    let mut records = Vec::with_capacity(points.len() * 80);
+                    for point in points {
                         let mut info = [0; 80];
                         info[..7].copy_from_slice(b"trames\0");
                         info[32..40].copy_from_slice(b"sw_sync\0");
-                        info[64..68].copy_from_slice(&point.status().to_le_bytes());
+                        let point_status = point.status();
+                        if status > 0 {
+                            status = point_status;
+                        }
+                        info[64..68].copy_from_slice(&point_status.to_le_bytes());
                         info[72..80].copy_from_slice(
                             &point.finished.get().map_or(0, |v| v.1).to_le_bytes(),
                         );
-                        let target = pointer.checked_add((i * 80) as u64).ok_or(Errno(14))?;
-                        memory.write(target, &info).map_err(|_| Errno(14))?;
+                        records.extend_from_slice(&info);
                     }
+                    output.push(pointer, records);
                 }
                 data[..32].copy_from_slice(&self.name);
-                data[32..36].copy_from_slice(&self.status().to_le_bytes());
+                data[32..36].copy_from_slice(&status.to_le_bytes());
                 data[40..44].copy_from_slice(&(points.len() as u32).to_le_bytes());
-                memory.write(address, &data).map_err(|_| Errno(14))?;
+                output.push_slice(address, &data);
             }
             _ => return Err(Errno(25)),
         }

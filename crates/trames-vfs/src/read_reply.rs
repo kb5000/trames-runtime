@@ -64,6 +64,12 @@ pub struct ReadReply {
     position: ReadPosition,
 }
 impl ReadReply {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
     pub(crate) fn new(bytes: Vec<u8>, position: impl CommitRead + 'static) -> Self {
         Self {
             bytes,

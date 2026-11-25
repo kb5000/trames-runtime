@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Short PTY controls use the accepted original endpoint on either execution path.
-use trames_memory::CpuMemory;
+use trames_memory::{CopiedOutput, CpuMemory};
 use trames_vfs::{Errno, PtyEnd};
 
 pub fn pty_control_request(request: u32) -> bool {
@@ -56,8 +56,8 @@ pub fn pty_control(
     Ok(0)
 }
 
-/// Read-only controls use the original endpoint and guest memory directly. They
-/// need neither an async call envelope nor task authority for termios/winsize.
+/// Snapshot the original endpoint while locked, then copy outside its lock.
+/// Resident-memory termios/winsize queries need no task authority.
 pub fn terminal_query(
     end: &PtyEnd,
     request: u32,
@@ -72,38 +72,31 @@ pub fn terminal_query(
             return Err(Errno(25));
         }
     }
+    let mut output = CopiedOutput::default();
     match request {
-        0x5401 => memory
-            .write(address, &tty.attributes)
-            .map_err(|_| Errno(14))?,
-        0x802c542a => memory
-            .write(address, &tty.termios2())
-            .map_err(|_| Errno(14))?,
-        0x540f => memory
-            .write_array(address, task.visible(tty.foreground).to_le_bytes())
-            .map_err(|_| Errno(14))?,
-        0x5413 => memory.write(address, &tty.window).map_err(|_| Errno(14))?,
-        0x541b => memory
-            .write_array(
-                address,
-                (if end.master {
-                    tty.output_queue.len()
-                } else {
-                    tty.available()
-                } as u32)
-                    .to_le_bytes(),
-            )
-            .map_err(|_| Errno(14))?,
+        0x5401 => output.push_slice(address, &tty.attributes),
+        0x802c542a => output.push_slice(address, &tty.termios2()),
+        0x540f => output.push_scalar(address, &task.visible(tty.foreground).to_le_bytes()),
+        0x5413 => output.push_slice(address, &tty.window),
+        0x541b => output.push_scalar(
+            address,
+            &((if end.master {
+                tty.output_queue.len()
+            } else {
+                tty.available()
+            }) as u32)
+                .to_le_bytes(),
+        ),
         0x5429 => {
             if tty.session == 0 {
                 return Err(Errno(25));
             }
-            memory
-                .write_array(address, task.visible(tty.session).to_le_bytes())
-                .map_err(|_| Errno(14))?;
+            output.push_scalar(address, &task.visible(tty.session).to_le_bytes());
         }
         _ => return Err(Errno(25)),
     }
+    drop(tty);
+    output.progress(memory).map_err(|_| Errno(14))?;
     Ok(0)
 }
 
@@ -116,6 +109,47 @@ pub fn terminal_control(
     flags: u32,
     task: &dyn trames_vfs::TerminalTask,
     memory: &mut impl CpuMemory,
+) -> trames_vfs::TerminalIo<u64> {
+    terminal_control_impl(end, request, address, flags, task, memory, true)
+}
+pub(crate) fn terminal_control_prechecked(
+    end: &PtyEnd,
+    request: u32,
+    address: u64,
+    flags: u32,
+    task: &dyn trames_vfs::TerminalTask,
+    memory: &mut impl CpuMemory,
+) -> trames_vfs::TerminalIo<u64> {
+    terminal_control_impl(end, request, address, flags, task, memory, false)
+}
+pub(crate) fn terminal_check_job(
+    end: &PtyEnd,
+    request: u32,
+    task: &dyn trames_vfs::TerminalTask,
+) -> trames_vfs::TerminalIo<()> {
+    use trames_vfs::TerminalIo;
+    if !terminal_job_request(request) {
+        return TerminalIo::Complete(Ok(()));
+    }
+    match end.pair.check_job(task, 22) {
+        TerminalIo::Complete(Err(error)) => {
+            TerminalIo::Complete(Err(if request == 0x5410 && error == Errno(5) {
+                Errno(25)
+            } else {
+                error
+            }))
+        }
+        result => result,
+    }
+}
+fn terminal_control_impl(
+    end: &PtyEnd,
+    request: u32,
+    address: u64,
+    flags: u32,
+    task: &dyn trames_vfs::TerminalTask,
+    memory: &mut impl CpuMemory,
+    check_job: bool,
 ) -> trames_vfs::TerminalIo<u64> {
     use trames_vfs::TerminalIo;
     if terminal_query_request(request) {
@@ -135,20 +169,32 @@ pub fn terminal_control(
             task.detach(pair, false).map(|()| 0)
         });
     }
-    if terminal_job_request(request) {
-        match pair.check_job(task, 22) {
+    if check_job {
+        match terminal_check_job(end, request, task) {
             TerminalIo::Complete(Ok(())) => {}
-            TerminalIo::Complete(Err(e)) => {
-                return TerminalIo::Complete(Err(if request == 0x5410 && e == Errno(5) {
-                    Errno(25)
-                } else {
-                    e
-                }))
-            }
+            TerminalIo::Complete(Err(error)) => return TerminalIo::Complete(Err(error)),
             TerminalIo::Stopped => return TerminalIo::Stopped,
         }
     }
     TerminalIo::Complete((|| {
+        // Faultable input is imported before taking the terminal state lock.
+        // The original job-control check has already completed for this call.
+        let mut input = [0; 44];
+        let count = match request {
+            0x5402..=0x5404 => 36,
+            0x402c542b..=0x402c542d => 44,
+            0x5410 => 4,
+            0x5414 => 8,
+            _ => 0,
+        };
+        if count != 0 {
+            memory
+                .read(address, &mut input[..count])
+                .map_err(|_| Errno(14))?;
+        }
+        if request == 0x5410 && i32::from_le_bytes(input[..4].try_into().unwrap()) < 0 {
+            return Err(Errno(22));
+        }
         let mut tty = pair.terminal.borrow_mut();
         if request == 0x5410 {
             let access = task.access();
@@ -158,11 +204,11 @@ pub fn terminal_control(
         }
         match request {
             0x5402..=0x5404 => {
-                let attr = memory.read_array::<36>(address).map_err(|_| Errno(14))?;
+                let attr = input[..36].try_into().unwrap();
                 tty.set_attributes(attr, None, request == 0x5404)?;
             }
             0x402c542b..=0x402c542d => {
-                let raw = memory.read_array::<44>(address).map_err(|_| Errno(14))?;
+                let raw = input;
                 let speeds = [
                     u32::from_le_bytes(raw[36..40].try_into().unwrap()),
                     u32::from_le_bytes(raw[40..].try_into().unwrap()),
@@ -175,12 +221,12 @@ pub fn terminal_control(
             }
             0x5409 => {} // A pseudoterminal has no physical break or transmitter to drain.
             0x5410 => {
-                let local = u32::from_le_bytes(memory.read_array(address).map_err(|_| Errno(14))?);
+                let local = u32::from_le_bytes(input[..4].try_into().unwrap());
                 tty.foreground = task.foreground(tty.session, local)?;
                 pair.retain_job_ids(task.namespace(), tty.session, tty.foreground);
             }
             0x5414 => {
-                let window = memory.read_array::<8>(address).map_err(|_| Errno(14))?;
+                let window = input[..8].try_into().unwrap();
                 let changed = tty.window != window;
                 tty.window = window;
                 let (session, group) = (tty.session, tty.foreground);

@@ -630,6 +630,7 @@ pub(super) struct Snapshot {
     dynamic_code: bool,
     dynamic_code_pages: usize,
     external_code: bool,
+    async_sources: bool,
     identities: BTreeMap<u64, usize>,
     alias_count: usize,
     backed_pages: BTreeSet<u64>,
@@ -1090,6 +1091,22 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn mapped_at_or_after(&self, address: u64) -> bool {
+        let address = address & 0x00ff_ffff_ffff_ffff;
+        self.snapshot
+            .pages
+            .last_key_value()
+            .is_some_and(|(&base, _)| address < base + PAGE_SIZE)
+            || self
+                .snapshot
+                .reservations
+                .last_key_value()
+                .is_some_and(|(_, &end)| address < end)
+            || self.snapshot.anonymous.mapped_at_or_after(address)
+    }
+    fn async_faults_possible(&self) -> bool {
+        self.snapshot.async_sources
+    }
     fn numa_mode_at(&self, address: u64) -> u32 {
         self.nodes.at(address)
     }
@@ -1397,6 +1414,9 @@ impl Memory {
         if let Some(memory) = &self.shared {
             return memory.borrow().current_parallel_view();
         }
+        if self.mapping_cleanup_pending() {
+            return None;
+        }
         let cache = self.parallel_cache.as_ref()?;
         if self.layout_publication.is_none() && cache.snapshot.backings.has_layouts() {
             return None;
@@ -1499,6 +1519,9 @@ impl Memory {
     pub fn parallel_view(&mut self, registry: &mut Registry) -> Option<View> {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().parallel_view(registry);
+        }
+        if !self.reap_mapping_cleanup().ok()? {
+            return None;
         }
         // Acquire before any provider read or metadata refresh. A failed
         // admission retains the original mm and lets its caller park on the
@@ -1685,6 +1708,7 @@ impl Memory {
             dynamic_code: dynamic_code_pages != 0 || anonymous_executable,
             dynamic_code_pages,
             external_code: self.has_external_code,
+            async_sources: self.has_async_sources,
             identities,
             alias_count,
             backed_pages,

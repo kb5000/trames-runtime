@@ -17,6 +17,7 @@ fn link_resource_path(key: Vec<u8>, mount: Option<Arc<Mount>>) -> ResolvedPath {
         key,
         mount,
         directory_inode: None,
+        fuse_entry: None,
         indexed_position: None,
         #[cfg(all(feature = "hostfs", unix))]
         host_position: None,
@@ -138,6 +139,7 @@ impl Vfs {
         };
         let node = if let Some(file) = &original {
             path = link_resource_path(file.label.clone(), file.mount.clone());
+            path.fuse_entry = file.fuse_entry();
             #[cfg(all(feature = "hostfs", unix))]
             {
                 path.host_position = file
@@ -515,10 +517,14 @@ impl Vfs {
         &self,
         node: NodeRef,
         mode: u32,
-        persistent: bool,
+        filesystem: Option<&FsHandle>,
         link: Option<&Arc<inotify::Link>>,
     ) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = node.host.get() {
+            host.metadata_file()?.refresh_permissions(&node)?;
+        }
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         if !self
@@ -531,21 +537,32 @@ impl Vfs {
         let old_mode = n.mode;
         let old_time = n.times[2];
         let old_acl = n.xattrs.get(acl::ACCESS).cloned();
-        #[cfg(all(feature = "hostfs", unix))]
-        {
-            drop(n);
-            if let Some(host) = self.host_for_node(&node) {
-                host.chmod(&node, mode)?;
-            }
-            n = node.borrow_mut();
-        }
-        n.mode = (n.mode & !0o7777) | (mode & 0o7777);
+        let mut applied_mode = (n.mode & !0o7777) | (mode & 0o7777);
         if !self
             .credentials
             .inode_cap(capabilities::FSETID, n.uid, n.gid)
             && !self.credentials.in_group(n.gid)
         {
-            n.mode &= !0o2000;
+            applied_mode &= !0o2000;
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        let mut native = false;
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            drop(n);
+            if let Some(host) = self.host_for_node(&node) {
+                host.chmod(&node, applied_mode)?;
+                native = true;
+            }
+            n = node.borrow_mut();
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if !native {
+            n.mode = applied_mode;
+        }
+        #[cfg(not(all(feature = "hostfs", unix)))]
+        {
+            n.mode = applied_mode;
         }
         let acl_mode = n.mode;
         if let Some(value) = n.xattrs.get_mut(acl::ACCESS) {
@@ -553,11 +570,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(e) = if persistent && !node.borrow().volatile && node.borrow().links != 0 {
-            self.checkpoint()
-        } else {
-            Ok(())
-        } {
+        if let Err(e) = filesystem.map_or(Ok(()), |fs| fs.checkpoint_metadata(&node)) {
             let mut n = node.borrow_mut();
             n.mode = old_mode;
             n.times[2] = old_time;
@@ -578,7 +591,7 @@ impl Vfs {
         let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
         let link = self.event_link(&path, &node);
-        self.chmod_node(node, mode, true, link.as_ref())
+        self.chmod_node(node, mode, Some(&path.filesystem(self)), link.as_ref())
     }
     pub fn chmod_at_flags(
         &mut self,
@@ -598,7 +611,7 @@ impl Vfs {
             return Err(Errno(95));
         }
         let link = self.event_link(&path, &node);
-        self.chmod_node(node, mode, true, link.as_ref())
+        self.chmod_node(node, mode, Some(&path.filesystem(self)), link.as_ref())
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -637,7 +650,9 @@ impl Vfs {
         self.chmod_node(
             n,
             mode,
-            open.node.is_some(),
+            open.node
+                .as_ref()
+                .map(|_| open.mount.as_ref().map_or(&self.fs, |m| &m.fs)),
             open.notification
                 .as_ref()
                 .and_then(|lease| lease.link.as_ref()),
@@ -702,7 +717,7 @@ impl Vfs {
             }
             self.fd_writable(dirfd as u32)?;
         }
-        let (node, link) = match path {
+        let (node, link, filesystem) = match path {
             Some(p) => {
                 let target = self.metadata_target(dirfd, p, flags & 0x100 == 0)?;
                 if let Some(result) =
@@ -716,7 +731,8 @@ impl Vfs {
                     .as_ref()
                     .and_then(|m| m.file.as_ref()?.notification.as_ref()?.link.clone())
                     .or_else(|| self.event_link(&target.path, &target.node));
-                (target.node, link)
+                let filesystem = target.path.filesystem(self);
+                (target.node, link, Some(filesystem))
             }
             None => {
                 let descriptor = self.descriptor(dirfd as u32)?;
@@ -726,6 +742,11 @@ impl Vfs {
                     open.notification
                         .as_ref()
                         .and_then(|lease| lease.link.clone()),
+                    open.node.as_ref().map(|_| {
+                        open.mount
+                            .as_ref()
+                            .map_or_else(|| self.fs.clone(), |m| m.fs.clone())
+                    }),
                 )
             }
         };
@@ -759,11 +780,10 @@ impl Vfs {
         }
         n.times[2] = now;
         drop(n);
-        if let Err(e) = if node.borrow().links != 0 {
-            self.checkpoint()
-        } else {
-            Ok(())
-        } {
+        if let Err(e) = filesystem
+            .as_ref()
+            .map_or(Ok(()), |fs| fs.checkpoint_metadata(&node))
+        {
             node.borrow_mut().times = old;
             return Err(e);
         }

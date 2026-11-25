@@ -13,6 +13,8 @@ pub(super) struct Retiring<C: Cpu> {
     status: i32,
     done: Option<Done<C>>,
     wait: Option<Wait>,
+    close: Option<Arc<trames_linux::FileResult>>,
+    retired: bool,
 }
 
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -293,6 +295,8 @@ impl<C: Cpu> Lifecycle<C> {
                     status,
                     done: None,
                     wait: None,
+                    close: None,
+                    retired: false,
                 });
             }
         }
@@ -352,6 +356,8 @@ impl<C: Cpu> Lifecycle<C> {
                     status: done.thread_exit.expect("source exit"),
                     done: Some(done),
                     wait: None,
+                    close: None,
+                    retired: false,
                 }),
         );
         let mut pending = Vec::new();
@@ -464,10 +470,11 @@ impl<C: Cpu> Lifecycle<C> {
         }
         let mut custody = work.task.write();
         let p = &mut *custody;
-        if work
-            .original
-            .as_ref()
-            .is_some_and(|original| !Arc::ptr_eq(original, &p.signals.io) || !original.live())
+        if !work.retired
+            && work
+                .original
+                .as_ref()
+                .is_some_and(|original| !Arc::ptr_eq(original, &p.signals.io) || !original.live())
         {
             return Ok(None);
         }
@@ -491,84 +498,187 @@ impl<C: Cpu> Lifecycle<C> {
         } else {
             None
         };
-        if let Some(done) = &mut work.done {
-            Kernel::<C>::log_worker_diagnostics(p, done);
-            p.linux.vfs.sync_task_namespaces();
-            p.cpu = std::mem::take(&mut done.cpu);
-            p.trace = std::mem::take(&mut done.trace);
-            p.signals.finish_io();
-            p.last_cpu = done.worker;
-            p.cpu_time += done.elapsed;
-            for group in std::mem::take(&mut done.exit_groups) {
-                self.exit_groups.watch(&group);
+        if !work.retired {
+            if let Some(done) = &mut work.done {
+                if let Some(crate::run_queue::WaitState::Delivery(delivery)) = &done.waiting {
+                    delivery.cancel();
+                }
+                if let Some(crate::run_queue::WaitState::Signal(wait)) = &done.waiting {
+                    wait.cancel();
+                }
+                if let Some(call) = done.io.as_ref().and_then(|io| io.binder.as_ref()) {
+                    call.cancel();
+                }
+                Kernel::<C>::log_worker_diagnostics(p, done);
+                p.linux.vfs.sync_task_namespaces();
+                p.cpu = std::mem::take(&mut done.cpu);
+                p.trace = std::mem::take(&mut done.trace);
+                p.signals.finish_io();
+                p.last_cpu = done.worker;
+                p.cpu_time += done.elapsed;
+                for group in std::mem::take(&mut done.exit_groups) {
+                    self.exit_groups.watch(&group);
+                }
+            } else {
+                if epoch.contains(work.pid) {
+                    return Ok(None);
+                }
+                let id = p.memory.coordinator_ownership().0;
+                if !owned.contains(&id) && epoch.contains_memory(id) {
+                    if !p.aio_must_finish_on_exit() {
+                        Kernel::<C>::cancel_native_task(p);
+                    }
+                    p.state = State::Zombie(work.status);
+                    return Ok(Some(Wait::Memory(id)));
+                }
+                let mut registry = self.registry.share();
+                let mut view = p.memory.current_parallel_view().or_else(|| {
+                    p.memory
+                        .parallel_views_quiescent()
+                        .then(|| p.memory.parallel_view(&mut registry))
+                        .flatten()
+                });
+                if view.is_none() {
+                    let signal = trames_shared::IoSignal::new(work.pid, target);
+                    let subscriptions = layouts::wait_view(&p.memory, &signal);
+                    return Ok(Some(Wait::Resource(tasks::AdmissionWait {
+                        signal,
+                        subscriptions,
+                    })));
+                }
+                let view = view.as_mut().unwrap();
+                C::prepare_hardware_view(view);
+                if let Some(call) = p
+                    .retained_aio
+                    .as_ref()
+                    .or_else(|| p.byte_wait.as_ref()?.aio.as_ref())
+                    .filter(|call| call.must_finish_on_exit())
+                    .cloned()
+                {
+                    let source =
+                        trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                            .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                            .with_file_executor(self.layouts.file_executor())
+                            .with_file_layouts(self.layouts.clone())
+                            .with_paths(p.linux.vfs.path_queries())
+                            .with_task_signal(p.signals.io.clone());
+                    let _actor = trames_vfs::FileActorScope::enter_with_sync(
+                        p.signals.io.credentials().clone(),
+                        work.pid,
+                        source.sync_executor(),
+                    );
+                    let (number, args) = call.entry();
+                    match source.drain_aio_exit(call, view, work.pid, &target) {
+                        trames_linux::IoAttempt::Complete(result) => {
+                            p.signals.io.io.complete(number, args[3], result);
+                            p.retained_aio = None;
+                            p.byte_wait = None;
+                        }
+                        trames_linux::IoAttempt::Blocked(wait) => {
+                            let signal = wait.signal.clone();
+                            p.retained_aio = wait.aio.clone();
+                            p.byte_wait = Some(wait);
+                            return Ok(Some(Wait::Resource(tasks::AdmissionWait {
+                                signal,
+                                subscriptions: Vec::new(),
+                            })));
+                        }
+                        trames_linux::IoAttempt::HostError(error) => {
+                            return Err(RuntimeError::Backend(error.to_string()))
+                        }
+                        _ => unreachable!("accepted AIO exit owns no structural import"),
+                    }
+                }
+                if let State::Futex { wait, .. } = &p.state {
+                    wait.cancel();
+                }
+                let task = p.signals.io.clone();
+                if let Some(call) = p
+                    .retained_binder
+                    .as_ref()
+                    .or_else(|| p.byte_wait.as_ref()?.binder.as_ref())
+                {
+                    call.cancel();
+                }
+                let Some(last) = task.try_exit(work.pid, work.status) else {
+                    return Ok(None);
+                };
+                p.linux.vfs.sync_task_namespaces();
+                p.linux.vfs.set_lock_owner(p.tgid);
+                p.linux.vfs.binder_exit(work.pid, last);
+                if last {
+                    p.linux.vfs.release_process_locks();
+                    self.timers.clear_process(p.tgid, false);
+                }
+                Kernel::<C>::cancel_native_task(p);
+                p.linux.cancel_uring(&mut p.memory, work.pid);
+                let files = p.linux.vfs.file_table_owner();
+                let context = p.linux.vfs.context_owner();
+                let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
+                p.linux.vfs.retire_sem_undo(p.tgid);
+                let exit = crate::worker_syscalls::ExitResources {
+                    session_keys: &p.linux.session_keys,
+                    task: &task,
+                    files: &files,
+                    context: context.as_ref(),
+                    parents: &p.signals.io_directory.parents,
+                    uid: p.linux.vfs.credentials.uid,
+                    futex: &futex,
+                    native: Some(&p.space),
+                }
+                .retire(work.status, last, view);
+                for group in exit.groups {
+                    self.exit_groups.watch(&group);
+                }
+                // The View is dropped by this block before final mm projection.
             }
-        } else {
-            if epoch.contains(work.pid) {
-                return Ok(None);
+            p.linux.vfs.set_lock_owner(p.tgid);
+            p.linux.vfs.collect_retired_descriptors();
+            Kernel::<C>::clear_exit_resources(p);
+            if let Some(done) = &mut work.done {
+                done.io = None;
             }
+            work.retired = true;
+        }
+        if p.memory.mapping_cleanup_pending() {
             let id = p.memory.coordinator_ownership().0;
             if !owned.contains(&id) && epoch.contains_memory(id) {
-                Kernel::<C>::cancel_native_task(p);
-                p.state = State::Zombie(work.status);
                 return Ok(Some(Wait::Memory(id)));
             }
-            let mut registry = self.registry.share();
-            let mut view = p.memory.current_parallel_view().or_else(|| {
-                p.memory
-                    .parallel_views_quiescent()
-                    .then(|| p.memory.parallel_view(&mut registry))
-                    .flatten()
-            });
-            if view.is_none() {
-                let signal = trames_shared::IoSignal::new(work.pid, target);
-                let subscriptions = layouts::wait_view(&p.memory, &signal);
+            let signal = trames_shared::IoSignal::new(work.pid, target.clone());
+            let subscription = p.memory.subscribe_parallel_idle(&signal);
+            if !p.memory.reap_mapping_cleanup()? {
                 return Ok(Some(Wait::Resource(tasks::AdmissionWait {
                     signal,
-                    subscriptions,
+                    subscriptions: vec![subscription],
                 })));
             }
-            let view = view.as_mut().unwrap();
-            C::prepare_hardware_view(view);
-            if let State::Futex { wait, .. } = &p.state {
-                wait.cancel();
-            }
-            let task = p.signals.io.clone();
-            let Some(last) = task.try_exit(work.pid, work.status) else {
-                return Ok(None);
-            };
-            p.linux.vfs.sync_task_namespaces();
-            p.linux.vfs.set_lock_owner(p.tgid);
-            p.linux.vfs.binder_exit(work.pid, last);
-            if last {
-                p.linux.vfs.release_process_locks();
-                self.timers.clear_process(p.tgid, false);
-            }
-            Kernel::<C>::cancel_native_task(p);
-            p.linux.cancel_uring(&mut p.memory, work.pid);
-            let files = p.linux.vfs.file_table_owner();
-            let context = p.linux.vfs.context_owner();
-            let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
-            p.linux.vfs.retire_sem_undo(p.tgid);
-            let exit = crate::worker_syscalls::ExitResources {
-                session_keys: &p.linux.session_keys,
-                task: &task,
-                files: &files,
-                context: context.as_ref(),
-                parents: &p.signals.io_directory.parents,
-                uid: p.linux.vfs.credentials.uid,
-                futex: &futex,
-                native: Some(&p.space),
-            }
-            .retire(work.status, last, view);
-            for group in exit.groups {
-                self.exit_groups.watch(&group);
-            }
-            // The View is dropped by this block before final mm projection.
         }
-        p.linux.vfs.set_lock_owner(p.tgid);
-        p.linux.vfs.collect_retired_descriptors();
-        Kernel::<C>::clear_exit_resources(p);
         let last_mm = p.memory.coordinator_ownership().1 == 1;
+        // exit_files precedes exit_mmap. In particular a dying daemon must
+        // release /dev/fuse before waiting for its own mapped inode writeback.
+        // Final family publication still follows the original writeback wait.
+        if work.close.is_none() {
+            let mut resources = p.memory.take_closed_resources();
+            if last_mm {
+                resources.extend(p.memory.close_resources());
+            }
+            if !resources.is_empty() {
+                work.close = Some(self.layouts.close_mappings(resources, 0));
+            }
+        }
+        if let Some(close) = &work.close {
+            if !close.ready() {
+                let signal = trames_shared::IoSignal::new(work.pid, target.clone());
+                let subscription = close.subscribe(&signal);
+                if !close.ready() {
+                    return Ok(Some(Wait::Resource(tasks::AdmissionWait {
+                        signal,
+                        subscriptions: vec![subscription],
+                    })));
+                }
+            }
+        }
         // Sibling threads keep observing the same mm. Sample native residency
         // only when this mm or this thread group is actually going away.
         if last_mm || !p.signals.io.lifecycle().has_live_members() {
@@ -660,6 +770,8 @@ impl<C: Cpu> Lifecycle<C> {
                 status: 9,
                 done: None,
                 wait: None,
+                close: None,
+                retired: false,
             });
         }
     }
@@ -710,6 +822,8 @@ impl<C: Cpu> Lifecycle<C> {
             status: done.thread_exit.expect("source exit"),
             done: Some(done),
             wait: None,
+            close: None,
+            retired: false,
         });
     }
     #[cfg(all(test, trames_interpreter_conformance))]

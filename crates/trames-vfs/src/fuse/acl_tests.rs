@@ -184,7 +184,7 @@ fn delayed_init_rechecks_negotiated_permissions_with_the_original_open_intent() 
         };
         let mut out = [0; 64];
         out[..4].copy_from_slice(&7u32.to_le_bytes());
-        out[4..8].copy_from_slice(&31u32.to_le_bytes());
+        out[4..8].copy_from_slice(&34u32.to_le_bytes());
         out[12..16].copy_from_slice(&OPTIONS.to_le_bytes());
         answer(c, &init, &out);
         if cancel {

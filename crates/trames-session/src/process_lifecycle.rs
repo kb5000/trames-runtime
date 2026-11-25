@@ -108,6 +108,9 @@ impl<C: Cpu> Lifecycle<C> {
             .is_some_and(|root| root.read().linux.vfs.has_native_services())
     }
     pub(super) fn capture(kernel: &Kernel<C>) -> Self {
+        let layouts = kernel.file_layout_work();
+        let memory = kernel.memory_retirements();
+        memory.bind_layouts(&layouts);
         #[cfg(all(test, trames_interpreter_conformance))]
         let owner = std::thread::current();
         #[cfg(all(test, trames_interpreter_conformance))]
@@ -127,9 +130,9 @@ impl<C: Cpu> Lifecycle<C> {
             tasks: kernel.processes.directory(),
             registry: kernel.parallel_memory.share(),
             report: Mutex::default(),
-            memory: kernel.memory_retirements(),
+            memory,
             memory_wake: Default::default(),
-            layouts: kernel.file_layout_work(),
+            layouts,
             layout_driver: Default::default(),
             proc_source: kernel.proc_source.clone(),
             proc_driver: Default::default(),
@@ -220,7 +223,9 @@ impl<C: Cpu> Lifecycle<C> {
             .expect("bound retirement resource")
             .signal
             .reset();
-        if let Err(error) = self.memory.pump() {
+        if let Err(error) = self.memory.pump_with_pause(|id| {
+            epoch.pause_memory(id);
+        }) {
             self.report.lock().unwrap().error = Some(error.into());
             epoch.fail();
         }

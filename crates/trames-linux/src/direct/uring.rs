@@ -11,8 +11,17 @@ use trames_vfs::{
 type Result<T> = std::result::Result<T, Errno>;
 pub(crate) mod actor;
 mod background;
+mod enter;
+mod registration;
+mod setup;
 pub use actor::UringActor;
 pub use background::UringBackground;
+pub use enter::{EnterControl, EnterInput};
+pub use registration::Registration;
+pub(super) use setup::Setup;
+pub(crate) fn enter_args(args: [u64; 6]) -> Result<[u64; 6]> {
+    enter::normalize(args)
+}
 
 trait ResourceOps: Sized {
     fn capture(file: &UringFile) -> Option<Self>;
@@ -64,6 +73,9 @@ impl RequestOps for Request {
     }
 
     fn metadata(&self) -> usize {
+        if self.import_pending {
+            return crate::uring::input::RESERVED_METADATA;
+        }
         512 + self.parts.as_ref().map_or(0, |p| p.len() * 16)
             + self.path.as_ref().map_or(0, Vec::len)
     }
@@ -75,6 +87,9 @@ impl RequestOps for Request {
         }
     }
     fn nowait(&self) -> bool {
+        if self.copy_pending {
+            return false;
+        }
         match self.sqe.opcode() {
             1 | 2 | 4 | 5 | 22 | 23 => self.sqe.op_flags() & 8 != 0,
             26 | 27 => self.sqe.op_flags() & 0x40 != 0,
@@ -88,6 +103,17 @@ impl RequestOps for Request {
         cache: &mut trames_vfs::DiskReadCache,
         selected: Option<trames_vfs::UringProvidedBuffer>,
     ) -> Option<Result<i32>> {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.strong_count() == 0)
+        {
+            // PID/mm number reuse cannot adopt a dead submitter's byte work.
+            return Some(Err(Errno(125)));
+        }
+        if self.import_pending {
+            return None;
+        }
         if let Some(e) = self.error {
             return Some(Err(e));
         }
@@ -111,15 +137,7 @@ impl RequestOps for Request {
         }
         // An accepted file actor owns its imported input through native waits.
         // Never retry a second byte operation through the stateless fast helper.
-        if self.execution.is_some()
-            && self
-                .file
-                .as_ref()
-                .and_then(|f| f.shared_file())
-                .and_then(|f| f.file_target())
-                .is_some()
-            && matches!(s.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
-        {
+        if self.execution.is_some() && matches!(s.opcode(), 1 | 2 | 4 | 5 | 22 | 23 | 26 | 27) {
             return None;
         }
         let resource = self.resource.as_ref()?;
@@ -422,6 +440,9 @@ impl StateOps for State {
         if !matches!(r.sqe.opcode(), 11 | 15) {
             self.completion_count = self.completion_count.saturating_add(1);
         }
+        if r.sqe.opcode() == 11 && r.started {
+            self.timeout_completions = self.timeout_completions.wrapping_add(1);
+        }
         self.overflow.push_back((
             r.sqe.user_data(),
             result.unwrap_or_else(|e| -(e.0 as i32)),
@@ -577,7 +598,7 @@ impl RingOps for Ring {
             if let Some(lease) = &r.selection {
                 selected = Some(lease.buffer);
                 group_lease = Some((lease.group, lease.identity));
-            } else if r.selected() {
+            } else if r.selected() && !r.import_pending {
                 match crate::uring::buffers::peek(&r.sqe, r.owner, &state.provided) {
                     Ok(buffer) => {
                         selected = Some(buffer);
@@ -592,11 +613,13 @@ impl RingOps for Ring {
             let reserved = r.sqe.multishot() && r.error.is_none();
             state.shot_reservations += usize::from(reserved);
             state.inflight += 1;
-            state.inflight_metadata += r.metadata();
+            let inflight_metadata = r.metadata();
+            state.inflight_metadata += inflight_metadata;
             state.running.insert(r.sequence, r.running());
             drop(state);
             // Only imported metadata/control runs under the object lock. Byte
             // transport and guest memory borrows remain on this worker outside it.
+            let was_importing = r.import_pending;
             let result = if let Some(e) = selected_error {
                 Some(Err(e))
             } else {
@@ -622,13 +645,13 @@ impl RingOps for Ring {
             if let (Some(selection), Some(buffer)) = (&mut r.selection, selected) {
                 selection.buffer = buffer;
             }
-            if result.is_some() {
+            if result.is_some() && !was_importing {
                 r.started = true;
             }
             let mut state = self.state.lock().unwrap();
             state.running.remove(&r.sequence);
             state.inflight -= 1;
-            state.inflight_metadata -= r.metadata();
+            state.inflight_metadata -= inflight_metadata;
             state.shot_reservations -= usize::from(reserved);
             let mut notify = false;
             let consumed =
@@ -655,14 +678,21 @@ impl RingOps for Ring {
             } else {
                 0
             };
-            let keep_group = r.selection.is_some() && matches!(result, Some(Err(Errno(11))));
-            let retired_group = if let Some((_, key)) = group_lease.filter(|_| !keep_group) {
-                state.busy_groups.remove(&key);
-                notify |= state.contended_groups.remove(&key);
-                state.retired_groups.remove(&key)
+            let selection_owned = r.selection.is_some();
+            let completed_selection = if r.sqe.multishot() && matches!(result, Some(Ok(_))) {
+                r.selection.take()
             } else {
                 None
             };
+            let keep_group = r.selection.is_some() && matches!(result, Some(Err(Errno(11))));
+            let retired_group =
+                if let Some((_, key)) = group_lease.filter(|_| !keep_group && !selection_owned) {
+                    state.busy_groups.remove(&key);
+                    notify |= state.contended_groups.remove(&key);
+                    state.retired_groups.remove(&key)
+                } else {
+                    None
+                };
             let mut retired = None;
             match result {
                 None => {
@@ -685,6 +715,7 @@ impl RingOps for Ring {
                 }
             }
             drop(state);
+            drop(completed_selection);
             drop(retired_group);
             drop(retired);
             if notify {
@@ -711,6 +742,7 @@ pub struct UringSnapshot {
     pub(super) clock: Option<Instant>,
     pub(super) descriptors: Option<trames_vfs::DirectFds>,
     actor: Option<Arc<std::sync::OnceLock<Arc<UringActor>>>>,
+    compat_actor: Option<Arc<UringActor>>,
     local_actor: std::sync::OnceLock<Arc<UringActor>>,
     context: std::sync::OnceLock<Arc<actor::Execution>>,
     staged_files: Cell<bool>,
@@ -754,6 +786,7 @@ impl UringSnapshot {
             .actor
             .as_ref()
             .and_then(|root| root.get())
+            .or(self.compat_actor.as_ref())
             .or_else(|| self.local_actor.get());
         if let Some(actor) = actor {
             actor.cancel_task(owner, task);
@@ -798,13 +831,17 @@ impl UringSnapshot {
             self.prepare_rings(actor.rings());
         }
         self.actor = Some(actor);
+        self.compat_actor = None;
         self
     }
     fn actor(&self) -> &Arc<UringActor> {
-        self.actor
-            .as_ref()
-            .map_or(&self.local_actor, |actor| &**actor)
-            .get_or_init(Arc::default)
+        if let Some(root) = &self.actor {
+            root.get_or_init(Arc::default)
+        } else if let Some(actor) = &self.compat_actor {
+            actor
+        } else {
+            self.local_actor.get_or_init(Arc::default)
+        }
     }
     fn prepare_rings(&self, rings: impl IntoIterator<Item = Arc<Uring>>) {
         for ring in rings {
@@ -885,6 +922,8 @@ impl UringSnapshot {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
         pid: u32,
+        source: &DirectSyscalls,
+        target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
         if !self.supports_register(args) {
             return None;
@@ -896,6 +935,14 @@ impl UringSnapshot {
             self.record_completed();
             return Some(IoAttempt::Complete(Err(Errno(9))));
         };
+        if memory.async_faults_possible() {
+            let Some(files) = self.membership.clone() else {
+                return Some(IoAttempt::Checkpoint);
+            };
+            return Some(
+                Box::new(Registration::new(ring, args, files)).resume(source, memory, pid, target),
+            );
+        }
         let result = crate::uring::register(&ring, args, memory, |fd| {
             Some(self.membership.as_ref()?.uring_file(fd))
         });
@@ -908,6 +955,7 @@ impl UringSnapshot {
             }
         }
     }
+    #[cfg(test)]
     pub(super) fn start(
         &self,
         args: [u64; 6],
@@ -921,12 +969,59 @@ impl UringSnapshot {
         if pid != self.task {
             return Some(IoAttempt::Checkpoint);
         }
+        let args = match enter::normalize(args) {
+            Ok(args) => args,
+            Err(error) => {
+                self.record_completed();
+                return Some(IoAttempt::Complete(Err(error)));
+            }
+        };
         let Some(ring) = self.ring(args[0] as u32) else {
             self.record_completed();
             return Some(IoAttempt::Complete(Err(Errno(9))));
         };
-        self.start_ring(ring, args, memory, pid, target)
+        self.start_ring(ring, args, memory, pid, target, None, None, true)
     }
+    pub(super) fn start_with_source(
+        &self,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        source: &DirectSyscalls,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<IoAttempt> {
+        if !self.available() {
+            return None;
+        }
+        if pid != self.task {
+            return Some(IoAttempt::Checkpoint);
+        }
+        let args = match enter::normalize(args) {
+            Ok(args) => args,
+            Err(error) => {
+                self.record_completed();
+                return Some(IoAttempt::Complete(Err(error)));
+            }
+        };
+        let Some(ring) = self.ring(args[0] as u32) else {
+            self.record_completed();
+            return Some(IoAttempt::Complete(Err(Errno(9))));
+        };
+        if args[3] & 1 == 0 {
+            // No GETEVENTS: native enter ignores argp/argsz completely. The
+            // normal submission stays inline and needs no control receipt.
+            return self.start_ring(ring, args, memory, pid, target, Some(None), None, true);
+        }
+        Some(
+            Box::new(EnterInput::new(
+                ring,
+                args,
+                self.clock.unwrap_or_else(Instant::now),
+            ))
+            .resume(source, memory, pid, target),
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Original ring, source wait authority and accepted enter state.
     fn start_ring(
         &self,
         ring: Arc<Ring>,
@@ -934,16 +1029,21 @@ impl UringSnapshot {
         memory: &mut impl CpuMemory,
         pid: u32,
         target: &Weak<dyn IoWake>,
+        imported_deadline: Option<Option<Instant>>,
+        control: Option<Arc<EnterControl>>,
+        account: bool,
     ) -> Option<IoAttempt> {
+        if memory.async_faults_possible() && self.context.get().is_none() {
+            // A missing source resolver must defer before it accepts files or
+            // reaches asynchronous user metadata, including a whole SQE batch.
+            return Some(IoAttempt::Checkpoint);
+        }
         let mut rejected_files = Vec::new();
         let mut prepared = Vec::new();
         let mut retired_graph = Vec::new();
         let mut rejected_requests = Vec::new();
         let mut state = ring.state.lock().unwrap();
-        if args[2] > ring.cq_entries as u64 {
-            state.waits.remove(&pid);
-            return Some(IoAttempt::Complete(Err(Errno(22))));
-        }
+        let minimum = (args[2] as u32).min(ring.cq_entries);
         let head = match ring.cq_head(&state) {
             Ok(h) => h,
             Err(e) => {
@@ -952,10 +1052,15 @@ impl UringSnapshot {
             }
         };
         if !state.waits.contains_key(&pid) {
-            let deadline = match crate::uring::time::enter_deadline(
-                args,
-                memory,
-                self.clock.unwrap_or_else(Instant::now),
+            let deadline = match imported_deadline.map_or_else(
+                || {
+                    crate::uring::time::enter_deadline(
+                        args,
+                        memory,
+                        self.clock.unwrap_or_else(Instant::now),
+                    )
+                },
+                Ok,
             ) {
                 Ok(deadline) => deadline,
                 Err(e) => return Some(IoAttempt::Complete(Err(e))),
@@ -987,10 +1092,10 @@ impl UringSnapshot {
                     previous = None;
                     continue;
                 };
-                let Some(mut r) = crate::uring::import_request(
+                let Some((mut r, imported)) = crate::uring::input::capture(
                     s,
                     sequence + 1,
-                    &state,
+                    &*state,
                     memory,
                     pid,
                     previous,
@@ -1028,9 +1133,12 @@ impl UringSnapshot {
                     rejected_requests.push(r);
                     break;
                 }
-                let context = matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
-                    && (self.staged_files.get() || r.resource.is_none())
-                    && r.file.is_some()
+                let context = r.import_pending
+                    || matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+                        && (self.staged_files.get()
+                            || r.resource.is_none()
+                            || memory.async_faults_possible() && r.buffer.is_none())
+                        && r.file.is_some()
                     || matches!(
                         r.sqe.opcode(),
                         3 | 13 | 16 | 17 | 18 | 19 | 21 | 28 | 34 | 45 | 55 | 56 | 57
@@ -1041,7 +1149,8 @@ impl UringSnapshot {
                             Some(Object::Byte(_))
                         )
                     || matches!(r.sqe.opcode(), 26 | 27)
-                        && (r.resource.is_none()
+                        && (memory.async_faults_possible()
+                            || r.resource.is_none()
                             || matches!(
                                 r.resource.as_ref().map(|f| &f.object),
                                 Some(Object::Tcp(_))
@@ -1054,7 +1163,8 @@ impl UringSnapshot {
                                 != 0);
                 if r.error.is_none() && context {
                     if let Some(context) = self.context.get() {
-                        self.actor().accept(&ring, &mut r, context.clone());
+                        self.actor()
+                            .accept_import(&ring, &mut r, context.clone(), imported);
                     } else if r.resource.is_none() || r.sqe.opcode() != 6 {
                         prepared.push(Some(r));
                         return Some(IoAttempt::Checkpoint);
@@ -1077,9 +1187,9 @@ impl UringSnapshot {
                 if let Some(r) = request {
                     state.next = r.sequence;
                     let mut r = r;
-                    r.source = Some(Arc::downgrade(
-                        &(self.actor().clone() as Arc<dyn trames_vfs::UringSource>),
-                    ));
+                    if r.source.is_none() {
+                        self.actor().bind_source(&mut r);
+                    }
                     state.insert(r);
                 } else {
                     state.dropped = state.dropped.wrapping_add(1);
@@ -1108,12 +1218,29 @@ impl UringSnapshot {
             }
         };
         let completion_event = ring.completion_event(&state, count);
-        let ready = args[3] & 1 == 0
-            || args[2] == 0
-            || state.tail.wrapping_sub(ring.load_queue(64)) >= args[2] as u32;
-        let (submitted, deadline) = state.waits.get(&pid).copied().unwrap_or((0, None));
-        let expired = deadline.is_some_and(|d| Instant::now() >= d);
-        if ready || expired {
+        let (submitted, mut deadline) = state.waits.get(&pid).copied().unwrap_or((0, None));
+        let count = state.tail.wrapping_sub(ring.load_queue(64));
+        let completed = if let Some(control) = &control {
+            match control.poll(count, minimum, state.timeout_completions) {
+                enter::Decision::Ready(result) => Some(result.map(|()| submitted as u64)),
+                enter::Decision::Pending(next) => {
+                    deadline = next;
+                    state.waits.insert(pid, (submitted, next));
+                    None
+                }
+            }
+        } else if args[3] & 1 == 0 || count >= minimum {
+            Some(Ok(submitted as u64))
+        } else if deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(if submitted != 0 || count != 0 {
+                Ok(submitted as u64)
+            } else {
+                Err(Errno(62))
+            })
+        } else {
+            None
+        };
+        if completed.is_some() {
             state.waits.remove(&pid);
         }
         let changed = tail != state.tail;
@@ -1121,13 +1248,11 @@ impl UringSnapshot {
         if changed {
             ring.notify_completion(completion_event);
         }
-        if ready || expired {
-            self.completed.set(self.completed.get() + 1);
-            return Some(IoAttempt::Complete(if !ready && submitted == 0 {
-                Err(Errno(62))
-            } else {
-                Ok(submitted as u64)
-            }));
+        if let Some(result) = completed {
+            if account {
+                self.record_completed();
+            }
+            return Some(IoAttempt::Complete(result));
         }
         if deferred {
             return Some(IoAttempt::Checkpoint);
@@ -1165,13 +1290,25 @@ impl UringSnapshot {
                     owner: self.owner,
                     task: pid,
                     sources: wait::WaitSources::default(),
+                    control: control.map_or_else(Default::default, std::sync::OnceLock::from),
                 })),
             },
             memory,
         )
         .into()
     }
-    pub(super) fn resume(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+    pub(super) fn resume(&self, pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+        let control = pending
+            .uring
+            .as_ref()
+            .and_then(|wait| wait.control.get().cloned());
+        if let Some(result) = control.as_ref().and_then(|control| control.result()) {
+            return IoAttempt::Complete(result);
+        }
+        let attempt = self.resume_inner(pending, memory);
+        enter::finish_attempt(&control, attempt)
+    }
+    fn resume_inner(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         pending.signal.reset();
         let wait = pending.uring.as_mut().unwrap();
         let before = wait.ring.request_deadline(wait.owner, wait.task);
@@ -1199,17 +1336,35 @@ impl UringSnapshot {
         };
         let completion_event = wait.ring.completion_event(&state, count);
         let changed = tail != state.tail;
-        let (submitted, deadline) = state
+        let (submitted, mut deadline) = state
             .waits
             .get(&wait.task)
             .copied()
             .unwrap_or((0, pending.deadline));
+        let minimum = (pending.args[2] as u32).min(wait.ring.cq_entries);
+        let count = state.tail.wrapping_sub(wait.ring.load_queue(64));
+        let completed = if let Some(control) = wait.control.get() {
+            match control.poll(count, minimum, state.timeout_completions) {
+                enter::Decision::Ready(result) => Some(result.map(|()| submitted as u64)),
+                enter::Decision::Pending(next) => {
+                    deadline = next;
+                    state.waits.insert(wait.task, (submitted, next));
+                    None
+                }
+            }
+        } else if pending.args[3] & 1 == 0 || count >= minimum {
+            Some(Ok(submitted as u64))
+        } else if deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(if submitted != 0 || count != 0 {
+                Ok(submitted as u64)
+            } else {
+                Err(Errno(62))
+            })
+        } else {
+            None
+        };
         pending.deadline = deadline;
-        let ready = pending.args[3] & 1 == 0
-            || pending.args[2] == 0
-            || state.tail.wrapping_sub(wait.ring.load_queue(64)) >= pending.args[2] as u32;
-        let expired = deadline.is_some_and(|d| Instant::now() >= d);
-        if ready || expired {
+        if completed.is_some() {
             state.waits.remove(&wait.task);
         }
         let checkpoint = deferred;
@@ -1225,13 +1380,9 @@ impl UringSnapshot {
         if changed {
             wait.ring.notify_completion(completion_event);
         }
-        if ready || expired {
+        if let Some(result) = completed {
             self.completed.set(self.completed.get() + 1);
-            return IoAttempt::Complete(if !ready && submitted == 0 {
-                Err(Errno(62))
-            } else {
-                Ok(submitted as u64)
-            });
+            return IoAttempt::Complete(result);
         }
         if checkpoint {
             return IoAttempt::Checkpoint;
@@ -1239,44 +1390,90 @@ impl UringSnapshot {
         IoAttempt::Blocked(pending)
     }
 }
-/// Accepted enter metadata, retaining the original ring across task handoff.
-/// Queue cursors, requests and registration authority stay in the shared ring.
+/// One original enter receipt. Logical completion releases its ring/task
+/// ownership even while old snapshots retain the completed receipt.
 #[derive(Clone)]
 pub struct UringEnter {
-    pub ring: Arc<Uring>,
-    pub submitted: u32,
-    pub deadline: Option<Instant>,
+    original: Arc<EnterControl>,
+}
+impl UringEnter {
+    pub fn retained(
+        ring: Arc<Uring>,
+        task: u32,
+        args: [u64; 6],
+        submitted: u32,
+        deadline: Option<Instant>,
+    ) -> Self {
+        let timeouts = ring.state.lock().unwrap().timeout_completions;
+        Self {
+            original: EnterControl::retained(ring, task, args, submitted, deadline, timeouts),
+        }
+    }
+    pub fn ring(&self) -> Option<Arc<Uring>> {
+        self.original.ring()
+    }
+    pub fn submitted(&self) -> u32 {
+        self.original.submitted()
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.original.deadline()
+    }
+    pub fn result(&self) -> Option<Result<u64>> {
+        self.original.result()
+    }
+    pub fn native_mask(&self) -> bool {
+        self.original.native_mask()
+    }
+    pub fn interrupted(&self) -> Result<u64> {
+        self.original.finish(Err(Errno(4)), true)
+    }
+    pub fn cancel(&self) {
+        self.original.finish(Err(Errno(4)), false).ok();
+    }
 }
 impl PendingIo {
     pub fn uring_enter(&self) -> Option<UringEnter> {
         let wait = self.uring.as_ref()?;
-        let (submitted, deadline) = wait
-            .ring
-            .state
-            .lock()
-            .unwrap()
-            .waits
-            .get(&wait.task)
-            .copied()?;
-        Some(UringEnter {
-            ring: wait.ring.clone(),
-            submitted,
-            deadline,
-        })
+        let original = wait
+            .control
+            .get_or_init(|| {
+                let state = wait.ring.state.lock().unwrap();
+                let (submitted, deadline) = state
+                    .waits
+                    .get(&wait.task)
+                    .copied()
+                    .unwrap_or((0, self.deadline));
+                EnterControl::retained(
+                    wait.ring.clone(),
+                    wait.task,
+                    self.args,
+                    submitted,
+                    deadline,
+                    state.timeout_completions,
+                )
+            })
+            .clone();
+        Some(UringEnter { original })
     }
 }
 impl DirectSyscalls {
     pub fn start_retained_uring(
         &self,
         call: UringEnter,
-        args: [u64; 6],
+        _args: [u64; 6],
         memory: &mut impl CpuMemory,
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if let Some(result) = call.result() {
+            return IoAttempt::Complete(result);
+        }
         if pid != self.urings.task {
             return IoAttempt::Checkpoint;
         }
+        let Some(ring) = call.ring() else {
+            return IoAttempt::Complete(Err(Errno(4)));
+        };
         self.urings.ensure_context(
             self.paths.as_ref(),
             self.resources.as_ref(),
@@ -1285,16 +1482,29 @@ impl DirectSyscalls {
             self.file_layouts.as_ref(),
             self.task_signal.as_ref(),
         );
-        call.ring
-            .state
+        let deadline = call.deadline();
+        ring.state
             .lock()
             .unwrap()
             .waits
             .entry(pid)
-            .or_insert((call.submitted, call.deadline));
-        self.urings
-            .start_ring(call.ring, args, memory, pid, target)
-            .expect("retained original ring")
+            .or_insert((call.submitted(), deadline));
+        let args = call.original.args();
+        let control = Some(call.original);
+        let attempt = self
+            .urings
+            .start_ring(
+                ring,
+                args,
+                memory,
+                pid,
+                target,
+                Some(deadline),
+                control.clone(),
+                true,
+            )
+            .expect("retained original ring");
+        enter::finish_attempt(&control, attempt)
     }
 }
 pub(super) struct Wait {
@@ -1303,6 +1513,7 @@ pub(super) struct Wait {
     owner: u64,
     task: u32,
     sources: wait::WaitSources,
+    control: std::sync::OnceLock<Arc<EnterControl>>,
 }
 impl Wait {
     pub fn external(&self) -> bool {
@@ -1434,6 +1645,12 @@ impl UringEpoch {
         retained_files: &BTreeMap<usize, trames_vfs::PreparedFile>,
     ) -> UringSnapshot {
         let mut snapshot = self.capture_worker(vfs, owner, task, files, retained_files);
+        let source: Arc<dyn std::any::Any + Send + Sync> =
+            vfs.uring_source(|| Arc::new(UringActor::default()));
+        snapshot.compat_actor = Some(
+            Arc::downcast::<UringActor>(source)
+                .unwrap_or_else(|_| panic!("one io_uring source type per original VFS")),
+        );
         snapshot.original = Some(Box::new(Original {
             paths: vfs.path_queries(),
             factory: vfs.descriptor_factory(),

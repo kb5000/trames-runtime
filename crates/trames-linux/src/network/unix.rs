@@ -2,7 +2,25 @@
 //! Owner-side Unix socket control and per-message metadata.
 use super::*;
 mod packet;
+mod replay;
 pub(crate) use packet::{prepare_transfer, DatagramState, PreparedTransfer};
+pub(crate) fn prepare_transfer_cached<I: MessageIo>(
+    number: u32,
+    args: [u64; 6],
+    memory: &impl CpuMemory,
+    io: &mut I,
+    sent: &std::sync::OnceLock<Result<I::Rights>>,
+) -> Option<Result<PreparedTransfer<I::Rights>>> {
+    let mut received = None;
+    let mut rights = None;
+    let io = replay::Io {
+        original: io,
+        received: &mut received,
+        rights: &mut rights,
+        sent: Some(sent),
+    };
+    prepare_transfer(number, args, memory, &io)
+}
 impl Linux {
     pub(crate) fn local_network_vfs(
         vfs: &mut trames_vfs::Vfs,
@@ -424,6 +442,7 @@ pub(crate) struct PreparedMessage<R> {
     args: [u64; 6],
     receive: bool,
     send: Option<(Vec<u8>, R, [u32; 3], bool)>,
+    pending: Option<std::sync::Arc<std::sync::Mutex<replay::Receive<R>>>>,
 }
 /// Import buffers, credentials and descriptor references once, before waiting.
 /// The typed worker Rights graph owns only actual shared OFDs.
@@ -449,6 +468,7 @@ pub(crate) fn prepare_message<I: MessageIo>(
                 args: a,
                 receive,
                 send: None,
+                pending: memory.async_faults_possible().then(Default::default),
             });
         }
         let control = frame.control;
@@ -527,6 +547,7 @@ pub(crate) fn prepare_message<I: MessageIo>(
             args: a,
             receive,
             send: Some((bytes, rights, identity, explicit)),
+            pending: None,
         })
     })();
     if deferred.get() {
@@ -559,6 +580,13 @@ impl<R: Clone + Default> PreparedMessage<R> {
         }
     }
     pub(crate) fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.lock().unwrap().received.is_some())
+        {
+            return Ok(());
+        }
         if !self.receive {
             return Ok(());
         }
@@ -584,6 +612,43 @@ impl<R: Clone + Default> PreparedMessage<R> {
         Ok(())
     }
     pub(crate) fn progress(
+        &self,
+        memory: &mut impl CpuMemory,
+        io: &mut impl MessageIo<Rights = R>,
+    ) -> Option<Result<u64>> {
+        if let Some(pending) = &self.pending {
+            let mut pending = pending.lock().unwrap();
+            if let Some(result) = pending.finished {
+                return Some(result);
+            }
+            let replay::Receive {
+                received,
+                rights,
+                copies,
+                ..
+            } = &mut *pending;
+            let mut io = replay::Io {
+                original: io,
+                received,
+                rights,
+                sent: None,
+            };
+            let mut memory = crate::copy_replay::Writer::new(memory, copies);
+            let result = self.progress_body(&mut memory, &mut io);
+            if pending.copies.fault.is_none()
+                && result.is_some_and(|result| result != Err(Errno(11)))
+            {
+                pending.finished = result;
+                pending.received = None;
+            }
+            return result;
+        }
+        self.progress_body(memory, io)
+    }
+    pub(crate) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        self.pending.as_ref()?.lock().unwrap().copies.fault.take()
+    }
+    fn progress_body(
         &self,
         memory: &mut impl CpuMemory,
         io: &mut impl MessageIo<Rights = R>,

@@ -573,8 +573,8 @@ impl<C: Cpu> Starter<C> {
                     }
                     let cpu_share = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).and_then(trames_vfs::CgroupTask::cpu_share);
                     let _memory_scope = work.syscalls.as_ref().and_then(|snapshot| snapshot.io_signals.cgroup()).map(trames_vfs::CgroupTask::memory_scope);
-                    let _file_actor = work.syscalls.as_ref().map(|snapshot| trames_vfs::FileActorScope::enter(
-                        snapshot.io_signals.credentials().clone(), snapshot.io_signals.tid()));
+                    let _file_actor = work.syscalls.as_ref().map(|snapshot| trames_vfs::FileActorScope::enter_with_sync(
+                        snapshot.io_signals.credentials().clone(), snapshot.io_signals.tid(), snapshot.direct.sync_executor()));
                     let began = Instant::now();
                     if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
                     let mut instructions = 0;
@@ -598,7 +598,7 @@ impl<C: Cpu> Starter<C> {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if let Some(snapshot) = &work.syscalls {
-                                if let Some(state) = snapshot.io_signals.take_trace_update() {
+                                if let Some(state) = (!(snapshot.io_signals.has_pending_frame() || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending))).then(||snapshot.io_signals.take_trace_update()).flatten() {
                                     work.cpu.restore_architectural_state(&state);
                                 }
                                 if epoch.is_some() && snapshot.io_signals.effective_affinity() & (1u64 << index) == 0 {
@@ -606,6 +606,33 @@ impl<C: Cpu> Starter<C> {
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(status) = snapshot.io_signals.lifecycle().termination() {
+                                    if let Some(call) = job.io.as_ref().and_then(|io|io.aio.as_ref())
+                                        .or_else(||job.retry.as_ref()?.aio.as_ref()).filter(|call|call.must_finish_on_exit()).cloned() {
+                                        if call.exit_waiting() && job.io.as_ref().is_some_and(|io|!io.signal.ready()
+                                            && !io.wake_deadline().is_some_and(|deadline|deadline<=Instant::now())) {
+                                            parked_io=job.io.take();
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
+                                        let (number,args)=call.entry();
+                                        let target=&epoch.as_ref().expect("source AIO wake authority").io_target;
+                                        match snapshot.direct.drain_aio_exit(call,work.memory.as_deref_mut().expect("original exit View"),work.pid,target) {
+                                            trames_linux::IoAttempt::Complete(result) => {
+                                                job.io=None;job.retry=None;
+                                                snapshot.io_signals.io.complete(number,args[3],result);
+                                                work.trace.finish(&mut work.cpu,result.unwrap_or_else(|error|0u64.wrapping_sub(error.0 as u64)));
+                                                syscalls+=1;
+                                            }
+                                            trames_linux::IoAttempt::Blocked(wait) => {
+                                                job.io=None;job.retry=None;parked_io=Some(wait);
+                                                break SliceOutcome::Yield { instructions: 0 };
+                                            }
+                                            trames_linux::IoAttempt::HostError(error) => {
+                                                epoch.as_ref().unwrap().fail_host_io(error);maintenance=true;
+                                                break SliceOutcome::Yield { instructions: 0 };
+                                            }
+                                            _=>unreachable!("accepted AIO exit owns no structural import"),
+                                        }
+                                    }
                                     if snapshot.io_signals.exit_stop_held() || snapshot.io_signals.trace_exit_stop(status, || work.cpu.architectural_state()) {
                                         maintenance=true;break SliceOutcome::Yield { instructions: 0 };
                                     }
@@ -613,10 +640,27 @@ impl<C: Cpu> Starter<C> {
                                         if let Some(compile) = pending.compile.take() { authority.context.abandon(compile.job); }
                                     }
                                     if let Some(crate::run_queue::WaitState::Futex { wait, .. }) = &job.waiting { wait.cancel(); }
+                                    if let Some(crate::run_queue::WaitState::Delivery(wait)) = &job.waiting { wait.cancel(); }
+                                    if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting { wait.cancel(); }
+                                    if let Some(call) = job.io.as_ref().and_then(|io|io.binder.as_ref()).or_else(||job.retry.as_ref()?.binder.as_ref()) { call.cancel(); }
+                                    if let Some(io) = &job.io { io.cancel_copies(); }
+                                    if let Some(io) = &job.retry {
+                                        if let Some(call) = &io.aio { call.cancel(); }
+                                        if let Some(call) = &io.uring { call.cancel(); }
+                                        if let Some(file) = &io.file { file.cancel_import(); }
+                                        if let Some(call) = &io.file_checkpoint { call.cancel(); }
+                                    }
                                     thread_exit = snapshot.exit_thread(work.pid, status, work.memory.as_deref_mut().expect("exit View"));
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
-                                if snapshot.io_signals.trace_control_point(|| work.cpu.architectural_state()) {
+                                let copying_control = snapshot.io_signals.has_pending_frame()
+                                    || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending)
+                                    || job.io.as_ref().is_some_and(|io|io.interruptible_file_wait() == Some(false))
+                                    || job.retry.as_ref().is_some_and(|call|call.file_checkpoint.is_some()
+                                        || call.file.as_ref().is_some_and(|file|!file.interruptible())
+                                        || call.binder.as_ref().is_some_and(|binder|!binder.interruptible())
+                                        || call.aio.as_ref().is_some_and(|aio|!aio.interruptible()));
+                                if !copying_control && snapshot.io_signals.trace_control_point(|| work.cpu.architectural_state()) {
                                     maintenance=true;break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
@@ -643,7 +687,7 @@ impl<C: Cpu> Starter<C> {
                                 }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
-                                    if let Some(value) = wait.request.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace) {
+                                    if let Some(value) = wait.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace, snapshot.io_wake.as_ref()) {
                                         work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
@@ -652,14 +696,14 @@ impl<C: Cpu> Starter<C> {
                                     }
                                 // Completion producers may hold resource locks. Publish a return
                                 // stop here, on the owning worker, before the next signal or instruction.
-                                if work.trace.take_return(|| !snapshot.io_signals.trace_stopped())
+                                if !(snapshot.io_signals.has_pending_frame() || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending)) && work.trace.take_return(|| !snapshot.io_signals.trace_stopped())
                                     && (snapshot.io_signals.trace_syscall_stop(false,||work.cpu.architectural_state())
                                         || snapshot.io_signals.trace_single_step() && snapshot.io_signals.trace_syscall_step_stop(|| work.cpu.architectural_state())) {
                                     maintenance=true;break SliceOutcome::Yield {instructions:0};
                                 }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
-                                    if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
+                                    if let Some(value) = wait.check(&snapshot.children, &snapshot.io_signals, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View"), snapshot.io_wake.as_ref()) {
                                         work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
@@ -669,10 +713,10 @@ impl<C: Cpu> Starter<C> {
                                 if let Some((sig, shared, action)) = snapshot.next_io_signal() {
                                     let disposition = trames_kernel::signal::disposition(sig, action);
                                     let namespace_init = snapshot.io_routes.namespace.is_nested() && snapshot.identities[0] == 1;
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=snapshot.io_signals.has_pending_frame() || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
-                                        || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
-                                        || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
+                                        || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.aio.as_ref().is_some_and(|aio|!aio.interruptible()) || io.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                        || job.retry.as_ref().is_some_and(|io|io.number==2 || io.aio.as_ref().is_some_and(|aio|!aio.interruptible()) || io.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
                                     if sig!=9 && !stop_held && snapshot.io_signals.trace_point(sig,Some(shared),||work.cpu.architectural_state()) {
                                         maintenance=true;break SliceOutcome::Yield {instructions:0};
                                     }
@@ -696,46 +740,74 @@ impl<C: Cpu> Starter<C> {
                                     if disposition == trames_kernel::signal::Disposition::Handler {
                                         if let Some(p)=job.io.as_ref().and_then(|io|io.file_pending()).or_else(||job.retry.as_ref()?.file.clone()) {p.fuse_interrupt();}
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || matches!(io.number, 2 | 270 | 271))
-                                        || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
+                                    let uninterruptible = snapshot.io_signals.has_pending_frame() || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.aio.as_ref().is_some_and(|call|!call.interruptible()) || io.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || matches!(io.number, 2 | 270 | 271))
+                                        || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.aio.as_ref().is_some_and(|aio|!aio.interruptible()) || call.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
-                                        if let Some(info) = snapshot.io_signals.take(sig, shared) {
-                                            if let Some(waiting) = job.waiting.take() {
-                                                if let crate::run_queue::WaitState::Futex { wait, .. } = &waiting {
-                                                    wait.cancel();
+                                        if let Some((action, info)) = snapshot.actions.take_handler(&snapshot.io_signals, sig, shared) {
+                                            let io = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or(job.retry.take());
+                                            let delivery = crate::run_queue::Delivery::new(sig, info, action, job.waiting.take(), io);
+                                            let Some(delivered) = delivery.progress(work.memory.as_deref_mut().expect("signal completion View")) else {
+                                                if let Some(signal) = &snapshot.io_wake { delivery.bind(signal); }
+                                                parked = Some(crate::run_queue::WaitState::Delivery(delivery));
+                                                break SliceOutcome::Yield { instructions: 0 };
+                                            };
+                                            if delivered.completion.as_ref().is_some_and(|completion|completion.account_io) { syscalls += 1; }
+                                            match snapshot.finish_delivery(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), &mut work.trace, delivered) {
+                                                Ok(Some(fault)) => {
+                                                    parked=Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(fault.wait)));
+                                                    break SliceOutcome::Yield { instructions:0 };
                                                 }
-                                                if let crate::run_queue::WaitState::Sleep { deadline, remaining } = &waiting {
-                                                    let result=crate::clock_sleep::interrupted(work.memory.as_deref_mut().expect("signal View"),*remaining,deadline.saturating_duration_since(Instant::now()));
-                                                    work.trace.finish(&mut work.cpu,result);
-                                                } else if let crate::run_queue::WaitState::ClockSleep(wait) = &waiting {
-                                                    let result=wait.interrupt(work.memory.as_deref_mut().expect("signal View"));
-                                                    work.trace.finish(&mut work.cpu,result);
-                                                } else if let crate::run_queue::WaitState::Child(wait) = &waiting {
-                                                    if action.flags & 0x10000000 != 0 {
-                                                        work.trace.restart();
-                                                        for (i, value) in wait.request.args.iter().enumerate() { work.cpu.set_x(i, *value); }
-                                                        work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                    } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
-                                                } else if !matches!(waiting, crate::run_queue::WaitState::Cgroup(_)) { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
-                                            }
-                                            let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
-                                            if let Some(pending) = pending {
-                                                syscalls += 1;
-                                                let interrupted=if let Some(wait)=&pending.retained_poll {
-                                                    wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
-                                                }else if let Some(result)=pending.retained_byte.as_ref().and_then(|file| file.interrupted(work.memory.as_deref_mut().expect("signal View"))).or_else(||pending.retained_socket.as_ref().and_then(|call|call.interrupted(work.memory.as_deref_mut().expect("signal View")))){result}else{Err(trames_vfs::Errno(4))};
-                                                if interrupted.is_err() && action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76..=77 | 206 | 207 | 211 | 212 | 243 | 269) && pending.deadline.is_none() {
-                                                    work.trace.restart();
-                                                    for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
-                                                    work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                } else { snapshot.io_signals.io.complete(pending.number, pending.args[3], interrupted); work.trace.finish(&mut work.cpu, interrupted.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); }
-                                            }
-                                            if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
-                                                snapshot.io_signals.lifecycle().request_exit(11);
+                                                Err(_) => { snapshot.io_signals.lifecycle().request_exit(11); },
+                                                Ok(None) => {},
                                             }
                                             continue;
                                         }
+                                        continue;
                                     }
+                                }
+                                if let Some(crate::run_queue::WaitState::Delivery(delivery)) = &job.waiting {
+                                    if !delivery.ready() {
+                                        parked = job.waiting.take();
+                                        break SliceOutcome::Yield { instructions: 0 };
+                                    }
+                                    let delivered = delivery.progress(work.memory.as_deref_mut().expect("signal completion View"));
+                                    if let Some(delivered) = delivered {
+                                        job.waiting = None;
+                                        if delivered.completion.as_ref().is_some_and(|completion|completion.account_io) { syscalls += 1; }
+                                        match snapshot.finish_delivery(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), &mut work.trace, delivered) {
+                                            Ok(Some(fault)) => {
+                                                parked=Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(fault.wait)));
+                                                break SliceOutcome::Yield { instructions:0 };
+                                            }
+                                            Err(_) => { snapshot.io_signals.lifecycle().request_exit(11); },
+                                            Ok(None) => {},
+                                        }
+                                    } else if delivery.external() {
+                                        parked = job.waiting.take();
+                                        break SliceOutcome::Yield { instructions: 0 };
+                                    } else { job.waiting=None; }
+                                    continue;
+                                }
+                                if snapshot.io_signals.has_pending_frame() {
+                                    if matches!(&job.waiting, Some(crate::run_queue::WaitState::Page(wait)) if !wait.ready()) {
+                                        parked=job.waiting.take();
+                                        break SliceOutcome::Yield { instructions:0 };
+                                    }
+                                    job.waiting=None;
+                                    match snapshot.resume_io_frame(&mut work.cpu, work.memory.as_deref_mut().expect("original signal frame View")) {
+                                        Ok((Some(fault), _)) => {
+                                            parked=Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(fault.wait)));
+                                            break SliceOutcome::Yield { instructions:0 };
+                                        }
+                                        Err((_, true)) => {
+                                            snapshot.bad_sigreturn(&mut work.cpu, work.memory.as_deref_mut().expect("original signal return View"));
+                                            work.trace.record(work.cpu.x(0));
+                                        }
+                                        Err((_, false)) => { snapshot.io_signals.lifecycle().request_exit(11); },
+                                        Ok((None, true)) => work.trace.record(work.cpu.x(0)),
+                                        Ok((None, false)) => {},
+                                    }
+                                    continue;
                                 }
                             }
                             if let Some(crate::run_queue::WaitState::Cgroup(deadline)) = &job.waiting {
@@ -777,8 +849,8 @@ impl<C: Cpu> Starter<C> {
                                 if job.hardware_wait.as_ref().is_some_and(|w|w.ready()) {job.hardware_wait=None;}
                                 let kernel_pending=job.pending_cpu.is_some()
                                     || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
-                                    || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
-                                    || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
+                                    || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.aio.as_ref().is_some_and(|aio|!aio.interruptible()) || io.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                    || job.retry.as_ref().is_some_and(|io|io.number==2 || io.aio.as_ref().is_some_and(|aio|!aio.interruptible()) || io.binder.as_ref().is_some_and(|binder|!binder.interruptible()) || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
                                 if !kernel_pending {maintenance=true;break SliceOutcome::Yield {instructions:0};}
                             }
                             if let Some(epoch) = &epoch {
@@ -849,6 +921,8 @@ impl<C: Cpu> Starter<C> {
                                     let _tcp_liveness=call.tcp_liveness;
                                     if let Some(message) = call.message {
                                         snapshot.direct.start_retained_message(message, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(binder) = call.binder {
+                                        snapshot.direct.start_retained_binder(binder, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
                                     } else if let Some(aio) = call.aio {
                                         snapshot.direct.start_retained_aio(aio, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
                                     } else if let Some(file) = call.file {
@@ -880,7 +954,7 @@ impl<C: Cpu> Starter<C> {
                                     trames_linux::IoAttempt::HostError(error) => { epoch.as_ref().expect("native I/O execution epoch").fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                     trames_linux::IoAttempt::Complete(result) => {
                                         if let Some(call) = &saved_call { snapshot.io_signals.io.complete(call.number, call.args[3], result); }
-                                        if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_wait_mask(); }
+                                        if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_event_mask(result); }
                                         work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         syscalls += 1;
                                         continue;
@@ -930,7 +1004,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         work.cpu.set_x(8, call.number as u64);
                                         // A SIGPIPE/checkpoint must still reach the
                                         // original accepted OFD in the joined kernel.
-                                        job.retry = saved_call.filter(|call| call.retained_socket.is_some() || call.retained_byte.is_some() || call.retained_poll.is_some() || call.tcp_liveness.is_some());
+                                        job.retry = saved_call.filter(|call| call.binder.is_some() || call.retained_socket.is_some() || call.retained_byte.is_some() || call.retained_poll.is_some() || call.tcp_liveness.is_some());
                                         break SliceOutcome::Syscall { instructions: 0 };
                                     }
                                 }
@@ -940,8 +1014,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             }
                             if job.pending_cpu.is_none() {
                                 if let Some(snapshot) = &work.syscalls {
-                                    if !snapshot.resume_rseq(&mut work.cpu, work.memory.as_deref_mut().expect("rseq View"), index) {
-                                        continue;
+                                    match snapshot.resume_rseq(&mut work.cpu, work.memory.as_deref_mut().expect("rseq View"), index) {
+                                        Ok(true) => {},
+                                        Ok(false) => continue,
+                                        Err(fault) => {
+                                            parked = Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(fault.wait)));
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
                                     }
                                 }
                             }
@@ -1398,6 +1477,8 @@ impl<C: Cpu> Drop for Pool<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    mod aio_exit_tests;
+    mod signal_delivery_tests;
     use std::sync::atomic::AtomicU64;
     use trames_cpu::Cpu;
     type Pool = crate::workers::Pool<Cpu>;
@@ -1532,6 +1613,7 @@ mod tests {
             None,
         );
         job.retry = Some(crate::run_queue::IoCall {
+            binder: None,
             aio: None,
             message: None,
             file: None,
@@ -2710,7 +2792,8 @@ mod tests {
                 .unwrap();
             memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
             let mut snapshot = syscall_snapshot();
-            snapshot.direct = trames_linux::DirectSyscalls::new(v.direct_descriptors());
+            snapshot.direct = trames_linux::DirectSyscalls::new(v.direct_descriptors())
+                .with_task_signal(snapshot.io_signals.clone());
             snapshot.io_signals.context.lock().unwrap().mask = 1 << 9;
             snapshot.io_signals.publish_mask(1 << 9);
             snapshot.actions.set(

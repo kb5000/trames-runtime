@@ -3,7 +3,7 @@
 //! and queue-discard effects on this original task group's resources.
 use super::UNBLOCKABLE;
 use std::sync::{Arc, Mutex};
-use trames_memory::{Access, CpuMemory};
+use trames_memory::CpuMemory;
 use trames_vfs::Errno;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -12,6 +12,20 @@ pub struct Action {
     pub flags: u64,
     pub restorer: u64,
     pub mask: u64,
+}
+
+impl Action {
+    pub(super) fn encode(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        for (part, value) in
+            bytes
+                .chunks_exact_mut(8)
+                .zip([self.handler, self.flags, self.restorer, self.mask])
+        {
+            part.copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
 }
 
 pub struct Actions(Arc<Mutex<[Action; 65]>>);
@@ -35,6 +49,84 @@ impl Actions {
     pub fn set(&self, signal: usize, action: Action) {
         self.0.lock().unwrap()[signal] = action;
     }
+    /// Claim the actual handler and signal under their original sighand lock.
+    /// A later installation survives this accepted handler's copy waits.
+    pub fn take_handler(
+        &self,
+        task: &super::IoTask,
+        signal: u32,
+        shared: bool,
+    ) -> Option<(Action, super::RetainedInfo)> {
+        if !(1..=64).contains(&signal) {
+            return None;
+        }
+        let mut table = self.0.lock().unwrap();
+        let action = table[signal as usize];
+        if action.handler <= 1 {
+            return None;
+        }
+        let info = task.take(signal, shared)?;
+        if action.flags & 0x8000_0000 != 0 {
+            table[signal as usize].handler = 0;
+        }
+        Some((action, info))
+    }
+    pub(super) fn accept_handler(&self, signal: u32, action: Action) {
+        if !(1..=64).contains(&signal) || action.flags & 0x8000_0000 == 0 {
+            return;
+        }
+        let mut table = self.0.lock().unwrap();
+        if table[signal as usize] == action {
+            table[signal as usize].handler = 0;
+        }
+    }
+    /// Native forced delivery over the original sighand and thread. Preserve
+    /// standard-signal coalescing; only the forced disposition/mask may change.
+    pub fn force_frame_signal(
+        &self,
+        task: &super::IoTask,
+        signal: Option<u32>,
+        fault: super::Fault,
+    ) {
+        debug_assert_eq!(fault.signal, 11);
+        let mut table = self.0.lock().unwrap();
+        let action = &mut table[11];
+        let bit = 1u64 << 10;
+        let mut context = task.context.lock().unwrap();
+        let mask = task.mask();
+        let blocked = mask & bit != 0;
+        if signal == Some(11) || blocked || action.handler == 1 {
+            action.handler = 0;
+        }
+        if blocked {
+            context.mask = mask & !bit;
+            task.publish_mask(context.mask);
+        }
+        drop(context);
+        let _ = task.inbox.enqueue_quiet(
+            11,
+            super::Info {
+                code: fault.code,
+                fault: Some(fault.address),
+                ..Default::default()
+            },
+        );
+        drop(table);
+        // Wake only after sighand and queue locks: an executor may inspect
+        // that same sighand while holding its existing run-queue lock.
+        task.inbox.changed();
+    }
+    pub fn failed_frame(&self, task: &super::IoTask, signal: u32) {
+        self.force_frame_signal(
+            task,
+            Some(signal),
+            super::Fault {
+                signal: 11,
+                code: 128,
+                address: 0,
+            },
+        );
+    }
     pub fn masks(&self) -> (u64, u64) {
         self.0.lock().unwrap().iter().enumerate().skip(1).fold(
             (0, 0),
@@ -56,8 +148,8 @@ impl Actions {
         }
         Self(Arc::new(Mutex::new(table)))
     }
-    /// Same ABI and preflight order for the task owner and executing workers.
-    /// Mutation callers clear ignored pending signals in their thread group.
+    /// Import before taking sighand; export the captured predecessor after
+    /// releasing it. A failed output does not undo an installed disposition.
     pub fn call(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<Option<Action>, Errno> {
         self.call_with(a, memory, |_| {})
     }
@@ -67,58 +159,53 @@ impl Actions {
         memory: &mut impl CpuMemory,
         changed: impl FnOnce(Action),
     ) -> Result<Option<Action>, Errno> {
-        let signal = a[0] as u32;
-        if signal == 0 || signal > 64 || a[1] != 0 && matches!(signal, 9 | 19) || a[3] != 8 {
-            return Err(Errno(22));
-        }
+        let (signal, new) = Self::import(a, memory)?;
+        let old = self.exchange(signal, new, changed);
         if a[2] != 0 {
             memory
-                .check(a[2], 32, Access::Write)
+                .write_array(a[2], old.encode())
                 .map_err(|_| Errno(14))?;
+        }
+        Ok(new)
+    }
+    pub(super) fn import(
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Result<(usize, Option<Action>), Errno> {
+        if a[3] != 8 {
+            return Err(Errno(22));
         }
         let new = if a[1] != 0 {
             let bytes = memory.read_array::<32>(a[1]).map_err(|_| Errno(14))?;
             let word = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-            // musl sign-extends int sa_flags; the kernel uses its low 32 bits.
-            // Linux accepts unknown bits and clears them on installation. This
-            // also implements SA_UNSUPPORTED probing without claiming support
-            // for SA_EXPOSE_TAGBITS (our fault records use untagged addresses).
-            let flags = word(8) as u32 as u64 & 0xdc000007;
             Some(Action {
                 handler: word(0),
-                flags,
+                flags: word(8) as u32 as u64 & 0xdc000007,
                 restorer: word(16),
                 mask: word(24) & !UNBLOCKABLE,
             })
         } else {
             None
         };
-        if let Some(action) = new {
-            let mut table = self.0.lock().unwrap();
-            // Import and output preflight already finished. Preserve the old
-            // fault-without-mutation contract and keep old/new one transaction.
-            Self::export(table[signal as usize], a[2], memory)?;
-            table[signal as usize] = action;
-            changed(action);
-        } else if a[2] != 0 {
-            // Query-only workers never keep the table lock across guest bytes.
-            Self::export(self.get(signal as usize), a[2], memory)?;
+        let signal = a[0] as u32;
+        if signal == 0 || signal > 64 || new.is_some() && matches!(signal, 9 | 19) {
+            return Err(Errno(22));
         }
-        Ok(new)
+        Ok((signal as usize, new))
     }
-    fn export(old: Action, address: u64, memory: &mut impl CpuMemory) -> Result<(), Errno> {
-        if address == 0 {
-            return Ok(());
+    pub(super) fn exchange(
+        &self,
+        signal: usize,
+        new: Option<Action>,
+        changed: impl FnOnce(Action),
+    ) -> Action {
+        let mut table = self.0.lock().unwrap();
+        let old = table[signal];
+        if let Some(action) = new {
+            table[signal] = action;
+            changed(action);
         }
-        let mut bytes = [0; 32];
-        for (part, value) in
-            bytes
-                .chunks_exact_mut(8)
-                .zip([old.handler, old.flags, old.restorer, old.mask])
-        {
-            part.copy_from_slice(&value.to_le_bytes());
-        }
-        memory.write_array(address, bytes).map_err(|_| Errno(14))
+        old
     }
     pub fn query(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
         if a[1] != 0 {
@@ -187,7 +274,16 @@ mod tests {
             actions.call([10, 0x1000, 0x1ff0, 8, 0, 0], &mut memory),
             Err(Errno(14))
         );
-        assert_eq!(actions.get(10), Action::default());
+        assert_eq!(
+            actions.get(10),
+            Action {
+                handler: 0x4000,
+                flags: 0x80000000,
+                restorer: 0x5000,
+                mask: !UNBLOCKABLE
+            }
+        );
+        actions.set(10, Action::default());
         assert_eq!(
             actions.query([10, 0x1000, 0x1100, 8, 0, 0], &mut memory),
             None

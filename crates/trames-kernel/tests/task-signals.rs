@@ -64,7 +64,7 @@ fn fork_and_exec_preserve_task_ownership_without_copying_pending_signals() {
 }
 
 #[test]
-fn failed_frame_publication_and_malformed_return_leave_complete_task_state_intact() {
+fn failed_frame_claims_the_one_shot_action_and_malformed_return_keeps_restored_scalars() {
     let mut memory = Memory::default();
     memory.map(0x1000, 4 * PAGE_SIZE, Permissions::R).unwrap();
     let original = Aarch64State {
@@ -96,23 +96,29 @@ fn failed_frame_publication_and_malformed_return_leave_complete_task_state_intac
     assert_eq!(state, original);
     assert_eq!(signals.mask, 1 << 11);
     assert_eq!(signals.frames, 0);
-    assert_eq!(signals.actions.get(10), action);
+    assert_eq!(
+        signals.actions.get(10),
+        Action {
+            handler: 0,
+            ..action
+        }
+    );
     memory
         .protect(0x1000, 4 * PAGE_SIZE, Permissions::RW)
         .unwrap();
     signals
         .enter(&mut state, &mut memory, 10, Info::default(), action)
         .unwrap();
-    let entered = state.clone();
-    let mask = signals.mask;
+    let frame = state.sp;
     memory.write(state.sp + 592, &[0; 4]).unwrap();
-    assert_eq!(signals.restore(&mut state, &memory), Err(Errno(14)));
-    assert_eq!(state, entered);
-    assert_eq!(signals.mask, mask);
+    assert_eq!(signals.restore(&mut state, &memory), Err(Errno(22)));
+    assert_eq!(state, original);
+    assert_eq!(signals.mask, 1 << 11);
     assert_eq!(signals.frames, 1);
     memory
-        .write(state.sp + 592, &0x46508001u32.to_le_bytes())
+        .write(frame + 592, &0x46508001u32.to_le_bytes())
         .unwrap();
+    state.sp = frame;
     signals.restore(&mut state, &memory).unwrap();
     assert_eq!(state, original);
     assert_eq!(signals.mask, 1 << 11);

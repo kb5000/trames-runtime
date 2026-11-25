@@ -117,6 +117,8 @@ impl Dispatch {
                 deadline,
                 remaining,
             })
+        } else if let State::Signal(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Signal(wait.clone()))
         } else if let State::Sigwait {
             mask,
             info,
@@ -138,6 +140,10 @@ impl Dispatch {
                     mask: p.signals.mask,
                 }),
             ))
+        } else if let State::Child(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Child(wait.clone()))
+        } else if let State::Delivery(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Delivery(wait.clone()))
         } else if let State::PidfdWait(request) = p.state {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(request),
@@ -362,6 +368,10 @@ impl Dispatch {
                 .as_ref()
                 .and_then(|wait| wait.message.clone())
                 .or_else(|| p.retained_message.take());
+            let retained_binder = previous
+                .as_ref()
+                .and_then(|wait| wait.binder.clone())
+                .or_else(|| p.retained_binder.take());
             let retained_aio = previous
                 .as_ref()
                 .and_then(|wait| wait.aio.clone())
@@ -370,17 +380,12 @@ impl Dispatch {
                 .and_then(|wait| wait.retained_byte)
                 .or_else(|| p.retained_byte.take());
             job.retry = Some(crate::run_queue::IoCall {
+                binder: retained_binder,
                 aio: retained_aio,
                 message: retained_message,
                 file: retained_file,
                 file_checkpoint: p.file_checkpoint.take(),
-                uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {
-                    trames_linux::UringEnter {
-                        submitted,
-                        ring,
-                        deadline,
-                    }
-                }),
+                uring: p.uring_wait.take(),
                 flock: if p.flock_wait.as_ref().is_some_and(|(r, _)| r.retains_file()) {
                     // The parked owner must not delay a worker's final
                     // close/notification until the next cohort join.

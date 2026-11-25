@@ -11,6 +11,8 @@ use std::sync::{atomic::AtomicBool, Mutex};
 pub(super) mod native_wait;
 pub(super) mod notify;
 mod path;
+#[cfg(target_os = "linux")]
+mod posix_acl;
 mod private_map;
 mod xattr;
 pub(super) use path::Position;
@@ -123,6 +125,29 @@ impl std::ops::Deref for Parent<'_> {
     }
 }
 impl Root {
+    fn guest_id(&self, group: bool, id: u32) -> u32 {
+        let (native, guest) = if group { self.gid } else { self.uid };
+        if id == native {
+            guest
+        } else {
+            id
+        }
+    }
+    fn native_id(&self, group: bool, id: u32) -> Result<u32> {
+        let (native, guest) = if group { self.gid } else { self.uid };
+        if id == u32::MAX {
+            return Ok(id);
+        }
+        if id == guest {
+            return Ok(native);
+        }
+        // A grant substitutes its native owner; its old numerical ID cannot
+        // independently name another guest principal through the same grant.
+        if id == native {
+            return Err(Errno(22));
+        }
+        Ok(id)
+    }
     fn metadata(&self, key: &[u8]) -> Result<libc::stat> {
         #[cfg(target_vendor = "apple")]
         {
@@ -225,9 +250,52 @@ pub(super) struct OpenFile {
     pub file: File,
     root: Arc<Root>,
 }
+#[cfg(not(target_vendor = "apple"))]
+fn metadata_path(file: &File) -> Result<Option<CString>> {
+    // SAFETY: the borrowed original descriptor stays owned by the caller.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    status(flags)?;
+    Ok((flags & libc::O_PATH != 0)
+        .then(|| CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()))
+}
 impl OpenFile {
+    fn chmod(&self, mode: u32) -> Result<()> {
+        let mode = (mode & 0o7777) as libc::mode_t;
+        #[cfg(not(target_vendor = "apple"))]
+        if let Some(path) = metadata_path(&self.file)? {
+            // SAFETY: this proc magic link jumps to the retained inode, even
+            // after unlink; it never re-resolves the guest's original name.
+            return status(unsafe { libc::chmod(path.as_ptr(), mode) });
+        }
+        // SAFETY: live descriptor and scalar mode, no user pointer or lookup.
+        status(unsafe { libc::fchmod(self.file.as_raw_fd(), mode) })
+    }
+    fn chown(&self, uid: u32, gid: u32) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: AT_EMPTY_PATH addresses this original O_PATH/ordinary
+            // descriptor, including a symlink, without using its mutable name.
+            status(unsafe {
+                libc::fchownat(
+                    self.file.as_raw_fd(),
+                    c"".as_ptr(),
+                    uid,
+                    gid,
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: the original descriptor also retains an O_SYMLINK vnode.
+            status(unsafe { libc::fchown(self.file.as_raw_fd(), uid, gid) })
+        }
+    }
     pub fn refresh_permissions(&self, node: &NodeRef) -> Result<()> {
-        let stat = self.stat()?;
+        let native = self.native_stat()?;
+        #[cfg(target_os = "linux")]
+        posix_acl::refresh(self, node, &native)?;
+        let stat = encode_stat(&self.root, &native);
         let word = |offset| u32::from_le_bytes(stat[offset..offset + 4].try_into().unwrap());
         let mut state = node.borrow_mut();
         state.mode = word(16);
@@ -286,6 +354,22 @@ fn encode_stat(root: &Root, meta: &libc::stat) -> [u8; 128] {
     out
 }
 
+fn creation_mode(parent: &File, mode: u32, umask: u32) -> Result<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // Query the same retained directory used by mkdirat/openat. A native
+        // default ACL replaces umask; the kernel applies its mask to mode.
+        let name = CString::new(acl::DEFAULT).unwrap();
+        match xattr::Native::from_file(parent)?.read(Some(&name), &mut []) {
+            Ok(_) => return Ok(mode),
+            Err(Errno(61 | 95)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = parent;
+    Ok(mode & !umask)
+}
 struct FileState {
     key: Vec<u8>,
     handles: [Vec<std::sync::Weak<OpenFile>>; 4],
@@ -329,67 +413,19 @@ impl HostFile {
     pub(super) fn matches_stat(&self, stat: &[u8; 128]) -> bool {
         stat[..8] == self.identity.0.to_le_bytes() && stat[8..16] == self.identity.1.to_le_bytes()
     }
-    pub fn chmod(&self, _node: &NodeRef, mode: u32) -> Result<()> {
+    pub fn chmod(&self, node: &NodeRef, mode: u32) -> Result<()> {
         self.root.writable()?;
-        let file = self.any_file()?;
-        #[cfg(target_vendor = "apple")]
-        // SAFETY: retained original native file, no path resolution.
-        return status(unsafe {
-            libc::fchmod(file.file.as_raw_fd(), (mode & 0o7777) as libc::mode_t)
-        });
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            // Linux O_PATH directory/metadata capabilities reject fchmod.
-            // A proc magic link addresses the retained inode after rename or
-            // unlink, on old and new kernels, without another native open.
-            // Symlink chmod must never follow a host target through this link.
-            if matches!(_node.borrow().content, Content::Symlink(_)) {
-                return Err(Errno(95));
-            }
-            let path = CString::new(format!("/proc/self/fd/{}", file.file.as_raw_fd())).unwrap();
-            status(unsafe { libc::chmod(path.as_ptr(), (mode & 0o7777) as libc::mode_t) })
-        }
+        let file = self.metadata_file()?;
+        file.chmod(mode)?;
+        file.refresh_permissions(node)
     }
     pub fn chown(&self, node: &NodeRef, uid: u32, gid: u32) -> Result<()> {
         self.root.writable()?;
-        let uid = if uid == self.root.uid.1 {
-            self.root.uid.0
-        } else {
-            uid
-        };
-        let gid = if gid == self.root.gid.1 {
-            self.root.gid.0
-        } else {
-            gid
-        };
-        if matches!(node.borrow().content, Content::Symlink(_)) {
-            let (parent, name) = self.root.parent(&self.state.lock().unwrap().key)?;
-            // SAFETY: retained parent; ownership of the link itself only.
-            status(unsafe {
-                libc::fchownat(
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    uid,
-                    gid,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            })
-        } else {
-            let file = self.any_file()?;
-            // SAFETY: retained original inode and scalar ownership ids.
-            #[cfg(target_vendor = "apple")]
-            return status(unsafe { libc::fchown(file.file.as_raw_fd(), uid, gid) });
-            #[cfg(not(target_vendor = "apple"))]
-            status(unsafe {
-                libc::fchownat(
-                    file.file.as_raw_fd(),
-                    c"".as_ptr(),
-                    uid,
-                    gid,
-                    libc::AT_EMPTY_PATH,
-                )
-            })
-        }
+        let uid = self.root.native_id(false, uid)?;
+        let gid = self.root.native_id(true, gid)?;
+        let file = self.metadata_file()?;
+        file.chown(uid, gid)?;
+        file.refresh_permissions(node)
     }
     pub fn times(&self, node: &NodeRef, values: [Option<storage::Timestamp>; 2]) -> Result<()> {
         self.root.writable()?;
@@ -482,11 +518,37 @@ impl HostFile {
         Ok(handle)
     }
     pub fn file(&self, write: bool) -> Result<Arc<OpenFile>> {
-        let found = self.state.lock().unwrap().retained(Some(write));
-        match found {
-            Some(file) => Ok(file),
-            None => self.acquire(u32::from(write)),
+        if write {
+            self.root.writable()?;
         }
+        let found = self.state.lock().unwrap().retained(Some(write));
+        if let Some(file) = found {
+            return Ok(file);
+        }
+        #[cfg(target_os = "linux")]
+        let original = self.state.lock().unwrap().metadata.upgrade();
+        #[cfg(target_os = "linux")]
+        if let Some(original) = original {
+            let path =
+                CString::new(format!("/proc/self/fd/{}", original.file.as_raw_fd())).unwrap();
+            let access = u32::from(write);
+            let flags = if write {
+                libc::O_WRONLY
+            } else {
+                libc::O_RDONLY
+            };
+            // SAFETY: this live original descriptor, rather than the mutable
+            // guest name, identifies the inode. Native open still checks the
+            // requested access; no new guest pathname open uses this helper.
+            let fd =
+                unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+            if fd < 0 {
+                return Err(errno(std::io::Error::last_os_error()));
+            }
+            // SAFETY: open returned a fresh owned descriptor.
+            return self.retain(unsafe { File::from_raw_fd(fd) }, access);
+        }
+        self.acquire(u32::from(write))
     }
     pub fn len(&self) -> u64 {
         if let Ok(meta) = self.metadata() {
@@ -513,6 +575,12 @@ impl HostFile {
             Some(handle) => Ok(handle),
             None => self.acquire(0),
         }
+    }
+    pub(super) fn metadata_file(&self) -> Result<Arc<OpenFile>> {
+        let mut state = self.state.lock().unwrap();
+        let file = state.retained(None).or_else(|| state.metadata.upgrade());
+        drop(state);
+        file.map_or_else(|| self.pin_path(), Ok)
     }
     pub(super) fn pin_path(&self) -> Result<Arc<OpenFile>> {
         let (parent, name) = self.root.parent(&self.state.lock().unwrap().key)?;
@@ -791,18 +859,31 @@ impl HostFs {
         {
             let mut n = node.borrow_mut();
             n.mode = meta.st_mode as u32;
-            n.uid = if meta.st_uid == self.root.uid.0 {
-                self.root.uid.1
-            } else {
-                meta.st_uid
-            };
-            n.gid = if meta.st_gid == self.root.gid.0 {
-                self.root.gid.1
-            } else {
-                meta.st_gid
-            };
+            n.uid = self.root.guest_id(false, meta.st_uid);
+            n.gid = self.root.guest_id(true, meta.st_gid);
             n.links = meta.st_nlink as u32;
             n.times = stat_times(&meta);
+        }
+        #[cfg(target_os = "linux")]
+        if kind != 0o120000 {
+            let host = node.host.get().expect("host inode");
+            let original = match relative {
+                Some((parent, name)) => {
+                    // A proc walk retains the actual parent even when its old
+                    // root-relative pathname has been renamed or unlinked.
+                    let file = open_at(parent, name, metadata_flags(), 0)?;
+                    let current = file.metadata().map_err(errno)?;
+                    if (current.dev(), current.ino()) != host.identity {
+                        return Err(Errno(2));
+                    }
+                    Arc::new(OpenFile {
+                        file,
+                        root: self.root.clone(),
+                    })
+                }
+                None => host.metadata_file()?,
+            };
+            original.refresh_permissions(&node)?;
         }
         // Never hold the identity index or file-key lock while acquiring the
         // namespace lock: rename already owns the namespace before those keys.
@@ -850,9 +931,15 @@ impl HostFs {
         path: &ResolvedPath,
         content: &Content,
         mode: u32,
+        umask: u32,
     ) -> Result<NodeRef> {
         self.root.writable()?;
         let (parent, name) = self.parent_path(filesystem, path)?;
+        let mode = if matches!(content, Content::Symlink(_)) {
+            mode
+        } else {
+            creation_mode(&parent, mode, umask)?
+        };
         match content {
             Content::Directory => {
                 // SAFETY: retained directory capability, valid final component.
@@ -889,9 +976,11 @@ impl HostFs {
         path: &ResolvedPath,
         flags: u32,
         mode: u32,
+        umask: u32,
     ) -> Result<(NodeRef, Arc<OpenFile>)> {
         self.root.writable()?;
         let (parent, name) = self.parent_path(filesystem, path)?;
+        let mode = creation_mode(&parent, mode, umask)?;
         let access = flags & 3;
         let native = match access {
             0 => libc::O_RDONLY,
@@ -1195,6 +1284,7 @@ impl Vfs {
             fs: filesystem,
             root,
             root_key: b"/".to_vec(),
+            root_entry: None,
             kind: Kind::Host,
             display: Default::default(),
             namespace: None,
@@ -1205,6 +1295,7 @@ impl Vfs {
             parent: RefCell::new(Some(Attachment {
                 parent: target.mount.ok_or(Errno(22))?,
                 node,
+                fuse_entry: None,
                 fallback: target.key,
             })),
         }));
@@ -1755,6 +1846,104 @@ mod tests {
             0o120000
         );
         assert_eq!(v.read(fd, 8), Err(Errno(9)));
+    }
+    #[test]
+    fn opath_metadata_changes_use_the_unlinked_inode_instead_of_its_replacement_name() {
+        let root = Fixture::new();
+        std::fs::write(root.0.join("file"), b"original").unwrap();
+        let mut v = root.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", O_PATH, 0).unwrap();
+        let original = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .host_file
+            .clone()
+            .unwrap();
+        std::fs::rename(root.0.join("file"), root.0.join("old")).unwrap();
+        std::fs::write(root.0.join("file"), b"replacement").unwrap();
+        let replacement_mode = std::fs::metadata(root.0.join("file"))
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::remove_file(root.0.join("old")).unwrap();
+        assert_eq!(v.chmod_fd(fd, 0o600), Err(Errno(9)));
+        v.chmod_fd_at(fd, 0o600).unwrap();
+        v.chown_fd_at(fd, u32::MAX, u32::MAX).unwrap();
+        assert_eq!(
+            u64::from(original.native_stat().unwrap().st_mode) & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(root.0.join("file"))
+                .unwrap()
+                .permissions()
+                .mode(),
+            replacement_mode
+        );
+    }
+    #[test]
+    fn retained_symlink_chown_survives_guest_close_reuse_and_unlink_without_a_path() {
+        let root = Fixture::new();
+        std::fs::write(root.0.join("file"), b"target").unwrap();
+        std::os::unix::fs::symlink("file", root.0.join("link")).unwrap();
+        let mut v = root.vfs(false);
+        let fd = v
+            .open_at(AT_FDCWD, b"/host/link", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        let (node, original) = {
+            let open = v.descriptor(fd).unwrap().open;
+            let open = open.borrow();
+            (open.node.clone().unwrap(), open.host_file.clone().unwrap())
+        };
+        let inode = original.native_stat().unwrap().st_ino;
+        v.close(fd).unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap(), fd);
+        std::fs::remove_file(root.0.join("link")).unwrap();
+        node.host
+            .get()
+            .unwrap()
+            .chown(&node, u32::MAX, u32::MAX)
+            .unwrap();
+        let stat = original.native_stat().unwrap();
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFLNK);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_by_opath_fd_reopens_the_original_unlinked_inode_and_keeps_its_bytes() {
+        use std::os::unix::fs::FileExt;
+        let root = Fixture::new();
+        std::fs::write(root.0.join("file"), b"original program").unwrap();
+        std::fs::set_permissions(root.0.join("file"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let mut v = root.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", O_PATH, 0).unwrap();
+        let inode = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .host_file
+            .as_ref()
+            .unwrap()
+            .native_stat()
+            .unwrap()
+            .st_ino;
+        std::fs::remove_file(root.0.join("file")).unwrap();
+        std::fs::write(root.0.join("file"), b"replacement program").unwrap();
+        let executable = v.executable_file_at(fd as i32, b"", 0x1000).unwrap();
+        let original = executable.node.host.get().unwrap().file(false).unwrap();
+        assert_eq!(original.native_stat().unwrap().st_ino, inode);
+        v.close(fd).unwrap();
+        let mut bytes = [0; 32];
+        let count = original.file.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes[..count], b"original program");
+        assert_eq!(
+            std::fs::read(root.0.join("file")).unwrap(),
+            b"replacement program"
+        );
     }
     #[test]
     fn rename_exchange_updates_native_names_and_retained_handles() {

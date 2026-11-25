@@ -20,17 +20,19 @@ mod fcntl;
 pub use entropy::getrandom;
 mod direct;
 pub use direct::{
-    epoll_parameters, epoll_scatter, Aio, DirectSyscalls, FileBoundary, FileCheckpoint,
-    FileExecutor, FileOutput, FilePending, FileResult, IoAttempt, PendingIo, RetainedAio,
-    RetainedByte, RetainedMessage, RetainedSocket, UringActor, UringBackground, UringEnter,
-    UringEpoch, UringSnapshot,
+    epoll_parameters, epoll_scatter, Aio, DirectSyscalls, EnterControl, FileBoundary,
+    FileCheckpoint, FileExecutor, FileOutput, FilePending, FileResult, IoAttempt, PendingIo,
+    Registration, RetainedAio, RetainedBinder, RetainedByte, RetainedMessage, RetainedSocket,
+    UringActor, UringBackground, UringEnter, UringEpoch, UringSnapshot, WaitInput,
 };
 mod file_advice;
 mod file_calls;
 mod file_layouts;
 mod ioctl;
+mod task_copy;
 mod task_name;
 pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
+pub use task_copy::TaskCopyCall;
 pub use task_name::task_name_call;
 mod host_files;
 pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
@@ -60,6 +62,7 @@ pub use poll::{RetainedPoll, RetainedSelect};
 pub use pty::{
     pty_control, pty_control_request, terminal_control, terminal_query, terminal_query_request,
 };
+mod copy_replay;
 mod record_locks;
 mod shm;
 mod state;
@@ -521,6 +524,9 @@ impl GuestOutput for CapturedOutput {
 pub enum SyscallOutcome {
     Continue,
     Exit(u8),
+    /// Original syscall state remains in Linux; the host must drive or take
+    /// its accepted wait/checkpoint before resuming guest instructions.
+    Deferred,
 }
 
 fn errno(value: u64) -> u64 {

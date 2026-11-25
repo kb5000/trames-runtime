@@ -45,6 +45,9 @@ impl<C: Cpu> Parked<C> {
         if job.io.as_ref().is_some_and(|io| io.external_wait())
             || job.uring.as_ref().is_some_and(|ring| ring.external())
             || matches!(job.waiting, Some(super::WaitState::Page(_)))
+            || matches!(&job.waiting, Some(super::WaitState::Signal(wait)) if wait.external())
+            || matches!(&job.waiting, Some(super::WaitState::Child(wait)) if wait.external())
+            || matches!(&job.waiting, Some(super::WaitState::Delivery(wait)) if wait.external())
         {
             self.external.insert(pid);
         }

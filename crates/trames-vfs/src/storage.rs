@@ -1898,7 +1898,7 @@ pub(super) struct FilesystemSync {
     active: bool,
 }
 impl FilesystemSync {
-    fn new(filesystem: FsHandle) -> Self {
+    pub(super) fn new(filesystem: FsHandle) -> Self {
         let nodes = filesystem
             .borrow()
             .inodes

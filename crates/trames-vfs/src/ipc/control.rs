@@ -256,6 +256,18 @@ impl DescriptorFactory {
         prepare: impl FnOnce(&mut C, usize) -> Result<P>,
         output: impl FnOnce(&mut C, P, &[u8]) -> Result<()>,
     ) -> Result<(u32, Vec<u8>)> {
+        let (descriptor, name, prepared) =
+            self.prepare_accept_local(socket, flags, context, prepare)?;
+        output(context, prepared, &name)?;
+        Ok((descriptor.publish()?, name))
+    }
+    pub fn prepare_accept_local<C, P>(
+        &self,
+        socket: &LocalResource,
+        flags: u32,
+        context: &mut C,
+        prepare: impl FnOnce(&mut C, usize) -> Result<P>,
+    ) -> Result<(PreparedDescriptor, Vec<u8>, P)> {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
@@ -272,7 +284,6 @@ impl DescriptorFactory {
         socket.listen_epoch.fetch_add(1, Ordering::Relaxed);
         drop(listener);
         socket.notify();
-        output(context, prepared, &name)?;
         let credentials = self.local_credentials();
         let descriptor = Vfs::local_description(
             self.open_id(),
@@ -280,6 +291,13 @@ impl DescriptorFactory {
             accepted,
             flags,
         );
-        Ok((reserved.publish(descriptor, None)?, name))
+        Ok((
+            PreparedDescriptor {
+                reservation: reserved,
+                descriptor,
+            },
+            name,
+            prepared,
+        ))
     }
 }

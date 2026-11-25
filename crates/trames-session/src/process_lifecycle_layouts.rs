@@ -202,6 +202,9 @@ pub(in crate::process) fn join_layout<C: Cpu>(
     epoch: Option<&Epoch<C>>,
     request: &mut trames_linux::FileLayoutRequest,
 ) -> Result<(), trames_memory::MemoryError> {
+    if request.cancelled() {
+        return Ok(());
+    }
     for report in request.layout().readers() {
         let mut candidates = tasks.memory(&report);
         candidates.sort_by_key(|(pid, _)| !epoch.is_some_and(|e| e.contains(*pid)));

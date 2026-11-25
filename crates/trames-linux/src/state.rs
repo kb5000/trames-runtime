@@ -68,6 +68,9 @@ pub struct Linux {
     pub(crate) uring_clock: std::time::Instant,
     pub(crate) boot_clock: trames_shared::boottime::Boottime,
     pub(crate) uring_actor: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::UringActor>>>,
+    pub(crate) uring_enters: std::collections::BTreeMap<u32, crate::uring::SoloEnter>,
+    task_copies: std::collections::BTreeMap<u32, crate::TaskCopyCall>,
+    pub(crate) ioctl_calls: std::collections::BTreeMap<u32, crate::direct::ioctl_control::Solo>,
     pub vfs: Vfs,
     pub trace: bool,
     /// Initial session capacity for guest processes and threads. Jobs and
@@ -117,6 +120,9 @@ impl Linux {
             file_layouts: self.file_layouts.clone(),
             mmap_pending: None,
             uring_actor: Default::default(),
+            uring_enters: Default::default(),
+            task_copies: Default::default(),
+            ioctl_calls: Default::default(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
             trace: self.trace,
             task_limit: self.task_limit,
@@ -181,6 +187,9 @@ impl Linux {
             file_layouts: None,
             mmap_pending: None,
             uring_actor: Default::default(),
+            uring_enters: Default::default(),
+            task_copies: Default::default(),
+            ioctl_calls: Default::default(),
             vfs: Vfs::default(),
             trace: false,
             task_limit: trames_vfs::MAX_TASKS,
@@ -242,6 +251,24 @@ impl Linux {
             return Err(Errno(14));
         }
         memory.check(address, count, access).map_err(|_| Errno(14))
+    }
+    /// Import an I/O buffer's address range without touching a lazy backing
+    /// before the operation reaches its actual copy. Metadata uses read/write
+    /// normally, retaining the first completed fragment at a page wait.
+    pub(crate) fn check_io_buffer(
+        memory: &impl CpuMemory,
+        address: u64,
+        count: usize,
+        access: Access,
+    ) -> Result<()> {
+        if address >= ADDRESS_LIMIT || count as u64 > ADDRESS_LIMIT - address {
+            return Err(Errno(14));
+        }
+        if memory.async_faults_possible() {
+            Ok(())
+        } else {
+            Self::check(memory, address, count, access)
+        }
     }
     /// Regular files can transfer the mapped prefix. check() already walked the
     /// pages in order, so a precise memory fault needs no second page walk.
@@ -436,7 +463,7 @@ impl Linux {
     }
     pub(crate) fn read_parameters(a: [u64; 6], memory: &impl CpuMemory) -> Result<usize> {
         let count = a[2].min(MAX_WRITE as u64) as usize;
-        Self::check(memory, a[1], count, Access::Write)?;
+        Self::check_io_buffer(memory, a[1], count, Access::Write)?;
         Ok(count)
     }
     fn read_bytes(
@@ -470,7 +497,7 @@ impl Linux {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
-        Self::check(memory, a[1], a[2] as usize * 16, Access::Read)?;
+        Self::check_io_buffer(memory, a[1], a[2] as usize * 16, Access::Read)?;
         let mut parts = Vec::new();
         let mut total = 0usize;
         let mut requested = 0u64;
@@ -483,7 +510,7 @@ impl Linux {
                 .ok_or(Errno(22))?;
             let take = length.min((MAX_WRITE - total) as u64) as usize;
             if take != 0 {
-                Self::check(memory, pointer, take, Access::Write)?;
+                Self::check_io_buffer(memory, pointer, take, Access::Write)?;
             }
             parts.push((pointer, take));
             total += take;
@@ -852,7 +879,7 @@ impl Linux {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
-        Self::check(memory, a[1], a[2] as usize * 16, Access::Read)?;
+        Self::check_io_buffer(memory, a[1], a[2] as usize * 16, Access::Read)?;
         let mut parts = Vec::new();
         let mut total = 0usize;
         let mut requested = 0u64;
@@ -879,7 +906,7 @@ impl Linux {
                 prefix
             } else {
                 if take != 0 {
-                    Self::check(memory, pointer, take, access)?;
+                    Self::check_io_buffer(memory, pointer, take, access)?;
                 }
                 take
             };
@@ -1570,7 +1597,7 @@ impl Linux {
         memory: &mut Memory,
         io: &mut impl crate::execution_io::Output,
     ) -> SyscallOutcome {
-        self.dispatch_with_trace(cpu, memory, io, self.trace)
+        self.dispatch_with_trace(cpu, memory, io, self.trace, 0)
     }
     /// A session's accepted-call diagnostic state owns its completion record.
     pub fn dispatch_untraced(
@@ -1579,7 +1606,22 @@ impl Linux {
         memory: &mut Memory,
         io: &mut impl crate::execution_io::Output,
     ) -> SyscallOutcome {
-        self.dispatch_with_trace(cpu, memory, io, false)
+        self.dispatch_with_trace(cpu, memory, io, false, 0)
+    }
+    pub fn take_task_copy(&mut self, task: u32) -> Option<crate::TaskCopyCall> {
+        self.task_copies.remove(&task)
+    }
+    pub fn task_copy_fault(&self, task: u32) -> Option<trames_memory::PageFault> {
+        self.task_copies.get(&task)?.fault()
+    }
+    pub fn dispatch_task_untraced(
+        &mut self,
+        task: u32,
+        cpu: &mut impl Registers,
+        memory: &mut Memory,
+        io: &mut impl crate::execution_io::Output,
+    ) -> SyscallOutcome {
+        self.dispatch_with_trace(cpu, memory, io, false, task)
     }
     fn dispatch_with_trace(
         &mut self,
@@ -1587,10 +1629,23 @@ impl Linux {
         memory: &mut Memory,
         io: &mut impl crate::execution_io::Output,
         trace: bool,
+        task: u32,
     ) -> SyscallOutcome {
         let number = cpu.x(8) as u32 as u64;
         let a = std::array::from_fn(|index| cpu.x(index));
         if number == 93 || number == 94 {
+            if number == 94 {
+                self.task_copies.clear();
+                for call in self.ioctl_calls.values() {
+                    call.cancel();
+                }
+                self.ioctl_calls.clear();
+            } else {
+                self.task_copies.remove(&task);
+                if let Some(call) = self.ioctl_calls.remove(&task) {
+                    call.cancel();
+                }
+            }
             self.exit_tid(memory);
             if trace {
                 eprintln!("trames syscall {number}: exit {}", a[0] as u8);
@@ -1598,7 +1653,51 @@ impl Linux {
             return SyscallOutcome::Exit(a[0] as u8);
         }
         let old_ids = matches!(number, 143..=147 | 149 | 151 | 152).then(|| self.vfs.fs_identity());
-        let result = self.syscall(number, a, memory, io);
+        let result = if self.task_copies.contains_key(&task)
+            || memory.async_faults_possible()
+                && (number == 219 || number == 167 && matches!(a[0], 15 | 16))
+        {
+            let mut call = self.task_copies.remove(&task).unwrap_or_else(|| {
+                if number == 219 {
+                    crate::TaskCopyCall::keys(
+                        self.session_keys.clone(),
+                        self.vfs.key_registry(),
+                        self.vfs.credentials.clone(),
+                        a,
+                    )
+                } else {
+                    crate::TaskCopyCall::name(self.command_name.clone(), a)
+                }
+            });
+            match call.check(memory) {
+                Some(result) => result,
+                None => {
+                    self.task_copies.insert(task, call);
+                    return SyscallOutcome::Deferred;
+                }
+            }
+        } else if self.ioctl_calls.contains_key(&task)
+            || number == 29 && memory.async_faults_possible()
+        {
+            match self.ioctl_progress(a, memory, task) {
+                Some(result) => result,
+                None => return SyscallOutcome::Deferred,
+            }
+        } else if number == 426 {
+            self.uring_enter(a, memory, self.uring_submitted(task), task)
+                .and_then(|(count, ready)| {
+                    if ready {
+                        Ok(count as u64)
+                    } else {
+                        Err(Errno(11))
+                    }
+                })
+        } else {
+            self.syscall(number, a, memory, io)
+        };
+        if number == 426 && result == Err(Errno(11)) && self.uring_submitted(task).is_some() {
+            return SyscallOutcome::Deferred;
+        }
         if let Some(old) = old_ids {
             self.vfs.reset_dumpable_after_ids(old);
         }
@@ -1628,7 +1727,7 @@ impl Linux {
         a: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Result<(u32, u64)> {
-        if a[1] == 2 {
+        if a[1] as u32 == 2 {
             return Ok((0, 0));
         }
         Self::check(memory, a[3], 16, Access::Read)?;
@@ -1656,7 +1755,7 @@ impl Linux {
             92 => self.personality.call(a[0]),
             425 => self.uring_setup(a, memory),
             426 => self
-                .uring_enter(a, memory, None, 0)
+                .uring_enter(a, memory, self.uring_submitted(0), 0)
                 .and_then(|(count, ready)| {
                     if ready {
                         Ok(count as u64)

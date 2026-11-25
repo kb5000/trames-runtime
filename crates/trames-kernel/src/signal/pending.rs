@@ -73,6 +73,11 @@ impl Pending {
     /// payload ahead of signals arriving while the tracer held the stop.
     pub(super) fn resume_observed(&mut self, sig: u32, mut info: RetainedInfo) {
         info.observed = true;
+        self.restore(sig, info);
+    }
+    /// A selected delivery deferred on user-copy keeps its exact observation,
+    /// sender lease and queue position, without a second enqueue admission.
+    pub(super) fn restore(&mut self, sig: u32, info: RetainedInfo) {
         self.0.entry(sig).or_default().push_front(info);
     }
 
@@ -142,6 +147,42 @@ impl std::ops::Index<&u32> for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deferred_delivery_restores_fifo_and_preserves_trace_observation() {
+        let mut q = Pending::default();
+        q.enqueue(
+            34,
+            Info {
+                sender: 11,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = q.remove(&34).unwrap();
+        q.enqueue(
+            34,
+            Info {
+                sender: 22,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        q.restore(34, first);
+        let first = q
+            .remove_for_trace(34)
+            .expect("deferred delivery still needs its original trace point");
+        assert_eq!(first.sender, 11);
+        q.resume_observed(34, first);
+        let first = q.remove(&34).unwrap();
+        q.restore(34, first);
+        assert!(
+            q.remove_for_trace(34).is_none(),
+            "an observed delivery is not traced twice"
+        );
+        assert_eq!(q.remove(&34).unwrap().sender, 11);
+        assert_eq!(q.remove(&34).unwrap().sender, 22);
+        assert!(q.is_empty());
+    }
     #[test]
     fn realtime_budget_preserves_fifo_and_cannot_drop_sigkill() {
         let mut q = Pending::default();

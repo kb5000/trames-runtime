@@ -689,6 +689,39 @@ impl Drop for FifoOpen {
     }
 }
 impl SharedFd {
+    pub fn kind(&self) -> FdKind {
+        self.open.kind.clone()
+    }
+    pub fn check_ioctl(&self, request: u32) -> Result<()> {
+        if self.open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        self.open.check_device_ioctl(request)
+    }
+    pub fn sync_file(&self) -> Option<Arc<sync_file::File>> {
+        match &self.open.control {
+            Some(events::SharedControl::Sync(file)) => Some(file.clone()),
+            _ => None,
+        }
+    }
+    pub fn binder_file(&self) -> Option<Arc<binder::Connection>> {
+        match &self.open.control {
+            Some(events::SharedControl::Binder(file)) => Some(file.clone()),
+            _ => None,
+        }
+    }
+    pub fn perf_event(&self) -> Option<Arc<perf::Event>> {
+        match &self.open.control {
+            Some(events::SharedControl::Perf(event)) => Some(event.clone()),
+            _ => None,
+        }
+    }
+    pub fn fuse_device(&self) -> Option<Arc<fuse::Device>> {
+        match &self.open.control {
+            Some(events::SharedControl::Fuse(device)) => Some(device.clone()),
+            _ => None,
+        }
+    }
     pub fn uring(&self) -> Option<Arc<Uring>> {
         match &self.open.control {
             Some(events::SharedControl::Uring(ring)) => Some(ring.clone()),

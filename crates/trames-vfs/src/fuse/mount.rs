@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+mod buffered;
+mod retry;
+pub(crate) use retry::PathRetry;
+
+pub(super) fn notification_needs_executor(node: &NodeRef) -> bool {
+    let cache = &inode::attr(node).cache;
+    cache.mapped() || cache.dirty()
+}
 
 pub(crate) struct Mounted {
     pub connection: Arc<Connection>,
@@ -16,11 +24,15 @@ pub(crate) struct Mounted {
     access_unsupported: std::sync::atomic::AtomicBool,
     flush_unsupported: std::sync::atomic::AtomicBool,
     sync_unsupported: std::sync::atomic::AtomicU8,
+    syncfs_unsupported: std::sync::atomic::AtomicBool,
+    allocate_unsupported: std::sync::atomic::AtomicBool,
     create_unsupported: std::sync::atomic::AtomicBool,
     rename_unsupported: std::sync::atomic::AtomicBool,
     link_unsupported: std::sync::atomic::AtomicBool,
     xattr_unsupported: std::sync::atomic::AtomicU8,
     directories: Arc<directory::Directories>,
+    entries: Arc<entry::Entries>,
+    rename: Arc<namespace::locks::Rename>,
 }
 
 impl Drop for Mounted {
@@ -208,11 +220,15 @@ pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Option<Binding>
         access_unsupported: Default::default(),
         flush_unsupported: Default::default(),
         sync_unsupported: Default::default(),
+        syncfs_unsupported: Default::default(),
+        allocate_unsupported: Default::default(),
         create_unsupported: Default::default(),
         rename_unsupported: Default::default(),
         link_unsupported: Default::default(),
         xattr_unsupported: Default::default(),
         directories: Default::default(),
+        entries: Default::default(),
+        rename: Default::default(),
     });
     assert!(connection.mounted.set(Arc::downgrade(&mounted)).is_ok());
     let mut root_attr = [0; 88];
@@ -232,7 +248,7 @@ pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Option<Binding>
         }),
         linked: std::sync::atomic::AtomicBool::new(true),
         cache: None,
-        location: std::sync::Mutex::new(None),
+        entry: mounted.entries.new_entry(&root, None),
     }));
     let usage = Arc::new(ConnectionUse(mounted.clone()));
     assert!(mounted.active.set(Arc::downgrade(&usage)).is_ok());
@@ -283,6 +299,7 @@ struct LookupRef {
     lease: Arc<LookupLease>,
     directory: Option<NodeRef>,
     leaf: Option<NodeRef>,
+    entry: Option<Arc<entry::Entry>>,
 }
 impl LookupRef {
     fn retained(fs: &Arc<Mounted>, directory: NodeRef) -> Self {
@@ -293,11 +310,13 @@ impl LookupRef {
             .or_else(|| directory.fuse_leaf.get().map(|f| f._lookup.clone()))
             .unwrap();
         let leaf = (!directory.directory).then(|| directory.clone());
+        let entry = directory.fuse_directory.get().map(|d| d.entry.clone());
         Self {
             fs: fs.clone(),
             lease,
             directory: directory.directory.then_some(directory),
             leaf,
+            entry,
         }
     }
     fn new(fs: &Arc<Mounted>, caller: Caller, node: u64) -> Self {
@@ -310,6 +329,7 @@ impl LookupRef {
             }),
             directory: None,
             leaf: None,
+            entry: None,
         }
     }
 }
@@ -331,15 +351,62 @@ struct Lookup {
     operation: PathOperation,
     parent: u64,
     parent_directory: NodeRef,
+    parent_access: Option<inode::Access>,
+    parent_wait: Option<inode::WriteWait>,
     change: Option<directory::Change>,
     name: Vec<u8>,
 }
 struct Create {
     _parent_directory: NodeRef,
+    _parent_access: Option<inode::Access>,
     fs: Arc<Mounted>,
     caller: Caller,
     parent: u64,
     name: Vec<u8>,
+}
+impl Lookup {
+    fn exclusive(&self) -> bool {
+        matches!(self.operation, PathOperation::Open(flags) if flags & O_CREAT != 0)
+            && self
+                .continuation
+                .as_ref()
+                .is_some_and(|walk| walk.parts.is_empty())
+    }
+    fn lock_ready(&self) -> bool {
+        let attr = inode::attr(&self.parent_directory);
+        if self.exclusive() {
+            attr.write_ready()
+        } else {
+            attr.read_ready()
+        }
+    }
+    fn start(&mut self) -> Result<Option<Arc<Request>>> {
+        if self.parent_access.is_none() {
+            let exclusive = self.exclusive();
+            let attr = inode::attr(&self.parent_directory);
+            let access = if exclusive {
+                attr.enter_write(&mut self.parent_wait)
+                    .map(|lease| inode::Access::Write { _lease: lease })
+            } else {
+                attr.try_read()
+                    .map(|lease| inode::Access::Read { _lease: lease })
+            };
+            let Some(access) = access else {
+                return Ok(None);
+            };
+            self.parent_access = Some(access);
+        }
+        if !self
+            .parent_directory
+            .fuse_directory
+            .get()
+            .ok_or(Errno(20))?
+            .linked()
+        {
+            return Err(Errno(2));
+        }
+        Metadata::lookup_request(&self.fs, self.parent, self.caller, self.name.clone()).map(Some)
+    }
 }
 struct Link {
     walk: PathWalk,
@@ -358,6 +425,12 @@ enum ResultKind {
     ReopenFile(Arc<File>),
     FileStat(Arc<File>),
     File(FileResult),
+    Buffered(Box<buffered::Io>),
+    Writeback(Box<AfterWriteback>),
+    Device(writeback::Pending, u64),
+    Notification(Arc<notify::Notification>, u64),
+    Filesystems(Box<sync::Batch>),
+    CacheCommand(Box<AfterCache>),
     Preparing(Box<killpriv::Preparation>),
     Readlink,
     FollowLink(Box<Link>),
@@ -372,6 +445,19 @@ enum ResultKind {
     MknodOpen(Create),
     CreatePermission(Box<(Create, posix::Check)>),
 }
+struct AfterWriteback {
+    file: Arc<File>,
+    pending: writeback::Pending,
+    opcode: u32,
+    body: Vec<u8>,
+    kind: Option<Box<ResultKind>>,
+}
+struct AfterCache {
+    file: Arc<File>,
+    original: SharedFd,
+    command: FileCommand,
+    pending: writeback::Pending,
+}
 pub(crate) struct Metadata {
     pub(crate) request: Option<Arc<Request>>,
     kind: ResultKind,
@@ -384,8 +470,50 @@ pub(crate) struct Metadata {
     dev: u64,
     owner_ns: UserNamespace,
     reader_ns: UserNamespace,
+    retry: Option<Box<PathRetry>>,
 }
 impl Metadata {
+    pub(crate) fn retain_entry(&mut self, entry: Option<Arc<Entry>>) {
+        if let Some(entry) = entry {
+            if let Some(reference) = &mut self.reference {
+                reference.entry = Some(entry);
+            }
+        }
+    }
+    pub(crate) fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        let node = match &self.kind {
+            ResultKind::Attributes(operation) => Some(operation.node().clone()),
+            ResultKind::Preparing(operation) => Some(operation.node().clone()),
+            ResultKind::File(operation) => operation.file().and_then(|file| file.inode()),
+            ResultKind::Buffered(operation) => {
+                operation.result.file().and_then(|file| file.inode())
+            }
+            ResultKind::FileStat(file) | ResultKind::ReopenFile(file) => file.inode(),
+            ResultKind::Lookup(lookup) => self
+                .request
+                .as_ref()?
+                .entry_identity()
+                .and_then(|id| lookup.fs.attribute_target(id)),
+            ResultKind::Mutation(mutation) => self
+                .request
+                .as_ref()?
+                .entry_identity()
+                .and_then(|id| mutation.reply_inode(id)),
+            ResultKind::Create(create) | ResultKind::MknodOpen(create) => self
+                .request
+                .as_ref()?
+                .entry_identity()
+                .and_then(|id| create.fs.attribute_target(id)),
+            _ => self.reference.as_ref().and_then(|reference| {
+                reference
+                    .leaf
+                    .clone()
+                    .or_else(|| reference.directory.clone())
+            }),
+        }?;
+        let attr = inode::attr(&node);
+        attr.cache.mapped().then(|| attr.layout.clone())
+    }
     pub(crate) fn retain_output(&mut self) {
         // stat/statfs release their lookup/file references after snapshotting,
         // before copying the already accepted metadata to user memory.
@@ -402,7 +530,12 @@ impl Metadata {
         );
         crate::output_resources::OutputScope::retain(|| resources);
     }
-    pub(crate) fn continuation(v: &Vfs, walk: Box<(PathWalk, PathOperation)>, owner: bool) -> Self {
+    pub(crate) fn continuation(
+        v: &Vfs,
+        mut walk: Box<(PathWalk, PathOperation)>,
+        owner: bool,
+    ) -> Self {
+        let retry = walk.0.retry.take();
         let id = walk.0.current.mount.as_ref().map_or(1, |m| m.id);
         let dev = walk.0.current.mount.as_ref().map_or(0, |m| m.device());
         Self {
@@ -421,6 +554,7 @@ impl Metadata {
             dev,
             owner_ns: v.credentials.user_namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry,
         }
     }
     pub(crate) fn prepare_open(
@@ -473,8 +607,8 @@ impl Metadata {
         let file = self.open_file(fh, attr, open_flags);
         self.publish_file(file)
     }
-    fn open_file(&self, fh: Option<u64>, attr: [u8; 88], open_flags: u32) -> Arc<File> {
-        let plan = self.open.as_ref().expect("FUSE open operands");
+    fn open_file(&mut self, fh: Option<u64>, attr: [u8; 88], open_flags: u32) -> Arc<File> {
+        let plan = self.open.as_mut().expect("FUSE open operands");
         let reference = self.reference.as_ref().expect("looked-up inode").clone();
         let attributes = reference
             .leaf
@@ -502,10 +636,16 @@ impl Metadata {
             status: Default::default(),
             open_flags,
             directory: u32::from_le_bytes(attr[60..64].try_into().unwrap()) & 0o170000 == 0o040000,
-            attr: attributes,
+            writeback_seen: AtomicU64::new(attributes.cache.error_sequence()),
             position_busy: Default::default(),
             position_changed: Default::default(),
             mount: plan.mount.clone(),
+            _writer: if fd_can_write(plan.flags) && attributes.kind_is_regular() {
+                plan.writer.take().map(Arc::new)
+            } else {
+                None
+            },
+            attr: attributes,
         })
     }
     fn publish_file(&mut self, file: Arc<File>) -> Result<FileValue> {
@@ -515,7 +655,10 @@ impl Metadata {
             plan.id,
             file.flags | plan.flags & O_CLOEXEC,
             FdKind::Node(plan.path),
-            file.reference.directory.clone(),
+            file.reference
+                .directory
+                .clone()
+                .or_else(|| file.reference.leaf.clone()),
             Some(events::SharedControl::FuseFile(file.clone())),
             None,
             Some(OpenMount::Shared(plan.mount)),
@@ -547,35 +690,35 @@ impl Metadata {
         fs: &Arc<Mounted>,
         parent: NodeRef,
         first: Vec<u8>,
-        continuation: PathWalk,
+        mut continuation: PathWalk,
         base: ResolvedPath,
         operation: PathOperation,
     ) -> Result<Self> {
         fs.check(&v.credentials)?;
         let caller = fs.caller(v);
+        let retry = continuation.retry.take();
+        let mut lookup = Lookup {
+            fs: fs.clone(),
+            caller,
+            follow: continuation.follow_final,
+            directory: continuation.trailing,
+            continuation: Some(Box::new(continuation)),
+            base: Some(base),
+            operation,
+            flags: m.flags.clone(),
+            root: false,
+            parent: parent.fuse_directory.get().ok_or(Errno(5))?.node,
+            parent_directory: parent,
+            parent_access: None,
+            parent_wait: None,
+            change: matches!(operation, PathOperation::Chdir | PathOperation::Chroot)
+                .then(|| directory::Change::new(v, m.shared.clone())),
+            name: first,
+        };
+        let request = lookup.start()?;
         Ok(Self {
-            request: Some(Self::lookup_request(
-                fs,
-                parent.fuse_directory.get().ok_or(Errno(5))?.node,
-                caller,
-                first.clone(),
-            )?),
-            kind: ResultKind::Lookup(Lookup {
-                fs: fs.clone(),
-                caller,
-                follow: continuation.follow_final,
-                directory: continuation.trailing,
-                continuation: Some(Box::new(continuation)),
-                base: Some(base),
-                operation,
-                flags: m.flags.clone(),
-                root: false,
-                parent: parent.fuse_directory.get().unwrap().node,
-                parent_directory: parent,
-                change: matches!(operation, PathOperation::Chdir | PathOperation::Chroot)
-                    .then(|| directory::Change::new(v, m.shared.clone())),
-                name: first,
-            }),
+            request,
+            kind: ResultKind::Lookup(lookup),
             _usage: Some(mounts::MountUse::new(m.identity.clone())),
             resolved: None,
             resolved_entry: None,
@@ -585,6 +728,7 @@ impl Metadata {
             dev: m.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry,
         })
     }
     pub(crate) fn open_inode(
@@ -640,6 +784,8 @@ impl Metadata {
             root: true,
             parent: node,
             parent_directory: directory,
+            parent_access: None,
+            parent_wait: None,
             change,
             name: Vec::new(),
         });
@@ -771,6 +917,21 @@ impl Metadata {
                 )?);
             }
         }
+        if !root {
+            let reference = self.reference.as_mut().unwrap();
+            reference.entry = Some(if let Some(node) = &reference.directory {
+                node.fuse_directory.get().unwrap().entry.clone()
+            } else {
+                walk.fs.entries.bind(
+                    reference.leaf.as_ref().unwrap(),
+                    &walk.parent_directory,
+                    &walk.name,
+                )
+            });
+        }
+        // Lookup has bound its accepted dentry. Permission, link following and
+        // OPEN operate on that inode after the parent directory is unlocked.
+        drop(walk.parent_access.take());
         let retained = self.reference.as_ref().unwrap();
         attr.copy_from_slice(
             &inode::attr(
@@ -836,14 +997,19 @@ impl Metadata {
             let mut continuation = *walk.continuation.take().unwrap();
             continuation.current.directory_inode =
                 self.reference.as_ref().unwrap().directory.clone();
+            continuation.current.fuse_entry = self.reference.as_ref().unwrap().entry.clone();
             let operation = walk.operation;
             return self.resume_walk(v, continuation, operation);
+        }
+        if let Some(retry) = &mut self.retry {
+            retry.looked_up();
         }
         match walk.operation {
             PathOperation::ResolveEntry => {
                 // Ordinary and magic targets finish through the common walk.
                 // A daemon directory already has its canonical inode here.
                 let mut path = walk.continuation.take().ok_or(Errno(5))?.current;
+                path.fuse_entry = self.reference.as_ref().unwrap().entry.clone();
                 path.directory_inode = self
                     .reference
                     .as_ref()
@@ -859,6 +1025,7 @@ impl Metadata {
                     return Err(Errno(20));
                 }
                 let mut path = walk.continuation.take().ok_or(Errno(5))?.current;
+                path.fuse_entry = self.reference.as_ref().unwrap().entry.clone();
                 path.directory_inode = self.reference.as_ref().unwrap().directory.clone();
                 let node = self.reference.as_ref().unwrap().directory.clone().unwrap();
                 self.resolved = Some(Box::new((path, node)));
@@ -903,6 +1070,7 @@ impl Metadata {
             }
             PathOperation::Truncate(length) => {
                 let mut path = walk.continuation.take().ok_or(Errno(5))?.current;
+                path.fuse_entry = self.reference.as_ref().unwrap().entry.clone();
                 path.directory_inode = self
                     .reference
                     .as_ref()
@@ -1066,6 +1234,7 @@ impl Metadata {
             dev: m.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(crate) fn readlink_inode(
@@ -1093,18 +1262,20 @@ impl Metadata {
             dev: mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(crate) fn follow_inode(
         v: &Vfs,
         node: NodeRef,
-        walk: PathWalk,
+        mut walk: PathWalk,
         base: ResolvedPath,
         operation: PathOperation,
     ) -> Result<Self> {
         let mount = walk.current.mount.as_ref().ok_or(Errno(5))?;
         let fs = mount.fs.fuse.as_ref().ok_or(Errno(5))?;
         let mut pending = Self::readlink_inode(v, mount, fs, node)?;
+        pending.retry = walk.retry.take();
         pending.kind = ResultKind::FollowLink(Box::new(Link {
             walk,
             base,
@@ -1137,6 +1308,7 @@ impl Metadata {
             dev: m.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         })
     }
     pub(crate) fn needs_interrupt(&self) -> bool {
@@ -1174,6 +1346,34 @@ impl Metadata {
         .flatten()
     }
     pub(crate) fn ready(&self) -> bool {
+        if let ResultKind::Buffered(operation) = &self.kind {
+            return operation.ready();
+        }
+        if let ResultKind::Mutation(mutation) = &self.kind {
+            if mutation.waiting_lock() {
+                return mutation.lock_ready();
+            }
+        }
+        if let ResultKind::Lookup(lookup) = &self.kind {
+            if self.request.is_none() {
+                return lookup.lock_ready();
+            }
+        }
+        if let ResultKind::CacheCommand(next) = &self.kind {
+            return next.pending.ready() && !next.file.waiting_for(&next.command);
+        }
+        if let ResultKind::Filesystems(batch) = &self.kind {
+            return batch.ready();
+        }
+        if let ResultKind::Device(pending, _) = &self.kind {
+            return pending.ready();
+        }
+        if let ResultKind::Notification(operation, _) = &self.kind {
+            return operation.ready();
+        }
+        if let ResultKind::Writeback(operation) = &self.kind {
+            return operation.pending.ready();
+        }
         if let ResultKind::Xattr(operation) = &self.kind {
             if operation.waiting_lock() {
                 return operation.lock_ready();
@@ -1190,6 +1390,38 @@ impl Metadata {
         self.daemon_request().is_none_or(|request| request.ready())
     }
     pub(crate) fn subscribe(&self, s: &Arc<IoSignal>) -> Option<IoSubscription> {
+        if let ResultKind::Buffered(operation) = &self.kind {
+            return operation.subscribe(s);
+        }
+        if let ResultKind::Mutation(mutation) = &self.kind {
+            if mutation.waiting_lock() {
+                return mutation.subscribe_lock(s);
+            }
+        }
+        if let ResultKind::Lookup(lookup) = &self.kind {
+            if self.request.is_none() {
+                return Some(inode::attr(&lookup.parent_directory).subscribe_write(s));
+            }
+        }
+        if let ResultKind::CacheCommand(next) = &self.kind {
+            return if next.pending.ready() {
+                Some(next.file.attr.subscribe_write(s))
+            } else {
+                Some(next.pending.subscribe(s))
+            };
+        }
+        if let ResultKind::Filesystems(batch) = &self.kind {
+            return batch.subscribe(s);
+        }
+        if let ResultKind::Device(pending, _) = &self.kind {
+            return Some(pending.subscribe(s));
+        }
+        if let ResultKind::Notification(operation, _) = &self.kind {
+            return operation.subscribe(s);
+        }
+        if let ResultKind::Writeback(operation) = &self.kind {
+            return Some(operation.pending.subscribe(s));
+        }
         if let ResultKind::Xattr(operation) = &self.kind {
             if operation.waiting_lock() {
                 return Some(operation.subscribe_lock(s));
@@ -1205,7 +1437,115 @@ impl Metadata {
         }
         self.daemon_request().map(|request| request.subscribe(s))
     }
-    pub(crate) fn take(&mut self, v: &mut Vfs) -> Option<Result<FileValue>> {
+    fn take_once(&mut self, v: &mut Vfs) -> Option<Result<FileValue>> {
+        if let ResultKind::Buffered(operation) = &mut self.kind {
+            let sync = operation.result.after_write_sync();
+            let result = operation.take()?;
+            if let (Some((file, data_only)), Ok(FileValue::Count(count))) = (sync, &result) {
+                if *count != 0 {
+                    let (position, writer) = operation.result.take_sync_leases();
+                    match file.sync(v, data_only, *count, position, writer) {
+                        Ok(next) => self.adopt(next),
+                        Err(error) => return Some(Err(error)),
+                    }
+                    return None;
+                }
+            }
+            return Some(result);
+        }
+        if let ResultKind::Mutation(mutation) = &mut self.kind {
+            if mutation.waiting_lock() {
+                return match mutation.resume_lock() {
+                    Ok(namespace::Step::Blocked) => {
+                        self.request = None;
+                        None
+                    }
+                    Ok(namespace::Step::Waiting(request)) => {
+                        self.request = Some(request);
+                        None
+                    }
+                    Ok(namespace::Step::Complete(value)) => Some(Ok(value)),
+                    Err(error) => Some(Err(error)),
+                };
+            }
+        }
+        if self.request.is_none() {
+            if let ResultKind::Lookup(lookup) = &mut self.kind {
+                return match lookup.start() {
+                    Ok(request) => {
+                        self.request = request;
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                };
+            }
+        }
+        if let ResultKind::CacheCommand(next) = &self.kind {
+            match next.pending.result()? {
+                Ok(()) => {}
+                Err(error) => return Some(Err(error)),
+            }
+            match next
+                .file
+                .operation_with_cache(v, &next.command, &next.original, false)
+            {
+                Ok(Some(operation)) => {
+                    self.adopt(operation);
+                    return self.take(v);
+                }
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        if let ResultKind::Filesystems(batch) = &mut self.kind {
+            return batch.take();
+        }
+        if let ResultKind::Device(pending, count) = &self.kind {
+            return pending
+                .result()
+                .map(|result| result.map(|()| FileValue::Count(*count)));
+        }
+        if let ResultKind::Notification(operation, count) = &self.kind {
+            return operation
+                .progress_entry()
+                .map(|result| result.map(|()| FileValue::Count(*count)));
+        }
+        if let ResultKind::Writeback(operation) = &self.kind {
+            match operation.pending.result() {
+                None => return None,
+                Some(Err(error)) => {
+                    let _ = operation
+                        .file
+                        .attr
+                        .cache
+                        .check_error(&operation.file.writeback_seen);
+                    return Some(Err(error));
+                }
+                Some(Ok(())) => {}
+            }
+            let ResultKind::Writeback(mut operation) =
+                std::mem::replace(&mut self.kind, ResultKind::Readlink)
+            else {
+                unreachable!()
+            };
+            let kind = *operation
+                .kind
+                .take()
+                .expect("original post-writeback operation");
+            match operation.file.request_with_cache(
+                v,
+                operation.opcode,
+                &operation.body,
+                kind,
+                false,
+            ) {
+                Ok(next) => {
+                    self.adopt(next);
+                    return self.take(v);
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
         if let ResultKind::InitWalk(_, fs, _) = &self.kind {
             if !fs.connection.initialized() {
                 return None;
@@ -1289,6 +1629,10 @@ impl Metadata {
             return match mutation
                 .advance(result, self.request.as_ref().map_or(0, |r| r.attr_version))
             {
+                Ok(namespace::Step::Blocked) => {
+                    self.request = None;
+                    None
+                }
                 Ok(namespace::Step::Waiting(request)) => {
                     self.request = Some(request);
                     None
@@ -1351,7 +1695,7 @@ impl Metadata {
                         let file = self.open_file(fh, attr, open_flags);
                         let mut operation = Metadata::file_size(v, file, 0, true)?;
                         operation.open = self.open.take();
-                        *self = operation;
+                        self.adopt(operation);
                         Ok(None)
                     } else {
                         self.publish_open(fh, attr, open_flags).map(Some)
@@ -1380,7 +1724,7 @@ impl Metadata {
                     Ok(operation) => operation,
                     Err(error) => return Some(Err(error)),
                 };
-                *self = operation;
+                self.adopt(operation);
                 return None;
             }
             return Some(result);
@@ -1536,15 +1880,22 @@ struct OpenPlan {
 mod access;
 mod attributes;
 mod cache;
+mod mapping;
+mod notify;
+mod writeback;
+pub(crate) use notify::prepare as prepare_notification;
 mod inode;
 mod permissions;
 #[path = "mount/acl.rs"]
 mod posix;
+mod sync;
 mod xattr;
 pub(crate) use attributes::AttributeChange;
 pub(crate) use xattr::XattrCall;
 mod create;
 mod directory;
+mod entry;
+pub(crate) use entry::Entry;
 mod leaf;
 mod parents;
 mod reopen;

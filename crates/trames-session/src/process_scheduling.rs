@@ -4,21 +4,38 @@
 use super::*;
 impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
-    pub(super) fn scheduling(
+    pub(super) fn scheduling_call(
         &self,
+        pid: u32,
         p: &mut Process<C>,
         number: u32,
-        a: [u64; 6],
-    ) -> Result<u64, Errno> {
-        let c = &p.linux.vfs.credentials;
-        trames_kernel::signal::IoRoutes {
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        let routes = trames_kernel::signal::IoRoutes {
             directory: p.signals.io_directory.clone(),
             namespace: p.linux.vfs.pid_namespace().clone(),
-            uid: c.uid,
-            euid: c.euid,
+            uid: p.linux.vfs.credentials.uid,
+            euid: p.linux.vfs.credentials.euid,
+        };
+        let mut call = trames_kernel::signal::SchedulingCall::new(
+            p.signals.io.clone(),
+            routes,
+            self.cpu_count,
+            number,
+            args,
+        );
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
         }
-        .scheduling(&p.signals.io, self.cpu_count, number, a, &mut p.memory)
+        let wait = crate::run_queue::SignalWait::scheduling(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
     }
+
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn mempolicy(p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         p.linux

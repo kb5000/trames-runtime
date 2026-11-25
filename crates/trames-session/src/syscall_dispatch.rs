@@ -271,15 +271,18 @@ pub(crate) fn execute<C: Cpu>(
             .as_ref()
             .filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu))
         {
-            match snapshot.return_io_signal(&mut work.cpu, &*memory) {
-                Ok(()) => work.trace.record(work.cpu.x(0)),
-                Err(error) => {
-                    let _ = snapshot
-                        .io_signals
-                        .inbox
-                        .enqueue(11, trames_kernel::signal::Info::default());
-                    work.trace
-                        .finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64));
+            match snapshot.return_io_signal(&mut work.cpu, memory) {
+                Ok(None) => work.trace.record(work.cpu.x(0)),
+                Ok(Some(fault)) => {
+                    parked = Some(crate::run_queue::WaitState::Page(
+                        crate::run_queue::PageWait::new(fault.wait),
+                    ));
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                Err(_) => {
+                    snapshot.bad_sigreturn(&mut work.cpu, memory);
+                    work.trace.record(work.cpu.x(0));
                 }
             }
             syscalls += 1;
@@ -333,7 +336,7 @@ pub(crate) fn execute<C: Cpu>(
                             }
                             trames_linux::IoAttempt::Complete(result) => {
                                 if trames_linux::event_wait(number) {
-                                    snapshot.finish_wait_mask();
+                                    snapshot.finish_event_mask(result);
                                 }
                                 work.trace.finish(
                                     &mut work.cpu,
@@ -754,11 +757,13 @@ pub(crate) fn execute<C: Cpu>(
             break 'entry Some(result);
         }
         if let Some(snapshot) = &work.syscalls {
-            if matches!(work.cpu.x(8) as u32, 132..=137)
+            if matches!(work.cpu.x(8) as u32, 132..=137 | 293)
                 || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260)
                 || snapshot.signal_send(&work.cpu)
                 || snapshot.thread_call(&work.cpu)
                 || snapshot.limit_call(work.cpu.x(8) as u32)
+                || snapshot.timers.is_some()
+                    && trames_kernel::timers::timer_call(work.cpu.x(8) as u32)
             {
                 let mut entry = snapshot.task_entry(&work.cpu);
                 if let Some(decision) = entry.as_ref() {
@@ -825,31 +830,28 @@ pub(crate) fn execute<C: Cpu>(
                 let began = snapshot.profile.then(Instant::now);
                 let number = work.cpu.x(8) as u32;
                 if matches!(number, 95 | 260) {
-                    let request = match trames_kernel::children::Wait::prepare_with_files(
+                    let request = trames_kernel::children::WaitCall::prepare(
                         work.pid,
                         number,
                         std::array::from_fn(|i| work.cpu.x(i)),
                         &snapshot.fd_flags,
                         &snapshot.io_routes.namespace,
-                    ) {
-                        Ok(request) => request,
-                        Err(e) => {
-                            work.trace
-                                .finish(&mut work.cpu, 0u64.wrapping_sub(e.0 as u64));
-                            syscalls += 1;
-                            break 'entry None;
-                        }
-                    };
+                    );
                     // Subscribe before checking: an exit between checking and
                     // parking cannot strand the accepted source wait.
                     let waiting = snapshot.begin_child_wait(request);
-                    let attempt = snapshot.children.wait(
-                        request,
+                    let crate::run_queue::WaitState::Child(wait) = &waiting else {
+                        unreachable!()
+                    };
+                    let attempt = wait.check(
+                        &snapshot.children,
+                        &snapshot.io_signals,
                         &snapshot.io_routes.namespace,
                         snapshot.io_signals.group(),
                         &mut *memory,
+                        snapshot.io_wake.as_ref(),
                     );
-                    if let Some(value) = attempt.transpose() {
+                    if let Some(value) = attempt {
                         work.trace.finish(
                             &mut work.cpu,
                             value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
@@ -864,21 +866,388 @@ pub(crate) fn execute<C: Cpu>(
                     syscalls += 1;
                     break 'entry Some(SliceOutcome::Yield { instructions: 0 });
                 }
-                if matches!(number, 133 | 137) {
-                    let attempt = trames_kernel::signal::SignalWait::prepare(
+                if memory.async_faults_possible()
+                    && (number == 219 || number == 167 && matches!(work.cpu.x(0), 2 | 15 | 16 | 37))
+                {
+                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                    let mut call = if number == 219 {
+                        let (registry, credentials) = snapshot
+                            .namespaces
+                            .as_ref()
+                            .expect("original key capability")
+                            .key_resources();
+                        trames_linux::TaskCopyCall::keys(
+                            snapshot.session_keys.clone(),
+                            registry,
+                            credentials,
+                            args,
+                        )
+                    } else {
+                        match args[0] {
+                            2 => trames_linux::TaskCopyCall::scalar(
+                                args[1],
+                                snapshot
+                                    .io_signals
+                                    .parentage()
+                                    .expect("original parent")
+                                    .death_signal(),
+                            ),
+                            37 => trames_linux::TaskCopyCall::scalar(
+                                args[1],
+                                u32::from(
+                                    snapshot
+                                        .io_signals
+                                        .family()
+                                        .expect("original family")
+                                        .subreaper(),
+                                ),
+                            ),
+                            _ => trames_linux::TaskCopyCall::name(snapshot.name.clone(), args),
+                        }
+                    };
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::task_copy(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if memory.async_faults_possible()
+                    && trames_kernel::signal::FdControlCall::entry(
                         number,
                         std::array::from_fn(|i| work.cpu.x(i)),
-                        &*memory,
+                    )
+                {
+                    snapshot.direct.record_fd_control();
+                    let mut call = trames_kernel::signal::FdControlCall::new(
+                        &snapshot.io_signals,
+                        snapshot.io_routes.clone(),
+                        &snapshot.fd_flags,
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
                     );
-                    let request = match attempt {
-                        Ok(r) => r,
-                        Err(e) => {
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::fd_control(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if matches!(number, 138 | 240 | 424) && memory.async_faults_possible() {
+                    let mut call = trames_kernel::signal::SendCall::new(
+                        snapshot.io_signals.clone(),
+                        snapshot.io_routes.clone(),
+                        snapshot.fd_flags.clone(),
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                    );
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::send(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if number == 241
+                    && memory.async_faults_possible()
+                    && snapshot.direct.descriptor_factory().is_some()
+                {
+                    let mut call = trames_kernel::perf::OpenCall::new(
+                        snapshot.io_signals.clone(),
+                        snapshot.io_routes.clone(),
+                        snapshot.fd_flags.clone(),
+                        snapshot.direct.descriptor_factory().unwrap().clone(),
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                        snapshot.cpus,
+                    );
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::perf(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if trames_kernel::scheduling::call(number) && memory.async_faults_possible() {
+                    let mut call = trames_kernel::signal::SchedulingCall::new(
+                        snapshot.io_signals.clone(),
+                        snapshot.io_routes.clone(),
+                        snapshot.cpus,
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                    );
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::scheduling(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if trames_kernel::query::entry(number) {
+                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                    if !memory.async_faults_possible() {
+                        let value = snapshot
+                            .invoke(&work.cpu, &mut *memory)
+                            .expect("original query authority");
+                        work.trace.finish(&mut work.cpu, value);
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let call = trames_kernel::query::Call::new(
+                        number,
+                        args,
+                        snapshot.started,
+                        &snapshot.io_signals,
+                        &snapshot.children,
+                        &snapshot.io_routes,
+                    );
+                    let mut call = match call {
+                        Ok(call) => call,
+                        Err(error) => {
                             work.trace
-                                .finish(&mut work.cpu, 0u64.wrapping_sub(e.0 as u64));
+                                .finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64));
+                            if let Some(began) = began {
+                                syscall_time += began.elapsed();
+                            }
                             syscalls += 1;
                             break 'entry None;
                         }
                     };
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::query(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if let Some(timers) = snapshot
+                    .timers
+                    .as_ref()
+                    .filter(|_| trames_kernel::timers::timer_call(number))
+                {
+                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                    if !memory.async_faults_possible() {
+                        let value = timers.call(
+                            number,
+                            args,
+                            &mut *memory,
+                            snapshot.started,
+                            &snapshot.io_signals,
+                            &snapshot.io_routes.directory,
+                            &snapshot.io_routes.namespace,
+                        );
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let mut call = trames_kernel::timers::Call::new(
+                        timers.clone(),
+                        number,
+                        args,
+                        snapshot.started,
+                        snapshot.io_signals.clone(),
+                        snapshot.io_routes.directory.clone(),
+                        snapshot.io_routes.namespace.clone(),
+                    );
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::timer(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if snapshot.limit_call(number) {
+                    if !memory.async_faults_possible() {
+                        let value = snapshot.limits.as_ref().unwrap().call(
+                            number,
+                            std::array::from_fn(|i| work.cpu.x(i)),
+                            &mut *memory,
+                        );
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let mut call = trames_kernel::limits::Call::new(
+                        snapshot.limits.as_ref().unwrap().clone(),
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                    );
+                    if let Some(value) = call.check(&mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::limit(call);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if matches!(number, 132 | 134..=136 | 293) {
+                    let mut request = trames_kernel::signal::ControlCall::new(
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                        work.cpu.sp(),
+                        snapshot.actions.shared(),
+                        snapshot.io_routes.directory.clone(),
+                    );
+                    if let Some(value) = request.check(&snapshot.io_signals, &mut *memory) {
+                        work.trace.finish(
+                            &mut work.cpu,
+                            value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                        );
+                        if let Some(began) = began {
+                            syscall_time += began.elapsed();
+                        }
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    let wait = crate::run_queue::SignalWait::control(request);
+                    if let Some(signal) = &snapshot.io_wake {
+                        wait.bind(&snapshot.io_signals, signal);
+                    }
+                    parked = Some(crate::run_queue::WaitState::Signal(wait));
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    syscalls += 1;
+                    break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                }
+                if matches!(number, 133 | 137) {
+                    let mut request = trames_kernel::signal::WaitCall::new(
+                        number,
+                        std::array::from_fn(|i| work.cpu.x(i)),
+                    );
                     if let Some(value) = request.check(
                         &snapshot.io_signals,
                         &mut *memory,
@@ -956,22 +1325,6 @@ pub(crate) fn execute<C: Cpu>(
                 syscalls += 1;
                 break 'entry None;
             }
-            if let Some(entry) = snapshot.timer_entry(&work.cpu) {
-                if !entry.allowed() {
-                    job.seccomp_entry = Some(entry);
-                    break 'entry Some(result);
-                }
-                let began = snapshot.profile.then(Instant::now);
-                let value = snapshot
-                    .invoke(&work.cpu, &mut *memory)
-                    .expect("shared timer authority");
-                if let Some(began) = began {
-                    syscall_time += began.elapsed();
-                }
-                work.trace.finish(&mut work.cpu, value);
-                syscalls += 1;
-                break 'entry None;
-            }
             if let Some(entry) = snapshot.event_entry(&work.cpu) {
                 if !entry.allowed() {
                     job.seccomp_entry = Some(entry);
@@ -999,7 +1352,7 @@ pub(crate) fn execute<C: Cpu>(
                                 break 'entry Some(SliceOutcome::Yield { instructions: 0 });
                             }
                             trames_linux::IoAttempt::Complete(value) => {
-                                snapshot.finish_wait_mask();
+                                snapshot.finish_event_mask(value);
                                 work.trace.finish(
                                     &mut work.cpu,
                                     value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
@@ -1016,6 +1369,12 @@ pub(crate) fn execute<C: Cpu>(
                             }
                             trames_linux::IoAttempt::WaitCheckpoint(wait) => {
                                 job.retry = Some(crate::run_queue::IoCall::from_wait(wait));
+                                break 'entry Some(result);
+                            }
+                            trames_linux::IoAttempt::FileCheckpoint(file) => {
+                                job.retry = Some(crate::run_queue::IoCall::from_file_checkpoint(
+                                    file, number, args,
+                                ));
                                 break 'entry Some(result);
                             }
                             trames_linux::IoAttempt::Checkpoint => {
@@ -1257,6 +1616,47 @@ pub(crate) fn execute<C: Cpu>(
                 work.trace.finish(&mut work.cpu, value);
                 syscalls += 1;
                 break 'entry None;
+            }
+            if let Some(epoch) = epoch.as_ref() {
+                let number = work.cpu.x(8) as u32;
+                let args = std::array::from_fn(|i| work.cpu.x(i));
+                if let Some(attempt) = snapshot.direct.start_metadata_copy(
+                    number,
+                    args,
+                    &mut *memory,
+                    work.pid,
+                    &epoch.io_target,
+                ) {
+                    if let Some(began) = began {
+                        syscall_time += began.elapsed();
+                    }
+                    match attempt {
+                        trames_linux::IoAttempt::Complete(value) => {
+                            work.trace.finish(
+                                &mut work.cpu,
+                                value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+                            );
+                            syscalls += 1;
+                            break 'entry None;
+                        }
+                        trames_linux::IoAttempt::Blocked(wait) => {
+                            parked_io = Some(wait);
+                            break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                        }
+                        trames_linux::IoAttempt::FileCheckpoint(file) => {
+                            job.retry = Some(crate::run_queue::IoCall::from_file_checkpoint(
+                                file, number, args,
+                            ));
+                            break 'entry Some(result);
+                        }
+                        trames_linux::IoAttempt::HostError(error) => {
+                            epoch.fail_host_io(error);
+                            maintenance = true;
+                            break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                        }
+                        _ => unreachable!("metadata copies own no structural mutation"),
+                    }
+                }
             }
             if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                 && snapshot.seccomp.mode() == 0

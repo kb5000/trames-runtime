@@ -35,6 +35,9 @@ impl ControlStateOps for State {
         r: &mut Request,
         retired: &mut Vec<Request>,
     ) -> Option<Result<(i32, bool)>> {
+        if r.import_pending {
+            return None;
+        }
         if let Some(e) = r.error {
             return Some(Err(e));
         }

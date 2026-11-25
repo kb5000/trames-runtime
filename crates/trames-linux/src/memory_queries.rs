@@ -220,6 +220,9 @@ mod tests {
     }
     struct Legacy(Memory);
     impl CpuMemory for Legacy {
+        fn mapped_at_or_after(&self, address: u64) -> bool {
+            self.0.mapped_at_or_after(address)
+        }
         fn read(&self, a: u64, b: &mut [u8]) -> Result<(), trames_memory::MemoryError> {
             CpuMemory::read(&self.0, a, b)
         }

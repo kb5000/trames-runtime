@@ -48,9 +48,13 @@ impl XattrTarget {
         {
             return Err(Errno(13));
         }
-        // Linux ACL/capability IDs cannot be forwarded into a host authority
-        // namespace unchanged. Their native/guest translation is a separate gate.
-        if acl::name(name) || name == file_caps::NAME {
+        // Native capability grants never inherit guest SETFCAP authority.
+        // Darwin's ACE ACL is not a Linux POSIX ACL; retain that format gate.
+        if name == file_caps::NAME {
+            return Err(Errno(95));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if acl::name(name) {
             return Err(Errno(95));
         }
         Ok(())
@@ -58,6 +62,10 @@ impl XattrTarget {
     pub(crate) fn read(&self, v: &Vfs, name: Option<&[u8]>, capacity: u64) -> Result<FileValue> {
         if let Some(name) = name {
             self.allowed(v, name, false)?;
+            #[cfg(target_os = "linux")]
+            if acl::name(name) {
+                return super::posix_acl::read(&self.file, v, name, capacity);
+            }
         }
         let native = Native::new(&self.file)?;
         let name = name.map(CString::new).transpose().map_err(|_| Errno(22))?;
@@ -113,7 +121,15 @@ impl XattrTarget {
         value: Option<&[u8]>,
         flags: u32,
     ) -> Result<()> {
+        let _metadata = acl::name(name).then(|| self.node.metadata.lock().unwrap());
         self.allowed(v, name, true)?;
+        #[cfg(target_os = "linux")]
+        if acl::name(name) {
+            super::posix_acl::write(&self.file, &self.node, v, name, value)?;
+            self.node.borrow_mut().times[2] = storage::Timestamp::now();
+            inotify::notify(&self.node, inotify::ATTRIB, self.link.as_ref());
+            return Ok(());
+        }
         let native = Native::new(&self.file)?;
         let name = CString::new(name).map_err(|_| Errno(22))?;
         // CREATE|REPLACE cannot succeed. Darwin rejects the combined bits;
@@ -145,31 +161,23 @@ fn xattr_error() -> Errno {
     };
     Errno(code)
 }
-struct Native<'a> {
-    file: &'a OpenFile,
+pub(super) struct Native<'a> {
+    file: &'a File,
     #[cfg(not(target_vendor = "apple"))]
     path: Option<CString>,
 }
 impl<'a> Native<'a> {
-    fn new(file: &'a OpenFile) -> Result<Self> {
+    pub(super) fn new(file: &'a OpenFile) -> Result<Self> {
+        Self::from_file(&file.file)
+    }
+    pub(super) fn from_file(file: &'a File) -> Result<Self> {
         #[cfg(not(target_vendor = "apple"))]
         let path = {
             // O_PATH metadata descriptors are not accepted by f*xattr. A proc
-            // magic link to this retained regular/directory inode preserves its
-            // identity after unlink without resolving mutable guest text.
-            // SAFETY: live retained descriptor, scalar F_GETFL command.
-            let flags = unsafe { libc::fcntl(file.file.as_raw_fd(), libc::F_GETFL) };
-            status(flags)?;
-            if flags & libc::O_PATH != 0 {
-                if file.native_stat()?.st_mode & libc::S_IFMT == libc::S_IFLNK {
-                    // Legacy Linux APIs cannot address an O_PATH symlink's
-                    // xattrs through its fd. Do not follow its target instead.
-                    return Err(Errno(95));
-                }
-                Some(CString::new(format!("/proc/self/fd/{}", file.file.as_raw_fd())).unwrap())
-            } else {
-                None
-            }
+            // magic link jumps to the retained inode, including a symlink: the
+            // pure jump ends path walking instead of following its link text.
+            // The live OpenFile prevents native descriptor reuse throughout.
+            metadata_path(file)?
         };
         Ok(Self {
             file,
@@ -177,8 +185,8 @@ impl<'a> Native<'a> {
             path,
         })
     }
-    fn read(&self, name: Option<&CString>, bytes: &mut [u8]) -> Result<usize> {
-        let fd = self.file.file.as_raw_fd();
+    pub(super) fn read(&self, name: Option<&CString>, bytes: &mut [u8]) -> Result<usize> {
+        let fd = self.file.as_raw_fd();
         let data = if bytes.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -210,8 +218,8 @@ impl<'a> Native<'a> {
             Ok(count as usize)
         }
     }
-    fn write(&self, name: &CString, value: Option<&[u8]>, flags: u32) -> Result<()> {
-        let fd = self.file.file.as_raw_fd();
+    pub(super) fn write(&self, name: &CString, value: Option<&[u8]>, flags: u32) -> Result<()> {
+        let fd = self.file.as_raw_fd();
         #[cfg(target_vendor = "apple")]
         let flags = if flags & 1 != 0 {
             libc::XATTR_CREATE
@@ -371,7 +379,7 @@ mod tests {
         );
         assert_eq!(
             v.get_xattr(AT_FDCWD, Some(b"/host/file"), true, acl::ACCESS),
-            Err(Errno(95))
+            Err(Errno(if cfg!(target_os = "linux") { 61 } else { 95 }))
         );
         v.credentials = Credentials::user(1000, 1000);
         assert_eq!(
@@ -448,6 +456,98 @@ mod tests {
         drop(target);
         v.mount(None, b"/host", None, 32 | 4096 | mounts::MS_RDONLY, None)
             .unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opath_symlink_native_xattrs_address_the_link_and_never_its_text_target() {
+        let root = Fixture::new();
+        std::fs::write(root.0.join("file"), b"target").unwrap();
+        std::os::unix::fs::symlink("file", root.0.join("link")).unwrap();
+        let mut v = root.vfs(false);
+        set(&mut v, Some(b"target attribute"), 0).unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/host/link", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        let file = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .host_file
+            .clone()
+            .unwrap();
+        let native = Native::new(&file).unwrap();
+        let name = CString::new("user.native").unwrap();
+        let mut bytes = [0; 4096];
+        assert_eq!(native.read(Some(&name), &mut bytes), Err(Errno(61)));
+        let count = native.read(None, &mut bytes).unwrap();
+        assert!(!bytes[..count]
+            .split(|&b| b == 0)
+            .any(|n| n == b"user.native"));
+        assert_eq!(native.write(&name, Some(b"wrong target"), 0), Err(Errno(1)));
+        assert_eq!(
+            v.get_xattr(AT_FDCWD, Some(b"/host/file"), true, b"user.native"),
+            Ok(b"target attribute".to_vec())
+        );
+        assert!(!v
+            .list_xattrs(AT_FDCWD, Some(b"/host/link"), false)
+            .unwrap()
+            .split(|&b| b == 0)
+            .any(|n| n == b"user.native"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opath_symlink_xattr_capability_survives_rename_unlink_and_guest_fd_reuse() {
+        let root = Fixture::new();
+        std::fs::write(root.0.join("file"), b"target").unwrap();
+        std::os::unix::fs::symlink("file", root.0.join("link")).unwrap();
+        let mut v = root.vfs(false);
+        set(&mut v, Some(b"target attribute"), 0).unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/host/link", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        let file = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .host_file
+            .clone()
+            .unwrap();
+        let inode = file.native_stat().unwrap().st_ino;
+        let native = Native::new(&file).unwrap();
+        v.close(fd).unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap(), fd);
+        std::fs::rename(root.0.join("link"), root.0.join("old-link")).unwrap();
+        std::fs::write(root.0.join("link"), b"replacement inode").unwrap();
+        v.set_xattr(
+            AT_FDCWD,
+            Some(b"/host/link"),
+            true,
+            b"user.native",
+            Some(b"replacement"),
+            0,
+        )
+        .unwrap();
+        std::fs::remove_file(root.0.join("old-link")).unwrap();
+        let mut bytes = [0; 4096];
+        assert_eq!(file.native_stat().unwrap().st_ino, inode);
+        assert_eq!(
+            native.read(Some(&CString::new("user.native").unwrap()), &mut bytes),
+            Err(Errno(61))
+        );
+        let count = native.read(None, &mut bytes).unwrap();
+        assert!(!bytes[..count]
+            .split(|&b| b == 0)
+            .any(|n| n == b"user.native"));
+        assert_eq!(
+            v.get_xattr(fd as i32, None, true, b"user.native"),
+            Ok(b"target attribute".to_vec())
+        );
+        assert_eq!(
+            v.get_xattr(AT_FDCWD, Some(b"/host/link"), true, b"user.native"),
+            Ok(b"replacement".to_vec())
+        );
     }
     #[cfg(target_vendor = "apple")]
     #[test]

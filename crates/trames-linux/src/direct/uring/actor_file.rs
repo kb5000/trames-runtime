@@ -20,9 +20,40 @@ enum FileDependency {
         ticket: Option<trames_memory::layout::LayoutWrite>,
     },
 }
+impl Drop for FileIo {
+    fn drop(&mut self) {
+        // A retired ring/task must not leave a late native reply (and its OFD
+        // position) owned by snapshots of this completion. The pool finishes
+        // only owned host work; cancelled replies never copy into guest RAM.
+        self.result.abandon(None, false);
+    }
+}
 struct SelectionLease {
     ring: Weak<Uring>,
     identity: u64,
+}
+pub(super) fn retain_selection(
+    actor: &UringActor,
+    ring: &Uring,
+    request: &mut Request,
+    buffer: trames_vfs::UringProvidedBuffer,
+) {
+    let identity = request
+        .selected_identity
+        .expect("original selected-buffer identity");
+    let ring = actor
+        .rings
+        .lock()
+        .unwrap()
+        .get(&(ring as *const Uring as usize))
+        .expect("original source ring")
+        .clone();
+    request.selection = Some(trames_vfs::UringSelection {
+        buffer,
+        group: request.sqe.buffer_group(),
+        identity,
+        lease: Arc::new(SelectionLease { ring, identity }),
+    });
 }
 impl trames_vfs::UringExecutionLease for SelectionLease {}
 impl Drop for SelectionLease {
@@ -39,6 +70,9 @@ impl Drop for SelectionLease {
     }
 }
 impl FileIo {
+    pub(super) fn pending_copy(&self) -> bool {
+        self.copyout.is_some()
+    }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
         if let Some(copy) = &self.copyout {
             return copy.subscribe(signal).into_iter().collect();
@@ -218,7 +252,7 @@ impl FileIo {
         }
     }
 }
-fn parameters(
+pub(super) fn parameters(
     request: &Request,
     memory: &impl CpuMemory,
 ) -> Result<(FileCommand, Vec<(u64, usize)>)> {
@@ -249,7 +283,7 @@ fn parameters(
             let count = parts.iter().map(|p| p.1).sum();
             for &(address, len) in &parts {
                 if len != 0 && request.buffer.is_none() {
-                    Linux::check(
+                    Linux::check_io_buffer(
                         memory,
                         address,
                         len,
@@ -298,10 +332,23 @@ pub(super) fn execute(
         });
     }
     let file: FileTarget = request.file.as_ref()?.file_target()?;
-    let (command, parts) = match parameters(request, memory) {
+    let imported = if memory.async_faults_possible() {
+        let input = call.input.get_or_insert_with(Default::default);
+        let reader = file_input::Reader::new(memory, input);
+        let result = parameters(request, &reader);
+        if let Some(fault) = reader.fault() {
+            call.page = Some(fault.wait);
+            return Some(Err(Errno(11)));
+        }
+        result
+    } else {
+        parameters(request, memory)
+    };
+    let (command, parts) = match imported {
         Ok(parameters) => parameters,
         Err(e) => return Some(Err(e)),
     };
+    call.input = None;
     let mut io = FileIo {
         result: Arc::default(),
         wait_revision: 0,

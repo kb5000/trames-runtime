@@ -500,6 +500,79 @@ mod tests {
         assert_eq!(process.linux.vfs.seek(fd, 0, 1), Ok(0));
     }
     #[test]
+    fn proc_read_wait_subscribes_to_original_pages_and_statistics_after_fd_reuse() {
+        use trames_vfs::{FileCommand, FileOutcome, FileWork, IoSignal, IoWake};
+        struct Wake;
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {}
+        }
+        for path in [b"/proc/self/environ".as_slice(), b"/proc/self/smaps"] {
+            let mut kernel = super::super::tests::kernel();
+            let mut process = super::super::tests::process();
+            image(&mut process.memory, b"one\0R=1\0");
+            kernel.install_proc_source(&process, None);
+            kernel.publish_task(1, &process);
+            let paths = process.linux.vfs.path_queries();
+            let fd = paths
+                .open_at_resolve(AT_FDCWD, path, 0, 0, 0, &Default::default())
+                .unwrap()
+                .unwrap();
+            let original = process
+                .linux
+                .vfs
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .file_target()
+                .unwrap();
+            let FileOutcome::Waiting(work) = FileWork::new(
+                &paths,
+                original.clone(),
+                FileCommand::Read {
+                    count: 128,
+                    offset: None,
+                },
+            )
+            .run() else {
+                panic!("original proc resource must be activated before its first read");
+            };
+            let target: Arc<dyn IoWake> = Arc::new(Wake);
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let _sources = work.wait_sources(&signal).unwrap();
+            assert!(!signal.ready());
+            assert!(!work.ready());
+            process.linux.vfs.close(fd).unwrap();
+            assert_eq!(process.linux.vfs.eventfd(99, 0).unwrap(), fd);
+            assert!(process.memory.activate_proc_reads());
+            assert!(signal.ready(), "{path:?} must wake its actual source wait");
+            assert!(work.ready());
+            let FileOutcome::Complete(reply) = work.run() else {
+                panic!("activated original read completes");
+            };
+            let bytes = reply.result.unwrap().into_bytes().unwrap();
+            assert!(!bytes.is_empty());
+            if path.ends_with(b"environ") {
+                assert_eq!(bytes, b"R=1\0");
+            }
+            let FileOutcome::Complete(reply) = FileWork::new(
+                &paths,
+                original,
+                FileCommand::Seek {
+                    offset: 0,
+                    whence: 1,
+                },
+            )
+            .run() else {
+                panic!("the original read released its position");
+            };
+            assert!(
+                matches!(reply.result, Ok(trames_vfs::FileValue::Count(n)) if n == bytes.len() as u64)
+            );
+            assert_eq!(process.linux.vfs.read(fd, 8).unwrap(), 99u64.to_le_bytes());
+        }
+    }
+    #[test]
     fn actual_live_proc_image_svcs_pause_only_the_target_mm_and_use_no_owner_service() {
         for cpus in [1, 2, 4, 12] {
             let mut kernel = super::super::tests::kernel();

@@ -20,7 +20,59 @@ fn start(s: &UringSnapshot, fd: u32, n: u32, min: u32, m: &mut impl CpuMemory) -
     .unwrap()
 }
 fn complete(a: IoAttempt, n: u64) {
-    assert!(matches!(a,IoAttempt::Complete(Ok(v)) if v==n));
+    match a {
+        IoAttempt::Complete(value) => assert_eq!(value, Ok(n)),
+        IoAttempt::Blocked(_) => panic!("original enter is still waiting, expected {n}"),
+        IoAttempt::Checkpoint => panic!("missing original source capability, expected {n}"),
+        IoAttempt::FileCheckpoint(_) => panic!("typed source continuation, expected {n}"),
+        _ => panic!("unexpected io_uring continuation, expected {n}"),
+    }
+}
+
+#[test]
+fn compatibility_source_survives_snapshot_handoff_but_does_not_cycle_through_files() {
+    for deferred in [false, true] {
+        let (mut linux, mut memory, fd, ring) = setup(8);
+        let [reader, _writer] = linux.vfs.pipe(0).unwrap();
+        let _page = if deferred {
+            memory.unmap(0x3000, PAGE_SIZE).unwrap();
+            Some(crate::direct::file::copyout_tests::install(
+                &mut memory,
+                0x3000,
+            ))
+        } else {
+            None
+        };
+        let owner = memory.instruction_identity().0;
+        let snapshot = UringEpoch::default().capture(&linux.vfs, owner, 7);
+        let source = Arc::downgrade(snapshot.actor());
+        add(&mut memory, &ring, data(22, reader, 0x3000, 1, 777, 0));
+        complete(start(&snapshot, fd, 1, 0, &mut memory), 1);
+        assert_eq!(ring.state.lock().unwrap().pending.len(), 1);
+        drop(snapshot);
+        assert!(
+            source.upgrade().is_some(),
+            "original task owns its outstanding calls"
+        );
+        let next = UringEpoch::default().capture(&linux.vfs, owner, 7);
+        assert!(std::ptr::addr_eq(
+            source.as_ptr(),
+            Arc::as_ptr(next.actor())
+        ));
+        drop(next);
+        drop(linux);
+        assert!(
+            source.upgrade().is_none(),
+            "sealed Files/resolvers cannot retain the task root"
+        );
+        let observer = UringActor::default();
+        ring.progress_with(&mut memory, owner, 7, &mut |request, memory, selected| {
+            observer.execute(&ring, request, memory, selected)
+        });
+        ring.flush(&mut ring.state.lock().unwrap()).unwrap();
+        assert_eq!(cq(&mut memory, &ring), (777, -125));
+        assert!(ring.state.lock().unwrap().pending.is_empty());
+    }
 }
 fn data(op: u8, fd: u32, address: u64, len: u32, id: u64, flags: u8) -> [u8; 64] {
     let mut s = sqe(op, fd, id);
@@ -196,7 +248,7 @@ fn foreign_capture_leaves_legacy_requests_unbound_until_the_original_submitter_a
         let request = crate::uring::import_request(
             UringSqe(entry),
             state.next,
-            &state,
+            &*state,
             &m,
             7,
             None,
@@ -923,6 +975,9 @@ struct Gate<M> {
     once: Cell<bool>,
 }
 impl<M: CpuMemory> CpuMemory for Gate<M> {
+    fn mapped_at_or_after(&self, address: u64) -> bool {
+        self.inner.mapped_at_or_after(address)
+    }
     fn read(&self, a: u64, b: &mut [u8]) -> std::result::Result<(), MemoryError> {
         if a == 0x2100 && !self.once.replace(true) {
             self.entered.send(()).unwrap();

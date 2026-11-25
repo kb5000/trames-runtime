@@ -48,6 +48,9 @@ pub(super) struct Preparation {
     result: Option<FileResult>,
 }
 impl Preparation {
+    pub(super) fn node(&self) -> &NodeRef {
+        &self.node
+    }
     fn next_mode(&self) -> Option<Phase> {
         (mode_mask(self.node.borrow().mode, &self.credentials) != 0).then_some(Phase::Refresh)
     }
@@ -165,7 +168,14 @@ impl Metadata {
                     .then_some(Phase::Mode)
             }
             Phase::Mode => {
-                fs.refresh_permission_attr(&preparation.node, &mut result?, version, true)?;
+                let mut bytes = result?;
+                if bytes.len() == 104 && fs.connection.option(1 << 16) {
+                    let attr = preparation.file.attr.lock().unwrap();
+                    bytes[24..32].copy_from_slice(&attr[8..16]);
+                    bytes[48..56].copy_from_slice(&attr[32..40]);
+                    bytes[68..72].copy_from_slice(&attr[52..56]);
+                }
+                fs.refresh_permission_attr(&preparation.node, &mut bytes, version, true)?;
                 fs.invalidate_acl(&preparation.node);
                 inotify::notify(&preparation.node, inotify::ATTRIB, None);
                 None
@@ -177,13 +187,19 @@ impl Metadata {
             return Ok(None);
         }
         fs.check_inode(&preparation.node)?;
+        let result = preparation.result.take().expect("original write result");
+        if buffered::Io::enabled(&result) {
+            self.kind = buffered::Io::wrap(result, preparation.caller);
+            self.request = None;
+            return Ok(None);
+        }
         self.request = Some(Arc::new(fs.connection.request(
             preparation.opcode,
             preparation.file.reference.node,
             preparation.caller,
             &preparation.body,
         )?));
-        self.kind = ResultKind::File(preparation.result.take().expect("original write result"));
+        self.kind = ResultKind::File(result);
         Ok(None)
     }
 }

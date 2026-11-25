@@ -11,6 +11,8 @@ use std::{
 use trames_memory::CpuMemory;
 use trames_shared::Readiness;
 use trames_vfs::{Errno, IoSignal, IoSubscription, PidNamespace};
+mod call;
+pub use call::WaitCall;
 
 // An observed thread can disappear before its tracer waits. Its wait queue
 // retains the exit record until acknowledgement or debugger retirement.
@@ -883,20 +885,16 @@ impl Children {
                     usage.write(memory, a[4])?;
                 }
                 if let Some((destination, uid)) = siginfo {
-                    let mut bytes = [0; 128];
-                    bytes[..4].copy_from_slice(&17u32.to_le_bytes());
-                    bytes[8..12].copy_from_slice(&code.to_le_bytes());
-                    bytes[16..20].copy_from_slice(&local.to_le_bytes());
-                    bytes[20..24].copy_from_slice(&uid.to_le_bytes());
                     let value = match code {
                         1 | 4 | 5 => status >> 8,
                         6 => 18,
                         _ => status & 127,
                     };
-                    bytes[24..28].copy_from_slice(&value.to_le_bytes());
-                    memory
-                        .write_array(destination, bytes)
-                        .map_err(|_| Errno(14))?;
+                    call::write_info(
+                        memory,
+                        destination,
+                        [17, 0, code as u32, local, uid, value as u32],
+                    )?;
                 }
             }
             return Ok(Some(if request.number == 260 {
@@ -907,16 +905,20 @@ impl Children {
         }
         drop(entries);
         if !found {
+            if request.number == 95 {
+                call::write_info(memory, request.args[2], [0; 6])?;
+            }
             return Err(Errno(10));
         }
         if request.nonblocking_pidfd && options & 1 == 0 {
+            if request.number == 95 {
+                call::write_info(memory, request.args[2], [0; 6])?;
+            }
             return Err(Errno(11));
         }
         if options & 1 != 0 {
-            if request.number == 95 && request.args[2] != 0 {
-                memory
-                    .write_array(request.args[2], [0; 128])
-                    .map_err(|_| Errno(14))?;
+            if request.number == 95 {
+                call::write_info(memory, request.args[2], [0; 6])?;
             }
             Ok(Some(0))
         } else {
@@ -956,6 +958,113 @@ mod tests {
             number: 95,
             args: [0, 0, 0x1000, options, 0x1100, 0],
         }
+    }
+    #[test]
+    fn accepted_wait4_keeps_its_reaped_child_and_copied_status_prefix_through_rusage_wait() {
+        let family = Arc::new(Children::default());
+        let selected = child(&family, 42, 1);
+        selected.exited(7 << 8);
+        let mut memory = crate::signal::frame_copy_tests::Faults::new(0x2000);
+        let mut call = WaitCall::accepted(Wait {
+            args: [42, 0x1100, 0, 0x1ff8, 0, 0],
+            ..wait4(0)
+        });
+        let namespace = PidNamespace::default();
+        assert_eq!(call.check(&family, &namespace, 1, &mut memory), None);
+        assert!(selected.reaped());
+        assert!(!call.interruptible());
+        assert_eq!(
+            family.wait(wait4(0), &namespace, 1, &mut memory.memory),
+            Err(Errno(10))
+        );
+        memory
+            .memory
+            .write_array(0x1100, 99u32.to_le_bytes())
+            .unwrap();
+        memory
+            .memory
+            .write_array(0x1ff8, 88u64.to_le_bytes())
+            .unwrap();
+        memory.wait.finish();
+        assert_eq!(
+            call.check(&family, &namespace, 9, &mut memory),
+            Some(Ok(42))
+        );
+        assert_eq!(memory.memory.read_u64(0x1ff8).unwrap(), 88);
+        assert_eq!(
+            memory.memory.read_array::<4>(0x1100).unwrap(),
+            99u32.to_le_bytes()
+        );
+    }
+    #[test]
+    fn waitid_nowait_output_keeps_its_original_event_while_another_waiter_reaps_it() {
+        let family = Arc::new(Children::default());
+        let selected = child(&family, 42, 1);
+        selected.exited(7 << 8);
+        let mut memory = crate::signal::frame_copy_tests::Faults::new(0x2000);
+        let mut call = WaitCall::accepted(Wait {
+            args: [0, 0, 0x1ff0, 4 | 0x01000000, 0, 0],
+            ..waitid(4)
+        });
+        let namespace = PidNamespace::default();
+        memory.memory.write(0x1ff0, &[0x55; 128]).unwrap();
+        assert_eq!(call.check(&family, &namespace, 1, &mut memory), None);
+        assert!(!selected.reaped());
+        assert_eq!(
+            family.wait(wait4(0), &namespace, 1, &mut memory.memory),
+            Ok(Some(42))
+        );
+        memory
+            .memory
+            .write_array(0x1ff0, 99u32.to_le_bytes())
+            .unwrap();
+        memory.wait.finish();
+        assert_eq!(call.check(&family, &namespace, 1, &mut memory), Some(Ok(0)));
+        assert_eq!(
+            memory.memory.read_array::<4>(0x1ff0).unwrap(),
+            99u32.to_le_bytes()
+        );
+        assert_eq!(
+            memory.memory.read_array::<4>(0x2000).unwrap(),
+            42u32.to_le_bytes()
+        );
+        assert_eq!(memory.memory.read_array::<4>(0x1ffc).unwrap(), [0x55; 4]);
+        assert_eq!(
+            memory.memory.read_array::<100>(0x200c).unwrap(),
+            [0x55; 100]
+        );
+    }
+    #[test]
+    fn waitid_error_keeps_its_errno_after_faultable_zero_fields_and_preserves_padding() {
+        let family = Arc::new(Children::default());
+        let namespace = PidNamespace::default();
+        let vfs = trames_vfs::Vfs::default();
+        let mut memory = crate::signal::frame_copy_tests::Faults::new(0x2000);
+        memory.memory.write(0x1ff0, &[0x55; 128]).unwrap();
+        let mut call = WaitCall::prepare(
+            1,
+            95,
+            [99, 0, 0x1ff0, 4, 0, 0],
+            &vfs.fd_flags_snapshot(),
+            &namespace,
+        );
+        assert_eq!(call.check(&family, &namespace, 1, &mut memory), None);
+        memory.wait.finish();
+        assert_eq!(
+            call.check(&family, &namespace, 1, &mut memory),
+            Some(Err(Errno(22)))
+        );
+        for offset in [0, 4, 8, 16, 20, 24] {
+            assert_eq!(
+                memory.memory.read_array::<4>(0x1ff0 + offset).unwrap(),
+                [0; 4]
+            );
+        }
+        assert_eq!(memory.memory.read_array::<4>(0x1ffc).unwrap(), [0x55; 4]);
+        assert_eq!(
+            memory.memory.read_array::<100>(0x200c).unwrap(),
+            [0x55; 100]
+        );
     }
     #[test]
     fn observer_exit_handoff_survives_nowait_adoption_and_tracer_departure() {
@@ -1036,7 +1145,13 @@ mod tests {
         let _child = child(&family, 42, 7);
         memory.write_array(0x1000, [0xff; 128]).unwrap();
         assert_eq!(family.wait(waitid(5), &ns, 1, &mut memory), Ok(Some(0)));
-        assert_eq!(memory.read_array::<128>(0x1000).unwrap(), [0; 128]);
+        // waitid uses six put_user fields; padding and the unused union remain
+        // untouched (Linux v6.12 kernel/exit.c, SYSCALL_DEFINE5(waitid)).
+        let mut expected = [0xff; 128];
+        for offset in [0, 4, 8, 16, 20, 24] {
+            expected[offset..offset + 4].fill(0);
+        }
+        assert_eq!(memory.read_array::<128>(0x1000).unwrap(), expected);
         assert_eq!(family.wait(wait4(0), &ns, 1, &mut memory), Ok(None));
     }
     #[test]

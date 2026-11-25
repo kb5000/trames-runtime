@@ -2,6 +2,8 @@
 //! Source-task execution ownership. Rings contain weak cleanup tokens, never
 //! a task, Files root or path island. No resource service thread is involved.
 use super::*;
+#[path = "actor_byte.rs"]
+mod byte;
 #[path = "actor_file.rs"]
 mod file;
 use std::sync::{
@@ -12,6 +14,15 @@ use std::sync::{
 mod scope;
 pub(crate) use scope::Scope;
 type Key = (usize, u64);
+fn retained(request: &Request) -> bool {
+    request.file.as_ref().is_some_and(|file| {
+        if matches!(request.sqe.opcode(), 1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55) {
+            file.file_target().is_none()
+        } else {
+            file.shared_file().is_none()
+        }
+    })
+}
 pub(crate) struct Execution {
     paths: Mutex<trames_vfs::PathQueries>,
     factory: trames_vfs::DescriptorFactory,
@@ -22,6 +33,9 @@ pub(crate) struct Execution {
     signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
 }
 struct Accepted {
+    import: Option<crate::uring::input::Pending>,
+    page: Option<Arc<trames_memory::PageWait>>,
+    input: Option<Box<file_input::Bytes>>,
     fifo_open: Option<trames_vfs::FifoOpen>,
     context: Arc<Execution>,
     owner: u64,
@@ -29,6 +43,7 @@ struct Accepted {
     retained: bool,
     socket: Option<socket_wait::RetainedSocket>,
     file: Option<file::FileIo>,
+    byte: Option<byte::ByteIo>,
 }
 #[derive(Default)]
 pub struct UringActor {
@@ -79,13 +94,32 @@ impl Execution {
         actor: &UringActor,
         ring: &Uring,
     ) -> Option<Result<(i32, bool)>> {
+        if call.import.is_some() {
+            return self.import(call, request, memory, actor, ring);
+        }
+        if call.page.as_ref().is_some_and(|page| !page.ready()) {
+            return Some(Err(Errno(11)));
+        }
+        call.page = None;
         let mut signal = false;
-        let result = if call.retained && !matches!(request.sqe.opcode(), 18 | 19 | 21 | 28 | 45) {
-            self.paths.lock().unwrap().uring_query(|vfs| {
-                let result = crate::uring::execute::retained(vfs, request, memory, None);
-                signal = vfs.take_file_size_signal();
-                result
-            })
+        let byte_copy = memory.async_faults_possible()
+            && request.buffer.is_none()
+            && matches!(request.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23 | 26 | 27);
+        let result = if call.retained
+            && !byte_copy
+            && !matches!(request.sqe.opcode(), 18 | 19 | 21 | 28 | 45)
+        {
+            if matches!(request.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+                && request.file.as_ref().is_some_and(|file| file.is_signalfd())
+            {
+                byte::signal(request, memory)
+            } else {
+                self.paths.lock().unwrap().uring_query(|vfs| {
+                    let result = crate::uring::execute::retained(vfs, request, memory, None);
+                    signal = vfs.take_file_size_signal();
+                    result
+                })
+            }
         } else {
             self.run_shared(call, request, memory, actor, ring)
         };
@@ -117,6 +151,71 @@ impl Execution {
             actor.file_size_signal.store(true, Ordering::Relaxed);
         }
     }
+    fn import(
+        &self,
+        call: &mut Accepted,
+        request: &mut Request,
+        memory: &impl CpuMemory,
+        actor: &UringActor,
+        ring: &Uring,
+    ) -> Option<Result<(i32, bool)>> {
+        let mut import = call.import.take().unwrap();
+        if !import.wait.ready() {
+            call.page = Some(import.wait.clone());
+            call.import = Some(import);
+            return Some(Err(Errno(11)));
+        }
+        let parsed = import
+            .replay(request, ring, memory, |fd| {
+                Some(self.factory.files().uring_file(fd))
+            })
+            .expect("original source Files authority");
+        let Some(mut parsed) = parsed else {
+            call.page = Some(import.wait.clone());
+            call.import = Some(import);
+            return Some(Err(Errno(11)));
+        };
+        if let Some(original) = &request.file {
+            parsed.file = Some(original.clone());
+            parsed.resource = request.resource.take();
+        } else if let Some(file) = parsed.file.take() {
+            let original = actor
+                .rings
+                .lock()
+                .unwrap()
+                .get(&(ring as *const Uring as usize))
+                .and_then(Weak::upgrade);
+            let Some(original) = original else {
+                return Some(Err(Errno(9)));
+            };
+            let (bound, retired) = original.bind_file_deferred(&file);
+            drop(retired);
+            match bound {
+                Ok(file) => {
+                    parsed.resource = file
+                        .shared_file()
+                        .and_then(|file| self.descriptors.byte_file(file))
+                        .map(|fd| Resource {
+                            object: Object::Byte(fd),
+                            identity: file.identity(),
+                        })
+                        .or_else(|| Resource::capture(&file));
+                    parsed.file = Some(file);
+                }
+                Err(error) => parsed.error = Some(error),
+            }
+        }
+        parsed.owner = request.owner;
+        parsed.execution = request.execution.take();
+        parsed.source = request.source.take();
+        call.retained = retained(&parsed);
+        call.page = None;
+        let result = parsed.error.unwrap_or(Errno(11));
+        *request = parsed;
+        // Re-enter the ordinary metadata/operation dispatcher once, after this
+        // pure import. No ready page subscription is retained as a polling loop.
+        Some(Err(result))
+    }
     fn run_shared(
         &self,
         call: &mut Accepted,
@@ -128,6 +227,13 @@ impl Execution {
         let s = &request.sqe;
         Some(match s.opcode() {
             1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55 => {
+                if memory.async_faults_possible()
+                    && request.buffer.is_none()
+                    && matches!(s.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+                    && request.file.as_ref()?.file_target().is_none()
+                {
+                    return byte::execute(self, call, request, memory);
+                }
                 return file::execute(self, call, request, memory, actor, ring);
             }
             6 => {
@@ -137,7 +243,15 @@ impl Execution {
                 {
                     return Some(Err(Errno(22)));
                 }
-                let (events, epoch) = request.file.as_ref()?.readiness(s.op_flags() as u16);
+                let file = request.file.as_ref()?;
+                let (events, epoch) = if file.is_signalfd() {
+                    let Object::Byte(fd) = &request.resource.as_ref()?.object else {
+                        return None;
+                    };
+                    fd.poll_state(s.op_flags() as u16)?
+                } else {
+                    file.readiness(s.op_flags() as u16)
+                };
                 let fresh = !s.multishot()
                     || s.length() & 8 != 0
                     || trames_vfs::poll_mask::new_edges(
@@ -229,10 +343,21 @@ impl Execution {
                 let socket = call.socket.as_mut().unwrap();
                 let result =
                     if matches!(s.opcode(), 16 | 56) && request.file.as_ref()?.socket().is_none() {
-                        socket.uring_attempt(memory, Some(&*self.paths.lock().unwrap()))?
+                        socket.uring_attempt(memory, Some(&*self.paths.lock().unwrap()))
                     } else {
-                        socket.uring_attempt(memory, None)?
+                        socket.uring_attempt(memory, None)
                     };
+                let result = match result {
+                    Some(result) => result,
+                    None if memory.async_faults_possible() && matches!(s.opcode(), 26 | 27) => {
+                        return byte::network(self, call, request, memory)
+                    }
+                    None => return None,
+                };
+                if let Some(fault) = socket.take_fault() {
+                    call.page = Some(fault.wait);
+                    return Some(Err(Errno(11)));
+                }
                 result.map(|n| {
                     (
                         n as i32,
@@ -287,7 +412,8 @@ impl UringActor {
         self.accepted.lock().unwrap().values().any(|call| {
             call.owner == owner
                 && call.task == task
-                && call.file.as_ref().is_some_and(file::FileIo::pending_native)
+                && (call.page.is_some()
+                    || call.file.as_ref().is_some_and(file::FileIo::pending_native))
         })
     }
 
@@ -326,6 +452,19 @@ impl UringActor {
         request: &mut Request,
         context: Arc<Execution>,
     ) {
+        self.accept_import(ring, request, context, None);
+    }
+    pub(crate) fn accept_import(
+        self: &Arc<Self>,
+        ring: &Arc<Uring>,
+        request: &mut Request,
+        context: Arc<Execution>,
+        mut import: Option<crate::uring::input::Pending>,
+    ) {
+        self.bind_source(request);
+        if let Some(import) = &mut import {
+            import.bind(request);
+        }
         if request.resource.is_none() {
             // Reader/task-sensitive byte resources belong to the submitter,
             // including requests imported before its first worker capture.
@@ -346,22 +485,20 @@ impl UringActor {
             .unwrap()
             .insert(key.0, Arc::downgrade(ring));
         // Decide original body admission once, not on every retry/byte copy.
-        let retained = request.file.as_ref().is_some_and(|file| {
-            if matches!(request.sqe.opcode(), 1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55) {
-                file.file_target().is_none()
-            } else {
-                file.shared_file().is_none()
-            }
-        });
+        let retained = retained(request);
         self.accepted.lock().unwrap().insert(
             key,
             Accepted {
+                page: import.as_ref().map(|import| import.wait.clone()),
+                import,
+                input: None,
                 context,
                 owner: request.owner,
                 task: request.task,
                 retained,
                 socket: None,
                 file: None,
+                byte: None,
                 fifo_open: None,
             },
         );
@@ -377,9 +514,37 @@ impl UringActor {
         memory: &mut impl CpuMemory,
         selected: Option<trames_vfs::UringProvidedBuffer>,
     ) -> Option<Result<(i32, bool)>> {
+        if request.execution.is_some() {
+            if let Some(source) = &request.source {
+                if !std::ptr::addr_eq(source.as_ptr(), self as *const Self) {
+                    let Some(source) = source.upgrade() else {
+                        return Some(Err(Errno(125)));
+                    };
+                    let source: Arc<dyn std::any::Any + Send + Sync> = source;
+                    let source = Arc::downcast::<Self>(source).ok()?;
+                    return source.execute_original(ring, request, memory, selected);
+                }
+            }
+        }
+        self.execute_original(ring, request, memory, selected)
+    }
+    pub(super) fn bind_source(self: &Arc<Self>, request: &mut Request) {
+        request.source = Some(Arc::downgrade(
+            &(self.clone() as Arc<dyn trames_vfs::UringSource>),
+        ));
+    }
+    fn execute_original(
+        &self,
+        ring: &Uring,
+        request: &mut Request,
+        memory: &mut impl CpuMemory,
+        selected: Option<trames_vfs::UringProvidedBuffer>,
+    ) -> Option<Result<(i32, bool)>> {
         let key = (ring as *const Uring as usize, request.sequence);
         let mut call = self.accepted.lock().unwrap().remove(&key)?;
         let before = (
+            call.import.is_some(),
+            call.page.as_ref().map(|page| Arc::as_ptr(page) as usize),
             call.socket.as_ref().map(|s| s.uring_wait_kind()),
             call.file.as_ref().map(|f| f.wait_revision),
         );
@@ -399,23 +564,36 @@ impl UringActor {
         } else {
             &mut *original
         };
+        let was_importing = request.import_pending;
         let result = call
             .context
             .clone()
             .run(&mut call, request, memory, self, ring);
+        let copy_pending = call.page.is_some()
+            || call.file.as_ref().is_some_and(file::FileIo::pending_copy)
+            || was_importing && !request.import_pending;
+        if copy_pending && request.selection.is_none() {
+            if let Some(buffer) = selected {
+                file::retain_selection(self, ring, request, buffer);
+            }
+        }
         let selection = request.selection.clone();
         if request.sqe.multishot()
             && matches!(request.sqe.opcode(), 26 | 27)
             && matches!(result, Some(Ok(_)))
         {
             call.socket = None;
+            call.byte = None;
         }
         let changed = before
             != (
+                call.import.is_some(),
+                call.page.as_ref().map(|page| Arc::as_ptr(page) as usize),
                 call.socket.as_ref().map(|s| s.uring_wait_kind()),
                 call.file.as_ref().map(|f| f.wait_revision),
             );
         original.selection = selection;
+        original.copy_pending = copy_pending;
         self.accepted.lock().unwrap().insert(key, call);
         if changed {
             ring.readiness.notify_locked();
@@ -431,6 +609,9 @@ impl UringActor {
         let socket = {
             let accepted = self.accepted.lock().unwrap();
             let call = accepted.get(&(ring as *const Uring as usize, sequence))?;
+            if let Some(page) = &call.page {
+                return Some(vec![page.subscribe(signal)]);
+            }
             if let Some(open) = &call.fifo_open {
                 return Some(vec![open.subscribe(signal)]);
             }

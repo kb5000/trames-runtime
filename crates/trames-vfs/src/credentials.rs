@@ -886,6 +886,7 @@ impl Vfs {
                     mount,
                     directory_inode: Some(node.clone()),
                     proc_binding: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     retained_directory: None,
                     #[cfg(all(feature = "hostfs", unix))]
@@ -899,6 +900,7 @@ impl Vfs {
                 mount: None,
                 directory_inode: None,
                 proc_binding: None,
+                fuse_entry: None,
                 indexed_position: None,
                 retained_directory: None,
                 #[cfg(all(feature = "hostfs", unix))]
@@ -917,7 +919,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Access(mode))),
             None,
         )?;
-        view.access_resolved(entry, mode)
+        let result = view.access_resolved(entry, mode);
+        fuse::PathRetry::arm(
+            &view,
+            dirfd,
+            path,
+            !nofollow,
+            !nofollow,
+            0,
+            !nofollow,
+            fuse::PathOperation::Access(mode),
+            None,
+            true,
+        );
+        result
     }
     pub(super) fn access_resolved(&self, (path, target): ResolvedEntry, mode: u32) -> Result<()> {
         match target {
@@ -940,6 +955,7 @@ impl Vfs {
                     mount: self.mount_for_path(open.mount.as_ref()),
                     proc_binding: None,
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -994,6 +1010,7 @@ impl Vfs {
                     mount: file.mount.clone(),
                     proc_binding: None,
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,
@@ -1078,8 +1095,18 @@ impl Vfs {
     pub(super) fn allowed(&self, node: &Node, bits: u32) -> bool {
         self.credentials.allows_node(node, bits)
     }
-    fn chown_node(&self, node: NodeRef, uid: u32, gid: u32, persistent: bool) -> Result<()> {
+    fn chown_node(
+        &self,
+        node: NodeRef,
+        uid: u32,
+        gid: u32,
+        filesystem: Option<&FsHandle>,
+    ) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = node.host.get() {
+            host.metadata_file()?.refresh_permissions(&node)?;
+        }
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
@@ -1116,11 +1143,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(error) = if persistent && !node.borrow().volatile && node.borrow().links != 0 {
-            self.checkpoint()
-        } else {
-            Ok(())
-        } {
+        if let Err(error) = filesystem.map_or(Ok(()), |fs| fs.checkpoint_metadata(&node)) {
             let mut n = node.borrow_mut();
             (n.uid, n.gid, n.mode, n.times[2]) = old;
             return Err(error);
@@ -1154,7 +1177,7 @@ impl Vfs {
         }
         let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
-        self.chown_node(node, uid, gid, true)
+        self.chown_node(node, uid, gid, Some(&path.filesystem(self)))
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -1196,7 +1219,14 @@ impl Vfs {
                 .map_err(|e| Errno(e.0));
         }
         let node = open.metadata_node().ok_or(Errno(22))?;
-        self.chown_node(node, uid, gid, open.node.is_some())
+        self.chown_node(
+            node,
+            uid,
+            gid,
+            open.node
+                .as_ref()
+                .map(|_| open.mount.as_ref().map_or(&self.fs, |m| &m.fs)),
+        )
     }
 }
 

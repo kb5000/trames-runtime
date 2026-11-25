@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Guest senders use the same resource queues as timers, signalfd and FASYNC.
 use super::*;
+#[path = "io_send_call.rs"]
+mod retained;
+pub use retained::Call as SendCall;
+
+struct PidSignal {
+    _file: trames_vfs::SharedFd,
+    target: Arc<trames_vfs::PidFd>,
+    scope: u32,
+    thread: bool,
+}
 
 impl Signals {
     pub fn publish_policy(&self, namespace: &PidNamespace, can_kill: bool) {
@@ -90,7 +100,12 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        self.queued(source, number, a, memory, false)
+        Some((|| {
+            let address = a[if number == 240 { 3 } else { 2 }];
+            let sig = a[if number == 240 { 2 } else { 1 }] as u32;
+            let user = Self::copy_signal_info(memory, address, Some(sig))?;
+            self.queued_value(source, number, a, user)
+        })())
     }
     pub fn pidfd_open(
         &self,
@@ -184,17 +199,53 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Result<u64, Errno> {
-        let scope = a[3] as u32;
+        let accepted = self.accept_pid_signal(files, a)?;
+        let user = if a[2] == 0 {
+            None
+        } else {
+            Some(Self::copy_signal_info(memory, a[2], None)?)
+        };
+        self.pid_signal_value(source, a, accepted, user)
+    }
+    fn accept_pid_signal(
+        &self,
+        files: &trames_vfs::FdFlags,
+        args: [u64; 6],
+    ) -> Result<PidSignal, Errno> {
+        let scope = args[3] as u32;
         if !matches!(scope, 0 | 1 | 2 | 4) {
             return Err(Errno(22));
         }
-        let (target, flags) = files.pidfd_flags(a[0] as u32)?;
-        let global = target.pid();
-        if self.namespace.local(global) == 0 {
+        let (file, target, flags) = files.retained_pidfd(args[0] as u32)?;
+        if self.namespace.local(target.pid()) == 0 {
             return Err(Errno(22));
         }
-        let thread = scope == 1 || scope == 0 && flags & trames_vfs::PIDFD_THREAD != 0;
-        let groups = if scope == 4 {
+        Ok(PidSignal {
+            _file: file,
+            target,
+            scope,
+            thread: scope == 1 || scope == 0 && flags & trames_vfs::PIDFD_THREAD != 0,
+        })
+    }
+    fn pid_signal_value(
+        &self,
+        source: &IoTask,
+        args: [u64; 6],
+        accepted: PidSignal,
+        user: Option<[u8; 48]>,
+    ) -> Result<u64, Errno> {
+        let global = accepted.target.pid();
+        let sig = args[1] as u32;
+        if let Some(user) = user {
+            if u32::from_le_bytes(user[..4].try_into().unwrap()) != sig {
+                return Err(Errno(22));
+            }
+            Self::signal_info_permission(user, accepted.scope != 4 && source.tid() == global)?;
+        }
+        // Match the retained pid object only after importing the user info.
+        // A dead/reused target cannot replace an input-copy error or receive
+        // a signal intended for the original pidfd identity.
+        let groups = if accepted.scope == 4 {
             let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
             for task in self.directory.tasks(2, global) {
                 groups.entry(task.tgid()).or_default().push(task);
@@ -202,78 +253,68 @@ impl IoRoutes {
             groups.into_values().collect()
         } else {
             let task = self.directory.proc_task(global).ok_or(Errno(3))?;
-            if !Self::task_pidfd(&task, global).is_some_and(|pid| Arc::ptr_eq(&pid, &target)) {
+            if !Self::task_pidfd(&task, global)
+                .is_some_and(|pid| Arc::ptr_eq(&pid, &accepted.target))
+            {
                 return Err(Errno(3));
             }
-            vec![if thread {
+            vec![if accepted.thread {
                 vec![task]
             } else {
                 self.directory.tasks(1, global)
             }]
         };
-        let sig = a[1] as u32;
-        let user = (a[2] != 0)
-            .then(|| {
-                let user = memory.read_array::<48>(a[2]).map_err(|_| Errno(14))?;
-                Self::signal_info(
-                    memory,
-                    a[2],
-                    user,
-                    sig,
-                    true,
-                    scope != 4 && source.tid() == global,
-                )
-            })
-            .transpose()?;
-        self.deliver_signal(source, sig, thread, groups, user)
+        self.deliver_signal(source, sig, accepted.thread, groups, user)
     }
-    fn queued(
+    fn queued_value(
         &self,
         source: &IoTask,
         number: u32,
-        a: [u64; 6],
-        memory: &impl CpuMemory,
-        check_signo: bool,
-    ) -> Option<Result<u64, Errno>> {
-        let (route, args, address) = if number == 138 {
-            (129, a, a[2])
-        } else {
-            (131, a, a[3])
-        };
-        let sig = a[if number == 240 { 2 } else { 1 }] as u32;
-        let target = a[if number == 240 { 1 } else { 0 }] as u32;
-        Some((|| {
-            let user = memory.read_array::<48>(address).map_err(|_| Errno(14))?;
-            if number == 240 && (a[0] as i32 <= 0 || a[1] as i32 <= 0) {
-                return Err(Errno(22));
-            }
-            let user = Self::signal_info(
-                memory,
-                address,
-                user,
-                sig,
-                check_signo,
-                self.namespace.local(source.tid()) == target,
-            )?;
-            if number == 138 && a[0] as i32 <= 0 {
-                return Err(Errno(3));
-            }
-            self.send_info(source, route, args, Some(user))
-                .expect("queued signal route")
-        })())
-    }
-    fn signal_info(
-        memory: &impl CpuMemory,
-        address: u64,
+        args: [u64; 6],
         user: [u8; 48],
-        sig: u32,
-        check_signo: bool,
-        to_self: bool,
-    ) -> Result<[u8; 48], Errno> {
-        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
-        if check_signo && u32::from_le_bytes(user[..4].try_into().unwrap()) != sig {
+    ) -> Result<u64, Errno> {
+        if number == 240 && (args[0] as u32 as i32 <= 0 || args[1] as u32 as i32 <= 0) {
             return Err(Errno(22));
         }
+        let target = args[if number == 240 { 1 } else { 0 }] as u32;
+        Self::signal_info_permission(user, self.namespace.local(source.tid()) == target)?;
+        if number == 138 && args[0] as u32 as i32 <= 0 {
+            return Err(Errno(3));
+        }
+        let mut route = args;
+        route[0] = args[0] as u32 as u64;
+        if number == 240 {
+            route[1] = args[1] as u32 as u64;
+        }
+        self.send_info(
+            source,
+            if number == 138 { 129 } else { 131 },
+            route,
+            Some(user),
+        )
+        .expect("accepted queued signal route")
+    }
+    fn signal_info_permission(user: [u8; 48], to_self: bool) -> Result<(), Errno> {
+        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
+        if (code >= 0 || code == -6) && !to_self {
+            Err(Errno(1))
+        } else {
+            Ok(())
+        }
+    }
+    fn copy_signal_info(
+        memory: &impl CpuMemory,
+        address: u64,
+        override_signo: Option<u32>,
+    ) -> Result<[u8; 48], Errno> {
+        let mut user = memory.read_array::<48>(address).map_err(|_| Errno(14))?;
+        // rt_[tg]sigqueueinfo replaces si_signo before checking its layout;
+        // pidfd_send_signal checks the supplied signo after the full copy.
+        if let Some(signo) = override_signo {
+            user[..4].copy_from_slice(&signo.to_le_bytes());
+        }
+        let sig = u32::from_le_bytes(user[..4].try_into().unwrap());
+        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
         let limit = match sig {
             4 => 11,
             5 => 6,
@@ -287,19 +328,11 @@ impl IoRoutes {
         let known =
             (-7..=0).contains(&code) || code == -60 || code == 128 || code > 0 && code <= limit;
         if !known {
-            let expansion = match address
-                .checked_add(48)
-                .and_then(|at| memory.read_array::<80>(at).ok())
-            {
-                Some(bytes) => bytes,
-                None => return Err(Errno(14)),
-            };
-            if expansion.iter().any(|b| *b != 0) {
+            let at = address.checked_add(48).ok_or(Errno(14))?;
+            let expansion = memory.read_array::<80>(at).map_err(|_| Errno(14))?;
+            if expansion.iter().any(|byte| *byte != 0) {
                 return Err(Errno(7));
             }
-        }
-        if (code >= 0 || code == -6) && !to_self {
-            return Err(Errno(1));
         }
         Ok(user)
     }

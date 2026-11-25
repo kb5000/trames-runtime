@@ -20,6 +20,8 @@ pub fn host_mapping_granule() -> usize {
     mmu::host_mapping_granule()
 }
 mod locking;
+mod mapping_cleanup;
+pub use mapping_cleanup::{MappingCleanup, MappingCleanupStatus, MappingLease};
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -47,9 +49,13 @@ pub use report::{ExecutableRanges, ImageRanges, MemoryReport, VmSizes};
 mod ownership_tests;
 mod root;
 mod slots;
+mod user_copy;
 mod vma_policy;
 use backing::Backed;
-pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource, SyncRange};
+pub use backing::{
+    backing_changed, external_memory_changed, MappingRemap, PageBacking, PageSource,
+    SyncCompletion, SyncExecutor, SyncRange, SyncResource,
+};
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
@@ -66,6 +72,7 @@ use std::{
         Arc,
     },
 };
+pub use user_copy::{CopiedInput, CopiedOutput};
 
 pub const PAGE_SIZE: u64 = 4096;
 /// Coarse metadata versioning for hardware translation caches, not RAM allocation.
@@ -301,6 +308,10 @@ pub struct Memory {
     shared: Option<Arc<Root<Memory>>>,
     has_backings: bool,
     has_external_code: bool,
+    has_async_sources: bool,
+    closed_resources: BTreeMap<u64, Arc<dyn SyncResource>>,
+    mm_close_resources: BTreeMap<u64, Arc<dyn SyncResource>>,
+    mapping_cleanup: Option<Arc<mapping_cleanup::Cleanup>>,
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
     layout_publication: Option<Arc<layout::Publication>>,
@@ -442,6 +453,10 @@ impl Memory {
             shared: None,
             has_backings: self.has_backings,
             has_external_code: self.has_external_code,
+            has_async_sources: self.has_async_sources,
+            closed_resources: BTreeMap::new(),
+            mm_close_resources: BTreeMap::new(),
+            mapping_cleanup: None,
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
             layout_publication: None,
@@ -517,6 +532,52 @@ impl Default for Memory {
 /// neither adds an address-space owner nor retains guest RAM after final exit.
 pub struct SharedRoot(std::sync::Weak<Root<Memory>>);
 impl SharedRoot {
+    /// Existing lifecycle executors may reap cancelled mapping allocations on
+    /// a still-shared old mm. Weak custody cannot extend its owner count.
+    pub fn try_reap_mapping_cleanup(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Result<MappingCleanupStatus, MemoryError> {
+        let Some(root) = self.0.upgrade() else {
+            return Ok(MappingCleanupStatus {
+                finished: true,
+                subscriptions: Vec::new(),
+                resources: Vec::new(),
+            });
+        };
+        let mut subscriptions = Vec::new();
+        let permit = match root.try_admit() {
+            Some(permit) => permit,
+            None => {
+                let subscription = root.subscribe(signal);
+                let Some(permit) = root.try_admit() else {
+                    return Ok(MappingCleanupStatus {
+                        finished: false,
+                        subscriptions: vec![subscription],
+                        resources: Vec::new(),
+                    });
+                };
+                drop(subscription);
+                permit
+            }
+        };
+        // Custody is already ours. Do not subscribe to our own unlock: it
+        // would make a cleanup waiting for live Views continuously ready.
+        let _permit = permit;
+        let mut memory = root.borrow_mut();
+        subscriptions.push(memory.subscribe_parallel_idle(signal));
+        let finished = memory.reap_mapping_cleanup()?;
+        let resources = if finished {
+            memory.take_closed_resources()
+        } else {
+            Vec::new()
+        };
+        Ok(MappingCleanupStatus {
+            finished,
+            subscriptions,
+            resources,
+        })
+    }
     /// The cohort's Views have returned; another original task/host owner may
     /// still retain the graph even when its dispatched task already exited.
     pub fn commit_parallel(&self) -> Result<(), MemoryError> {
@@ -611,6 +672,10 @@ impl Memory {
             shared: None,
             has_backings: false,
             has_external_code: false,
+            has_async_sources: false,
+            closed_resources: BTreeMap::new(),
+            mm_close_resources: BTreeMap::new(),
+            mapping_cleanup: None,
             cpu_borrow_safe: true,
             parallel_cache: None,
             layout_publication: None,
@@ -1024,6 +1089,20 @@ impl Memory {
             if let Some(p) = self.frames[frame].as_ref() {
                 if let Some(backing) = &p.backing {
                     backing.detach(&p.charge);
+                    if backing.shared {
+                        let key = backing.object.sync_key();
+                        if key.is_none_or(|key| !self.closed_resources.contains_key(&key)) {
+                            if let Some(resource) = backing.object.close_resource() {
+                                self.closed_resources.insert(
+                                    key.unwrap_or_else(new_backing_identity),
+                                    Arc::new(backing::BackingClose {
+                                        resource,
+                                        _backing: backing.object.clone(),
+                                    }),
+                                );
+                            }
+                        }
+                    }
                     backing.object.unmapped();
                 }
             }

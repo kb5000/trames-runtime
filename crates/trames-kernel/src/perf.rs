@@ -3,6 +3,8 @@
 use crate::signal::{IoRoutes, IoTask};
 use trames_memory::CpuMemory;
 use trames_vfs::{perf::Attr, DescriptorFactory, Errno, FdFlags};
+mod open;
+pub use open::OpenCall;
 
 impl IoRoutes {
     pub fn perf_event_open(
@@ -18,6 +20,17 @@ impl IoRoutes {
             return Err(Errno(22));
         }
         let attr = Attr::read(memory, a[0])?;
+        self.perf_open_attr(caller, files, factory, a, cpus, attr)
+    }
+    fn perf_open_attr(
+        &self,
+        caller: &IoTask,
+        files: &FdFlags,
+        factory: &DescriptorFactory,
+        a: [u64; 6],
+        cpus: usize,
+        attr: Attr,
+    ) -> Result<u64, Errno> {
         factory.check_perf_attr(&attr)?;
         let pid = a[1] as i32;
         let cpu = a[2] as i32;
@@ -28,6 +41,7 @@ impl IoRoutes {
         if cpu != -1 || pid == -1 || a[4] & 4 != 0 {
             return Err(Errno(95));
         }
+        let slot = factory.reserve_perf()?;
         let group = a[3] as i32;
         let named = if group == -1 {
             None
@@ -51,15 +65,14 @@ impl IoRoutes {
             .check_perf(&caller.credentials().read(), target.tgid() == caller.tgid())?;
         let leader = if a[4] & 1 == 0 { named.as_ref() } else { None };
         let output = if a[4] & 2 != 0 { named.as_ref() } else { None };
-        factory
-            .perf_event_configured(
-                attr,
-                target.proc_view.perf_clock(),
-                leader,
-                output,
-                a[4] & 8 != 0,
-                cpus,
-            )
-            .map(u64::from)
+        slot.publish(
+            attr,
+            target.proc_view.perf_clock(),
+            leader,
+            output,
+            a[4] & 8 != 0,
+            cpus,
+        )
+        .map(u64::from)
     }
 }

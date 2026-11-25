@@ -22,7 +22,7 @@ fn joined_sigsuspend_preserves_temporary_handler_mask_and_restores_original_mask
         [0x1000, 8, 0, 0, 0, 0],
         &mut CapturedOutput::default(),
     );
-    assert!(matches!(p.state,State::Suspend(old) if old==original));
+    assert!(matches!(p.state, State::Signal(_)));
     Kernel::queue_one(1, &mut p, 10, 1);
     assert!(k.deliver(1, &mut p).unwrap());
     assert_eq!(p.signals.mask, temporary | (1 << 9));

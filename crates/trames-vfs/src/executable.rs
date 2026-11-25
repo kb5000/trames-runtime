@@ -165,6 +165,12 @@ impl Vfs {
             }
         };
         let (node, label, mount) = (&accepted.node, &accepted.label, &accepted.mount);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(original) = &accepted.host_file {
+            original.refresh_permissions(node)?;
+        } else if let Some(host) = node.host.get() {
+            host.metadata_file()?.refresh_permissions(node)?;
+        }
         let n = node.borrow();
         if matches!(n.content, Content::Symlink(_)) {
             return Err(Errno(40));

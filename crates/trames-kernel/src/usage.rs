@@ -109,13 +109,16 @@ impl Usage {
         self.peak_bytes = self.peak_bytes.max(other.peak_bytes);
     }
     pub fn write(self, memory: &mut impl CpuMemory, address: u64) -> Result<(), Errno> {
+        crate::user_copy::write_bytes(memory, address, &self.encode()).map_err(|_| Errno(14))
+    }
+    pub(crate) fn encode(self) -> [u8; 144] {
         // timeval utime/stime, followed by fourteen signed long counters.
         // The virtual execution clock currently attributes CPU time to utime.
         let mut bytes = [0; 144];
         bytes[..8].copy_from_slice(&self.cpu.as_secs().to_le_bytes());
         bytes[8..16].copy_from_slice(&u64::from(self.cpu.subsec_micros()).to_le_bytes());
         bytes[32..40].copy_from_slice(&((self.peak_bytes / 1024) as u64).to_le_bytes());
-        memory.write_array(address, bytes).map_err(|_| Errno(14))
+        bytes
     }
 }
 pub fn getrusage(
@@ -125,7 +128,11 @@ pub fn getrusage(
     address: u64,
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
-    let usage = match who {
+    observe(task, children, who)?.write(memory, address)?;
+    Ok(0)
+}
+pub(crate) fn observe(task: &IoTask, children: &Children, who: i32) -> Result<Usage, Errno> {
+    Ok(match who {
         -1 => children.usage(),
         0 | 1 => {
             let group = task.lifecycle();
@@ -145,9 +152,7 @@ pub fn getrusage(
             }
         }
         _ => return Err(Errno(22)),
-    };
-    usage.write(memory, address)?;
-    Ok(0)
+    })
 }
 
 /// ARM64 USER_HZ is 100. The return clock and the four tms fields share this
@@ -159,14 +164,30 @@ pub fn times(
     address: u64,
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
-    let ticks = |time: Duration| (time.as_millis() / 10) as u64;
     if address != 0 {
-        let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&ticks(task.lifecycle().cpu_time()).to_le_bytes());
-        bytes[16..24].copy_from_slice(&ticks(children.usage().cpu).to_le_bytes());
-        memory.write_array(address, bytes).map_err(|_| Errno(14))?;
+        crate::user_copy::write_bytes(memory, address, &times_bytes(task, children))
+            .map_err(|_| Errno(14))?;
     }
     Ok(ticks(elapsed))
+}
+pub(crate) fn ticks(time: Duration) -> u64 {
+    (time.as_millis() / 10) as u64
+}
+pub(crate) fn times_bytes(task: &IoTask, children: &Children) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&ticks(task.lifecycle().cpu_time()).to_le_bytes());
+    bytes[16..24].copy_from_slice(&ticks(children.usage().cpu).to_le_bytes());
+    bytes
+}
+pub fn times_since(
+    task: &IoTask,
+    children: &Children,
+    started: std::time::Instant,
+    address: u64,
+    memory: &mut impl CpuMemory,
+) -> Result<u64, Errno> {
+    times(task, children, Duration::ZERO, address, memory)?;
+    Ok(ticks(started.elapsed()))
 }
 
 #[cfg(test)]

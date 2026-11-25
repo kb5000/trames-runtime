@@ -34,6 +34,11 @@ impl Drop for ReadLease {
         data.io_epoch[0] = data.io_epoch[0].wrapping_add(1);
     }
 }
+impl read_reply::CommitRead for ReadLease {
+    fn commit(&self, copied: usize) {
+        ReadLease::commit(self, copied);
+    }
+}
 pub(super) struct WriteLease {
     pipe: Arc<PipeResource>,
     pub(super) count: usize,
@@ -85,10 +90,12 @@ struct Stage {
     bytes: Vec<u8>,
     read: Option<ReadLease>,
     from: u64,
+    written: Option<usize>,
 }
 /// Fully accepted original OFDs. Only one executing source/disk job owns this
 /// state; FileWork moves it across readiness/layout boundaries without FD lookup.
 pub struct StreamTransfer {
+    pub(super) io: transfer_io::Io,
     pub(crate) input: SharedFd,
     pub(crate) output: SharedFd,
     from: Result<Option<u64>>,
@@ -99,6 +106,7 @@ pub struct StreamTransfer {
     stage: Option<Stage>,
     blocked: Option<bool>, // true: output; false: input
     deadline: Option<Instant>,
+    read_from: Option<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransferMode {
@@ -112,7 +120,23 @@ pub struct TransferWait {
     pub deadline: Option<Instant>,
 }
 impl StreamTransfer {
+    pub(super) fn daemon_backed(&self) -> bool {
+        [&self.input, &self.output].iter().any(|f| {
+            matches!(
+                f.open.control,
+                Some(events::SharedControl::Fuse(_) | events::SharedControl::FuseFile(_))
+            )
+        })
+    }
     pub fn admitted(input: &SharedFd, output: &SharedFd) -> bool {
+        if [input, output]
+            .iter()
+            .any(|f| matches!(f.open.control, Some(events::SharedControl::Fuse(_))))
+            && input.open.pipe.is_none()
+            && output.open.pipe.is_none()
+        {
+            return false;
+        }
         if input.open.pipe.is_some()
             && output
                 .open
@@ -124,7 +148,9 @@ impl StreamTransfer {
         }
         [input, output].iter().all(|file| {
             let open = &file.open;
-            open.control.is_none()
+            (matches!(&open.control, Some(events::SharedControl::Fuse(_)))
+                || matches!(&open.control, Some(events::SharedControl::FuseFile(file)) if file.regular()))
+                || open.control.is_none()
                 && (open.node.as_ref().is_some_and(|n| n.regular_file)
                     || open.pipe.is_some()
                     || open.local.as_ref().is_some_and(|s| s.kind() == 1)
@@ -141,6 +167,7 @@ impl StreamTransfer {
         flags: u32,
     ) -> Self {
         Self {
+            io: Default::default(),
             input,
             output,
             from,
@@ -155,6 +182,7 @@ impl StreamTransfer {
             stage: None,
             blocked: None,
             deadline: None,
+            read_from: None,
         }
     }
     pub fn tee(input: SharedFd, output: SharedFd, count: u64, flags: u32) -> Result<Self> {
@@ -215,6 +243,9 @@ impl StreamTransfer {
             && self.host_work())
     }
     pub(crate) fn waits(&self) -> bool {
+        if self.io.blocked() {
+            return true;
+        }
         let Some(write) = self.blocked else {
             return false;
         };
@@ -324,8 +355,8 @@ impl StreamTransfer {
         }
         let source_pipe = source.pipe.as_ref().map(|p| p.data.clone());
         let dest_pipe = dest.pipe.as_ref().map(|p| p.data.clone());
-        let from_seekable = source.node.as_ref().is_some_and(|n| n.regular_file);
-        let to_seekable = dest.node.as_ref().is_some_and(|n| n.regular_file);
+        let from_seekable = transfer_io::Io::regular(&self.input);
+        let to_seekable = transfer_io::Io::regular(&self.output);
         if Arc::ptr_eq(source, dest)
             || source_pipe
                 .as_ref()
@@ -347,7 +378,11 @@ impl StreamTransfer {
         let from = self.from?;
         let to = self.to?;
         let start = if from_seekable && self.stage.is_none() {
-            let pos = from.unwrap_or_else(|| source.file_position.snapshot());
+            let pos = if let Some(pos) = self.read_from.or(from) {
+                pos
+            } else {
+                self.io.seek(v, &Self::descriptor(&self.input), 0, 1)?
+            };
             Vfs::check_io_range(pos, self.requested)?;
             pos
         } else {
@@ -370,7 +405,7 @@ impl StreamTransfer {
         }
         self.blocked = None;
         // EOF in a drained pipe never waits for space in an unrelated sink.
-        if let Some(pipe) = &source_pipe {
+        if let Some(pipe) = source_pipe.as_ref().filter(|_| self.stage.is_none()) {
             let data = pipe.lock().unwrap();
             if self.mode == TransferMode::Tee
                 && (data.read_reserved || data.bytes.is_empty() && data.writers != 0)
@@ -387,7 +422,9 @@ impl StreamTransfer {
                 });
             }
         }
-        let mut destination = if let Some(pipe) = dest_pipe {
+        let mut destination = if self.stage.as_ref().is_some_and(|s| s.written.is_some()) {
+            None
+        } else if let Some(pipe) = dest_pipe {
             match WriteLease::take(pipe, count, from_seekable) {
                 Ok(lease) => Some(lease),
                 Err(Errno(11)) => {
@@ -403,27 +440,52 @@ impl StreamTransfer {
         if self.stage.is_none() {
             let input = Self::descriptor(&self.input);
             let from = start;
+            self.read_from = Some(from);
             let result = if let Some(pipe) = source_pipe {
                 ReadLease::take(pipe, count).map(|(lease, bytes)| Stage {
                     bytes,
                     read: Some(lease),
                     from,
+                    written: None,
                 })
+            } else if matches!(source.control, Some(events::SharedControl::FuseFile(_))) {
+                self.io
+                    .call(
+                        &input,
+                        v,
+                        FileCommand::Read {
+                            count,
+                            offset: Some(from),
+                        },
+                        transfer_io::Step::Read,
+                    )
+                    .and_then(transfer_io::Io::bytes)
+                    .map(|bytes| Stage {
+                        bytes,
+                        read: None,
+                        from,
+                        written: None,
+                    })
             } else if from_seekable {
                 v.pread_description(&input, count, from).map(|bytes| Stage {
                     bytes,
                     read: None,
                     from,
+                    written: None,
                 })
             } else {
                 v.read_description(&input, count).map(|bytes| Stage {
                     bytes,
                     read: None,
                     from,
+                    written: None,
                 })
             };
             match result {
-                Ok(stage) => self.stage = Some(stage),
+                Ok(stage) => {
+                    self.stage = Some(stage);
+                    self.read_from = None;
+                }
                 Err(Errno(11)) => {
                     self.blocked(false);
                     return Err(Errno(11));
@@ -431,13 +493,30 @@ impl StreamTransfer {
                 Err(e) => return Err(e),
             }
         }
-        let stage = self.stage.as_ref().unwrap();
+        let stage = self.stage.as_mut().unwrap();
         let bytes = &stage.bytes[..stage.bytes.len().min(count)];
         let output = Self::descriptor(&self.output);
-        let written = if bytes.is_empty() {
+        let written = if let Some(written) = stage.written {
+            Ok(written)
+        } else if bytes.is_empty() {
             Ok(0)
         } else if let Some(lease) = &mut destination {
             lease.commit(bytes)
+        } else if matches!(
+            dest.control,
+            Some(events::SharedControl::FuseFile(_) | events::SharedControl::Fuse(_))
+        ) {
+            self.io
+                .call(
+                    &output,
+                    v,
+                    FileCommand::Write {
+                        bytes: bytes.to_vec(),
+                        offset: to,
+                    },
+                    transfer_io::Step::Write,
+                )
+                .and_then(transfer_io::Io::count)
         } else if to_seekable {
             v.file_write_description(&output, bytes, to)
         } else {
@@ -445,14 +524,24 @@ impl StreamTransfer {
         };
         let n = match written {
             Ok(n) => n,
+            Err(Errno(11)) if to_seekable && dest.file_position.lock().unwrap().pending != 0 => {
+                let position = dest.file_position.clone();
+                self.blocked(true);
+                return self.io.wait_position(v, position);
+            }
+            Err(e) if self.io.blocked() => {
+                self.blocked(true);
+                return Err(e);
+            }
             Err(Errno(11)) => {
                 self.blocked(true);
                 return Err(Errno(11));
             }
             Err(e) => return Err(e),
         };
+        stage.written = Some(n);
         if self.mode != TransferMode::Tee {
-            if let Some(lease) = &stage.read {
+            if let Some(lease) = stage.read.take() {
                 lease.commit(n);
             }
         }
@@ -466,7 +555,8 @@ impl StreamTransfer {
         }
         let position = stage.from + n as u64;
         if from_seekable && from.is_none() {
-            Vfs::seek_description(&Self::descriptor(&self.input), position as i64, 0)?;
+            self.io
+                .seek(v, &Self::descriptor(&self.input), position as i64, 0)?;
         }
         self.stage = None;
         Ok(FileValue::Transfer {
@@ -488,7 +578,7 @@ mod tests {
         FileWork::from_vfs(
             v,
             output.filesystem_target(),
-            FileCommand::Transfer(RefCell::new(StreamTransfer::new(
+            FileCommand::Transfer(Arc::new(std::sync::Mutex::new(StreamTransfer::new(
                 file(v, input),
                 output,
                 Ok(None),
@@ -496,7 +586,7 @@ mod tests {
                 n,
                 true,
                 0,
-            ))),
+            )))),
         )
     }
     fn finish(work: FileWork) -> Result<u64> {

@@ -817,13 +817,15 @@ fn partial_commands_publish_consumed_bytes_and_mapping_unmap_rejects_delivery() 
     let mut b = Client::new(&root, 20, b"/dev/binder");
     b.manager();
     let mut commands = command(ENTER_LOOPER, &[]);
-    commands.extend_from_slice(&FREE_BUFFER.to_le_bytes());
+    commands.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
     assert!(matches!(a.start(&commands, 0), Err(Errno(22))));
     assert_eq!(a.memory.read_u64(0x1008).unwrap(), 4);
     b.memory.unmap(0x100000, 0x10000).unwrap();
     a.send(0, 0, b"unmapped", &[], false);
     assert_eq!(a.transaction().0, BR_DEAD_REPLY);
 }
+#[path = "copy_tests.rs"]
+mod copy_tests;
 #[test]
 fn fd_buffer_mapping_and_process_resources_are_send_sync() {
     fn check<T: Send + Sync>() {}
@@ -960,7 +962,10 @@ fn failed_fd_import_reclaims_async_slot_and_signal_cancellation_keeps_write_effe
     b.vfs.set_descriptor_limit(4);
     a.send(0, ONE_WAY, &flat(TYPE_FD, fd as u64, 0), &[0], false);
     let mut request = b.start(&[], 4096).unwrap();
-    assert_eq!(request.finish(&mut b.memory), Err(Errno(24)));
+    // Native Binder drops a failed incoming transaction and waits for the
+    // next work item. The receiver's read does not expose the FD allocator's
+    // EMFILE; the async slot must still be released before the next send.
+    assert_eq!(request.finish(&mut b.memory), Ok(None));
     drop(request);
     b.vfs.set_descriptor_limit(32);
     a.send(0, ONE_WAY, b"next", &[], false);

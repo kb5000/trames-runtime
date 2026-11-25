@@ -37,7 +37,7 @@ impl FileTarget {
     fn daemon_backed(&self) -> bool {
         matches!(
             self.0.open.control,
-            Some(events::SharedControl::FuseFile(_))
+            Some(events::SharedControl::FuseFile(_) | events::SharedControl::Fuse(_))
         ) || self.0.open.node.as_ref().is_some_and(|node| {
             node.fuse_directory.get().is_some() || node.fuse_leaf.get().is_some()
         })
@@ -55,6 +55,15 @@ impl FileTarget {
                     | FileCommand::Read { .. }
             )
     }
+    fn positioned_read(&self) -> bool {
+        let open = &self.0.open;
+        open.is_regular_file()
+            || open.proc_control()
+            || matches!(
+                open.control,
+                Some(events::SharedControl::Cgroup(_) | events::SharedControl::MessageQueue(_))
+            )
+    }
     fn position_command(&self, command: &FileCommand) -> bool {
         matches!(
             command,
@@ -62,13 +71,7 @@ impl FileTarget {
                 | FileCommand::Write { offset: None, .. }
                 | FileCommand::WriteSync { offset: None, .. }
                 | FileCommand::Seek { .. }
-        ) && (self.0.open.is_regular_file()
-            || self
-                .0
-                .open
-                .runtime_file
-                .as_ref()
-                .is_some_and(|f| f.is_memory()))
+        ) && self.positioned_read()
     }
     fn position_busy(&self, command: &FileCommand) -> bool {
         self.position_command(command) && self.0.open.file_position.lock().unwrap().pending != 0
@@ -134,7 +137,8 @@ impl FileTarget {
         {
             return true;
         }
-        matches!(command, FileCommand::Transfer(t) if t.borrow().waits())
+        matches!(command, FileCommand::Transfer(t) if t.lock().unwrap().waits())
+            || matches!(command, FileCommand::Copy { transfer, .. } if transfer.lock().unwrap().io.blocked())
             || matches!(command, FileCommand::Read { .. })
                 && self
                     .0
@@ -249,7 +253,7 @@ impl FileTarget {
             return true;
         }
         match command {
-            FileCommand::Transfer(transfer) => transfer.borrow().host_work_owned(),
+            FileCommand::Transfer(transfer) => transfer.lock().unwrap().host_work_owned(),
             FileCommand::Read { count, .. } if *count < 16 * 1024 => false,
             FileCommand::Write { bytes, .. }
                 if bytes.len() < 16 * 1024 && self.0.open.flags.get() & 0x1000 == 0 =>
@@ -277,7 +281,7 @@ impl FileTarget {
             ) && console.io.host_work();
         }
         if let FileCommand::Transfer(transfer) = operation {
-            return transfer.borrow().host_work();
+            return transfer.lock().unwrap().host_work();
         }
         if matches!(
             operation,
@@ -310,7 +314,7 @@ impl FileTarget {
         let persistent = data.disk_source().is_some();
         match operation {
             FileCommand::Copy { .. } => true,
-            FileCommand::Transfer(transfer) => transfer.borrow().host_work(),
+            FileCommand::Transfer(transfer) => transfer.lock().unwrap().host_work(),
             FileCommand::Seek { .. } => persistent,
             FileCommand::Stat | FileCommand::ReadDirectory { .. } => false,
             FileCommand::Seals(add) => add.is_some_and(|add| add & 8 != 0) && data.mapped_work(),
@@ -360,7 +364,15 @@ impl SharedFd {
         {
             return Some(FileTarget(self.clone()));
         }
-        if matches!(open.control, Some(events::SharedControl::FuseFile(_))) {
+        if matches!(
+            open.control,
+            Some(
+                events::SharedControl::FuseFile(_)
+                    | events::SharedControl::Fuse(_)
+                    | events::SharedControl::Cgroup(_)
+                    | events::SharedControl::MessageQueue(_)
+            )
+        ) {
             return Some(FileTarget(self.clone()));
         }
         if open.control.is_some()
@@ -372,6 +384,7 @@ impl SharedFd {
     }
 }
 
+#[derive(Clone)]
 pub enum FileCommand {
     ReadDirectory {
         count: usize,
@@ -414,10 +427,10 @@ pub enum FileCommand {
         whence: u32,
     },
     Stat,
-    Transfer(RefCell<StreamTransfer>),
+    Transfer(Arc<std::sync::Mutex<StreamTransfer>>),
     Copy {
         input: FileTarget,
-        transfer: RefCell<FileCopy>,
+        transfer: Arc<std::sync::Mutex<FileCopy>>,
     },
 }
 pub enum FileValue {
@@ -456,9 +469,11 @@ pub struct FileWork {
     command: FileCommand,
     exclusive: bool,
     layout_exclusive: Option<trames_memory::layout::LayoutExclusive>,
+    fuse_layout: Option<Arc<trames_memory::layout::Layout>>,
     active: Option<FileActive>,
     input_active: Option<FileActive>,
     open: Option<Box<PreparedOpen>>,
+    path_retry: Option<Box<PathRevalidation>>,
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
     proc_wait: Vec<proc_file::ProcWait>,
@@ -527,6 +542,12 @@ pub(super) struct PreparedOpen {
     pub(super) target: FileTarget,
     pub(super) cloexec: CloseOnExec,
     pub(super) publication: Option<DirectFiles>,
+}
+// Cold pathname -> native truncate fallback. The typed descriptor work keeps
+// using its accepted OFD; only ESTALE may return to this original path context.
+struct PathRevalidation {
+    paths: Box<PathQueries>,
+    pending: Box<fuse::Metadata>,
 }
 impl PreparedOpen {
     fn publish(self, paths: &PathQueries) -> Result<u32> {
@@ -600,6 +621,10 @@ impl FileWork {
         // cannot cross their retained operation and replay its source inputs.
         self.fuse_request().is_none()
             && !self
+                .command
+                .transfer_io(transfer_io::Io::blocked)
+                .unwrap_or(false)
+            && !self
                 .target
                 .as_ref()
                 .is_some_and(|target| target.position_busy(&self.command))
@@ -616,6 +641,12 @@ impl FileWork {
             .cloned()
     }
     fn position_wait(&self) -> Option<&fuse::File> {
+        if matches!(
+            self.command,
+            FileCommand::Copy { .. } | FileCommand::Transfer(_)
+        ) {
+            return None;
+        }
         let target = self.target.as_ref()?;
         if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
             Some(file)
@@ -624,6 +655,13 @@ impl FileWork {
         }
     }
     pub fn waiting(&self) -> bool {
+        if self
+            .command
+            .transfer_io(transfer_io::Io::blocked)
+            .unwrap_or(false)
+        {
+            return true;
+        }
         if self.proc_memory.is_some()
             || self
                 .target
@@ -645,11 +683,21 @@ impl FileWork {
         if self.console_wait().is_some() {
             return !self.ready();
         }
+        if let Some(device) = self.device_read_wait() {
+            return device.poll(1).0 == 0;
+        }
         self.namespace.as_ref().is_some_and(|work| work.waiting())
             || !self.proc_wait.is_empty()
-            || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
+            || matches!(&self.command, FileCommand::Transfer(t) if t.lock().unwrap().waits())
     }
     pub fn ready(&self) -> bool {
+        if !self
+            .command
+            .transfer_io(transfer_io::Io::ready)
+            .unwrap_or(true)
+        {
+            return false;
+        }
         if let Some(io) = &self.proc_memory {
             return io.request.as_ref().is_none_or(|r| r.ready());
         }
@@ -677,15 +725,46 @@ impl FileWork {
                 .0
                 != 0;
         }
+        if let Some(device) = self.device_read_wait() {
+            return device.poll(1).0 != 0;
+        }
         if let Some(work) = &self.namespace {
             return work.ready();
         }
         match &self.command {
-            FileCommand::Transfer(t) => t.borrow().ready(),
+            FileCommand::Transfer(t) => t.lock().unwrap().ready(),
             _ => self.proc_wait.iter().all(|page| page.ready()),
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        let mut wait = self.resource_wait_sources(signal)?;
+        // A position can become busy after subscription but before ready().
+        // Subscribe even when currently idle, alongside the actual page/proc
+        // dependency; choosing only one loses either kind of completion.
+        if let Some(target) = self.target.as_ref().filter(|target| {
+            target.position_command(&self.command)
+                && !matches!(
+                    target.0.open.control,
+                    Some(events::SharedControl::FuseFile(_))
+                )
+        }) {
+            wait.subscriptions
+                .push(target.0.open.file_position.subscribe_pending(signal));
+        }
+        Ok(wait)
+    }
+    fn resource_wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if self
+            .command
+            .transfer_io(transfer_io::Io::blocked)
+            .unwrap_or(false)
+        {
+            return Ok(TransferWait {
+                subscriptions: self.command.transfer_io(|io| io.subscribe(signal)).unwrap(),
+                native: Vec::new(),
+                deadline: None,
+            });
+        }
         if let Some(request) = self.proc_memory.as_ref().and_then(|io| io.request.as_ref()) {
             return Ok(TransferWait {
                 subscriptions: vec![request.subscribe(signal)],
@@ -693,17 +772,6 @@ impl FileWork {
                 deadline: None,
             });
         }
-        if let Some(target) = self.target.as_ref().filter(|t| {
-            t.position_command(&self.command)
-                && !matches!(t.0.open.control, Some(events::SharedControl::FuseFile(_)))
-        }) {
-            return Ok(TransferWait {
-                subscriptions: vec![target.0.open.file_position.subscribe_pending(signal)],
-                native: Vec::new(),
-                deadline: None,
-            });
-        }
-
         if let Some(wait) = &self.linger {
             return Ok(TransferWait {
                 subscriptions: wait.subscribe(signal).into_iter().collect(),
@@ -742,6 +810,13 @@ impl FileWork {
                 deadline: None,
             });
         }
+        if let Some(device) = self.device_read_wait() {
+            return Ok(TransferWait {
+                subscriptions: vec![device.subscribe(signal)],
+                native: Vec::new(),
+                deadline: None,
+            });
+        }
         if let Some(work) = &self.namespace {
             return Ok(TransferWait {
                 subscriptions: work.subscribe(signal).into_iter().collect(),
@@ -750,7 +825,7 @@ impl FileWork {
             });
         }
         match &self.command {
-            FileCommand::Transfer(t) => t.borrow().wait_sources(signal),
+            FileCommand::Transfer(t) => t.lock().unwrap().wait_sources(signal),
             _ => Ok(TransferWait {
                 subscriptions: self.proc_wait.iter().map(|p| p.subscribe(signal)).collect(),
                 native: Vec::new(),
@@ -778,7 +853,7 @@ impl FileWork {
             return console.io.native_wait_fds(console.stream);
         }
         match &self.command {
-            FileCommand::Transfer(t) => t.borrow().native_wait_fds(),
+            FileCommand::Transfer(t) => t.lock().unwrap().native_wait_fds(),
             _ => Vec::new(),
         }
     }
@@ -795,6 +870,18 @@ impl FileWork {
             _ => return None,
         };
         Some((console, writing))
+    }
+    fn device_read_wait(&self) -> Option<&fuse::Device> {
+        let target = self.target.as_ref()?;
+        if target.0.open.flags.get() & O_NONBLOCK != 0
+            || !matches!(self.command, FileCommand::Read { offset: None, .. })
+        {
+            return None;
+        }
+        match &target.0.open.control {
+            Some(events::SharedControl::Fuse(device)) => Some(device),
+            _ => None,
+        }
     }
 
     /// Owned staging only, not file size or a guest mapping quota.
@@ -864,9 +951,11 @@ impl FileWork {
             command: FileCommand::SyncAll,
             exclusive: false,
             layout_exclusive: None,
+            fuse_layout: None,
             active: None,
             input_active: None,
             open: None,
+            path_retry: None,
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
@@ -876,6 +965,13 @@ impl FileWork {
         }
     }
     pub fn host_work(&self) -> bool {
+        if self
+            .command
+            .transfer_io(|io| io.blocked() && !io.ready())
+            .unwrap_or(false)
+        {
+            return false;
+        }
         if self
             .target
             .as_ref()
@@ -899,14 +995,16 @@ impl FileWork {
     }
     pub fn new(paths: &PathQueries, target: FileTarget, command: FileCommand) -> Self {
         Self {
-            paths: Box::new(paths.file_context(&target)),
+            paths: Box::new(paths.file_context(&target, &command)),
             target: Some(target),
             command,
             exclusive: false,
             layout_exclusive: None,
+            fuse_layout: None,
             active: None,
             input_active: None,
             open: None,
+            path_retry: None,
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
@@ -917,14 +1015,16 @@ impl FileWork {
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
         Self {
-            paths: Box::new(PathQueries::file_view(vfs, &target)),
+            paths: Box::new(PathQueries::file_view(vfs, &target, &command)),
             target: Some(target),
             command,
             exclusive: false,
             layout_exclusive: None,
+            fuse_layout: None,
             active: None,
             input_active: None,
             open: None,
+            path_retry: None,
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
@@ -945,20 +1045,52 @@ impl FileWork {
                         .as_ref()
                         .is_some_and(|t| t.status_flags() & O_PATH == 0))
         {
+            let view = self.paths.view.borrow();
+            let all = matches!(self.command, FileCommand::SyncAll);
+            let selected = self
+                .target
+                .as_ref()
+                .and_then(|target| target.0.open.mount_resource.get())
+                .map_or(&view.fs, |mount| &mount.fs);
+            let storage = if all {
+                view.sync_targets(true)
+            } else {
+                vec![storage::FilesystemSync::new(selected.clone())]
+            };
             self.sync_targets = Some(
-                self.paths
-                    .view
-                    .borrow()
-                    .sync_targets(matches!(self.command, FileCommand::SyncAll))
+                storage
                     .into_iter()
                     .map(storage::FilesystemSync::queued)
                     .collect(),
             );
+            let mut filesystems = BTreeMap::new();
+            if all {
+                if let Some(fs) = &view.fs.fuse {
+                    filesystems.insert(view.fs.identity(), fs.clone());
+                }
+                for mount in view
+                    .mount_resources
+                    .borrow()
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                {
+                    if let Some(fs) = &mount.fs.fuse {
+                        filesystems
+                            .entry(mount.fs.identity())
+                            .or_insert_with(|| fs.clone());
+                    }
+                }
+            } else if let Some(fs) = &selected.fuse {
+                filesystems.insert(selected.identity(), fs.clone());
+            }
+            self.fuse_stat =
+                fuse::Metadata::sync_filesystems(&view, filesystems.into_values().collect(), all)
+                    .map(Box::new);
         }
         if self.input_active.is_none() {
             let input = match &self.command {
                 FileCommand::Copy { input, .. } => Some(input.clone()),
-                FileCommand::Transfer(t) => t.borrow().input.file_target(),
+                FileCommand::Transfer(t) => t.lock().unwrap().input.file_target(),
                 _ => None,
             };
             if let Some(input) = input {
@@ -994,6 +1126,7 @@ impl FileWork {
         if target.proc_memory_command(&command)
             || target.position_busy(&command)
             || target.daemon_backed()
+            || command.daemon_backed()
         {
             return Self::from_vfs(vfs, target, command).run();
         }
@@ -1039,7 +1172,7 @@ impl FileWork {
         if target.proc_memory_command(&command) || target.position_busy(&command) {
             return Self::new(paths, target, command).run();
         }
-        if target.daemon_backed() {
+        if target.daemon_backed() || command.daemon_backed() {
             return Self::new(paths, target, command).run();
         }
         if let Some(result) = target.proc_read(&command) {
@@ -1063,6 +1196,12 @@ impl FileWork {
                     scratch,
                 })
             }
+            None if command
+                .transfer_io(transfer_io::Io::blocked)
+                .unwrap_or(false) =>
+            {
+                FileOutcome::Waiting(Self::new(paths, target, command))
+            }
             None => FileOutcome::Layout(Self::new(paths, target, command)),
         }
     }
@@ -1079,13 +1218,18 @@ impl FileWork {
         self
     }
     pub fn begin_layout(&self) -> Option<trames_memory::layout::LayoutWrite> {
-        self.target.as_ref()?.layout().map(|layout| layout.write())
+        self.admission_layout().map(|layout| layout.write())
+    }
+    pub fn admission_layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        self.fuse_layout
+            .clone()
+            .or_else(|| self.target.as_ref()?.layout())
     }
     pub fn enter_layout(mut self, exclusive: trames_memory::layout::LayoutExclusive) -> Self {
         let original = self
-            .target
-            .as_ref()
-            .and_then(FileTarget::layout)
+            .fuse_layout
+            .clone()
+            .or_else(|| self.target.as_ref().and_then(FileTarget::layout))
             .expect("mapped original inode");
         assert!(
             Arc::ptr_eq(&original, exclusive.layout()),
@@ -1215,12 +1359,36 @@ impl FileWork {
     pub fn run(self) -> FileOutcome {
         let scope = crate::output_resources::OutputScope::enter();
         let original = self.target.as_ref().map(|target| target.0.clone());
-        self.run_inner()
-            .retain_file(original)
-            .retain_output(scope.finish())
+        let mut outcome = self.run_inner();
+        if let FileOutcome::Waiting(work) = &mut outcome {
+            if work.fuse_layout.take().is_some() {
+                work.layout_exclusive = None;
+                work.exclusive = false;
+            }
+        }
+        outcome.retain_file(original).retain_output(scope.finish())
     }
     fn run_inner(mut self) -> FileOutcome {
         self.command.retain_output_inputs();
+        if !self.exclusive {
+            let layout = if let Some(metadata) = &self.fuse_stat {
+                if !metadata.ready() {
+                    return FileOutcome::Waiting(self);
+                }
+                metadata.layout()
+            } else {
+                self.target
+                    .as_ref()
+                    .and_then(|target| match &target.0.open.control {
+                        Some(events::SharedControl::FuseFile(file)) => file.mapped_layout(),
+                        _ => None,
+                    })
+            };
+            if let Some(layout) = layout {
+                self.fuse_layout = Some(layout);
+                return FileOutcome::Layout(self);
+            }
+        }
         if let Some(result) = self.proc_memory_step() {
             return match result {
                 Ok(None) => FileOutcome::Waiting(self),
@@ -1261,6 +1429,23 @@ impl FileWork {
         }
         if let Some(p) = &mut self.fuse_stat {
             let value = p.take(&mut self.paths.view.borrow_mut());
+            if self
+                .command
+                .transfer_io(transfer_io::Io::pending)
+                .unwrap_or(false)
+            {
+                let Some(value) = value else {
+                    return FileOutcome::Waiting(self);
+                };
+                self.command.complete_transfer_io(value);
+                self.fuse_stat = None;
+                // One copy can cross different mapped source/target inodes.
+                // Admission for a completed step cannot authorize the next one.
+                self.layout_exclusive = None;
+                self.fuse_layout = None;
+                self.exclusive = false;
+                return self.run_inner();
+            }
             if matches!(&value, Some(Err(_))) {
                 let open = {
                     let view = self.paths.view.borrow();
@@ -1275,21 +1460,42 @@ impl FileWork {
                         // A daemon symlink/magic link reached an ordinary file.
                         // Keep its accepted inode, drop the unused reservation,
                         // and enter the ordinary layout-aware truncate path.
-                        return FileWork::new(
+                        let mut next = FileWork::new(
                             &self.paths,
                             open.target.clone(),
                             FileCommand::Truncate(length),
-                        )
-                        .run();
+                        );
+                        if let Some(pending) = self.fuse_stat.take().filter(|p| p.retry_armed()) {
+                            next.path_retry = Some(Box::new(PathRevalidation {
+                                paths: self.paths,
+                                pending,
+                            }));
+                        }
+                        return next.run();
                     }
                     let mut next =
                         FileWork::new(&self.paths, open.target.clone(), FileCommand::TruncateOpen);
                     next.open = Some(Box::new(open));
+                    if let Some(pending) = self.fuse_stat.take().filter(|p| p.retry_armed()) {
+                        next.path_retry = Some(Box::new(PathRevalidation {
+                            paths: self.paths,
+                            pending,
+                        }));
+                    }
                     return next.run();
                 }
             }
             if value.as_ref().is_some_and(FileResources::needed) {
                 p.retain_output();
+            }
+            if matches!(
+                self.command,
+                FileCommand::SyncAll | FileCommand::SyncFilesystem
+            ) && self.sync_targets.is_some()
+                && matches!(&value, Some(Ok(_)))
+            {
+                self.fuse_stat = None;
+                return self.run_inner();
             }
             return match value {
                 Some(result) => FileOutcome::Complete(FileReply {
@@ -1302,7 +1508,42 @@ impl FileWork {
             };
         }
         if let Some(target) = &self.target {
-            if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
+            if let (
+                Some(events::SharedControl::Fuse(device)),
+                FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. },
+            ) = (&target.0.open.control, &self.command)
+            {
+                let pending = if fd_can_write(target.0.open.flags.get()) {
+                    device.notification(&self.paths.view.borrow(), bytes)
+                } else {
+                    Err(Errno(9))
+                };
+                match pending {
+                    Ok(Some(pending)) => {
+                        self.fuse_stat = Some(Box::new(pending));
+                        return FileOutcome::Waiting(self);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return FileOutcome::Complete(FileReply {
+                            resources: Default::default(),
+                            result: Err(error),
+                            file_size_signal: false,
+                            scratch: None,
+                        })
+                    }
+                }
+            }
+            if let Some(events::SharedControl::FuseFile(file)) =
+                target.0.open.control.as_ref().filter(|_| {
+                    !matches!(
+                        self.command,
+                        FileCommand::SyncFilesystem
+                            | FileCommand::Copy { .. }
+                            | FileCommand::Transfer(_)
+                    )
+                })
+            {
                 if let FileCommand::Seek { offset, whence } = self.command {
                     return match file.seek(&target.0.open.file_position, offset, whence) {
                         Ok(None) => FileOutcome::Waiting(self),
@@ -1404,9 +1645,31 @@ impl FileWork {
                 self.fuse_stat = Some(pending);
                 return FileOutcome::Waiting(self);
             }
+            if self
+                .command
+                .transfer_io(transfer_io::Io::blocked)
+                .unwrap_or(false)
+            {
+                return FileOutcome::Waiting(self);
+            }
         }
         match reply {
             Some((mut result, signal)) => {
+                if matches!(result, Err(Errno(116))) {
+                    if let Some(mut original) = self.path_retry.take() {
+                        let slot = self.open.take().map(|open| open.reservation);
+                        if original.pending.native_stale(slot) {
+                            let mut next = FileWork::sync_all(*original.paths);
+                            next.command =
+                                std::mem::replace(&mut self.command, FileCommand::SyncAll);
+                            next.fuse_stat = Some(original.pending);
+                            // Release the failed native OFD, writer and layout
+                            // admission before rewalking the original pathname.
+                            drop(self);
+                            return next.run();
+                        }
+                    }
+                }
                 if result.as_ref().is_err_and(|e| e.0 == 11)
                     && (self.console_wait().is_some()
                         || self.waiting()
@@ -1450,7 +1713,7 @@ impl PathQueries {
         };
         if !matches!(
             descriptor.open.borrow().control,
-            Some(events::SharedControl::FuseFile(_))
+            Some(events::SharedControl::FuseFile(_) | events::SharedControl::Fuse(_))
         ) {
             return None;
         }
@@ -1476,7 +1739,22 @@ impl PathQueries {
                 ))),
                 None,
             )
-            .and_then(|entry| view.prepare_path_truncate(entry, length));
+            .and_then(|entry| {
+                let result = view.prepare_path_truncate(entry, length);
+                fuse::PathRetry::arm(
+                    &view,
+                    AT_FDCWD,
+                    path,
+                    true,
+                    true,
+                    0,
+                    true,
+                    fuse::PathOperation::Truncate(length),
+                    None,
+                    true,
+                );
+                result
+            });
         let query = view.query.as_ref().unwrap();
         let accepted = query.prepared.borrow_mut().open.take();
         if let Some(open) = accepted {
@@ -1565,6 +1843,18 @@ impl PathQueries {
         }))
     }
     pub fn take_fuse_stat(&self) -> Option<FileWork> {
+        if let Some(work) = self
+            .view
+            .borrow()
+            .query
+            .as_ref()?
+            .prepared
+            .borrow_mut()
+            .work
+            .take()
+        {
+            return Some(work.into_inner().unwrap());
+        }
         let pending = self
             .view
             .borrow()
@@ -1595,11 +1885,11 @@ impl PathQueries {
         work.open = Some(Box::new(open));
         Some(work)
     }
-    fn file_context(&self, target: &FileTarget) -> Self {
+    fn file_context(&self, target: &FileTarget, command: &FileCommand) -> Self {
         let original = self.view.borrow();
-        Self::file_view(&original, target)
+        Self::file_view(&original, target, command)
     }
-    fn file_view(original: &Vfs, target: &FileTarget) -> Self {
+    fn file_view(original: &Vfs, target: &FileTarget, command: &FileCommand) -> Self {
         let retained = target.0.clone().retained();
         let open = retained.0.open.borrow();
         // This typed FD operation needs its original filesystem/credentials,
@@ -1618,6 +1908,7 @@ impl PathQueries {
         }
         view.pid = original.pid;
         if matches!(open.control, Some(events::SharedControl::FuseFile(_)))
+            || command.daemon_backed()
             || open
                 .mount
                 .as_ref()
@@ -1694,13 +1985,34 @@ impl Vfs {
 }
 
 impl FileCommand {
+    fn daemon_backed(&self) -> bool {
+        match self {
+            Self::Copy { input, .. } => input.daemon_backed(),
+            Self::Transfer(transfer) => transfer.lock().unwrap().daemon_backed(),
+            _ => false,
+        }
+    }
+    fn transfer_io<T>(&self, f: impl FnOnce(&transfer_io::Io) -> T) -> Option<T> {
+        match self {
+            Self::Copy { transfer, .. } => Some(f(&transfer.lock().unwrap().io)),
+            Self::Transfer(transfer) => Some(f(&transfer.lock().unwrap().io)),
+            _ => None,
+        }
+    }
+    fn complete_transfer_io(&self, value: Result<FileValue>) {
+        match self {
+            Self::Copy { transfer, .. } => transfer.lock().unwrap().io.complete(value),
+            Self::Transfer(transfer) => transfer.lock().unwrap().io.complete(value),
+            _ => unreachable!("accepted transfer reply"),
+        }
+    }
     fn retain_output_inputs(&self) {
         match self {
             Self::Copy { input, .. } => {
                 crate::output_resources::OutputScope::retain(|| input.0.clone())
             }
             Self::Transfer(transfer) => crate::output_resources::OutputScope::retain(|| {
-                let transfer = transfer.borrow();
+                let transfer = transfer.lock().unwrap();
                 (transfer.input.clone(), transfer.output.clone())
             }),
             _ => {}
@@ -1741,11 +2053,11 @@ impl FileCommand {
         match self {
             Self::Seals(add) => Vfs::seals_description(&descriptor, *add)
                 .map(|value| FileValue::Count(value as u64)),
-            Self::Transfer(transfer) => transfer.borrow_mut().execute(v),
+            Self::Transfer(transfer) => transfer.lock().unwrap().execute(v),
             Self::Read {
                 count,
                 offset: None,
-            } if *count != 0 && target.regular_file() => {
+            } if *count != 0 && target.positioned_read() => {
                 if !fd_can_read(target.0.open.flags.get()) {
                     return Err(Errno(9));
                 }
@@ -1796,10 +2108,10 @@ impl FileCommand {
     }
     fn execute(&self, v: &mut Vfs, fd: u32) -> Result<FileValue> {
         match self {
-            FileCommand::Transfer(transfer) => transfer.borrow_mut().execute(v),
+            FileCommand::Transfer(transfer) => transfer.lock().unwrap().execute(v),
             FileCommand::ReadDirectory { count } => v.getdents(fd, *count).map(FileValue::Bytes),
             FileCommand::Copy { input, transfer } => v.with_file_peer(input, |v, input| {
-                transfer.borrow_mut().execute(v, input, fd)
+                transfer.lock().unwrap().execute(v, input, fd)
             }),
             FileCommand::Seek { offset, whence } => {
                 v.seek(fd, *offset, *whence).map(FileValue::Count)
@@ -1890,11 +2202,18 @@ pub struct FileCopy {
     pub range: bool,
     stage: Option<CopyStage>,
     copied: u64,
+    io: transfer_io::Io,
+    source_stat: Option<[u8; 128]>,
+    target_stat: Option<[u8; 128]>,
+    start_from: Option<u64>,
+    start_to: Option<u64>,
 }
 struct CopyStage {
     from: u64,
     to: Option<u64>,
     bytes: Option<Vec<u8>>,
+    written: Option<(usize, usize)>,
+    source_committed: bool,
 }
 impl Vfs {
     pub const MAX_RW_COUNT: u64 = i32::MAX as u64 & !(trames_memory::PAGE_SIZE - 1);
@@ -1977,6 +2296,11 @@ impl FileCopy {
             range,
             stage: None,
             copied: 0,
+            io: Default::default(),
+            source_stat: None,
+            target_stat: None,
+            start_from: None,
+            start_to: None,
         }
     }
     fn execute(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
@@ -1984,20 +2308,48 @@ impl FileCopy {
             if !self.range {
                 Vfs::check_sendfile_modes(v.flags(input)?, v.flags(output)?)?;
             }
-            let source = v.stat_fd(input)?;
+            if self.source_stat.is_none() {
+                self.source_stat = Some(transfer_io::Io::stat(self.io.call(
+                    &v.descriptor(input)?,
+                    v,
+                    FileCommand::Stat,
+                    transfer_io::Step::SourceStat,
+                )?)?);
+            }
+            let source = self.source_stat.unwrap();
             v.fd_kind(output)?;
-            let from = match self.from? {
-                Some(offset) => offset,
-                None => v.seek(input, 0, 1)?,
+            let from = if let Some(from) = self.start_from {
+                from
+            } else {
+                let from = match self.from? {
+                    Some(offset) => offset,
+                    None => self.io.seek(v, &v.descriptor(input)?, 0, 1)?,
+                };
+                self.start_from = Some(from);
+                from
             };
             let to = if self.range {
-                let target = v.stat_fd(output)?;
+                if self.target_stat.is_none() {
+                    self.target_stat = Some(transfer_io::Io::stat(self.io.call(
+                        &v.descriptor(output)?,
+                        v,
+                        FileCommand::Stat,
+                        transfer_io::Step::TargetStat,
+                    )?)?);
+                }
+                let target = self.target_stat.unwrap();
                 if v.flags(output)? & 0x400 != 0 {
                     return Err(Errno(9));
                 }
-                let offset = match self.to? {
-                    Some(offset) => offset,
-                    None => v.seek(output, 0, 1)?,
+                let offset = if let Some(to) = self.start_to {
+                    to
+                } else {
+                    let to = match self.to? {
+                        Some(offset) => offset,
+                        None => self.io.seek(v, &v.descriptor(output)?, 0, 1)?,
+                    };
+                    self.start_to = Some(to);
+                    to
                 };
                 self.count =
                     Vfs::copy_file_range_length(&source, &target, from, offset, self.count)?;
@@ -2007,8 +2359,13 @@ impl FileCopy {
             };
             if !self.range {
                 Vfs::check_io_range(from, self.count)?;
-                if v.regular_file_fd(output)? {
-                    Vfs::check_io_range(v.seek(output, 0, 1)?, self.count.min(Vfs::MAX_RW_COUNT))?;
+                if transfer_io::Io::regular(&SharedFd::new(
+                    v.descriptor(output)?.open.borrow().shared.clone(),
+                )) {
+                    Vfs::check_io_range(
+                        self.io.seek(v, &v.descriptor(output)?, 0, 1)?,
+                        self.count.min(Vfs::MAX_RW_COUNT),
+                    )?;
                 }
             }
             self.start(from, to);
@@ -2026,6 +2383,31 @@ impl FileCopy {
         to: Option<u64>,
     ) -> Result<u64> {
         self.start(from, to);
+        if v.query.is_some()
+            && [input, output].iter().any(|&fd| {
+                v.descriptor(fd).is_ok_and(|d| {
+                    matches!(
+                        d.open.borrow().control,
+                        Some(events::SharedControl::FuseFile(_))
+                    )
+                })
+            })
+        {
+            let input = FileTarget(SharedFd::new(
+                v.descriptor(input)?.open.borrow().shared.clone(),
+            ));
+            let target = FileTarget(SharedFd::new(
+                v.descriptor(output)?.open.borrow().shared.clone(),
+            ));
+            let command = FileCommand::Copy {
+                input,
+                transfer: Arc::new(std::sync::Mutex::new(self)),
+            };
+            return match v.transfer_work(FileWork::from_vfs(v, target, command))? {
+                FileValue::Transfer { count, .. } => Ok(count),
+                _ => unreachable!("retained copy result"),
+            };
+        }
         self.drive(v, input, output)?;
         Ok(self.copied)
     }
@@ -2036,6 +2418,8 @@ impl FileCopy {
             from,
             to,
             bytes: None,
+            written: None,
+            source_committed: false,
         });
     }
 
@@ -2045,18 +2429,52 @@ impl FileCopy {
             let stage = self.stage.as_mut().unwrap();
             let (from, to) = (stage.from, stage.to);
             if stage.bytes.is_none() {
-                match v.pread(input, chunk, from) {
+                let read = self
+                    .io
+                    .call(
+                        &v.descriptor(input)?,
+                        v,
+                        FileCommand::Read {
+                            count: chunk,
+                            offset: Some(from),
+                        },
+                        transfer_io::Step::Read,
+                    )
+                    .and_then(transfer_io::Io::bytes);
+                match read {
                     Ok(bytes) if self.copied > 0 && bytes.is_empty() => {
                         return Ok(self.result(from, to))
                     }
                     Ok(bytes) => stage.bytes = Some(bytes),
-                    Err(e) if self.copied == 0 => return Err(e),
+                    Err(e)
+                        if self.copied == 0 || v.query.as_ref().is_some_and(|q| q.deferred()) =>
+                    {
+                        return Err(e)
+                    }
                     Err(_) => return Ok(self.result(from, to)),
                 }
             }
             let bytes = stage.bytes.as_ref().unwrap();
             let mut offered = bytes.len();
-            let result = if let Some(to) = to {
+            let result = if let Some((written, original_offered)) = stage.written {
+                offered = original_offered;
+                Ok(written)
+            } else if matches!(
+                &v.descriptor(output)?.open.borrow().control,
+                Some(events::SharedControl::FuseFile(_))
+            ) {
+                self.io
+                    .call(
+                        &v.descriptor(output)?,
+                        v,
+                        FileCommand::Write {
+                            bytes: bytes.clone(),
+                            offset: to,
+                        },
+                        transfer_io::Step::Write,
+                    )
+                    .and_then(transfer_io::Io::count)
+            } else if let Some(to) = to {
                 v.pwrite(output, bytes, to)
             } else if !bytes.is_empty() && bytes.len() < chunk {
                 let out = v.descriptor(output)?;
@@ -2081,24 +2499,43 @@ impl FileCopy {
             };
             let written = match result {
                 Ok(n) => n,
+                Err(Errno(11))
+                    if v.descriptor(output)?
+                        .open
+                        .borrow()
+                        .file_position
+                        .lock()
+                        .unwrap()
+                        .pending
+                        != 0 =>
+                {
+                    return self.io.wait_position(
+                        v,
+                        v.descriptor(output)?.open.borrow().file_position.clone(),
+                    );
+                }
                 // A deferred layout keeps this stage and the cumulative count.
                 // The outer file transaction retries it before publishing a reply.
-                Err(e) if self.copied == 0 => return Err(e),
+                Err(e) if self.copied == 0 || v.query.as_ref().is_some_and(|q| q.deferred()) => {
+                    return Err(e)
+                }
                 Err(_) => return Ok(self.result(from, to)),
             };
             let short = written < offered;
+            stage.written = Some((written, offered));
             let written = written as u64;
             let from = from + written;
             let to = to.map(|p| p + written);
-            self.copied += written;
-            if self.from?.is_none() {
-                v.seek(input, from as i64, 0)?;
+            if self.from?.is_none() && !stage.source_committed {
+                self.io.seek(v, &v.descriptor(input)?, from as i64, 0)?;
+                stage.source_committed = true;
             }
             if let Some(to) = to {
                 if self.to?.is_none() {
-                    v.seek(output, to as i64, 0)?;
+                    self.io.seek(v, &v.descriptor(output)?, to as i64, 0)?;
                 }
             }
+            self.copied += written;
             if short || written == 0 || self.copied == self.count {
                 return Ok(self.result(from, to));
             }
@@ -2106,6 +2543,8 @@ impl FileCopy {
                 from,
                 to,
                 bytes: None,
+                written: None,
+                source_committed: false,
             });
         }
     }
@@ -2123,6 +2562,16 @@ impl FileCopy {
     }
 }
 impl Vfs {
+    pub(super) fn transfer_work(&self, work: FileWork) -> Result<FileValue> {
+        match work.run() {
+            FileOutcome::Complete(reply) => reply.result,
+            FileOutcome::Waiting(work) | FileOutcome::Layout(work) | FileOutcome::Owner(work) => {
+                let query = self.query.as_ref().ok_or(Errno(95))?;
+                query.prepared.borrow_mut().work = Some(std::sync::Mutex::new(work));
+                query.defer()
+            }
+        }
+    }
     fn with_file_peer<T>(
         &mut self,
         input: &FileTarget,

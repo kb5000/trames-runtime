@@ -4,7 +4,7 @@ use super::*;
 
 impl Metadata {
     pub(super) fn create_missing(&mut self) -> Result<bool> {
-        let ResultKind::Lookup(walk) = &self.kind else {
+        let ResultKind::Lookup(walk) = &mut self.kind else {
             return Ok(false);
         };
         let PathOperation::Open(flags) = walk.operation else {
@@ -39,6 +39,7 @@ impl Metadata {
         }
         let create = Create {
             _parent_directory: walk.parent_directory.clone(),
+            _parent_access: walk.parent_access.take(),
             fs: walk.fs.clone(),
             caller: walk.caller,
             parent: walk.parent,
@@ -57,7 +58,8 @@ impl Metadata {
             self.request = Some(request);
             self.kind = ResultKind::CreatePermission(Box::new((create, check)));
         } else {
-            self.start_create(create, walk.fs.create_unsupported.load(Ordering::Relaxed))?;
+            let fallback = walk.fs.create_unsupported.load(Ordering::Relaxed);
+            self.start_create(create, fallback)?;
         }
         Ok(true)
     }
@@ -121,18 +123,14 @@ impl Metadata {
         Ok(())
     }
     pub(super) fn finish_create(&mut self, result: Result<Vec<u8>>) -> Option<Result<FileValue>> {
-        if let ResultKind::Create(create) = &self.kind {
-            if matches!(result, Err(Errno(38))) {
-                create.fs.create_unsupported.store(true, Ordering::Relaxed);
-                let create = Create {
-                    _parent_directory: create._parent_directory.clone(),
-                    fs: create.fs.clone(),
-                    caller: create.caller,
-                    parent: create.parent,
-                    name: create.name.clone(),
-                };
-                return self.start_create(create, true).err().map(Err);
-            }
+        if matches!(self.kind, ResultKind::Create(_)) && matches!(result, Err(Errno(38))) {
+            let ResultKind::Create(create) =
+                std::mem::replace(&mut self.kind, ResultKind::Readlink)
+            else {
+                unreachable!()
+            };
+            create.fs.create_unsupported.store(true, Ordering::Relaxed);
+            return self.start_create(create, true).err().map(Err);
         }
         let has_open = matches!(self.kind, ResultKind::Create(_));
         let result = result.and_then(|bytes| {
@@ -178,6 +176,12 @@ impl Metadata {
                     return Err(error);
                 }
             });
+            reference.entry = Some(create.fs.entries.bind(
+                reference.leaf.as_ref().unwrap(),
+                &create._parent_directory,
+                &create.name,
+            ));
+            create.fs.inode_changed(&create._parent_directory);
             self.reference = Some(reference);
             self.open.as_mut().unwrap().created = true;
             if has_open {

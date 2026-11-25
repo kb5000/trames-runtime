@@ -60,7 +60,14 @@ impl Mounted {
             notifications: Default::default(),
             path_hint: Default::default(),
             device: parent.borrow().device,
-            content: Content::Fuse,
+            content: match word(60) & 0o170000 {
+                0o010000 => Content::Fifo(Pipe::new(trames_memory::new_backing_identity())),
+                0o020000 | 0o060000 => {
+                    pseudo::Device::node(word(76), word(60) & 0o170000 == 0o060000)
+                }
+                0o140000 => Content::Socket(ipc::PathBinding::default()),
+                _ => Content::Fuse,
+            },
             mode: word(60) & 0o177777,
             uid: self
                 .namespace
@@ -74,6 +81,9 @@ impl Mounted {
             seals: None,
             xattrs: BTreeMap::new(),
         }));
+        if cached_attr.kind_is_regular() {
+            let _ = node.layout.set(cached_attr.layout.clone());
+        }
         let _ = node.fuse_leaf.set(Arc::new(Leaf {
             node: reference.node,
             _lookup: reference.lease.clone(),

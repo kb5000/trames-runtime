@@ -1741,7 +1741,7 @@ impl Vfs {
         accepted: OpenHandle,
         flags: u32,
         publication: Option<&DirectFiles>,
-        reservation: fd_table::ReservedFd,
+        reservation: &mut Option<fd_table::ReservedFd>,
     ) -> Result<u32> {
         if flags & O_DIRECTORY != 0 {
             return Err(Errno(20));
@@ -1819,7 +1819,10 @@ impl Vfs {
         if let Some(publication) = publication {
             publication.publish_open(self, &descriptor.open.borrow());
         }
-        reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))
+        reservation
+            .take()
+            .expect("original unpublished open slot")
+            .publish(descriptor, self.query.is_none().then_some(&self.fds))
     }
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
         let entry = self.resolve_entry_operation(
@@ -1832,7 +1835,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Statfs)),
             None,
         )?;
-        self.statfs_resolved(entry)
+        let result = self.statfs_resolved(entry);
+        fuse::PathRetry::arm(
+            self,
+            AT_FDCWD,
+            path,
+            true,
+            true,
+            0,
+            true,
+            fuse::PathOperation::Statfs,
+            None,
+            true,
+        );
+        result
     }
     pub(super) fn statfs_resolved(&self, (path, target): ResolvedEntry) -> Result<[u8; 120]> {
         match target {

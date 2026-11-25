@@ -91,15 +91,22 @@ struct Queue {
     interrupts_enabled: bool,
     pending: VecDeque<u64>,
     interrupts: VecDeque<u64>,
+    notifications: VecDeque<Vec<u8>>,
     requests: BTreeMap<u64, Entry>,
 }
 struct Completion {
-    result: Mutex<Option<Result<Vec<u8>>>>,
+    result: Mutex<CompletionState>,
     receiver: Option<std::sync::Weak<dyn ReplyReceiver>>,
     cleanup: Option<(std::sync::Weak<Connection>, Caller, ReplyResource)>,
     attributes: Option<AbandonedAttributes>,
     attr_version: u64,
     changed: Arc<Readiness>,
+}
+#[derive(Default)]
+struct CompletionState {
+    value: Option<Result<Vec<u8>>>,
+    finished: bool,
+    cancellation: Vec<Box<dyn Send>>,
 }
 /// A retained byte resource completes on the actor writing the daemon reply.
 /// Installed before enqueueing, weakly owned, and invoked without connection
@@ -128,7 +135,7 @@ enum ReplyResource {
 // A successful reply can arrive after its guest waiter has gone.
 impl Drop for Completion {
     fn drop(&mut self) {
-        let Some(Ok(bytes)) = self.result.get_mut().unwrap().take() else {
+        let Some(Ok(bytes)) = self.result.get_mut().unwrap().value.take() else {
             return;
         };
         if let Some(attributes) = &self.attributes {
@@ -220,13 +227,20 @@ pub(super) fn entry_id(bytes: &[u8], kind: Option<u32>) -> Option<u64> {
 }
 impl Completion {
     fn finish(&self, result: Result<Vec<u8>>) {
+        let mut state = self.result.lock().unwrap();
+        state.finished = true;
+        let cancellation = std::mem::take(&mut state.cancellation);
         if let Some(receiver) = &self.receiver {
+            drop(state);
             if let Some(receiver) = receiver.upgrade() {
                 receiver.complete(result);
             }
+            drop(cancellation);
             return;
         }
-        *self.result.lock().unwrap() = Some(result);
+        state.value = Some(result);
+        drop(state);
+        drop(cancellation);
         self.changed.notify_atomic();
     }
 }
@@ -236,6 +250,7 @@ pub struct Connection {
     changed: Arc<Readiness>,
     max_write: std::sync::atomic::AtomicUsize,
     options: std::sync::atomic::AtomicU32,
+    minor: std::sync::atomic::AtomicU32,
     attr_version: std::sync::atomic::AtomicU64,
     pub(super) mounted: OnceLock<std::sync::Weak<Mounted>>,
 }
@@ -252,10 +267,37 @@ impl Request {
         self.completion.changed.subscribe(signal)
     }
     pub fn ready(&self) -> bool {
-        self.completion.result.lock().unwrap().is_some()
+        self.completion.result.lock().unwrap().value.is_some()
     }
     pub fn take(&self) -> Option<Result<Vec<u8>>> {
-        self.completion.result.lock().unwrap().take()
+        self.completion.result.lock().unwrap().value.take()
+    }
+    /// Retain an abandoned operation's completion credit until this original
+    /// daemon request replies or disconnects. An unread withdrawal releases it
+    /// when the request is dropped. Already finished requests return the lease
+    /// so its caller can release other local resources first, outside all locks.
+    pub fn retain_cancellation(&self, lease: Box<dyn Send>) -> Option<Box<dyn Send>> {
+        let mut state = self.completion.result.lock().unwrap();
+        if state.finished {
+            Some(lease)
+        } else {
+            state.cancellation.push(lease);
+            None
+        }
+    }
+    pub(super) fn entry_identity(&self) -> Option<u64> {
+        if !matches!(
+            self.completion
+                .cleanup
+                .as_ref()
+                .map(|(_, _, resource)| resource),
+            Some(ReplyResource::Lookup { .. } | ReplyResource::Create { .. })
+        ) {
+            return None;
+        }
+        let result = self.completion.result.lock().unwrap();
+        let bytes = result.value.as_ref()?.as_ref().ok()?;
+        entry_id(bytes.get(..128)?, None)
     }
     pub fn needs_interrupt(&self) -> bool {
         let q = self.connection.queue.lock().unwrap();
@@ -285,6 +327,23 @@ impl Request {
         drop(q);
         self.connection.changed.notify_atomic();
     }
+    pub fn interrupt_fatal(&self) {
+        let mut queue = self.connection.queue.lock().unwrap();
+        let Some(entry) = queue.requests.get(&self.id) else {
+            return;
+        };
+        if entry.message.is_some() {
+            queue.requests.remove(&self.id);
+            queue.pending.retain(|id| *id != self.id);
+            queue.epoch = queue.epoch.wrapping_add(1);
+            drop(queue);
+            self.completion.finish(Err(Errno(4)));
+            self.connection.changed.notify_atomic();
+        } else {
+            drop(queue);
+            self.interrupt();
+        }
+    }
 }
 impl Drop for Request {
     fn drop(&mut self) {
@@ -302,6 +361,13 @@ impl Drop for Request {
             if self.completion.cleanup.is_none()
                 && self.completion.attributes.is_none()
                 && self.completion.receiver.is_none()
+                && self
+                    .completion
+                    .result
+                    .lock()
+                    .unwrap()
+                    .cancellation
+                    .is_empty()
             {
                 entry.reply = None;
             }
@@ -335,9 +401,10 @@ impl Connection {
     pub fn new(caller: Caller) -> Arc<Self> {
         let mut body = [0; 16];
         body[..4].copy_from_slice(&7u32.to_le_bytes());
-        body[4..8].copy_from_slice(&31u32.to_le_bytes());
-        body[12..16]
-            .copy_from_slice(&((1u32 << 5) | (1 << 6) | (1 << 20) | (1 << 29)).to_le_bytes()); // BIG_WRITES, DONT_MASK, POSIX_ACL, SETXATTR_EXT
+        body[4..8].copy_from_slice(&34u32.to_le_bytes());
+        body[12..16].copy_from_slice(
+            &((1u32 << 5) | (1 << 6) | (1 << 16) | (1 << 20) | (1 << 29)).to_le_bytes(),
+        ); // BIG_WRITES, DONT_MASK, WRITEBACK_CACHE, POSIX_ACL, SETXATTR_EXT
         let init = Entry {
             message: Some(packet(2, INIT, 0, caller, &body).expect("fixed init length")),
             interrupt: Interrupt::None,
@@ -355,17 +422,43 @@ impl Connection {
                 interrupts_enabled: true,
                 pending: [2].into(),
                 interrupts: VecDeque::new(),
+                notifications: VecDeque::new(),
                 requests: [(2, init)].into(),
             }),
             changed: Arc::default(),
             max_write: std::sync::atomic::AtomicUsize::new(4096),
             options: Default::default(),
+            minor: Default::default(),
             attr_version: std::sync::atomic::AtomicU64::new(1),
             mounted: OnceLock::new(),
         })
     }
     pub(crate) fn initialized(&self) -> bool {
         self.options.load(Ordering::Relaxed) & (1 << 31) != 0
+    }
+    pub(super) fn mounted(&self) -> Option<Arc<Mounted>> {
+        self.mounted.get().and_then(std::sync::Weak::upgrade)
+    }
+    pub(super) fn minor(&self) -> u32 {
+        self.minor.load(Ordering::Relaxed)
+    }
+    pub(super) fn notify_reply(
+        &self,
+        cookie: u64,
+        node: u64,
+        caller: Caller,
+        body: &[u8],
+    ) -> Result<()> {
+        let message = packet(cookie, 41, node, caller, body)?;
+        let mut queue = self.queue.lock().unwrap();
+        if queue.phase == Phase::Aborted {
+            return Err(Errno(19));
+        }
+        queue.notifications.push_back(message);
+        queue.epoch = queue.epoch.wrapping_add(1);
+        drop(queue);
+        self.changed.notify_atomic();
+        Ok(())
     }
     pub(crate) fn option(&self, flag: u32) -> bool {
         self.options.load(Ordering::Relaxed) & flag != 0
@@ -395,8 +488,8 @@ impl Connection {
         receiver: std::sync::Weak<dyn ReplyReceiver>,
     ) -> Result<Request> {
         // Resource-granting replies need the ordinary abandoned-reply cleanup.
-        // Page IO owns byte replies only and cannot bypass that lifecycle.
-        assert!(matches!(opcode, 15 | 16));
+        // Page IO and timestamp writeback grant no daemon-owned resources.
+        assert!(matches!(opcode, 4 | 15 | 16 | 20));
         self.request_with_entry_kind(opcode, node, caller, body, None, Some(receiver))
     }
     pub(super) fn request_entry(
@@ -556,6 +649,7 @@ impl Connection {
     pub fn poll(&self, mask: u16) -> (u16, [u64; 2]) {
         let q = self.queue.lock().unwrap();
         let available = q.phase == Phase::Aborted
+            || !q.notifications.is_empty()
             || !q.interrupts.is_empty()
             || q.pending
                 .front()
@@ -578,8 +672,18 @@ impl Connection {
                     .get()
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(Errno(2))?;
+                let id = u64::from_le_bytes(body[..8].try_into().unwrap());
+                if fs
+                    .attribute_target(id)
+                    .is_some_and(|node| mount::notification_needs_executor(&node))
+                {
+                    // The raw transport API cannot retain a parked daemon
+                    // write. Production device writes use FileWork's accepted
+                    // notification before reaching this synchronous fallback.
+                    return Err(Errno(95));
+                }
                 fs.notify_inode(
-                    u64::from_le_bytes(body[..8].try_into().unwrap()),
+                    id,
                     i64::from_le_bytes(body[8..16].try_into().unwrap()),
                     i64::from_le_bytes(body[16..24].try_into().unwrap()),
                 )
@@ -594,6 +698,12 @@ impl Connection {
         }
         if size < MIN_BUFFER {
             return Err(Errno(22));
+        }
+        if let Some(message) = q.notifications.front() {
+            if size < message.len() {
+                return Err(Errno(22));
+            }
+            return Ok(q.notifications.pop_front().unwrap());
         }
         if let Some(id) = q.interrupts.pop_front() {
             let e = q
@@ -688,6 +798,8 @@ impl Connection {
                 && info[..4] == 7u32.to_le_bytes()
                 && u32::from_le_bytes(info[4..8].try_into().unwrap()) >= 9;
             if valid {
+                let minor = u32::from_le_bytes(info[4..8].try_into().unwrap()).min(34);
+                self.minor.store(minor, Ordering::Relaxed);
                 let max_write = bytes.get(36..40).map_or(4096, |raw| {
                     u32::from_le_bytes(raw.try_into().unwrap()) as usize
                 });
@@ -699,7 +811,12 @@ impl Connection {
                     .get(28..32)
                     .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
                 self.options.store(
-                    (1 << 31) | (flags & ((1 << 6) | (1 << 20) | (1 << 29))),
+                    (1 << 31)
+                        | (flags
+                            & ((1 << 6)
+                                | (1 << 20)
+                                | if minor >= 23 { 1 << 16 } else { 0 }
+                                | if minor >= 33 { 1 << 29 } else { 0 })),
                     Ordering::Relaxed,
                 );
                 q.requests.remove(&id);
@@ -753,6 +870,7 @@ impl Connection {
         q.epoch = q.epoch.wrapping_add(1);
         q.pending.clear();
         q.interrupts.clear();
+        q.notifications.clear();
         let requests = std::mem::take(&mut q.requests);
         drop(q);
         self.changed.notify_atomic();

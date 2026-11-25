@@ -26,6 +26,15 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Cold VMA observation for exception classification: whether a mapping
+    /// covers or follows this address, irrespective of permissions/residency.
+    /// It must not fault in bytes, allocate pages or edit mapping ownership.
+    fn mapped_at_or_after(&self, address: u64) -> bool;
+    /// Cold syscall import capability. Memory/View keep a monotonic summary so
+    /// ordinary address spaces do not allocate asynchronous import journals.
+    fn async_faults_possible(&self) -> bool {
+        true
+    }
     /// Optional address-specific policy metadata. Small CPU embeddings with
     /// no placement controls expose the guest default on their mapped pages.
     fn numa_mode_at(&self, _address: u64) -> u32 {
@@ -194,6 +203,23 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn mapped_at_or_after(&self, address: u64) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().mapped_at_or_after(address);
+        }
+        let address = address & 0x00ff_ffff_ffff_ffff;
+        self.region_layout
+            .ranges
+            .last()
+            .is_some_and(|&(_, end, _)| address < end)
+    }
+    fn async_faults_possible(&self) -> bool {
+        self.shared
+            .as_ref()
+            .map_or(self.has_async_sources, |shared| {
+                shared.borrow().has_async_sources
+            })
+    }
     fn numa_mode_at(&self, address: u64) -> u32 {
         if let Some(shared) = &self.shared {
             return shared.borrow().numa_mode_at(address);

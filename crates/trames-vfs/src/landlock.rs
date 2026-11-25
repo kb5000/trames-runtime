@@ -332,6 +332,7 @@ impl Vfs {
                 key: key.clone(),
                 mount: file.mount.clone(),
                 directory_inode: None,
+                fuse_entry: None,
                 indexed_position: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_position: None,

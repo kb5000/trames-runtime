@@ -3,6 +3,9 @@
 use super::direct_io::{DirectWatch, WatchResource};
 use super::*;
 use std::sync::{Mutex, RwLock};
+mod delivery;
+use delivery::Gate;
+pub use delivery::{EpollBlocked, EpollDelivery, EpollObservations, EpollPrepareError};
 
 type Observation = ((u32, u64), [u64; 2]);
 type Parent = (std::sync::Weak<LiveEpoll>, (u32, u64));
@@ -96,6 +99,7 @@ pub(super) fn inspect<const CONSUME: bool>(
     }
 }
 pub(super) struct LiveEpoll {
+    pub(super) gate: Arc<Gate>,
     pub(super) graph: Arc<epoll_graph::Graph>,
     open: std::sync::OnceLock<std::sync::Weak<SharedOpenDescription>>,
     watches: RwLock<Arc<Vec<DirectWatch>>>,
@@ -107,6 +111,7 @@ pub(super) struct LiveEpoll {
 impl LiveEpoll {
     pub(super) fn new(graph: Arc<epoll_graph::Graph>) -> Arc<Self> {
         Arc::new(Self {
+            gate: Arc::default(),
             graph,
             open: Default::default(),
             watches: Default::default(),
@@ -170,6 +175,17 @@ impl LiveEpoll {
         }
     }
     pub(super) fn update(
+        self: &Arc<Self>,
+        key: (u32, u64),
+        op: u32,
+        events: u32,
+        data: u64,
+        target: WatchResource,
+    ) -> Result<()> {
+        let _permit = self.gate.enter().ok_or(Errno(11))?;
+        self.update_admitted(key, op, events, data, target)
+    }
+    fn update_admitted(
         self: &Arc<Self>,
         key: (u32, u64),
         op: u32,
@@ -257,6 +273,7 @@ impl LiveEpoll {
         max: usize,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> Result<Vec<(u32, u64)>> {
+        let _permit = self.gate.enter_blocking();
         let mut cursor = self.cursor.lock().unwrap();
         let shared = self.snapshot();
         let mut result = Vec::new();
@@ -285,14 +302,14 @@ impl LiveEpoll {
 }
 /// One source/solo control body over accepted original OFDs. FD validation
 /// precedes this function; target type/ET checks retain their canonical order.
-pub(super) fn control(
+pub(super) fn prepare_control(
     epoll: OpenHandle,
     target: OpenHandle,
     number: u32,
     op: u32,
     events: u32,
     data: u64,
-) -> Result<()> {
+) -> Result<EpollControl> {
     if OpenHandle::ptr_eq(&epoll, &target) {
         return Err(Errno(22));
     }
@@ -360,12 +377,79 @@ pub(super) fn control(
         &target.borrow().anonymous,
         Some(events::Anonymous::Epoll(_))
     );
+    let epoll_file = SharedFd::new(epoll.borrow().shared.clone());
+    let target_file = SharedFd::new(target.borrow().shared.clone());
+    let target_open = OpenHandle::Shared(target_file.open.clone());
     let target = if nested {
-        WatchResource::Nested(target.downgrade())
+        WatchResource::Nested(target_open.downgrade())
     } else {
-        WatchResource::Original(target.downgrade())
+        WatchResource::Original(target_open.downgrade())
     };
-    live.update(key, op, events, data, target)
+    Ok(EpollControl {
+        live,
+        key,
+        op,
+        events,
+        data,
+        target,
+        _files: [epoll_file, target_file],
+    })
+}
+/// Captured epoll_ctl file references survive its original mutex wait. No
+/// numeric descriptor or guest event structure is revisited after admission.
+pub struct EpollControl {
+    live: Arc<LiveEpoll>,
+    key: (u32, u64),
+    op: u32,
+    events: u32,
+    data: u64,
+    target: WatchResource,
+    _files: [SharedFd; 2],
+}
+impl EpollControl {
+    pub fn run_blocking(&self) -> Result<()> {
+        let _permit = self.live.gate.enter_blocking();
+        self.live.update_admitted(
+            self.key,
+            self.op,
+            self.events,
+            self.data,
+            self.target.clone(),
+        )
+    }
+    pub fn attempt(&self) -> Result<bool> {
+        match self.live.update(
+            self.key,
+            self.op,
+            self.events,
+            self.data,
+            self.target.clone(),
+        ) {
+            Err(Errno(11)) => Ok(false),
+            result => result.map(|()| true),
+        }
+    }
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        EpollBlocked::new(self.live.gate.clone(), Some(self._files[0].clone())).subscribe(signal)
+    }
+}
+impl SharedFd {
+    pub fn observe_epolls(&self, observations: &mut EpollObservations) {
+        if let Some(events::SharedControl::Epoll(live)) = &self.open.control {
+            observations.collect(live, Some(self.clone()));
+        }
+    }
+}
+pub(super) fn control(
+    epoll: OpenHandle,
+    target: OpenHandle,
+    number: u32,
+    op: u32,
+    events: u32,
+    data: u64,
+) -> Result<()> {
+    let call = prepare_control(epoll, target, number, op, events, data)?;
+    call.run_blocking()
 }
 pub(super) fn ordered(
     watches: &[DirectWatch],

@@ -28,6 +28,7 @@ impl LayerPath {
     fn resolved(&self) -> ResolvedPath {
         ResolvedPath {
             directory_inode: None,
+            fuse_entry: None,
             indexed_position: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_position: None,
@@ -864,6 +865,7 @@ impl Vfs {
             }
             let at = ResolvedPath {
                 directory_inode: None,
+                fuse_entry: None,
                 indexed_position: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_position: None,

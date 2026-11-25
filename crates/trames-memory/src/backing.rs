@@ -23,22 +23,96 @@ pub trait PageSource: Send + Sync {
     /// original PageWait. Never block a CPU worker or encode a guest errno.
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
 }
+/// A file VMA's cold mremap hook. The caller owns original mm custody and
+/// restores moved pages if the provider rejects the destination VMA.
+pub trait MappingRemap: Send + Sync {
+    fn remapped(&self, mm: u64, address: u64) -> Result<(), MemoryError>;
+}
+
+/// One accepted original writeback. A provider may finish on its existing
+/// resource reply path; the caller keeps guest pointers and VM custody outside.
+pub trait SyncCompletion: Send {
+    fn complete(self: Box<Self>, result: Result<(), MemoryError>);
+    /// Retry the same accepted resource after an inode transaction becomes
+    /// available. Source executors reacquire original layout admission first.
+    fn retry(self: Box<Self>) {
+        self.complete(Err(MemoryError::BackingIo(5)));
+    }
+}
+pub trait SyncExecutor: Send + Sync {
+    fn submit(&self, resource: Arc<dyn SyncResource>, completion: Box<dyn SyncCompletion>);
+}
+
+/// A cold, accepted writeback resource, captured before leaving the caller's
+/// actor scope. It owns no guest address, VMA lookup or running CPU view.
+pub trait SyncResource: Send + Sync {
+    fn layout(&self) -> Option<Arc<crate::layout::Layout>>;
+    fn sync(&self) -> Result<(), MemoryError>;
+    /// The accepted executor ended before this resource could complete. File
+    /// providers retain the error on their original mapping/OFD, even for the
+    /// void VMA-close path; this never retries a guest syscall.
+    /// A provider which has already completed ignores retirement. Its terminal
+    /// result and callbacks cannot be replaced or published a second time.
+    fn failed(&self, _error: MemoryError) {}
+    fn sync_async(
+        &self,
+        completion: Box<dyn SyncCompletion>,
+    ) -> Result<(), Box<dyn SyncCompletion>> {
+        Err(completion)
+    }
+}
+struct BackingSync(Arc<dyn PageBacking>);
+impl SyncResource for BackingSync {
+    fn layout(&self) -> Option<Arc<crate::layout::Layout>> {
+        self.0.layout()
+    }
+    fn sync(&self) -> Result<(), MemoryError> {
+        self.0.sync()
+    }
+}
+pub(super) struct BackingClose {
+    pub(super) resource: Arc<dyn SyncResource>,
+    pub(super) _backing: Arc<dyn PageBacking>,
+}
+impl SyncResource for BackingClose {
+    fn layout(&self) -> Option<Arc<crate::layout::Layout>> {
+        self.resource.layout()
+    }
+    fn sync(&self) -> Result<(), MemoryError> {
+        self.resource.sync()
+    }
+    fn failed(&self, error: MemoryError) {
+        self.resource.failed(error);
+    }
+    fn sync_async(
+        &self,
+        completion: Box<dyn SyncCompletion>,
+    ) -> Result<(), Box<dyn SyncCompletion>> {
+        self.resource.sync_async(completion)
+    }
+}
 
 /// Accepted original writeback resources. No guest pointers, Memory borrow or
 /// View survives capture; unmap/replacement cannot redirect a parked sync.
 #[derive(Default)]
 pub struct SyncRange {
-    objects: Vec<Arc<dyn PageBacking>>,
+    objects: Vec<Arc<dyn SyncResource>>,
 }
 impl SyncRange {
-    pub(crate) fn capture<'a>(objects: impl Iterator<Item = &'a Arc<dyn PageBacking>>) -> Self {
+    pub(crate) fn capture<'a>(
+        objects: impl Iterator<Item = &'a Arc<dyn PageBacking>>,
+    ) -> Result<Self, MemoryError> {
         let mut synced = std::collections::BTreeSet::new();
-        Self {
+        Ok(Self {
             objects: objects
                 .filter(|b| b.sync_required() && b.sync_key().is_none_or(|key| synced.insert(key)))
-                .cloned()
-                .collect(),
-        }
+                .map(|backing| {
+                    backing.sync_resource().unwrap_or_else(|| {
+                        Ok(Arc::new(BackingSync(backing.clone())) as Arc<dyn SyncResource>)
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        })
     }
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
@@ -46,7 +120,7 @@ impl SyncRange {
     pub(crate) fn source_scoped(&self) -> bool {
         self.objects.iter().all(|object| object.layout().is_some())
     }
-    pub fn into_backings(self) -> Vec<Arc<dyn PageBacking>> {
+    pub fn into_resources(self) -> Vec<Arc<dyn SyncResource>> {
         self.objects
     }
     pub fn run(self) -> Result<(), MemoryError> {
@@ -82,6 +156,9 @@ pub trait PageBacking: Send + Sync {
     /// Cold VMA growth policy (Linux VM_DONTEXPAND). Byte access is unaffected.
     fn expandable(&self) -> bool {
         true
+    }
+    fn mapping_remap(&self) -> Option<Arc<dyn MappingRemap>> {
+        None
     }
     /// Retained immutable Views of device pages may need the original VMA/OFD
     /// lifetime even without writeback. Kept in cold snapshot metadata only;
@@ -233,6 +310,12 @@ pub trait PageBacking: Send + Sync {
         Ok(false)
     }
     fn sync(&self) -> Result<(), MemoryError>;
+    /// Capture daemon identity/credentials at the accepted syscall, rather than
+    /// looking them up on a later native file worker. Ordinary providers keep
+    /// the default retained-backing resource without an actor-dependent path.
+    fn sync_resource(&self) -> Option<Result<Arc<dyn SyncResource>, MemoryError>> {
+        None
+    }
     /// Cold writeback selection only. Providers whose sync body is a no-op
     /// need no retained job or backing publication. Never queried by byte I/O.
     fn sync_required(&self) -> bool {
@@ -250,6 +333,11 @@ pub trait PageBacking: Send + Sync {
     }
     /// Original VMA removal, before retained byte snapshots are reclaimed.
     fn unmapped(&self) {}
+    /// VMA-close writeback, separate from msync/FSYNC. Capture before removing
+    /// the original page; the caller waits after releasing mapping custody.
+    fn close_resource(&self) -> Option<Arc<dyn SyncResource>> {
+        None
+    }
     /// Maximum mapping permission, sampled by mmap/mprotect, never CPU loads.
     fn executable(&self) -> bool {
         true
@@ -512,6 +600,7 @@ impl Memory {
         let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
         let external_code =
             permissions.execute && objects.iter().any(|object| object.external_code_updates());
+        let async_sources = objects.iter().any(|object| object.page_source().is_some());
         self.check_backed_mapping(address, len, fixed)?;
         let charges: Vec<_> = (0..objects.len())
             .map(|_| Charge::new(&self.account))
@@ -565,6 +654,7 @@ impl Memory {
         self.has_backings = true;
         self.cpu_borrow_safe &= cpu_safe;
         self.has_external_code |= external_code;
+        self.has_async_sources |= async_sources;
         Ok(())
     }
     pub fn prepare_sync(&self, address: u64, len: u64) -> Result<SyncRange, MemoryError> {
@@ -573,20 +663,61 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
-        Ok(SyncRange::capture(
-            self.pages.range(address..end).filter_map(|(_, &frame)| {
-                self.frames[frame]
-                    .as_ref()
-                    .expect("page")
-                    .backing
-                    .as_ref()
-                    .filter(|b| b.shared)
-                    .map(|b| &b.object)
-            }),
-        ))
+        SyncRange::capture(self.pages.range(address..end).filter_map(|(_, &frame)| {
+            self.frames[frame]
+                .as_ref()
+                .expect("page")
+                .backing
+                .as_ref()
+                .filter(|b| b.shared)
+                .map(|b| &b.object)
+        }))
     }
     pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {
         self.prepare_sync(address, len)?.run()
+    }
+    /// Take only resources detached by completed structural edits. Failed
+    /// edits and holes cannot redirect this work to a replacement mapping.
+    pub fn take_closed_resources(&mut self) -> Vec<Arc<dyn SyncResource>> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().take_closed_resources();
+        }
+        std::mem::take(&mut self.closed_resources)
+            .into_values()
+            .collect()
+    }
+    /// Attach an original mm resource to final retirement. Ordinary unmap and
+    /// fork neither execute nor inherit it; shared-mm owners use the same root.
+    pub fn retain_mm_close_resource(&mut self, key: u64, resource: Arc<dyn SyncResource>) {
+        if let Some(shared) = &self.shared {
+            shared.borrow_mut().retain_mm_close_resource(key, resource);
+            return;
+        }
+        self.mm_close_resources.entry(key).or_insert(resource);
+    }
+    /// Final-mm close retains mm and inode resources before address-space
+    /// destruction. Private COW mappings never write back to their files.
+    pub fn close_resources(&self) -> Vec<Arc<dyn SyncResource>> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().close_resources();
+        }
+        let mut seen = BTreeSet::new();
+        self.mm_close_resources
+            .values()
+            .cloned()
+            .chain(self.pages.values().filter_map(|&frame| {
+                let backing = self.frames[frame].as_ref()?.backing.as_ref()?;
+                if !backing.shared
+                    || backing
+                        .object
+                        .sync_key()
+                        .is_some_and(|key| !seen.insert(key))
+                {
+                    return None;
+                }
+                backing.object.close_resource()
+            }))
+            .collect()
     }
     pub fn resident(&self, address: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         if let Some(shared) = &self.shared {
@@ -732,7 +863,38 @@ impl Memory {
         let policy = self.vma_policy.moved(old, old_len, new, new_len);
         let moved_locks = self.locks.moved(old, old_len, new, new_len);
         let moved = self.attachments.moved(old, old_len, new, new_len);
+        let callback = (old != new)
+            .then(|| {
+                self.page_for_access_unchecked(old)
+                    .and_then(|page| page.backing.as_ref())
+                    .and_then(|backing| backing.object.mapping_remap())
+            })
+            .flatten();
+        let restore = callback.as_ref().map(|_| {
+            (
+                self.region_layout.origins.moved(old, old_len, old, new_len),
+                self.vma_policy.moved(old, old_len, old, new_len),
+                self.attachments.moved(old, old_len, old, new_len),
+                self.locks.moved(old, old_len, old, new_len),
+            )
+        });
         self.remap_inner(old, old_len, new, new_len, fixed)?;
+        if let Some(callback) = callback {
+            if let Err(error) = callback.remapped(self.original_identity, new) {
+                // Linux has already discarded a fixed destination and any
+                // truncated tail when a file mremap hook fails. Move back the
+                // surviving source pages, preserving that same failure boundary.
+                self.remap_inner(new, new_len, old, new_len, false)?;
+                let (origins, policy, attachments, locks) = restore.unwrap();
+                Arc::make_mut(&mut self.region_layout)
+                    .origins
+                    .extend(origins);
+                self.vma_policy.extend(policy);
+                self.attachments.0.extend(attachments);
+                self.locks.finish_move(old, old_len, old, new_len, locks);
+                return Err(error);
+            }
+        }
         Arc::make_mut(&mut self.region_layout)
             .origins
             .extend(origins);

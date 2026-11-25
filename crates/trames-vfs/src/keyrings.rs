@@ -241,6 +241,17 @@ impl SessionKeys {
         id: i32,
         op: KeyOperation,
     ) -> Result<KeyResult> {
+        self.access_retained(registry, c, id, op)
+            .map(|(value, _)| value)
+    }
+    /// The accepted key remains referenced until its original user copy ends.
+    pub fn access_retained(
+        &self,
+        registry: &KeyRegistry,
+        c: &Credentials,
+        id: i32,
+        op: KeyOperation,
+    ) -> Result<(KeyResult, Option<KeyLease>)> {
         let (ring, possessed) =
             self.resolve(registry, c, id, matches!(op, KeyOperation::Lookup(true)))?;
         let mut mask = ring.permissions.lock().unwrap();
@@ -258,7 +269,11 @@ impl SessionKeys {
         if !ring.allows(c, *mask, possessed, need) {
             return Err(Errno(13));
         }
-        Ok(match op {
+        let retained =
+            matches!(op, KeyOperation::Describe | KeyOperation::Read).then(|| KeyLease {
+                _ring: ring.clone(),
+            });
+        let result = match op {
             KeyOperation::Lookup(_) => KeyResult::Number(ring.id as u64),
             KeyOperation::Read => KeyResult::Bytes(
                 ring.links
@@ -283,8 +298,12 @@ impl SessionKeys {
                 *mask = value;
                 KeyResult::Number(0)
             }
-        })
+        };
+        Ok((result, retained))
     }
+}
+pub struct KeyLease {
+    _ring: Arc<Ring>,
 }
 pub enum KeyOperation {
     Lookup(bool),

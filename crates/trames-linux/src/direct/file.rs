@@ -7,7 +7,7 @@ mod copyout;
 pub(super) use copyout::FileCopyout;
 #[cfg(test)]
 #[path = "file_copyout_tests.rs"]
-pub(super) mod copyout_tests;
+pub(crate) mod copyout_tests;
 
 pub trait FileExecutor: Send + Sync {
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<FileResult>);
@@ -19,21 +19,22 @@ pub trait FileExecutor: Send + Sync {
         job.fail();
     }
 }
+#[derive(Default)]
 pub struct FileResult {
-    result: Mutex<Option<trames_vfs::FileOutcome>>,
+    result: Mutex<FileResultState>,
     readiness: Arc<trames_vfs::Readiness>,
     owner: std::sync::OnceLock<std::thread::Thread>,
     finished: std::sync::atomic::AtomicBool,
 }
-impl Default for FileResult {
-    fn default() -> Self {
-        Self {
-            result: Mutex::new(None),
-            readiness: Arc::default(),
-            owner: Default::default(),
-            finished: Default::default(),
-        }
-    }
+#[derive(Default)]
+struct FileResultState {
+    outcome: Option<trames_vfs::FileOutcome>,
+    target: Option<trames_vfs::FileTarget>,
+    cancelled: bool,
+    // Only abandoned native work needs a completion-held release. It owns no
+    // guest pointer and runs its cleanup on the existing completing thread.
+    release: Option<Box<dyn Send>>,
+    notifiers: Vec<Box<dyn FnOnce() + Send>>,
 }
 impl FileResult {
     pub fn wake_joined() -> Self {
@@ -43,9 +44,25 @@ impl FileResult {
         }
     }
     pub fn complete(&self, result: trames_vfs::FileOutcome) {
-        *self.result.lock().unwrap() = Some(result);
+        let mut state = self.result.lock().unwrap();
+        let discarded = if state.cancelled {
+            Some(result)
+        } else {
+            state.outcome.replace(result)
+        };
+        let release = state.release.take();
+        let notifiers = std::mem::take(&mut state.notifiers);
         self.finished
             .store(true, std::sync::atomic::Ordering::Release);
+        drop(state);
+        let release = Self::defer_fuse_release(&discarded, release);
+        // Replies can own original positions, FUSE requests and AIO credits.
+        // Their readiness callbacks must run outside this completion mutex.
+        drop(discarded);
+        drop(release);
+        for notify in notifiers {
+            notify();
+        }
         self.readiness.notify_locked();
         if let Some(owner) = self.owner.get() {
             owner.unpark();
@@ -66,16 +83,83 @@ impl FileResult {
     pub fn finished(&self) -> bool {
         self.finished.load(std::sync::atomic::Ordering::Acquire)
     }
+    pub(crate) fn on_finished(&self, notify: Box<dyn FnOnce() + Send>) {
+        let notify = {
+            let mut state = self.result.lock().unwrap();
+            if self.finished.load(std::sync::atomic::Ordering::Relaxed) {
+                Some(notify)
+            } else {
+                state.notifiers.push(notify);
+                None
+            }
+        };
+        if let Some(notify) = notify {
+            notify();
+        }
+    }
     pub fn wake_owner(&self) {
         let _ = self.owner.set(std::thread::current());
     }
     pub fn ready(&self) -> bool {
-        self.result.lock().unwrap().is_some()
+        let state = self.result.lock().unwrap();
+        state.cancelled || state.outcome.is_some()
     }
     pub(super) fn take(&self) -> Option<trames_vfs::FileOutcome> {
-        self.result.lock().unwrap().take()
+        let (outcome, target) = {
+            let mut state = self.result.lock().unwrap();
+            let outcome = state.outcome.take();
+            let target = outcome.as_ref().and_then(|_| state.target.take());
+            (outcome, target)
+        };
+        drop(target);
+        outcome
     }
-    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> trames_vfs::IoSubscription {
+    pub fn cancelled(&self) -> bool {
+        self.result.lock().unwrap().cancelled
+    }
+    pub(super) fn abandon(&self, release: Option<Box<dyn Send>>, native_pending: bool) {
+        let mut state = self.result.lock().unwrap();
+        state.cancelled = true;
+        let outcome = state.outcome.take();
+        let target = state.target.take();
+        let deferred = native_pending
+            && outcome.is_none()
+            && !self.finished.load(std::sync::atomic::Ordering::Relaxed);
+        let release = if deferred {
+            // A batch drains each original request once, even when its caller
+            // kept snapshots. A later generic cancel cannot take this credit.
+            debug_assert!(release.is_none() || state.release.is_none());
+            if release.is_some() {
+                state.release = release;
+            }
+            None
+        } else {
+            release
+        };
+        drop(state);
+        let release = Self::defer_fuse_release(&outcome, release);
+        drop(outcome);
+        drop(target);
+        drop(release);
+        self.readiness.notify_locked();
+        if let Some(owner) = self.owner.get() {
+            owner.unpark();
+        }
+    }
+    fn defer_fuse_release(
+        outcome: &Option<trames_vfs::FileOutcome>,
+        release: Option<Box<dyn Send>>,
+    ) -> Option<Box<dyn Send>> {
+        let lease = release?;
+        match outcome {
+            Some(trames_vfs::FileOutcome::Waiting(work)) => match work.fuse_signal_request() {
+                Some(request) => request.retain_cancellation(lease),
+                None => Some(lease),
+            },
+            _ => Some(lease),
+        }
+    }
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> trames_vfs::IoSubscription {
         self.readiness.subscribe(signal)
     }
 }
@@ -122,18 +206,44 @@ impl FileOutput {
 pub struct FilePending {
     pub result: Arc<FileResult>,
     pub output: FileOutput,
-    _target: Option<trames_vfs::FileTarget>,
     waiting: Option<Arc<Mutex<Option<trames_vfs::FileWork>>>>,
-    copyout: Option<Arc<Mutex<FileCopyout>>>,
+    copyout: Option<Arc<Mutex<Option<FileCopyout>>>>,
+    input: Option<Arc<Mutex<Option<super::file_input::Accepted>>>>,
 }
 impl FilePending {
+    pub(crate) fn uring_input_submitted(&self) -> Option<u32> {
+        let slot = self.input.as_ref()?.lock().unwrap();
+        match slot.as_ref()? {
+            super::file_input::Accepted::UringEnter(call) => Some(call.submitted()),
+            _ => None,
+        }
+    }
+    pub fn cancel_import(&self) {
+        let accepted = self
+            .input
+            .as_ref()
+            .and_then(|input| input.lock().unwrap().take());
+        let work = self
+            .waiting
+            .as_ref()
+            .and_then(|waiting| waiting.lock().unwrap().take());
+        let copy = self
+            .copyout
+            .as_ref()
+            .and_then(|copy| copy.lock().unwrap().take())
+            .map(|mut copy| copy.cancel());
+        self.result.abandon(None, false);
+        drop(accepted);
+        drop(work);
+        drop(copy);
+    }
     fn copyout(copy: FileCopyout) -> Self {
         Self {
             result: Arc::default(),
             output: FileOutput::None,
-            _target: None,
             waiting: None,
-            copyout: Some(Arc::new(Mutex::new(copy))),
+            copyout: Some(Arc::new(Mutex::new(Some(copy)))),
+            input: None,
         }
     }
     pub fn fuse_interrupt_needed(&self) -> bool {
@@ -156,6 +266,12 @@ impl FilePending {
         }
     }
     pub fn interruptible(&self) -> bool {
+        if self.input.as_ref().is_some_and(|input| {
+            input.lock().unwrap().as_ref().is_some_and(|input|
+            matches!(input,super::file_input::Accepted::Ioctl(call) if call.interruptible()))
+        }) {
+            return true;
+        }
         self.waiting.as_ref().is_some_and(|w| {
             w.lock()
                 .unwrap()
@@ -176,16 +292,32 @@ impl FilePending {
         output: FileOutput,
         target: impl Into<Option<trames_vfs::FileTarget>>,
     ) -> Self {
+        result.result.lock().unwrap().target = target.into();
         Self {
             result,
             output,
-            _target: target.into(),
             waiting: None,
             copyout: None,
+            input: None,
         }
     }
 }
 pub enum FileBoundary {
+    WaitInput(Box<super::event_input::WaitInput>),
+    EpollControl {
+        fd: u32,
+        op: u32,
+        target: u32,
+        events: u32,
+        data: u64,
+    },
+    Registration(Box<super::uring::Registration>),
+    UringEnter(Box<super::uring::EnterInput>),
+    Aio(super::aio::RetainedAio),
+    AioLookup(Box<super::aio::lookup::Lookup>),
+    AioSetup(Box<super::aio::SetupInput>),
+    TimerFd(Box<super::timer_control::TimerControl>),
+    Ioctl(Box<super::ioctl_control::IoctlControl>),
     Owner {
         work: trames_vfs::FileWork,
         output: FileOutput,
@@ -201,7 +333,13 @@ pub enum FileBoundary {
 #[derive(Clone)]
 pub struct FileCheckpoint(Arc<Mutex<Option<FileBoundary>>>);
 impl FileCheckpoint {
-    fn new(boundary: FileBoundary) -> Self {
+    pub(crate) fn uring_submitted(&self) -> Option<u32> {
+        match self.0.lock().unwrap().as_ref()? {
+            FileBoundary::UringEnter(call) => Some(call.submitted()),
+            _ => None,
+        }
+    }
+    pub(super) fn new(boundary: FileBoundary) -> Self {
         Self(Arc::new(Mutex::new(Some(boundary))))
     }
     pub fn layout_domains(&self) -> Option<Vec<u64>> {
@@ -219,15 +357,25 @@ impl FileCheckpoint {
             .lock()
             .unwrap()
             .take()
-            .expect("one accepted file checkpoint")
+            .unwrap_or(FileBoundary::Signal {
+                value: Err(Errno(4)),
+            })
+    }
+    pub fn cancel(&self) {
+        let accepted = self.0.lock().unwrap().take();
+        drop(accepted);
     }
 }
 pub(super) struct PreparedFileCall {
     pub number: u32,
     pub args: [u64; 6],
-    action: PreparedAction,
+    pub(super) action: PreparedAction,
 }
-enum PreparedAction {
+#[allow(clippy::large_enum_variant)] // Prepared calls own their cold resource state without another allocation.
+pub(super) enum PreparedAction {
+    EpollControl(Box<trames_vfs::EpollControl>),
+    Checkpoint(FileCheckpoint),
+    Input(Box<super::file_input::Accepted>, trames_memory::PageFault),
     Fifo(trames_vfs::FifoOpen),
     Copyout(Box<FileCopyout>),
     Byte(RetainedByte),
@@ -249,7 +397,39 @@ enum PreparedAction {
         output: FileOutput,
     },
 }
+type ImportedFileInput = (
+    Result<(trames_vfs::FileCommand, FileOutput), Errno>,
+    Option<(super::file_input::Input, trames_memory::PageFault)>,
+);
 impl DirectSyscalls {
+    #[allow(clippy::too_many_arguments)]
+    fn import_file_input(
+        &self,
+        paths: impl FnOnce() -> trames_vfs::PathQueries,
+        file: &trames_vfs::FileTarget,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+        regular: bool,
+        unsigned: bool,
+    ) -> ImportedFileInput {
+        if !memory.async_faults_possible() || !matches!(number, 63..=70 | 286 | 287) {
+            return (
+                import(
+                    number,
+                    args,
+                    memory,
+                    &mut self.scratch.borrow_mut(),
+                    regular,
+                    unsigned,
+                ),
+                None,
+            );
+        }
+        let input = super::file_input::Input::new(paths(), file.clone(), regular, unsigned);
+        let (result, fault) = input.read(number, args, memory, &mut self.scratch.borrow_mut());
+        (result, fault.map(|fault| (input, fault)))
+    }
     fn fifo_reply(
         &self,
         number: u32,
@@ -269,7 +449,9 @@ impl DirectSyscalls {
             || matches!(number, 45..=47 | 56 | 61..=71 | 76..=77 | 80..=84 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
-        number == 57 || Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
+        matches!(number, 21 | 57 | 59 | 199 | 425)
+            || Self::file_call(number)
+            || number == 25 && matches!(args[1], 1033 | 1034)
     }
     fn read_zero_file(
         &self,
@@ -327,6 +509,12 @@ impl DirectSyscalls {
         if !Self::file_entry(number, args) {
             return None;
         }
+        if number == 21 {
+            if let Some(result) = self.invoke_epoll_control(number, args, memory) {
+                return Some(IoAttempt::Complete(result));
+            }
+            return self.start_prepared_file(number, args, memory, pid, target);
+        }
         if number == 57 {
             if let Some(value) = self.close_membership(args) {
                 self.record_fd_control();
@@ -349,6 +537,12 @@ impl DirectSyscalls {
             }
             if self.file_prepared(number, args) {
                 return self.start_prepared_file(number, args, memory, pid, target);
+            }
+            if memory.async_faults_possible() {
+                return match self.invoke_path_input(number, args, memory) {
+                    Some(result) => Some(IoAttempt::Complete(result)),
+                    None => self.start_prepared_file(number, args, memory, pid, target),
+                };
             }
             let path = match Linux::path(memory, args[0]) {
                 Ok(path) => path,
@@ -638,7 +832,15 @@ impl DirectSyscalls {
         output: FileOutput,
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        let mut copy = self.accept_file_reply(reply, output);
+        self.finish_file_copyout(number, args, self.accept_file_reply(reply, output), memory)
+    }
+    pub(super) fn finish_file_copyout(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        mut copy: FileCopyout,
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
         match copy.progress(memory) {
             Ok(value) => Some(value),
             Err(_) => {
@@ -670,6 +872,13 @@ impl DirectSyscalls {
         }
         let accepted = self.file_prepared.borrow_mut().take().unwrap();
         Some(match accepted.action {
+            PreparedAction::EpollControl(call) => {
+                self.start_retained_epoll_control(call, args, pid, target)
+            }
+            PreparedAction::Checkpoint(call) => IoAttempt::FileCheckpoint(call),
+            PreparedAction::Input(input, fault) => {
+                self.park_input(*input, fault, number, args, pid, target)
+            }
             PreparedAction::Copyout(copy) => {
                 self.deliver_copyout(*copy, number, args, memory, pid, target)
             }
@@ -901,14 +1110,19 @@ impl DirectSyscalls {
             };
             if matches!(number, 63..=70 | 286 | 287) {
                 if let Some(file_target) = original.nonbyte_target() {
-                    let (command, output) = match import(
+                    let (imported, pending) = self.import_file_input(
+                        || vfs.path_queries(),
+                        &file_target,
                         number,
                         args,
                         memory,
-                        &mut self.scratch.borrow_mut(),
                         false,
                         false,
-                    ) {
+                    );
+                    if let Some((input, fault)) = pending {
+                        return Some(self.park_file_input(input, fault, number, args, pid, target));
+                    }
+                    let (command, output) = match imported {
                         Ok(call) => call,
                         Err(error) => return Some(IoAttempt::Complete(Err(error))),
                     };
@@ -943,14 +1157,19 @@ impl DirectSyscalls {
             if let Some(result) = self.read_zero_file(&file, number, args, memory) {
                 return Some(IoAttempt::Complete(result));
             }
-            let (command, output) = match import(
+            let (imported, pending) = self.import_file_input(
+                || vfs.path_queries(),
+                &file,
                 number,
                 args,
                 memory,
-                &mut self.scratch.borrow_mut(),
                 file.regular_file(),
                 file.unsigned_offsets(),
-            ) {
+            );
+            if let Some((input, fault)) = pending {
+                return Some(self.park_file_input(input, fault, number, args, pid, target));
+            }
+            let (command, output) = match imported {
                 Ok(call) => call,
                 Err(error) => return Some(IoAttempt::Complete(Err(error))),
             };
@@ -1005,10 +1224,115 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if pending.result.cancelled() {
+            return IoAttempt::Complete(Err(Errno(4)));
+        }
+        if let Some(input) = &pending.input {
+            let Some(input) = input.lock().unwrap().take() else {
+                return IoAttempt::Complete(Err(Errno(4)));
+            };
+            let input = match input {
+                super::file_input::Accepted::File(input) => input,
+                super::file_input::Accepted::Path(input) => {
+                    return self.resume_path_input(input, number, args, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::Byte(file) => {
+                    return self.start_retained_byte(file, number, args, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::Socket(call) => {
+                    return self.start_retained_socket(call, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::EventWait(call) => {
+                    return self.start_retained_poll(call, args, memory, signal.pid, target, None)
+                }
+                super::file_input::Accepted::WaitInput(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::EpollControl(bytes) => {
+                    return self.resume_epoll_control(bytes, args, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::EpollControlWait(call) => {
+                    return self.start_retained_epoll_control(call, args, signal.pid, target)
+                }
+                super::file_input::Accepted::Registration(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::UringEnter(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::AioLookup(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::AioSetup(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::Uts(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::TimerFd(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::Ioctl(call) => {
+                    return call.resume(self, memory, signal.pid, target)
+                }
+                super::file_input::Accepted::UringSetup(mut call) => {
+                    return match call.progress(memory) {
+                        Ok(result) => {
+                            self.urings.record_completed();
+                            IoAttempt::Complete(result)
+                        }
+                        Err(fault) => self.park_input(
+                            super::file_input::Accepted::UringSetup(call),
+                            fault,
+                            number,
+                            args,
+                            signal.pid,
+                            target,
+                        ),
+                    }
+                }
+                super::file_input::Accepted::Pair(mut pair) => {
+                    return match pair.progress(memory) {
+                        Ok(result) => IoAttempt::Complete(result),
+                        Err(fault) => self.park_input(
+                            super::file_input::Accepted::Pair(pair),
+                            fault,
+                            number,
+                            args,
+                            signal.pid,
+                            target,
+                        ),
+                    }
+                }
+            };
+            let (result, fault) = input.read(number, args, memory, &mut self.scratch.borrow_mut());
+            if let Some(fault) = fault {
+                return self.park_file_input(input, fault, number, args, signal.pid, target);
+            }
+            return match result {
+                Ok((command, output)) => {
+                    let work = trames_vfs::FileWork::new(&input.paths, input.file, command);
+                    self.submit_file_work(work, output, number, args, memory, signal.pid, target)
+                }
+                Err(error) => self.complete(number, args, Err(error)),
+            };
+        }
         if let Some(copy) = &pending.copyout {
             let (value, signal_owner) = {
-                let mut copy = copy.lock().unwrap();
-                (copy.progress(memory), copy.signal_owner)
+                let mut slot = copy.lock().unwrap();
+                let Some(copy) = slot.as_mut() else {
+                    // This receipt already completed or was cancelled. It is
+                    // not another syscall and cannot account a replacement FD.
+                    return IoAttempt::Complete(Err(Errno(4)));
+                };
+                let value = copy.progress(memory);
+                let signal_owner = copy.signal_owner;
+                if value.is_ok() {
+                    // Completion consumes the original receipt. Cloned stale
+                    // handles cannot publish the result or its effects twice.
+                    slot.take();
+                }
+                (value, signal_owner)
             };
             return match value {
                 Ok(value) => Self::copyout_value(signal_owner, value),
@@ -1064,6 +1388,341 @@ impl DirectSyscalls {
                 self.queue_layout(work, pending, number, args, signal, subscriptions, target)
             }
             None => Self::wait_file(pending, number, args, signal, subscriptions, target),
+        }
+    }
+    fn park_file_input(
+        &self,
+        input: super::file_input::Input,
+        fault: trames_memory::PageFault,
+        number: u32,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        self.park_input(
+            super::file_input::Accepted::File(input),
+            fault,
+            number,
+            args,
+            pid,
+            target,
+        )
+    }
+    pub(super) fn park_byte_page(
+        &self,
+        file: RetainedByte,
+        fault: trames_memory::PageFault,
+        number: u32,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        self.park_input(
+            super::file_input::Accepted::Byte(file),
+            fault,
+            number,
+            args,
+            pid,
+            target,
+        )
+    }
+    pub(super) fn park_socket_page(
+        &self,
+        call: RetainedSocket,
+        fault: trames_memory::PageFault,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let number = call.number;
+        let args = call.args;
+        self.park_input(
+            super::file_input::Accepted::Socket(call),
+            fault,
+            number,
+            args,
+            pid,
+            target,
+        )
+    }
+    pub(super) fn park_event_page(
+        &self,
+        call: Arc<crate::RetainedWait>,
+        fault: trames_memory::PageFault,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let (number, args) = (call.number, call.args);
+        let attempt = self.park_input(
+            super::file_input::Accepted::EventWait(call.clone()),
+            fault,
+            number,
+            args,
+            pid,
+            target,
+        );
+        let IoAttempt::Blocked(mut pending) = attempt else {
+            unreachable!("accepted event output page")
+        };
+        pending.retained_poll = Some(call);
+        IoAttempt::Blocked(pending)
+    }
+    pub(super) fn park_event_resource(
+        &self,
+        call: Arc<crate::RetainedWait>,
+        blocked: trames_vfs::EpollBlocked,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let signal = IoSignal::new(pid, target.clone());
+        let subscriptions = vec![blocked.subscribe(&signal)];
+        let (number, args) = (call.number, call.args);
+        let attempt = self.park_resource_input(
+            super::file_input::Accepted::EventWait(call.clone()),
+            number,
+            args,
+            signal,
+            subscriptions,
+            target,
+        );
+        let IoAttempt::Blocked(mut pending) = attempt else {
+            unreachable!("original epoll admission wait")
+        };
+        pending.retained_poll = Some(call);
+        IoAttempt::Blocked(pending)
+    }
+    /// A caught signal may finish a partial receive's msg_len/timeout copies.
+    /// Preserve that original completion if its final user output faults.
+    /// Caught-signal callers retain their delivery separately; this envelope
+    /// also supports the legacy ordinary poll-output suspension path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interrupted_page(
+        &self,
+        byte: Option<&RetainedByte>,
+        socket: Option<&RetainedSocket>,
+        poll: Option<&Arc<crate::RetainedWait>>,
+        number: u32,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<PendingIo> {
+        let attempt = if let Some((file, fault)) =
+            byte.and_then(|file| Some((file, file.take_input_fault()?)))
+        {
+            self.park_byte_page(file.clone(), fault, number, args, pid, target)
+        } else if let Some((call, fault)) = socket.and_then(|call| Some((call, call.take_fault()?)))
+        {
+            self.park_socket_page(call.clone(), fault, pid, target)
+        } else if let Some((call, fault)) = poll.and_then(|call| Some((call, call.take_fault()?))) {
+            self.park_event_page(call.clone(), fault, pid, target)
+        } else if let Some((call, blocked)) = poll.and_then(|call| Some((call, call.blocker()?))) {
+            self.park_event_resource(call.clone(), blocked, pid, target)
+        } else {
+            return None;
+        };
+        let IoAttempt::Blocked(wait) = attempt else {
+            unreachable!("original page continuation")
+        };
+        Some(wait)
+    }
+    /// The caller retains its selected signal and the original completion
+    /// while this accepted output waits for a page. No I/O request is retried.
+    pub fn interrupted_copy_fault(
+        byte: Option<&RetainedByte>,
+        socket: Option<&RetainedSocket>,
+        poll: Option<&Arc<crate::RetainedWait>>,
+    ) -> Option<trames_memory::PageFault> {
+        byte.and_then(RetainedByte::take_input_fault)
+            .or_else(|| socket.and_then(RetainedSocket::take_fault))
+            .or_else(|| poll.and_then(|poll| poll.take_fault()))
+    }
+    pub(super) fn prepare_retained_byte(&self, number: u32, args: [u64; 6], file: RetainedByte) {
+        self.file_prepared.replace(Some(PreparedFileCall {
+            number,
+            args,
+            action: PreparedAction::Byte(file),
+        }));
+    }
+    pub(super) fn invoke_pair_creation(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let address = if number == 59 { args[0] } else { args[3] };
+        if memory.check(address, 8, Access::Write).is_err() {
+            return Some(Err(Errno(14)));
+        }
+        let factory = self.resources.as_ref()?;
+        let pair = if number == 59 {
+            factory.prepare_pipe(args[1] as u32)
+        } else {
+            factory.prepare_local_pair(args[0] as u32, args[1] as u32, args[2] as u32)
+        };
+        let mut pair = match pair {
+            Ok(pair) => super::file_input::Pair::new(pair, address),
+            Err(error) => return Some(Err(error)),
+        };
+        match pair.progress(memory) {
+            Ok(result) => Some(result),
+            Err(fault) => {
+                self.file_prepared.replace(Some(PreparedFileCall {
+                    number,
+                    args,
+                    action: PreparedAction::Input(
+                        Box::new(super::file_input::Accepted::Pair(pair)),
+                        fault,
+                    ),
+                }));
+                None
+            }
+        }
+    }
+    pub(super) fn invoke_uring_setup(
+        &self,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let mut call = Box::new(super::uring::Setup::new(
+            self.paths.as_ref()?.retain_context(),
+            args,
+        ));
+        match call.progress(memory) {
+            Ok(result) => {
+                self.urings.record_completed();
+                Some(result)
+            }
+            Err(fault) => {
+                self.file_prepared.replace(Some(PreparedFileCall {
+                    number: 425,
+                    args,
+                    action: PreparedAction::Input(
+                        Box::new(super::file_input::Accepted::UringSetup(call)),
+                        fault,
+                    ),
+                }));
+                None
+            }
+        }
+    }
+    pub(super) fn park_input(
+        &self,
+        input: super::file_input::Accepted,
+        fault: trames_memory::PageFault,
+        number: u32,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let mut pending = FilePending::new(Arc::default(), FileOutput::None, input.file());
+        pending.input = Some(Arc::new(Mutex::new(Some(input))));
+        let signal = IoSignal::new(pid, target.clone());
+        Self::park_copyout(pending, fault, number, args, signal, target)
+    }
+    pub(super) fn prepare_input(
+        &self,
+        input: super::file_input::Accepted,
+        fault: trames_memory::PageFault,
+        number: u32,
+        args: [u64; 6],
+    ) {
+        self.file_prepared.replace(Some(PreparedFileCall {
+            number,
+            args,
+            action: PreparedAction::Input(Box::new(input), fault),
+        }));
+    }
+    pub(super) fn prepare_checkpoint(&self, call: FileCheckpoint, number: u32, args: [u64; 6]) {
+        self.file_prepared.replace(Some(PreparedFileCall {
+            number,
+            args,
+            action: PreparedAction::Checkpoint(call),
+        }));
+    }
+    pub(super) fn prepare_epoll_control_call(
+        &self,
+        call: Box<trames_vfs::EpollControl>,
+        args: [u64; 6],
+    ) {
+        self.file_prepared.replace(Some(PreparedFileCall {
+            number: 21,
+            args,
+            action: PreparedAction::EpollControl(call),
+        }));
+    }
+    pub(super) fn park_resource_input(
+        &self,
+        input: super::file_input::Accepted,
+        number: u32,
+        args: [u64; 6],
+        signal: Arc<IoSignal>,
+        subscriptions: Vec<IoSubscription>,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let mut pending = FilePending::new(Arc::default(), FileOutput::None, input.file());
+        pending.input = Some(Arc::new(Mutex::new(Some(input))));
+        Self::wait_file(pending, number, args, signal, subscriptions, target)
+    }
+    pub(super) fn invoke_path_input(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let input = super::file_input::PathInput::new(
+            self.paths.as_ref()?.retain_context(),
+            self.files.clone(),
+        );
+        match input.read(number, args, memory) {
+            super::file_input::Step::Pending(fault) => {
+                self.file_prepared.replace(Some(PreparedFileCall {
+                    number,
+                    args,
+                    action: PreparedAction::Input(
+                        Box::new(super::file_input::Accepted::Path(input)),
+                        fault,
+                    ),
+                }));
+                None
+            }
+            super::file_input::Step::Reply(reply, output) => {
+                self.finish_file_reply(number, args, reply, output, memory)
+            }
+            super::file_input::Step::Work(work, output) => {
+                self.prepare_filesystem_work(number, args, work, output, memory)
+            }
+            super::file_input::Step::Fifo(open) => {
+                self.prepare_fifo_open(number, args, open);
+                None
+            }
+        }
+    }
+    fn resume_path_input(
+        &self,
+        input: super::file_input::PathInput,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        match input.read(number, args, memory) {
+            super::file_input::Step::Pending(fault) => self.park_input(
+                super::file_input::Accepted::Path(input),
+                fault,
+                number,
+                args,
+                pid,
+                target,
+            ),
+            super::file_input::Step::Reply(reply, output) => {
+                self.complete_file_attempt(reply, output, number, args, memory, pid, target)
+            }
+            super::file_input::Step::Work(work, output) => {
+                self.submit_file_work(work, output, number, args, memory, pid, target)
+            }
+            super::file_input::Step::Fifo(open) => {
+                self.start_fifo_open(open, number, args, pid, target)
+            }
         }
     }
     #[allow(clippy::too_many_arguments)] // Accepted file and original result/wake context.
@@ -1464,14 +2123,27 @@ impl DirectSyscalls {
                 (None, Some(target))
             }
             trames_vfs::FileAccess::Descriptor(target) => {
-                let (command, output) = match import(
+                let (imported, pending) = self.import_file_input(
+                    || self.paths.as_ref().unwrap().retain_context(),
+                    &target,
                     number,
                     a,
                     memory,
-                    &mut self.scratch.borrow_mut(),
                     false,
                     false,
-                ) {
+                );
+                if let Some((input, fault)) = pending {
+                    self.file_prepared.replace(Some(PreparedFileCall {
+                        number,
+                        args: a,
+                        action: PreparedAction::Input(
+                            Box::new(super::file_input::Accepted::File(input)),
+                            fault,
+                        ),
+                    }));
+                    return None;
+                }
+                let (command, output) = match imported {
                     Ok(prepared) => prepared,
                     Err(error) => return Some(Err(error)),
                 };
@@ -1480,14 +2152,43 @@ impl DirectSyscalls {
                 return self.finish_file_reply(number, a, reply, output, memory);
             }
         };
-        let (mut command, output) = match import(
-            number,
-            a,
-            memory,
-            &mut self.scratch.borrow_mut(),
-            fast.is_some() || target.as_ref().is_some_and(|file| file.regular_file()),
-            target.as_ref().is_some_and(|file| file.unsigned_offsets()),
-        ) {
+        let regular = fast.is_some() || target.as_ref().is_some_and(|file| file.regular_file());
+        let unsigned = target.as_ref().is_some_and(|file| file.unsigned_offsets());
+        let (imported, pending) = if let Some(target) = &target {
+            self.import_file_input(
+                || self.paths.as_ref().unwrap().retain_context(),
+                target,
+                number,
+                a,
+                memory,
+                regular,
+                unsigned,
+            )
+        } else {
+            (
+                import(
+                    number,
+                    a,
+                    memory,
+                    &mut self.scratch.borrow_mut(),
+                    regular,
+                    unsigned,
+                ),
+                None,
+            )
+        };
+        if let Some((input, fault)) = pending {
+            self.file_prepared.replace(Some(PreparedFileCall {
+                number,
+                args: a,
+                action: PreparedAction::Input(
+                    Box::new(super::file_input::Accepted::File(input)),
+                    fault,
+                ),
+            }));
+            return None;
+        }
+        let (mut command, output) = match imported {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.completed.set(self.completed.get() + 1);
@@ -1571,7 +2272,7 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
         };
         let target = output.filesystem_target();
         let transfer = trames_vfs::StreamTransfer::tee(input, output, a[2], a[3] as u32)
-            .map(|op| trames_vfs::FileCommand::Transfer(RefCell::new(op)));
+            .map(|op| trames_vfs::FileCommand::Transfer(Arc::new(std::sync::Mutex::new(op))));
         return Some(Ok((
             target,
             transfer,
@@ -1638,8 +2339,8 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
         && trames_vfs::StreamTransfer::admitted(&input, &output)
     {
         let target = output.filesystem_target();
-        let command =
-            trames_vfs::FileCommand::Transfer(RefCell::new(trames_vfs::StreamTransfer::new(
+        let command = trames_vfs::FileCommand::Transfer(Arc::new(std::sync::Mutex::new(
+            trames_vfs::StreamTransfer::new(
                 input,
                 output,
                 offset(from),
@@ -1647,7 +2348,8 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
                 count,
                 splice,
                 flags,
-            )));
+            ),
+        )));
         return Some(Ok((
             target,
             Ok(command),
@@ -1687,12 +2389,12 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
     } else {
         Ok(trames_vfs::FileCommand::Copy {
             input,
-            transfer: RefCell::new(trames_vfs::FileCopy::new(
+            transfer: Arc::new(std::sync::Mutex::new(trames_vfs::FileCopy::new(
                 offset(from),
                 offset(to),
                 count,
                 range,
-            )),
+            ))),
         })
     };
     Some(Ok((output, command, FileOutput::CopyOffsets { from, to })))

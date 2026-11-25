@@ -80,15 +80,13 @@ impl Metadata {
             return Err(Errno(40));
         }
         if (fd_can_write(flags) || flags & O_TRUNC != 0)
+            && matches!(kind, 0o100000 | 0o040000)
             && mount_flags.get() & mounts::MS_RDONLY != 0
         {
             return Err(Errno(30));
         }
         if kind == 0o040000 && flags & (3 | O_TRUNC) != 0 {
             return Err(Errno(21));
-        }
-        if !matches!(kind, 0o100000 | 0o040000) {
-            return Err(Errno(95));
         }
         if fs.local_permissions() && !permission_checked {
             let mask =
@@ -99,6 +97,36 @@ impl Metadata {
                 mask,
                 permissions::After::Open(flags),
             );
+        }
+        if !matches!(kind, 0o100000 | 0o040000) {
+            let mut plan = self.open.take().expect("original special-file open");
+            let inode = reference.leaf.clone().ok_or(Errno(5))?;
+            let path = ResolvedPath {
+                key: plan.path.clone(),
+                mount: Some(Mount::resource_projection(plan.mount.clone())),
+                directory_inode: Some(inode),
+                proc_binding: None,
+                fuse_entry: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
+                retained_directory: None,
+            };
+            let open = |v: &mut Vfs| {
+                v.open_resolved::<false>(
+                    (path, None),
+                    flags,
+                    plan.mode & 0o7777,
+                    plan.publication.as_ref(),
+                    plan.slot.take().unwrap(),
+                )
+            };
+            let result = if v.query.as_ref().unwrap().original {
+                open(v)
+            } else {
+                v.with_original_resources(None, open).0
+            };
+            return result.map(|fd| Some(FileValue::Count(u64::from(fd))));
         }
         let mut body = [0; 8];
         // ATOMIC_O_TRUNC is not negotiated: Linux completes OPEN first, then
@@ -148,6 +176,7 @@ impl Metadata {
             dev: file.mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
             kind: ResultKind::ReopenFile(file),
         })
     }
@@ -160,7 +189,7 @@ impl Vfs {
         flags: u32,
         mode: u32,
         publication: Option<&DirectFiles>,
-        reservation: fd_table::ReservedFd,
+        reservation: &mut Option<fd_table::ReservedFd>,
     ) -> Result<u32> {
         let query = self.query.as_ref().ok_or(Errno(95))?;
         let root = ResolvedPath {
@@ -168,6 +197,7 @@ impl Vfs {
             mount: Some(Mount::resource_projection(file.mount.clone())),
             proc_binding: None,
             directory_inode: None,
+            fuse_entry: None,
             indexed_position: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_position: None,
@@ -196,7 +226,7 @@ impl Vfs {
             self.credentials.open_identity(),
         );
         pending.reserve_open(
-            reservation,
+            reservation.take().expect("original unpublished open slot"),
             mode,
             self.umask_capability(),
             publication.cloned(),

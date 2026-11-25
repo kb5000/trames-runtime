@@ -13,6 +13,14 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
         return Err(Errno(9));
     }
     vfs.check_device_ioctl(a[0] as u32, a[1] as u32)?;
+    call_accepted(vfs, a, memory)
+}
+/// Entry permissions have already been checked against the accepted original OFD.
+pub(crate) fn call_accepted(
+    vfs: &mut Vfs,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Result<u64, Errno> {
     if let Some(event) = vfs.perf_event(a[0] as u32)? {
         if a[1] as u32 == 0x2405 {
             let target = if a[2] == u64::MAX {
@@ -108,11 +116,8 @@ fn tun_ioctl(
                 .map_err(|_| Errno(14))?;
         }
         0x400454ca => {
-            // Linux ifreq is 40 bytes on AArch64; preflight its output before publishing a link.
+            // Native TUNSETIFF attaches before its faultable ifreq copyout.
             let mut ifreq = memory.read_array::<40>(argument).map_err(|_| Errno(14))?;
-            memory
-                .check(argument, 40, trames_memory::Access::Write)
-                .map_err(|_| Errno(14))?;
             let name = &ifreq[..ifreq[..16].iter().position(|b| *b == 0).ok_or(Errno(22))?];
             let flags = u16::from_le_bytes([ifreq[16], ifreq[17]]);
             let name = file
@@ -125,7 +130,7 @@ fn tun_ioctl(
                 .map_err(net)?;
             ifreq[..16].fill(0);
             ifreq[..name.len()].copy_from_slice(&name);
-            memory.write(argument, &ifreq).map_err(|_| Errno(14))?;
+            crate::time_read::copy_bytes(memory, argument, &ifreq)?;
         }
         0x400454cb => file.set_persist(argument != 0).map_err(net)?,
         0x800454d2 => {
@@ -133,7 +138,7 @@ fn tun_ioctl(
             let mut ifreq = [0; 40];
             ifreq[..name.len()].copy_from_slice(&name);
             ifreq[16..18].copy_from_slice(&flags.to_le_bytes());
-            memory.write(argument, &ifreq).map_err(|_| Errno(14))?;
+            crate::time_read::copy_bytes(memory, argument, &ifreq)?;
         }
         0x400454d0 if argument == 0 => (), // No checksum/GSO offloads advertised.
         _ => return Err(Errno(95)),
@@ -146,7 +151,7 @@ mod tun_tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     #[test]
-    fn tun_creation_preflights_output_and_reports_real_interface_flags() {
+    fn tun_creation_faults_before_input_effects_and_reports_real_interface_flags() {
         let mut linux = Linux::new(0x10000);
         linux
             .vfs

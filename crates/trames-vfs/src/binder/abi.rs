@@ -31,6 +31,7 @@ pub const DEAD_DONE: u32 = io(1, b'c', 16, 8);
 pub const TRANSACTION_SG: u32 = io(1, b'c', 17, 72);
 pub const REPLY_SG: u32 = io(1, b'c', 18, 72);
 pub const BR_TRANSACTION: u32 = io(2, b'r', 2, 64);
+pub const BR_OK: u32 = io(0, b'r', 1, 0);
 pub const BR_REPLY: u32 = io(2, b'r', 3, 64);
 pub const BR_DEAD_REPLY: u32 = io(0, b'r', 5, 0);
 pub const BR_COMPLETE: u32 = io(0, b'r', 6, 0);

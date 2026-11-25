@@ -38,36 +38,42 @@ fn uts_call_with_release(
 ) -> Result<u64, Errno> {
     if number == 160 {
         Linux::check(memory, a[0], 390, Access::Write)?;
-        let [hostname, domainname] = uts.names();
-        let mut fields = [0; 390];
-        for (i, text) in [
-            b"Linux".as_slice(),
-            hostname.as_slice(),
-            if uname26 {
-                b"2.6.60-trames"
-            } else {
-                b"6.0.0-trames"
-            },
-            b"#1 Trames compatibility runtime",
-            b"aarch64",
-            domainname.as_slice(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            fields[i * 65..i * 65 + text.len()].copy_from_slice(text);
-        }
+        let fields = fields(uts, uname26);
         memory.write(a[0], &fields).map_err(|_| Errno(14))?;
     } else {
         debug_assert!(matches!(number, 161 | 162));
-        if a[1] > 64 {
+        uts.writable()?;
+        let length = a[1] as u32 as i32;
+        if !(0..=64).contains(&length) {
             return Err(Errno(22));
         }
-        let mut name = vec![0; a[1] as usize];
+        let mut name = vec![0; length as usize];
         memory.read(a[0], &mut name).map_err(|_| Errno(14))?;
         uts.set(number == 162, &name)?;
     }
     Ok(0)
+}
+pub(crate) fn fields(uts: &UtsAccess, uname26: bool) -> [u8; 390] {
+    let [hostname, domainname] = uts.names();
+    let mut fields = [0; 390];
+    for (i, text) in [
+        b"Linux".as_slice(),
+        hostname.as_slice(),
+        if uname26 {
+            b"2.6.60-trames"
+        } else {
+            b"6.0.0-trames"
+        },
+        b"#1 Trames compatibility runtime",
+        b"aarch64",
+        domainname.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fields[i * 65..i * 65 + text.len()].copy_from_slice(text);
+    }
+    fields
 }
 
 #[cfg(test)]

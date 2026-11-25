@@ -24,6 +24,15 @@ pub fn sysinfo<M: CpuMemory>(
         return Some(Err(e));
     }
     let info = observe(memory)?;
+    let out = encode(info);
+    Some(
+        memory
+            .write(address, &out)
+            .map(|()| 0)
+            .map_err(|_| Errno(14)),
+    )
+}
+pub(crate) fn encode(info: SystemInfo) -> [u8; 112] {
     let mut out = [0; 112];
     for (offset, value) in [
         (
@@ -42,12 +51,7 @@ pub fn sysinfo<M: CpuMemory>(
     }
     out[80..82].copy_from_slice(&(info.tasks as u16).to_le_bytes());
     out[104..108].copy_from_slice(&1u32.to_le_bytes());
-    Some(
-        memory
-            .write(address, &out)
-            .map(|()| 0)
-            .map_err(|_| Errno(14)),
-    )
+    out
 }
 
 #[cfg(test)]

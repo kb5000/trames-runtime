@@ -12,10 +12,23 @@ use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
 mod aio;
 mod binder;
+#[cfg(test)]
+mod binder_copy_tests;
+mod byte_read;
+mod event_input;
 pub(crate) mod file;
+pub(crate) mod file_input;
+pub(crate) mod ioctl_control;
+mod metadata;
+mod timer_control;
 pub use aio::{Aio, RetainedAio};
+pub use binder::RetainedBinder;
+pub use event_input::WaitInput;
+pub use uring::Registration;
 #[cfg(test)]
 mod console_tests;
+#[cfg(test)]
+mod event_copy_tests;
 #[cfg(test)]
 mod event_tests;
 mod ip_message;
@@ -37,7 +50,7 @@ pub use file::{FileBoundary, FileCheckpoint, FileExecutor, FileOutput, FilePendi
 use stream_write::StreamWrite;
 pub(crate) mod uring;
 pub use socket_wait::RetainedSocket;
-pub use uring::{UringActor, UringBackground, UringEnter, UringEpoch, UringSnapshot};
+pub use uring::{EnterControl, UringActor, UringBackground, UringEnter, UringEpoch, UringSnapshot};
 
 fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
     let (fd, lease) = tcp.readiness_fd()?;
@@ -48,7 +61,7 @@ fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostF
 /// FD table entries or count as additional pipe endpoints.
 pub struct PendingIo {
     process_vm: Option<Box<process_vm::Copy>>,
-    binder: Option<Box<trames_vfs::binder::Ioctl>>,
+    pub binder: Option<RetainedBinder>,
     pub aio: Option<RetainedAio>,
     pub message: Option<RetainedMessage>,
     pub number: u32,
@@ -84,6 +97,9 @@ pub struct RetainedByte {
 }
 #[derive(Clone)]
 enum ByteOperation {
+    Preparing(Arc<local_message::Preparing>),
+    Read(Arc<std::sync::Mutex<byte_read::Read>>),
+    Input(Arc<std::sync::Mutex<file_input::ByteInput>>),
     Plain,
     Stream(Arc<StreamWrite>),
     Pipe(Arc<std::sync::Mutex<PipeWrite>>),
@@ -96,6 +112,74 @@ struct PipeWrite {
     written: usize,
 }
 impl RetainedByte {
+    fn cancel_read_copy(&self) {
+        match &self.operation {
+            ByteOperation::Read(read) => {
+                let copy = read.lock().unwrap().cancel();
+                // Commit the already copied prefix and release the original
+                // pipe/position outside the accepted read-state mutex.
+                drop(copy);
+            }
+            ByteOperation::Input(input) => {
+                let original = input.lock().unwrap().original.clone();
+                original.cancel_read_copy();
+            }
+            ByteOperation::Preparing(preparing) => {
+                if let Some(original) = preparing.ready.get() {
+                    original.cancel_read_copy();
+                }
+            }
+            _ => {}
+        }
+    }
+    fn socket_deadline(&self, number: u32) -> Option<Instant> {
+        let receive = matches!(number, 63 | 65 | 207 | 212 | 243 | 286);
+        self.fd
+            .local_operation()
+            .and_then(|socket| socket.io_timeout(receive))
+            .or_else(|| {
+                self.tcp()
+                    .and_then(|tcp| tcp.timeouts[usize::from(receive)])
+            })
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+    }
+    fn accepted_deadline(&self) -> Option<Option<Instant>> {
+        match &self.operation {
+            ByteOperation::Preparing(preparing) => Some(preparing.deadline),
+            ByteOperation::Read(read) => Some(read.lock().unwrap().deadline),
+            ByteOperation::Input(input) => Some(input.lock().unwrap().deadline),
+            _ => None,
+        }
+    }
+    fn tcp(&self) -> Option<Arc<trames_vfs::DirectTcpFd>> {
+        match &self.operation {
+            ByteOperation::Tcp(tcp) => Some(tcp.clone()),
+            ByteOperation::Read(read) => read.lock().unwrap().original.tcp(),
+            ByteOperation::Input(input) => input.lock().unwrap().original.tcp(),
+            _ => None,
+        }
+    }
+    fn take_input_fault(&self) -> Option<trames_memory::PageFault> {
+        if let ByteOperation::Preparing(preparing) = &self.operation {
+            return preparing
+                .fault
+                .lock()
+                .unwrap()
+                .take()
+                .or_else(|| preparing.ready.get()?.take_input_fault());
+        }
+        if let Some(message) = self.message() {
+            return message.take_fault();
+        }
+        if let ByteOperation::Read(read) = &self.operation {
+            return read.lock().unwrap().fault.take();
+        }
+        if let ByteOperation::Input(input) = &self.operation {
+            input.lock().unwrap().fault.take()
+        } else {
+            None
+        }
+    }
     pub fn interrupted(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
         if let Some(message) = self.message() {
             return message.interrupted(memory);
@@ -103,6 +187,12 @@ impl RetainedByte {
         self.partial_write().map(Ok)
     }
     pub fn partial_write(&self) -> Option<u64> {
+        if let ByteOperation::Preparing(preparing) = &self.operation {
+            return preparing.ready.get()?.partial_write();
+        }
+        if let ByteOperation::Input(input) = &self.operation {
+            return input.lock().unwrap().original.partial_write();
+        }
         if let ByteOperation::Stream(write) = &self.operation {
             let n = write.written();
             return (n != 0).then_some(n as u64);
@@ -115,6 +205,9 @@ impl RetainedByte {
         }
     }
     fn message(&self) -> Option<&Arc<local_message::AcceptedMessage>> {
+        if let ByteOperation::Preparing(preparing) = &self.operation {
+            return preparing.ready.get()?.message();
+        }
         if let ByteOperation::Message(m) = &self.operation {
             Some(m)
         } else {
@@ -145,6 +238,24 @@ impl RetainedByte {
     }
 }
 impl PendingIo {
+    /// Invalidate accepted copy/control receipts before replacing task state.
+    pub fn cancel_copies(&self) {
+        if let Some(file) = &self.retained_byte {
+            file.cancel_read_copy();
+        }
+        if let Some(call) = &self.binder {
+            call.cancel();
+        }
+        if let Some(call) = &self.aio {
+            call.cancel();
+        }
+        if let Some(call) = self.uring_enter() {
+            call.cancel();
+        }
+        if let Some(file) = &self.file {
+            file.cancel_import();
+        }
+    }
     pub fn is_binder(&self) -> bool {
         self.binder.is_some()
     }
@@ -153,16 +264,13 @@ impl PendingIo {
     pub fn tcp_liveness(&self) -> Option<trames_net::TcpLease> {
         self.native_tcp
             .as_ref()
-            .or_else(|| {
-                self.retained_byte.as_ref().and_then(|file| {
-                    if let ByteOperation::Tcp(tcp) = &file.operation {
-                        Some(&**tcp)
-                    } else {
-                        None
-                    }
-                })
-            })
             .map(|fd| fd.tcp.retain().expect("accepted TCP transport"))
+            .or_else(|| {
+                self.retained_byte
+                    .as_ref()?
+                    .tcp()
+                    .map(|fd| fd.tcp.retain().expect("accepted TCP transport"))
+            })
     }
     pub fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
         let mut fds = self
@@ -196,7 +304,10 @@ impl PendingIo {
     pub fn notification_external(&self) -> bool {
         // Native file jobs notify the existing source target directly. Joined
         // execution must park on that notification, rather than sleep/poll.
-        self.file.as_ref().is_some_and(|p| !p.interruptible())
+        self.binder
+            .as_ref()
+            .is_some_and(|binder| binder.copy_fault().is_some())
+            || !self.terminal_job && self.file.as_ref().is_some_and(|p| !p.interruptible())
             || self
                 ._subscriptions
                 .iter()
@@ -208,14 +319,25 @@ impl PendingIo {
     /// A FIFO rendezvous remains interruptible before descriptor publication,
     /// independently of submitted native file work and its copyout lifetime.
     pub fn interruptible_file_wait(&self) -> Option<bool> {
-        if self.fifo_open.is_some() {
+        if let Some(binder) = &self.binder {
+            Some(binder.interruptible())
+        } else if let Some(aio) = &self.aio {
+            Some(aio.interruptible())
+        } else if self.fifo_open.is_some() || self.terminal_job {
             Some(true)
         } else {
             self.file.as_ref().map(FilePending::interruptible)
         }
     }
     pub fn external_wait(&self) -> bool {
-        if self.file.as_ref().is_some_and(|p| !p.interruptible())
+        if self
+            .binder
+            .as_ref()
+            .is_some_and(|binder| binder.copy_fault().is_some())
+        {
+            return true;
+        }
+        if !self.terminal_job && self.file.as_ref().is_some_and(|p| !p.interruptible())
             || DirectSyscalls::aio_call(self.number)
         {
             return true;
@@ -261,7 +383,15 @@ pub fn epoll_parameters(
     number: u32,
     a: [u64; 6],
 ) -> Result<Option<Duration>, Errno> {
+    let timeout = epoll_timeout(memory, number, a)?;
     epoll_buffer(memory, a)?;
+    Ok(timeout)
+}
+pub(crate) fn epoll_timeout(
+    memory: &impl CpuMemory,
+    number: u32,
+    a: [u64; 6],
+) -> Result<Option<Duration>, Errno> {
     if number == 441 {
         if a[3] == 0 {
             return Ok(None);
@@ -278,11 +408,20 @@ pub fn epoll_parameters(
         Ok((ms >= 0).then(|| Duration::from_millis(ms as u64)))
     }
 }
-pub(crate) fn epoll_buffer(memory: &impl CpuMemory, a: [u64; 6]) -> Result<(), Errno> {
-    if a[2] == 0 || a[2] > (crate::MAX_WRITE / 16) as u64 {
+pub(crate) fn epoll_count(a: [u64; 6]) -> Result<usize, Errno> {
+    let count = a[2] as u32 as i32;
+    if count <= 0 || count > i32::MAX / 16 {
         return Err(Errno(22));
     }
-    Linux::check(memory, a[1], a[2] as usize * 16, Access::Write)
+    Ok(count as usize)
+}
+pub(crate) fn epoll_buffer(_memory: &impl CpuMemory, a: [u64; 6]) -> Result<(), Errno> {
+    let count = epoll_count(a)? as u64 * 16;
+    let address = a[1] & 0x00ff_ffff_ffff_ffff;
+    if address >= trames_memory::ADDRESS_LIMIT || count > trames_memory::ADDRESS_LIMIT - address {
+        return Err(Errno(14));
+    }
+    Ok(())
 }
 pub fn epoll_scatter(
     memory: &mut impl CpuMemory,
@@ -290,11 +429,11 @@ pub fn epoll_scatter(
     events: &[(u32, u64)],
 ) -> Result<u64, Errno> {
     for (i, (events, data)) in events.iter().enumerate() {
-        let mut bytes = [0; 16];
-        bytes[..4].copy_from_slice(&events.to_le_bytes());
-        bytes[8..].copy_from_slice(&data.to_le_bytes());
         memory
-            .write_array(address + i as u64 * 16, bytes)
+            .write_array(address + i as u64 * 16, events.to_le_bytes())
+            .map_err(|_| Errno(14))?;
+        memory
+            .write_array(address + i as u64 * 16 + 8, data.to_le_bytes())
             .map_err(|_| Errno(14))?;
     }
     Ok(events.len() as u64)
@@ -399,7 +538,21 @@ impl DirectSyscalls {
         if number != 179 {
             return None;
         }
-        crate::sysinfo(memory, args[0], |_| self.statistics.as_ref()?.observe())
+        if !memory.async_faults_possible() {
+            return crate::sysinfo(memory, args[0], |_| self.statistics.as_ref()?.observe());
+        }
+        if self.file_prepared(number, args) {
+            return None;
+        }
+        let info = self.statistics.as_ref()?.observe()?;
+        self.finish_metadata_output(
+            number,
+            args,
+            args[0],
+            crate::system_info::encode(info).to_vec(),
+            false,
+            memory,
+        )
     }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
         self.urings.refresh_context();
@@ -491,7 +644,18 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if self.file_prepared(number, a) {
+            return None;
+        }
+        if memory.async_faults_possible() && matches!(number, 59 | 199) {
+            let result = self.invoke_pair_creation(number, a, memory);
+            self.record_fd_control();
+            return result;
+        }
         if number == 425 {
+            if memory.async_faults_possible() {
+                return self.invoke_uring_setup(a, memory);
+            }
             let paths = self.paths.as_ref()?;
             let result = (|| {
                 let (entries, cq_entries, output) = crate::uring::setup_parameters(a, memory)?;
@@ -510,25 +674,30 @@ impl DirectSyscalls {
     }
     pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
         number == 29
-            && self.paths.is_some()
+            && (self.paths.is_some() || self.supports_binder(number, args))
             && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
     }
     pub fn supports_binder(&self, number: u32, args: [u64; 6]) -> bool {
-        number == 29
-            && args[1] as u32 == trames_vfs::binder::abi::WRITE_READ
-            && self
-                .resources
-                .as_ref()
-                .is_some_and(|f| f.binder_file(args[0] as u32).is_some())
+        if number != 29 {
+            return false;
+        }
+        if let Some(factory) = &self.resources {
+            return factory.binder_file(args[0] as u32).is_some();
+        }
+        self.paths.as_ref().is_some_and(|paths| {
+            paths
+                .control_factory()
+                .binder_file(args[0] as u32)
+                .is_some()
+        })
     }
     fn invoke_other_ioctl(
         &self,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        // WRITE_READ can consume write commands before parking. The legacy
-        // single-assignment probe must leave it untouched for start_binder;
-        // returning EAGAIN here would lose the retained read operation.
+        // Binder controls and transactions own their input and output cursors.
+        // Leave their admission to start_binder, including control copy faults.
         if args[1] as u32 == trames_vfs::fuse::CLONE {
             return Some(
                 self.paths
@@ -575,15 +744,141 @@ impl DirectSyscalls {
         if !self.supports_epoll_control(number) {
             return None;
         }
-        let (events, data) = match Linux::epoll_control_parameters(a, memory) {
+        if self.file_prepared(number, a) {
+            return None;
+        }
+        if memory.async_faults_possible() {
+            let bytes = file_input::Bytes::default();
+            let (result, fault) = self.import_epoll_control(&bytes, a, memory);
+            if let Some(fault) = fault {
+                self.prepare_input(file_input::Accepted::EpollControl(bytes), fault, number, a);
+                return None;
+            }
+            return self.finish_or_prepare_epoll_control(a, result);
+        }
+        self.finish_or_prepare_epoll_control(a, Linux::epoll_control_parameters(a, memory))
+    }
+    fn epoll_control_checkpoint(args: [u64; 6], parameters: (u32, u64)) -> FileCheckpoint {
+        FileCheckpoint::new(FileBoundary::EpollControl {
+            fd: args[0] as u32,
+            op: args[1] as u32,
+            target: args[2] as u32,
+            events: parameters.0,
+            data: parameters.1,
+        })
+    }
+    fn finish_or_prepare_epoll_control(
+        &self,
+        args: [u64; 6],
+        parameters: Result<(u32, u64), Errno>,
+    ) -> Option<Result<u64, Errno>> {
+        let result = self.finish_epoll_control(args, parameters);
+        if result.is_none() && !self.file_prepared(21, args) {
+            self.prepare_checkpoint(
+                Self::epoll_control_checkpoint(args, parameters.expect("only missing provider")),
+                21,
+                args,
+            );
+        }
+        result
+    }
+    fn import_epoll_control(
+        &self,
+        bytes: &file_input::Bytes,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> (Result<(u32, u64), Errno>, Option<trames_memory::PageFault>) {
+        let reader = file_input::Reader::new(memory, bytes);
+        let result = Linux::epoll_control_parameters(a, &reader);
+        (result, reader.fault())
+    }
+    fn finish_epoll_control(
+        &self,
+        a: [u64; 6],
+        parameters: Result<(u32, u64), Errno>,
+    ) -> Option<Result<u64, Errno>> {
+        let (events, data) = match parameters {
             Ok(value) => value,
             Err(error) => return Some(Err(error)),
         };
-        let result =
-            self.descriptors
-                .epoll_control(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
-        self.record_fd_control();
-        Some(result.map(|()| 0))
+        let call = match self.descriptors.prepare_epoll_control(
+            a[0] as u32,
+            a[1] as u32,
+            a[2] as u32,
+            events,
+            data,
+        )? {
+            Ok(call) => call,
+            Err(error) => {
+                self.record_fd_control();
+                return Some(Err(error));
+            }
+        };
+        match call.attempt() {
+            Ok(false) => {
+                self.prepare_epoll_control_call(Box::new(call), a);
+                None
+            }
+            result => {
+                self.record_fd_control();
+                Some(result.map(|_| 0))
+            }
+        }
+    }
+    pub fn start_retained_epoll_control(
+        &self,
+        call: Box<trames_vfs::EpollControl>,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let signal = IoSignal::new(pid, target.clone());
+        let subscriptions = vec![call.subscribe(&signal)];
+        match call.attempt() {
+            Ok(false) => self.park_resource_input(
+                file_input::Accepted::EpollControlWait(call),
+                21,
+                args,
+                signal,
+                subscriptions,
+                target,
+            ),
+            result => {
+                self.record_fd_control();
+                IoAttempt::Complete(result.map(|_| 0))
+            }
+        }
+    }
+    fn resume_epoll_control(
+        &self,
+        bytes: file_input::Bytes,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let (result, fault) = self.import_epoll_control(&bytes, args, memory);
+        if let Some(fault) = fault {
+            return self.park_input(
+                file_input::Accepted::EpollControl(bytes),
+                fault,
+                21,
+                args,
+                pid,
+                target,
+            );
+        }
+        match self.finish_epoll_control(args, result) {
+            Some(result) => IoAttempt::Complete(result),
+            None => self
+                .start_prepared_file(21, args, memory, pid, target)
+                .unwrap_or_else(|| {
+                    IoAttempt::FileCheckpoint(Self::epoll_control_checkpoint(
+                        args,
+                        result.expect("only missing provider"),
+                    ))
+                }),
+        }
     }
     pub fn user_identity(&self, number: u32) -> Option<u64> {
         let c = self.resources.as_ref()?.local_credentials();
@@ -612,6 +907,12 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if memory.async_faults_possible()
+            && self.resources.is_some()
+            && matches!(number, 200 | 202..=205 | 208 | 209 | 242)
+        {
+            return None;
+        }
         if self.resources.is_none() {
             // Retain compatibility for explicitly native-only captures. Product
             // workers carry DescriptorFactory and use the full socket ABI below.
@@ -679,6 +980,14 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if memory.async_faults_possible()
+            && matches!(number, 27 | 45 | 48 | 56 | 78..=80 | 291 | 437 | 439)
+        {
+            if self.file_prepared(number, a) {
+                return None;
+            }
+            return self.invoke_path_input(number, a, memory);
+        }
         if namespace::supported(number) {
             return self.invoke_namespace(number, a, memory);
         }
@@ -873,6 +1182,11 @@ impl DirectSyscalls {
         self.file_layouts = Some(layouts);
         self
     }
+    pub fn sync_executor(&self) -> Option<Arc<dyn trames_memory::SyncExecutor>> {
+        self.file_layouts
+            .as_ref()
+            .map(crate::FileLayouts::sync_executor)
+    }
     pub fn with_urings(mut self, mut snapshot: UringSnapshot) -> Self {
         // Builder services and task readers belong to future acceptance, not
         // the compatibility capture's service-less initial execution context.
@@ -936,6 +1250,9 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if number == 21 {
+            return self.invoke_epoll_control(number, a, memory);
+        }
         // Legacy dispatch defers blocking flock before effects. In particular,
         // a failed conversion may already have released the old lock: it must
         // not be attempted speculatively and then replayed on fallback.
@@ -1010,40 +1327,25 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if let Some(paths) = self
-            .paths
-            .as_ref()
-            .filter(|_| matches!(number, 28 | 86 | 87))
-        {
+        if matches!(number, 86 | 87) {
+            return self.invoke_timer_control(number, args, memory);
+        }
+        if let Some(paths) = self.paths.as_ref().filter(|_| number == 28) {
             let result = paths.fd_control(args[0] as u32, |vfs, alias| {
-                if number == 28 {
-                    return vfs.inotify_remove(alias, args[1] as i32).map(|()| 0);
-                }
-                let timer = vfs.timerfd_resource(alias)?;
-                if number == 86 {
-                    trames_vfs::TimerFd::check_alarm(timer.clock, &vfs.credentials)?;
-                }
-                crate::timer::timerfd_control_with_boot(
-                    &timer,
-                    number,
-                    args,
-                    memory,
-                    self.started.unwrap_or_else(Instant::now),
-                    self.boot_clock,
-                )
+                vfs.inotify_remove(alias, args[1] as i32).map(|()| 0)
             })?;
             self.completed.set(self.completed.get() + 1);
-            if number == 28 {
-                self.record_fd_control();
-            } else {
-                self.timer_completed.set(self.timer_completed.get() + 1);
-            }
+            self.record_fd_control();
             return Some(result);
         }
         // Acceptance, type validation, execution and accounting use one OFD.
         // Another CLONE_FILES task may close or replace its numeric slot.
         let fd = self.descriptors.get(args[0] as u32)?;
-        let result = self.transfer_fd(&fd, number, args, memory)?;
+        let result = if number == 28 && !fd.is_inotify() {
+            Err(Errno(22))
+        } else {
+            self.transfer_fd(&fd, number, args, memory)?
+        };
         self.completed.set(self.completed.get() + 1);
         if number == 28 {
             self.record_fd_control();
@@ -1070,6 +1372,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if self.supports_binder(number, args) {
+            return true;
+        }
         if matches!(number, 182 | 183 | 185..=195) {
             return self.resources.is_some();
         }
@@ -1625,6 +1930,25 @@ impl DirectSyscalls {
         } else {
             result
         };
+        if let Some((wait, fault)) = pending
+            .retained_poll
+            .as_ref()
+            .and_then(|wait| Some((wait, wait.take_fault()?)))
+        {
+            return self.park_event_page(wait.clone(), fault, pending.signal.pid, &pending.target);
+        }
+        if let Some(file) = &pending.retained_byte {
+            if let Some(fault) = file.take_input_fault() {
+                return self.park_byte_page(
+                    file.clone(),
+                    fault,
+                    pending.number,
+                    pending.args,
+                    pending.signal.pid,
+                    &pending.target,
+                );
+            }
+        }
         if pending.native_tcp.is_some() {
             self.complete_tcp(result)
         } else if let Some(file) = &pending.retained_byte {
@@ -1644,6 +1968,9 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if number == 21 {
+            return self.start_file_call(number, args, memory, pid, target);
+        }
         if matches!(number, 194 | 195) {
             let result = crate::shm::control(self.resources.as_ref()?, number, args, memory, pid);
             return Some(self.complete(number, args, result));
@@ -1661,6 +1988,14 @@ impl DirectSyscalls {
         }
         if number == 227 {
             return self.start_memory_sync(args, memory, pid, target);
+        }
+        if number == 29 && self.file_prepared(number, args) {
+            return self.start_prepared_file(number, args, memory, pid, target);
+        }
+        if number == 29 && memory.async_faults_possible() {
+            if let Some(attempt) = self.start_ioctl_control(args, memory, pid, target) {
+                return Some(attempt);
+            }
         }
         if number == 29 {
             if let Some(attempt) = self.start_binder(args, memory, pid, target) {
@@ -1685,7 +2020,7 @@ impl DirectSyscalls {
                 return Some(attempt);
             }
         }
-        if matches!(number, 63..=66) {
+        if matches!(number, 63..=66) && !memory.async_faults_possible() {
             if let Some(fd) = self.network.get(args[0] as u32) {
                 return Some(self.start_tcp(fd, number, args, memory, pid, target, saved_deadline));
             }
@@ -1703,9 +2038,10 @@ impl DirectSyscalls {
             return Some(attempt);
         }
         if matches!(number, 28 | 86 | 87) {
-            return self
-                .invoke_control(number, args, memory)
-                .map(IoAttempt::Complete);
+            let value = self.invoke_control(number, args, memory);
+            return value
+                .map(IoAttempt::Complete)
+                .or_else(|| self.start_prepared_file(number, args, memory, pid, target));
         }
         if number == 32 {
             let request = match self.flock_request(args[0] as u32, args[1] as u32)? {
@@ -1718,7 +2054,7 @@ impl DirectSyscalls {
             return self.start_record_lock(args, memory, pid, target);
         }
         if number == 427 {
-            return self.urings.register(args, memory, pid);
+            return self.urings.register(args, memory, pid, self, target);
         }
         if number == 426 {
             self.urings.ensure_context(
@@ -1729,13 +2065,21 @@ impl DirectSyscalls {
                 self.file_layouts.as_ref(),
                 self.task_signal.as_ref(),
             );
-            let attempt = self.urings.start(args, memory, pid, target)?;
+            let attempt = self
+                .urings
+                .start_with_source(args, memory, pid, self, target)?;
             return Some(attempt);
         }
         if !self.supports_call(number, args) {
             return None;
         }
         if crate::event_wait(number) {
+            if memory.async_faults_possible() || WaitInput::masked(number, args) {
+                return Some(
+                    Box::new(WaitInput::new(number, args, saved_deadline))
+                        .resume(self, memory, pid, target),
+                );
+            }
             return Some(
                 match crate::RetainedWait::prepare_worker(
                     &self.descriptors,
@@ -1863,6 +2207,9 @@ impl DirectSyscalls {
         args: [u64; 6],
         file: trames_vfs::SharedFd,
     ) -> Option<Result<RetainedByte, Errno>> {
+        if matches!(number, 63..=70 | 286 | 287) && file.file_target().is_some() {
+            return None;
+        }
         if matches!(number, 286 | 287) {
             if file.file_target().is_some() {
                 return None;
@@ -1914,13 +2261,47 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let wait = accepted.borrow();
-        if !self.urings.poll_pump(&wait.poll_resources(), memory) {
+        if !wait.output_started()
+            && (!wait.fully_bound() || wait.epoll_revision() != wait.epoll_accepted_revision())
+        {
+            let original = accepted.into();
+            let Some(bound) = original.rearm(&self.descriptors) else {
+                return IoAttempt::WaitCheckpoint(original);
+            };
+            return self.start_bound_event_wait(bound, memory, pid, target);
+        }
+        self.start_bound_event_wait(accepted, memory, pid, target)
+    }
+    fn start_bound_event_wait<
+        W: std::borrow::Borrow<crate::RetainedWait> + Into<Arc<crate::RetainedWait>>,
+    >(
+        &self,
+        accepted: W,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let wait = accepted.borrow();
+        if !wait.output_started() && !self.urings.poll_pump(&wait.poll_resources(), memory) {
             return IoAttempt::WaitCheckpoint(accepted.into());
         }
-        match wait.check(memory) {
+        let result = wait.check(memory);
+        if wait.needs_owner() {
+            return IoAttempt::WaitCheckpoint(accepted.into());
+        }
+        if let Some(fault) = wait.take_fault() {
+            return self.park_event_page(accepted.into(), fault, pid, target);
+        }
+        if let Some(blocked) = wait.blocker() {
+            return self.park_event_resource(accepted.into(), blocked, pid, target);
+        }
+        match result {
             Err(Errno(11)) => {}
             result => {
                 let result = wait.finish(memory, result);
+                if let Some(fault) = wait.take_fault() {
+                    return self.park_event_page(accepted.into(), fault, pid, target);
+                }
                 return self.complete(wait.number, wait.args, result);
             }
         }
@@ -1975,20 +2356,34 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         linux.progress_uring(memory, pid);
-        let Some(wait) = wait.rearm(&linux.vfs.direct_descriptors()) else {
-            return IoAttempt::WaitCheckpoint(wait);
-        };
+        let wait = wait.rearm(&linux.vfs.direct_descriptors()).unwrap_or(wait);
         let pending = self.event_pending(wait.clone(), pid, target);
         let host_error = pending
             ._subscriptions
             .iter()
             .find_map(|s| s.rearm_host().err());
         linux.progress_uring(memory, pid);
-        match wait.check(memory) {
+        let result = wait.check_owned(memory, &linux.vfs, 0, |_, _| Ok(None));
+        if wait.needs_owner() {
+            return IoAttempt::WaitCheckpoint(wait);
+        }
+        if let Some(fault) = wait.take_fault() {
+            return self.park_event_page(wait, fault, pid, target);
+        }
+        if let Some(blocked) = wait.blocker() {
+            return self.park_event_resource(wait, blocked, pid, target);
+        }
+        match result {
             Err(Errno(11)) => {
                 host_error.map_or_else(|| IoAttempt::Blocked(pending), IoAttempt::HostError)
             }
-            result => self.complete(wait.number, wait.args, wait.finish(memory, result)),
+            result => {
+                let result = wait.finish(memory, result);
+                if let Some(fault) = wait.take_fault() {
+                    return self.park_event_page(wait, fault, pid, target);
+                }
+                self.complete(wait.number, wait.args, result)
+            }
         }
     }
     /// Bind the actual original resources missing from a standalone fast-path
@@ -2053,7 +2448,10 @@ impl DirectSyscalls {
             .or_else(|| self.retain_byte(number, args))?;
         Some(match retained {
             Ok(file)
-                if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message().is_none() =>
+                if file.fd.is_unix()
+                    && file.fd.local_kind() != 1
+                    && file.message().is_none()
+                    && matches!(file.operation, ByteOperation::Plain) =>
             {
                 match self.prepare_packet_byte(&file, number, args, memory) {
                     Some(Ok(file)) => {
@@ -2076,7 +2474,11 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message().is_none() {
+        if file.fd.is_unix()
+            && file.fd.local_kind() != 1
+            && file.message().is_none()
+            && matches!(file.operation, ByteOperation::Plain)
+        {
             return match self.prepare_packet_byte(&file, number, args, memory) {
                 Some(Ok(prepared)) => {
                     self.start_byte(prepared, number, args, memory, pid, target, true)
@@ -2122,6 +2524,31 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         let mut file = file;
+        if memory.async_faults_possible()
+            && matches!(number, 63 | 65 | 286)
+            && matches!(
+                file.operation,
+                ByteOperation::Plain | ByteOperation::Signal(_) | ByteOperation::Tcp(_)
+            )
+            && (!file.fd.is_unix() || file.fd.local_kind() == 1)
+        {
+            let original = file.clone();
+            file.operation = ByteOperation::Read(Arc::new(std::sync::Mutex::new(
+                byte_read::Read::new(original, number),
+            )));
+        }
+        if memory.async_faults_possible()
+            && matches!(number, 64 | 66 | 287)
+            && matches!(
+                file.operation,
+                ByteOperation::Plain | ByteOperation::Stream(_) | ByteOperation::Pipe(_)
+            )
+        {
+            let original = file.clone();
+            file.operation = ByteOperation::Input(Arc::new(std::sync::Mutex::new(
+                file_input::ByteInput::new(original, number),
+            )));
+        }
         if file.fd.is_pipe()
             && !file.fd.nonblocking()
             && matches!(number, 64 | 66)
@@ -2190,6 +2617,9 @@ impl DirectSyscalls {
         } else {
             self.transfer_retained(&file, number, args, memory, original_paths)
         };
+        if let Some(fault) = file.take_input_fault() {
+            return self.park_byte_page(file, fault, number, args, pid, target);
+        }
         match result {
             Some(Err(Errno(11)))
                 if self.terminal_stop.get()
@@ -2197,6 +2627,9 @@ impl DirectSyscalls {
             Some(Err(Errno(11))) => {
                 // F_SETFL may have enabled O_NONBLOCK while a blocking call was making progress.
                 let result = file.interrupted(memory).unwrap_or(Err(Errno(11)));
+                if let Some(fault) = file.take_input_fault() {
+                    return self.park_byte_page(file, fault, number, args, pid, target);
+                }
                 return self.complete_byte(&file, result);
             }
             Some(result) => {
@@ -2217,16 +2650,9 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = file.subscribe(&signal);
-        let deadline = if let Some(socket) = file.fd.local_operation() {
-            socket
-                .io_timeout(matches!(number, 63 | 65 | 207 | 212 | 243 | 286))
-                .and_then(|timeout| Instant::now().checked_add(timeout))
-        } else if let ByteOperation::Tcp(tcp) = &file.operation {
-            tcp.timeouts[usize::from(matches!(number, 63 | 65 | 286))]
-                .and_then(|timeout| Instant::now().checked_add(timeout))
-        } else {
-            None
-        };
+        let deadline = file
+            .accepted_deadline()
+            .unwrap_or_else(|| file.socket_deadline(number));
         self.resume_inner_in(
             PendingIo {
                 process_vm: None,
@@ -2363,7 +2789,7 @@ impl DirectSyscalls {
         if pending.fifo_open.is_some() {
             return self.resume_fifo_open(pending);
         }
-        if Self::aio_call(pending.number) {
+        if pending.aio.is_some() {
             return self.start_retained_aio(
                 pending.aio.take().expect("accepted AIO"),
                 memory,
@@ -2521,6 +2947,46 @@ impl DirectSyscalls {
             };
             result
         };
+        if let Some(wait) = pending
+            .retained_poll
+            .as_ref()
+            .filter(|wait| wait.needs_owner())
+        {
+            return IoAttempt::WaitCheckpoint(wait.clone());
+        }
+        if let Some(fault) = pending
+            .retained_byte
+            .as_ref()
+            .and_then(RetainedByte::take_input_fault)
+        {
+            return self.park_byte_page(
+                pending.retained_byte.take().unwrap(),
+                fault,
+                pending.number,
+                pending.args,
+                pending.signal.pid,
+                &pending.target,
+            );
+        }
+        if let Some((wait, fault)) = pending
+            .retained_poll
+            .as_ref()
+            .and_then(|wait| Some((wait, wait.take_fault()?)))
+        {
+            return self.park_event_page(wait.clone(), fault, pending.signal.pid, &pending.target);
+        }
+        if let Some((wait, blocked)) = pending
+            .retained_poll
+            .as_ref()
+            .and_then(|wait| Some((wait, wait.blocker()?)))
+        {
+            return self.park_event_resource(
+                wait.clone(),
+                blocked,
+                pending.signal.pid,
+                &pending.target,
+            );
+        }
         if self.terminal_stop.get() && !pending.terminal_job {
             if let Some(subscription) = self
                 .terminal_task
@@ -2590,6 +3056,11 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if number == 29 && memory.async_faults_possible() {
+            if let Some(value) = self.invoke_ioctl_control(args, memory) {
+                return value;
+            }
+        }
         if matches!(number, 28 | 86 | 87) {
             return self.invoke_control(number, args, memory);
         }
@@ -2601,6 +3072,10 @@ impl DirectSyscalls {
                     return Some(Err(error));
                 }
             };
+            if memory.async_faults_possible() && matches!(number, 63..=66 | 286 | 287) {
+                self.prepare_retained_byte(number, args, file);
+                return None;
+            }
             let result = if StreamWrite::accepts(&file.fd, number, args) {
                 match StreamWrite::new(number, args, memory, self.local_identity) {
                     Ok(write) => {
@@ -2627,6 +3102,9 @@ impl DirectSyscalls {
         }
         if matches!(number, 63..=66) {
             if let Some(fd) = self.network.get(args[0] as u32) {
+                if memory.async_faults_possible() {
+                    return None;
+                }
                 return match self.transfer_tcp(&fd, number, args, memory) {
                     Err(Errno(11)) if !fd.nonblocking() => None,
                     result => {
@@ -2949,11 +3427,11 @@ mod tests {
                 assert_eq!(direct.completed(), 1);
                 assert_eq!(direct.timer_completed(), u64::from(kind == 1));
                 assert_eq!(direct.fd_control_completed(), u64::from(kind == 2));
-                // A stale scheduling hint must defer before effects when the
-                // actual replacement no longer supports this control syscall.
+                // The shared entry validates the actual replacement type;
+                // completing its native EINVAL does not repeat the old effect.
                 if kind != 0 {
-                    assert!(direct.invoke(number, args, &mut m).is_none());
-                    assert_eq!(direct.completed(), 1);
+                    assert_eq!(direct.invoke(number, args, &mut m), Some(Err(Errno(22))));
+                    assert_eq!(direct.completed(), 2);
                 }
             }
         }
@@ -3389,7 +3867,7 @@ mod tests {
         assert!(!direct.supports_call(29, [master as u64, 0x5441, 2, 0, 0, 0]));
     }
     #[test]
-    fn timer_control_preflights_outputs_and_keeps_relative_and_absolute_state() {
+    fn timer_control_updates_before_output_and_keeps_relative_and_absolute_state() {
         let mut vfs = Vfs::default();
         let fd = vfs.timerfd(1, 0).unwrap();
         let started = Instant::now();

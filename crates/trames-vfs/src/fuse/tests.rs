@@ -31,12 +31,16 @@ mod parent_tests;
 mod permission_tests;
 #[path = "proc_walk_tests.rs"]
 mod proc_walk_tests;
+#[path = "retry_tests.rs"]
+mod retry_tests;
 #[path = "statfs_tests.rs"]
 mod statfs_tests;
 #[path = "symlink_inode_tests.rs"]
 mod symlink_inode_tests;
 #[path = "topology_tests.rs"]
 mod topology_tests;
+#[path = "transfer_tests.rs"]
+mod transfer_tests;
 #[path = "walk_tests.rs"]
 mod walk_tests;
 #[path = "xattr_tests.rs"]
@@ -245,7 +249,7 @@ fn waiter_registered_before_mount_observes_successive_requests() {
 pub(super) fn mounted() -> (Vfs, Arc<Device>) {
     mounted_with_limit(0)
 }
-fn mounted_with_limit(max_write: u32) -> (Vfs, Arc<Device>) {
+pub(super) fn mounted_with_limit(max_write: u32) -> (Vfs, Arc<Device>) {
     mount_vfs(Vfs::default(), max_write)
 }
 fn mount_vfs(v: Vfs, max_write: u32) -> (Vfs, Arc<Device>) {
@@ -254,7 +258,12 @@ fn mount_vfs(v: Vfs, max_write: u32) -> (Vfs, Arc<Device>) {
 fn mount_vfs_options(v: Vfs, max_write: u32, extra: &str) -> (Vfs, Arc<Device>) {
     mount_vfs_negotiated(v, max_write, extra, 0)
 }
-fn mount_vfs_negotiated(mut v: Vfs, max_write: u32, extra: &str, flags: u32) -> (Vfs, Arc<Device>) {
+pub(super) fn mount_vfs_negotiated(
+    mut v: Vfs,
+    max_write: u32,
+    extra: &str,
+    flags: u32,
+) -> (Vfs, Arc<Device>) {
     v.set_runtime_info(1, RuntimeInfo::default());
     v.mkdir_at(AT_FDCWD, b"/mnt", 0o755).unwrap();
     let fd = v.open_at(AT_FDCWD, b"/dev/fuse", 2, 0).unwrap();
@@ -266,14 +275,15 @@ fn mount_vfs_negotiated(mut v: Vfs, max_write: u32, extra: &str, flags: u32) -> 
     let init = c.read(8192).unwrap();
     let mut version = [0; 64];
     version[..4].copy_from_slice(&7u32.to_le_bytes());
-    version[4..8].copy_from_slice(&31u32.to_le_bytes());
+    let minor = if flags & (1 << 29) != 0 { 34u32 } else { 31u32 };
+    version[4..8].copy_from_slice(&minor.to_le_bytes());
     version[20..24].copy_from_slice(&max_write.to_le_bytes());
     version[12..16].copy_from_slice(&flags.to_le_bytes());
     c.write(&reply(id(&init), 0, &version)).unwrap();
     (v, device)
 }
 
-fn entry(node: u64, ino: u64, mode: u32) -> [u8; 128] {
+pub(super) fn entry(node: u64, ino: u64, mode: u32) -> [u8; 128] {
     let mut entry = [0; 128];
     entry[..8].copy_from_slice(&node.to_le_bytes());
     entry[24..32].copy_from_slice(&1u64.to_le_bytes());
@@ -290,7 +300,22 @@ pub(super) fn receive(c: &Connection, opcode: u32, node: u64) -> Vec<u8> {
 pub(super) fn answer(c: &Connection, req: &[u8], body: &[u8]) {
     c.write(&reply(id(req), 0, body)).unwrap();
 }
-fn waiting(work: FileWork) -> FileWork {
+fn forget_each(c: &Connection, expected: &[u64]) {
+    let mut observed = Vec::new();
+    for _ in expected {
+        let forget = c.read(8192).unwrap();
+        assert_eq!(op(&forget), 2);
+        assert_eq!(&forget[40..], &1u64.to_le_bytes());
+        observed.push(u64::from_le_bytes(forget[16..24].try_into().unwrap()));
+        assert_eq!(c.write(&reply(id(&forget), 0, &[])), Err(Errno(2)));
+    }
+    observed.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(observed, expected);
+}
+#[track_caller]
+pub(super) fn waiting(work: FileWork) -> FileWork {
     match work.run() {
         FileOutcome::Waiting(work) => work,
         FileOutcome::Complete(reply) => panic!(
@@ -301,7 +326,7 @@ fn waiting(work: FileWork) -> FileWork {
         FileOutcome::Layout(_) => panic!("next daemon operation requires layout admission"),
     }
 }
-fn finish(work: FileWork) -> Result<FileValue> {
+pub(super) fn finish(work: FileWork) -> Result<FileValue> {
     match work.run() {
         FileOutcome::Complete(reply) => reply.result,
         _ => panic!("expected completed operation"),
@@ -327,11 +352,7 @@ fn nested_lookup_stat_returns_ino_and_forgets_each_reference() {
     };
     assert!(!m.is_root);
     assert_eq!(u64::from_le_bytes(stat[8..16].try_into().unwrap()), 103);
-    for node in [22, 23] {
-        let forget = receive(c, 2, node);
-        assert_eq!(&forget[40..], &1u64.to_le_bytes());
-        assert_eq!(c.write(&reply(id(&forget), 0, &[])), Err(Errno(2)));
-    }
+    forget_each(c, &[22, 23]);
 }
 
 #[test]
@@ -598,7 +619,7 @@ fn abandoned_open_releases_handle_granted_after_interrupt() {
     }
 }
 
-fn open_directory(v: &Vfs, c: &Connection, root: bool) -> (PathQueries, u32) {
+pub(super) fn open_directory(v: &Vfs, c: &Connection, root: bool) -> (PathQueries, u32) {
     let files = FileEpoch::default().capture(v, true);
     let paths = v.path_queries();
     assert!(paths

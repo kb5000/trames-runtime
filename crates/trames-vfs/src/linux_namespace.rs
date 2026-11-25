@@ -226,13 +226,18 @@ pub struct UtsAccess {
     authorized: bool,
 }
 impl UtsAccess {
+    pub fn writable(&self) -> Result<()> {
+        if self.authorized {
+            Ok(())
+        } else {
+            Err(Errno(1))
+        }
+    }
     pub fn names(&self) -> [Vec<u8>; 2] {
         self.namespace.0.names.lock().unwrap().clone()
     }
     pub fn set(&self, domain: bool, name: &[u8]) -> Result<()> {
-        if !self.authorized {
-            return Err(Errno(1));
-        }
+        self.writable()?;
         if name.len() > 64 {
             return Err(Errno(22));
         }
@@ -861,7 +866,20 @@ impl Vfs {
             Some(ResolveOperation::Fuse(fuse::PathOperation::Chroot)),
             None,
         )?;
-        self.change_directory_resolved(entry, true)
+        let result = self.change_directory_resolved(entry, true);
+        fuse::PathRetry::arm(
+            self,
+            AT_FDCWD,
+            path,
+            true,
+            true,
+            0,
+            true,
+            fuse::PathOperation::Chroot,
+            None,
+            true,
+        );
+        result
     }
 }
 

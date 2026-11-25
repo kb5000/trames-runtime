@@ -13,6 +13,98 @@ pub struct FileLayouts {
     executor: Arc<dyn FileExecutor>,
     driver: Mutex<Option<Weak<IoSignal>>>,
     owner: std::sync::OnceLock<Arc<IoSignal>>,
+    sync_executor: std::sync::OnceLock<Arc<dyn trames_memory::SyncExecutor>>,
+}
+struct WritebackExecutor(Weak<FileLayouts>);
+struct BackgroundSync {
+    resource: Arc<dyn trames_memory::SyncResource>,
+    completion: Option<Box<dyn trames_memory::SyncCompletion>>,
+    layouts: Weak<FileLayouts>,
+    registration: Option<SyncRegistration>,
+}
+// An async provider may own the completion that retains the provider itself.
+// Keep only a weak resource here so executor retirement can break that cycle.
+pub(crate) struct SyncRegistration {
+    layouts: Weak<FileLayouts>,
+    id: u64,
+}
+impl Drop for SyncRegistration {
+    fn drop(&mut self) {
+        if let Some(layouts) = self.layouts.upgrade() {
+            layouts.state.lock().unwrap().syncs.remove(&self.id);
+        }
+    }
+}
+impl trames_memory::SyncExecutor for WritebackExecutor {
+    fn submit(
+        &self,
+        resource: Arc<dyn trames_memory::SyncResource>,
+        completion: Box<dyn trames_memory::SyncCompletion>,
+    ) {
+        if let Some(layouts) = self.0.upgrade() {
+            layouts.submit_host(Box::new(BackgroundSync {
+                resource,
+                completion: Some(completion),
+                layouts: self.0.clone(),
+                registration: None,
+            }));
+        } else {
+            resource.failed(trames_memory::MemoryError::BackingIo(5));
+            completion.complete(Err(trames_memory::MemoryError::BackingIo(5)));
+        }
+    }
+}
+impl Drop for BackgroundSync {
+    fn drop(&mut self) {
+        drop(self.registration.take());
+        if let Some(completion) = self.completion.take() {
+            self.resource
+                .failed(trames_memory::MemoryError::BackingIo(5));
+            completion.complete(Err(trames_memory::MemoryError::BackingIo(5)));
+        }
+    }
+}
+impl HostFileTask for BackgroundSync {
+    fn layout(&self) -> Option<Arc<Layout>> {
+        self.resource.layout()
+    }
+    fn run(mut self: Box<Self>, admission: Option<crate::HostFileAdmission>) {
+        let layouts = self.layouts.upgrade();
+        self.registration = layouts
+            .as_ref()
+            .map(|layouts| layouts.retain_sync(&self.resource));
+        let resource = self.resource.clone();
+        match resource.sync_async(self) {
+            Ok(()) => {
+                drop(admission);
+                if layouts.is_none() {
+                    resource.failed(trames_memory::MemoryError::BackingIo(5));
+                }
+            }
+            Err(completion) => {
+                let result = resource.sync();
+                drop(admission);
+                completion.complete(result);
+            }
+        }
+    }
+    fn fail(self: Box<Self>) {
+        drop(self);
+    }
+}
+impl trames_memory::SyncCompletion for BackgroundSync {
+    fn complete(mut self: Box<Self>, result: Result<(), trames_memory::MemoryError>) {
+        drop(self.registration.take());
+        if let Some(completion) = self.completion.take() {
+            completion.complete(result);
+        }
+    }
+    fn retry(mut self: Box<Self>) {
+        drop(self.registration.take());
+        if let Some(layouts) = self.layouts.upgrade() {
+            layouts.submit_host(self);
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -20,7 +112,30 @@ struct State {
     live: BTreeSet<u64>,
     ready: BTreeSet<u64>,
     pending: BTreeMap<u64, FileLayoutRequest>,
+    syncs: BTreeMap<u64, Weak<dyn trames_memory::SyncResource>>,
 }
+impl Drop for FileLayouts {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap();
+        let pending = std::mem::take(&mut state.pending);
+        let syncs = std::mem::take(&mut state.syncs);
+        // Queued jobs still own their completion directly. Parked providers
+        // retain it themselves and must be failed through the weak index.
+        for request in pending.into_values() {
+            request.work.fail(5);
+        }
+        for resource in syncs
+            .into_values()
+            .filter_map(|resource| resource.upgrade())
+        {
+            resource.failed(trames_memory::MemoryError::BackingIo(5));
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "file_layouts_tests.rs"]
+mod tests;
 struct Wake {
     owner: Weak<FileLayouts>,
     id: u64,
@@ -45,6 +160,7 @@ pub struct FileLayoutRequest {
     pub signal: Arc<IoSignal>,
     _wake: Arc<Wake>,
     _layout: IoSubscription,
+    _completion: Option<IoSubscription>,
     waits: Vec<IoSubscription>,
 }
 #[allow(clippy::large_enum_variant)] // Preserve inline ordinary file jobs; only cold host work allocates.
@@ -55,12 +171,18 @@ enum LayoutWork {
 impl LayoutWork {
     fn fail(self, errno: u32) {
         match self {
-            Self::File(_, result) => result.fail(errno),
+            Self::File(work, result) => {
+                drop(work);
+                result.fail(errno);
+            }
             Self::Host(work) => work.fail(),
         }
     }
 }
 impl FileLayoutRequest {
+    pub fn cancelled(&self) -> bool {
+        matches!(&self.work, LayoutWork::File(_, result) if result.cancelled())
+    }
     pub fn layout(&self) -> &Arc<Layout> {
         self.ticket.as_ref().expect("accepted layout").layout()
     }
@@ -105,16 +227,41 @@ impl Drop for FileLayoutDriver {
     }
 }
 impl FileLayouts {
+    pub(crate) fn retain_sync(
+        self: &Arc<Self>,
+        resource: &Arc<dyn trames_memory::SyncResource>,
+    ) -> SyncRegistration {
+        let id = {
+            let mut state = self.state.lock().unwrap();
+            let id = state.next;
+            state.next = state.next.wrapping_add(1);
+            assert!(state.syncs.insert(id, Arc::downgrade(resource)).is_none());
+            id
+        };
+        SyncRegistration {
+            layouts: Arc::downgrade(self),
+            id,
+        }
+    }
+    pub fn file_executor(&self) -> Arc<dyn FileExecutor> {
+        self.executor.clone()
+    }
     pub fn new(executor: Arc<dyn FileExecutor>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             executor,
             driver: Mutex::default(),
             owner: Default::default(),
+            sync_executor: Default::default(),
         })
     }
     pub fn bind_owner(&self, signal: Arc<IoSignal>) {
         let _ = self.owner.set(signal);
+    }
+    pub fn sync_executor(self: &Arc<Self>) -> Arc<dyn trames_memory::SyncExecutor> {
+        self.sync_executor
+            .get_or_init(|| Arc::new(WritebackExecutor(Arc::downgrade(self))))
+            .clone()
     }
     pub fn bind_reader(self: &Arc<Self>, signal: Arc<IoSignal>) -> FileLayoutDriver {
         *self.driver.lock().unwrap() = Some(Arc::downgrade(&signal));
@@ -158,7 +305,14 @@ impl FileLayouts {
     /// directly. No execution slot is retained by either kind of host job.
     pub fn submit_host(self: &Arc<Self>, work: Box<dyn HostFileTask>) {
         if let Some(layout) = work.layout() {
-            self.enqueue(layout.write(), LayoutWork::Host(work));
+            // The original ticket excludes publications before the try. With
+            // no readers, the existing pool can run immediately and retain
+            // exactly the same lease; a new mmap cannot slip past a mapped()
+            // observation. Only actual readers need the quiescence driver.
+            match layout.write().try_enter() {
+                Ok(exclusive) => self.executor.submit_host(work, Some(exclusive)),
+                Err(ticket) => self.enqueue(ticket, LayoutWork::Host(work)),
+            }
         } else {
             self.executor.submit_host(work, None);
         }
@@ -178,6 +332,10 @@ impl FileLayouts {
         let target: Arc<dyn IoWake> = wake.clone();
         let signal = IoSignal::new(0, Arc::downgrade(&target));
         let subscription = ticket.layout().subscribe(&signal);
+        let completion = match &work {
+            LayoutWork::File(_, result) => Some(result.subscribe(&signal)),
+            LayoutWork::Host(_) => None,
+        };
         let request = FileLayoutRequest {
             id,
             work,
@@ -185,6 +343,7 @@ impl FileLayouts {
             signal,
             _wake: wake,
             _layout: subscription,
+            _completion: completion,
             waits: Vec::new(),
         };
         let mut state = self.state.lock().unwrap();
@@ -238,6 +397,10 @@ impl FileLayouts {
     /// waiting, the caller parks the request and gives its CPU slot back.
     #[allow(clippy::result_large_err)] // The pending map owns this request by value on every retry.
     pub fn try_submit(&self, mut request: FileLayoutRequest) -> Result<(), FileLayoutRequest> {
+        if request.cancelled() {
+            self.fail(request, 125);
+            return Ok(());
+        }
         let ticket = request.ticket.take().expect("one accepted mutation");
         let exclusive = match ticket.try_enter() {
             Ok(exclusive) => exclusive,

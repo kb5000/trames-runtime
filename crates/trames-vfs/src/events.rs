@@ -348,6 +348,18 @@ impl Vfs {
         let target_open = self.descriptor(target)?.open.clone();
         epoll::control(epoll, target_open, target, op, events, data)
     }
+    pub fn prepare_epoll_control(
+        &self,
+        fd: u32,
+        op: u32,
+        target: u32,
+        events: u32,
+        data: u64,
+    ) -> Result<crate::EpollControl> {
+        let epoll = self.descriptor(fd)?.open.clone();
+        let target_open = self.descriptor(target)?.open.clone();
+        epoll::prepare_control(epoll, target_open, target, op, events, data)
+    }
     pub fn epoll_wait(
         &self,
         fd: u32,
@@ -500,19 +512,67 @@ impl Vfs {
         let Some(open) = target.original_open() else {
             return Ok(None);
         };
-        let open = open.borrow();
+        let result = self
+            .peek_original(&open.borrow(), events, pending, special)
+            .map(Some);
+        result
+    }
+    /// Observe this accepted description even after its numeric FD was reused.
+    /// Caller-only input providers also apply to every original nested epoll.
+    pub fn poll_original(
+        &self,
+        file: &SharedFd,
+        events: u16,
+        pending: u64,
+        mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
+    ) -> Result<u16> {
+        let open = OpenDescription::shared_projection(file.open.clone());
+        let ready = self.peek_original(&open, events, pending, &mut special)?;
+        if let Some(watch) = open.proc_watch() {
+            watch.acknowledge(ready.1[0]);
+        }
+        Ok(ready.0)
+    }
+    pub(super) fn peek_original(
+        &self,
+        open: &OpenDescription,
+        events: u16,
+        pending: u64,
+        special: &mut impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
+    ) -> Result<(u16, [u64; 2])> {
         if open.pty.is_none() {
             if let Some(ready) = special(&open.kind, events)? {
-                return Ok(Some(ready));
+                return Ok(ready);
             }
         }
+        if let Some(Anonymous::Epoll(live)) = &open.anonymous {
+            let Some(_walk) = epoll::Traversal::enter(live) else {
+                return Ok((0, [live.revision(), 0]));
+            };
+            let mut ready = false;
+            let mut generation = live.revision();
+            for (_, state, resource) in live.snapshot().iter() {
+                let observed = epoll::inspect::<false>(state, resource.is_nested(), |requested| {
+                    let result = self.epoll_target_poll(resource, requested, pending, special)?;
+                    if let Some((_, epoch)) = result {
+                        generation = generation.wrapping_add(epoch[0]).wrapping_add(epoch[1]);
+                    }
+                    Ok(result)
+                })?;
+                ready |= observed.is_some();
+            }
+            return Ok((if ready { events & 1 } else { 0 }, [generation, 0]));
+        }
         let reader = self.signal_reader.borrow();
-        Ok(Some(Self::peek_poll_open(
-            &open,
-            events,
-            pending,
-            reader.as_ref(),
-        )))
+        if open.kind == FdKind::Stdin {
+            return direct_io::DirectFd::source_poll(
+                OpenHandle::Shared(open.shared.clone()),
+                reader.as_ref(),
+            )
+            .map(|fd| fd.peek_poll(events))
+            .ok_or(Errno(95));
+        }
+        Ok(Self::peek_poll_open(open, events, pending, reader.as_ref()))
     }
     pub fn epoll_ready_signals(
         &self,
@@ -552,6 +612,7 @@ impl Vfs {
         let Some(_traversal) = epoll::Traversal::enter(&live) else {
             return Ok(Vec::new());
         };
+        let _permit = live.gate.enter().ok_or(Errno(11))?;
         let mut cursor = live.cursor.lock().unwrap();
         let watches = live.snapshot();
         let mut result = Vec::new();

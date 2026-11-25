@@ -10,13 +10,16 @@ impl View {
         if let Err(error) = self.observe_mapped(address, len) {
             return Some(Err(error));
         }
-        let work = SyncRange::capture(
+        let work = match SyncRange::capture(
             self.snapshot
                 .backings
                 .syncs
                 .range(address..address + len)
                 .map(|(_, object)| object),
-        );
+        ) {
+            Ok(work) => work,
+            Err(error) => return Some(Err(error)),
+        };
         // Unpublished/custom copied providers need their real original byte
         // authority. Do not execute their callback on a stale snapshot copy.
         work.source_scoped().then_some(Ok(work))

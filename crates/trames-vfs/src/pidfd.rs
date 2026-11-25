@@ -99,6 +99,9 @@ impl DescriptorFactory {
     }
 }
 impl FdFlags {
+    pub fn retained_pidfd(&self, fd: u32) -> Result<(SharedFd, Arc<PidFd>, u32)> {
+        self.descriptor_control(fd)?.retained_pidfd()
+    }
     pub fn pidfd(&self, fd: u32) -> Result<(Arc<PidFd>, bool)> {
         let (target, flags) = self.pidfd_flags(fd)?;
         Ok((target, flags & O_NONBLOCK != 0))

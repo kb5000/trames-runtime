@@ -2,9 +2,6 @@
 //! Compatibility state belongs to virtual tasks, never the host process.
 use super::*;
 
-#[cfg(all(test, trames_interpreter_conformance))]
-use trames_kernel::signal::SS_DISABLE;
-
 impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn reboot_guest(
@@ -69,6 +66,29 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn rlimit_call(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        args: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        if number == 261 && args[0] as u32 != 0 {
+            self.publish_io_tasks(Some((pid, p)));
+        }
+        let mut call = trames_kernel::limits::Call::new(self.limit_authority(pid, p), number, args);
+        if let Some(value) = call.check(&mut p.memory) {
+            return value.map(Some);
+        }
+        let wait = crate::run_queue::SignalWait::limit(call);
+        wait.bind(
+            &p.signals.io,
+            &trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target)),
+        );
+        p.state = State::Signal(wait);
+        Ok(None)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn rlimit(
         &self,
         pid: u32,
@@ -76,12 +96,10 @@ impl<C: Cpu> Kernel<C> {
         number: u32,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
-        let target = if number == 261 && a[0] as u32 != 0 {
-            p.linux.vfs.global_pid(a[0] as u32)?
-        } else {
-            pid
-        };
-        if target == pid {
+        if number != 261
+            || a[0] as u32 == 0
+            || a[0] as u32 == p.linux.vfs.pid_namespace().local(pid)
+        {
             // Solo execution borrows its actual limit object. No directory
             // refresh, authority cloning or second namespace translation.
             return p.limits.call(
@@ -93,8 +111,7 @@ impl<C: Cpu> Kernel<C> {
             );
         }
         self.publish_io_tasks(Some((pid, p)));
-        self.limit_authority(pid, p)
-            .call_resolved(target, number, a, &mut p.memory)
+        self.limit_authority(pid, p).call(number, a, &mut p.memory)
     }
 }
 
@@ -280,18 +297,12 @@ mod tests {
             k.rlimit(1, &mut p, 261, [3, 7, 0x1000, 0xffff, 0, 0]),
             Err(Errno(14))
         );
-        assert_eq!(
-            k.processes.read(&2).limits.get(7).0,
-            trames_vfs::DEFAULT_MAX_FDS as u64
-        );
+        assert_eq!(k.processes.read(&2).limits.get(7).0, 8);
         assert_eq!(
             k.rlimit(1, &mut p, 261, [3, 7, 0x1000, 0x1000, 0, 0]),
             Ok(0)
         );
-        assert_eq!(
-            read_u64(&p.memory, 0x1000),
-            Ok(trames_vfs::DEFAULT_MAX_FDS as u64)
-        );
+        assert_eq!(read_u64(&p.memory, 0x1000), Ok(8));
         assert_eq!(p.limits.get(7).0, trames_vfs::DEFAULT_MAX_FDS as u64);
         for id in [2, 3] {
             assert_eq!(k.processes.read(&id).limits.get(7), (8, 16));
@@ -403,13 +414,16 @@ mod tests {
         assert_eq!(p.limits.get(4), (0, 0));
     }
     #[test]
-    fn compatibility_state_and_fault_preflight() {
+    fn compatibility_state_and_native_output_fault_order() {
         let mut p = process();
         write_u64(&mut p.memory, 0x1000, 0x2000).unwrap();
         write_u64(&mut p.memory, 0x1008, 0).unwrap();
-        write_u64(&mut p.memory, 0x1010, 2048).unwrap();
+        write_u64(&mut p.memory, 0x1010, 8192).unwrap();
         assert_eq!(Kernel::sigaltstack(&mut p, 0x1000, 0xffff), Err(Errno(14)));
-        assert_eq!(p.signals.alt_stack.flags, SS_DISABLE);
+        assert_eq!(
+            p.signals.alt_stack.flags, 0,
+            "the input is installed before the failing old-stack output"
+        );
         assert_eq!(Kernel::sigaltstack(&mut p, 0x1000, 0), Ok(0));
         p.cpu.sp = 0x2400;
         assert_eq!(Kernel::sigaltstack(&mut p, 0x1000, 0), Err(Errno(1)));
@@ -421,7 +435,7 @@ mod tests {
         assert_eq!(Kernel::membarrier(&p, 32, 0), Err(Errno(22)));
     }
     #[test]
-    fn file_size_limit_changes_are_atomic_and_hard_limit_is_privileged() {
+    fn file_size_limit_exchange_precedes_old_copy_and_hard_limit_is_privileged() {
         let mut p = process();
         let k = kernel();
         write_u64(&mut p.memory, 0x1000, 10).unwrap();
@@ -430,13 +444,16 @@ mod tests {
             k.rlimit(1, &mut p, 261, [0, 1, 0x1000, 0xffff, 0, 0]),
             Err(Errno(14))
         );
-        assert_eq!(p.limits.get(1), (u64::MAX, u64::MAX));
+        // prlimit publishes the new pair before copying the predecessor.
+        // A bad old-limit output pointer cannot roll that exchange back.
+        assert_eq!(p.limits.get(1), (10, 20));
         assert_eq!(
             k.rlimit(1, &mut p, 261, [0, 1, 0x1000, 0x1000, 0, 0]),
             Ok(0)
         );
         assert_eq!(p.limits.get(1), (10, 20));
-        assert_eq!(read_u64(&p.memory, 0x1000), Ok(u64::MAX));
+        assert_eq!(read_u64(&p.memory, 0x1000), Ok(10));
+        assert_eq!(read_u64(&p.memory, 0x1008), Ok(20));
         let child = p.fork();
         child.limits.set(1, (5, 20));
         assert_eq!(p.limits.get(1), (10, 20));

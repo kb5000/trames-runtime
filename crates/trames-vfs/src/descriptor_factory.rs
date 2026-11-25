@@ -1,6 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Real Files publication for shared anonymous resources and network sockets.
 use super::*;
+pub struct PreparedDescriptor {
+    pub(crate) reservation: fd_table::ReservedFd,
+    pub(crate) descriptor: Descriptor,
+}
+impl PreparedDescriptor {
+    pub fn publish(self) -> Result<u32> {
+        self.reservation.publish(self.descriptor, None)
+    }
+}
+pub struct PreparedPair {
+    reservation: fd_table::ReservedPair,
+    descriptions: [Descriptor; 2],
+}
+impl PreparedPair {
+    pub fn numbers(&self) -> [u32; 2] {
+        self.reservation.numbers()
+    }
+    pub fn publish(self) -> Result<[u32; 2]> {
+        self.reservation.publish(self.descriptions)
+    }
+}
 
 #[derive(Clone)]
 pub struct DescriptorFactory {
@@ -104,6 +125,16 @@ impl DescriptorFactory {
         protocol: u32,
         output: impl FnOnce([u32; 2]) -> Result<()>,
     ) -> Result<[u32; 2]> {
+        let prepared = self.prepare_local_pair(family, kind, protocol)?;
+        output(prepared.numbers())?;
+        prepared.publish()
+    }
+    pub fn prepare_local_pair(
+        &self,
+        family: u32,
+        kind: u32,
+        protocol: u32,
+    ) -> Result<PreparedPair> {
         if matches!(family, 2 | 10) {
             // Linux creates the first Internet socket before discovering that
             // the protocol has no socketpair operation. Never publish that FD.
@@ -123,9 +154,10 @@ impl DescriptorFactory {
         ipc::LocalResource::pair(&a, &b);
         let descriptors =
             [a, b].map(|socket| Vfs::local_description(self.open_id(), self.owner, socket, kind));
-        let fds = reserved.numbers();
-        output(fds)?;
-        reserved.publish(descriptors)
+        Ok(PreparedPair {
+            reservation: reserved,
+            descriptions: descriptors,
+        })
     }
     /// TIOCGPTPEER accepts the original full master OFD; no pathname relookup.
     pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
@@ -380,13 +412,21 @@ impl DescriptorFactory {
         flags: u32,
         output: impl FnOnce(std::net::SocketAddr) -> Result<()>,
     ) -> Result<(u32, std::net::SocketAddr)> {
+        let (prepared, address) = self.prepare_accept_socket(socket, flags)?;
+        output(address)?;
+        Ok((prepared.publish()?, address))
+    }
+    pub fn prepare_accept_socket(
+        &self,
+        socket: &SocketOperation,
+        flags: u32,
+    ) -> Result<(PreparedDescriptor, std::net::SocketAddr)> {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
         let reserved = self.files.reserve()?;
         let namespace = socket.user_namespace().clone();
         let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
-        output(address)?;
         let descriptor =
             Vfs::socket_descriptor(self.open_id(), self.owner, socket, flags, namespace);
         {
@@ -395,8 +435,13 @@ impl DescriptorFactory {
             let open = descriptor.open.borrow();
             *open.tcp_publication.lock().unwrap() = Vfs::direct_tcp_shared(&open.shared);
         }
-        let fd = reserved.publish(descriptor, None)?;
-        Ok((fd, address))
+        Ok((
+            PreparedDescriptor {
+                reservation: reserved,
+                descriptor,
+            },
+            address,
+        ))
     }
     fn anonymous(&self, flags: u32, resource: events::Anonymous) -> Result<u32> {
         let reservation = self.files.reserve()?;
@@ -445,6 +490,11 @@ impl DescriptorFactory {
         flags: u32,
         output: impl FnOnce([u32; 2]) -> Result<()>,
     ) -> Result<[u32; 2]> {
+        let prepared = self.prepare_pipe(flags)?;
+        output(prepared.numbers())?;
+        prepared.publish()
+    }
+    pub fn prepare_pipe(&self, flags: u32) -> Result<PreparedPair> {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(Errno(22));
         }
@@ -520,8 +570,10 @@ impl DescriptorFactory {
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
-        output(reservation.numbers())?;
-        reservation.publish(descriptions)
+        Ok(PreparedPair {
+            reservation,
+            descriptions,
+        })
     }
 }
 

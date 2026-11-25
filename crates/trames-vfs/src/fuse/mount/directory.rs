@@ -15,7 +15,7 @@ pub(crate) struct Directory {
     pub(super) _lookup: Arc<LookupLease>,
     pub(super) linked: std::sync::atomic::AtomicBool,
     pub(super) cache: Option<(std::sync::Weak<Directories>, (u64, u64))>,
-    pub(super) location: std::sync::Mutex<Option<(NodeRef, Vec<u8>)>>,
+    pub(super) entry: Arc<entry::Entry>,
 }
 impl Drop for Directory {
     fn drop(&mut self) {
@@ -35,11 +35,12 @@ impl Directory {
     pub(crate) fn linked(&self) -> bool {
         self.linked.load(Ordering::Relaxed)
     }
-    pub(super) fn rename(&self, parent: NodeRef, name: Vec<u8>) {
-        *self.location.lock().unwrap() = Some((parent, name));
+    pub(super) fn rename(&self, fs: &Mounted, parent: NodeRef, name: Vec<u8>) -> Result<()> {
+        self.entry.relocate(fs, parent, name)
     }
     pub(super) fn unlink(&self) {
         self.linked.store(false, Ordering::Relaxed);
+        self.entry.unhash();
     }
     pub(crate) fn id(&self) -> u64 {
         self.node
@@ -64,15 +65,20 @@ impl Directory {
         false
     }
     pub(crate) fn parent(&self) -> Option<NodeRef> {
-        self.location.lock().unwrap().as_ref().map(|p| p.0.clone())
+        self.entry
+            .location
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.0.clone())
     }
     pub(crate) fn path(&self) -> Result<Vec<u8>> {
-        if !self.linked() {
+        if !self.linked() || !self.entry.hashed() {
             return Err(Errno(2));
         }
         let mut names = Vec::new();
         let mut bytes = 0;
-        let mut parent = self.location.lock().unwrap().clone();
+        let mut parent = self.entry.location.lock().unwrap().clone();
         while let Some((node, name)) = parent {
             bytes += name.len() + 1;
             if bytes >= MAX_PATH {
@@ -80,10 +86,10 @@ impl Directory {
             }
             names.push(name);
             let directory = node.fuse_directory.get().ok_or(Errno(5))?;
-            if !directory.linked() {
+            if !directory.linked() || !directory.entry.hashed() {
                 return Err(Errno(2));
             }
-            parent = directory.location.lock().unwrap().clone();
+            parent = directory.entry.location.lock().unwrap().clone();
         }
         let mut path = Vec::with_capacity(bytes.max(1));
         for name in names.iter().rev() {
@@ -142,6 +148,10 @@ impl Mounted {
             drop(directories);
             drop(retired);
             self.refresh_inode_at(&node, attr, version, valid, inode::Update::Lookup)?;
+            node.fuse_directory
+                .get()
+                .unwrap()
+                .rename(self, parent.clone(), name.to_vec())?;
             return Ok(node);
         }
         let cached_attr = self.fresh_attr(attr, valid)?;
@@ -176,11 +186,14 @@ impl Mounted {
             _lookup: reference.lease.clone(),
             linked: std::sync::atomic::AtomicBool::new(true),
             cache: Some((Arc::downgrade(&self.directories), key)),
-            location: std::sync::Mutex::new(Some((parent.clone(), name.to_vec()))),
+            entry: self
+                .entries
+                .new_entry(&node, Some((parent.clone(), name.to_vec()))),
         }));
         directories.insert(key, Arc::downgrade(&node));
         drop(directories);
         drop(retired);
+        node.fuse_directory.get().unwrap().entry.publish();
         Ok(node)
     }
 }

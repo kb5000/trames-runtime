@@ -236,6 +236,7 @@ pub(super) fn proc_unix(namespace: Option<&linux_namespace::RootNetwork>) -> Vec
     }
     bytes
 }
+#[derive(Clone)]
 pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
     pub length: usize,

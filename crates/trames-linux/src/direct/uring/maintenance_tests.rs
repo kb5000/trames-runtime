@@ -34,6 +34,312 @@ fn complete(attempt: IoAttempt, n: u64) {
         _ => panic!("unexpected attempt"),
     }
 }
+fn ready(
+    direct: &DirectSyscalls,
+    mut attempt: IoAttempt,
+    memory: &mut trames_memory::Memory,
+) -> Result<u64> {
+    for _ in 0..8 {
+        attempt = match attempt {
+            IoAttempt::Complete(value) => return value,
+            IoAttempt::Blocked(wait) => direct.resume(wait, memory),
+            _ => panic!("original source continuation"),
+        };
+    }
+    panic!("ready import did not reach its operation")
+}
+
+#[test]
+fn enter_header_fault_keeps_its_original_ring_and_accepted_parameter_prefix() {
+    use trames_memory::PAGE_SIZE;
+    let (mut linux, mut memory, ring_fd, ring) = setup(8);
+    memory.unmap(0x3000, PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+    memory.write_array(0x2ff0, [0u8; 16]).unwrap();
+    let direct = caller(&linux, &memory);
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let wake = Arc::downgrade(&target);
+    add(&mut memory, &ring, sqe(0, 0, 101));
+    let IoAttempt::Blocked(wait) = direct
+        .start(
+            426,
+            [ring_fd as u64, 1, 0, 9, 0x2ff0, 24],
+            &mut memory,
+            7,
+            &wake,
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("GETEVENTS descriptor waits after accepting the original SQE")
+    };
+    assert_eq!(ring.state.lock().unwrap().head, 1);
+    linux.vfs.close(ring_fd).unwrap();
+    assert_eq!(linux.vfs.eventfd(7, 0).unwrap(), ring_fd);
+    memory.write_array(0x2ff0, 123u64.to_le_bytes()).unwrap();
+    add(&mut memory, &ring, sqe(0, 0, 102));
+    page.finish();
+    let attempt = direct.resume(wait, &mut memory);
+    assert_eq!(ready(&direct, attempt, &mut memory), Ok(1));
+    assert_eq!(cq(&mut memory, &ring), (101, 0));
+    assert_eq!(
+        ring.state.lock().unwrap().head,
+        1,
+        "resuming the descriptor must not submit the later SQE"
+    );
+    assert_eq!(linux.vfs.read(ring_fd, 8).unwrap(), 7u64.to_le_bytes());
+}
+
+#[test]
+fn vector_import_fault_retains_its_already_accepted_file_and_copied_header() {
+    use trames_memory::PAGE_SIZE;
+    let (mut linux, mut memory, ring_fd, ring) = setup(8);
+    linux
+        .vfs
+        .import_file(b"/old", b"original".to_vec())
+        .unwrap();
+    linux
+        .vfs
+        .import_file(b"/new", b"replaced".to_vec())
+        .unwrap();
+    let file = linux.vfs.open_at(-100, b"/old", 0, 0).unwrap();
+    memory.unmap(0x3000, PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+    memory.write_array(0x2ff8, 0x4000u64.to_le_bytes()).unwrap();
+    let direct = caller(&linux, &memory);
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let wake = Arc::downgrade(&target);
+    let mut read = sqe(1, file, 92);
+    read[16..24].copy_from_slice(&0x2ff8u64.to_le_bytes());
+    read[24..28].copy_from_slice(&1u32.to_le_bytes());
+    add(&mut memory, &ring, read);
+    complete(
+        direct
+            .start(
+                426,
+                [ring_fd as u64, 1, 0, 0, 0, 0],
+                &mut memory,
+                7,
+                &wake,
+                None,
+            )
+            .unwrap(),
+        1,
+    );
+    assert_eq!(memory.read_array::<4>(0x10000 + 68).unwrap(), [0; 4]);
+    linux.vfs.close(file).unwrap();
+    assert_eq!(linux.vfs.open_at(-100, b"/new", 0, 0).unwrap(), file);
+    memory.write_array(0x2ff8, 0x4100u64.to_le_bytes()).unwrap();
+    page.finish();
+    memory.write_array(0x3000, 8u64.to_le_bytes()).unwrap();
+    let attempt = direct
+        .start(
+            426,
+            [ring_fd as u64, 0, 1, 1, 0, 0],
+            &mut memory,
+            7,
+            &wake,
+            None,
+        )
+        .unwrap();
+    assert_eq!(ready(&direct, attempt, &mut memory), Ok(0));
+    assert_eq!(cq(&mut memory, &ring), (92, 8));
+    assert_eq!(memory.read_array::<8>(0x4000).unwrap(), *b"original");
+    assert_eq!(memory.read_array::<8>(0x4100).unwrap(), [0; 8]);
+}
+
+#[test]
+fn registration_fault_keeps_each_accepted_slot_after_numeric_fd_reuse() {
+    use trames_memory::PAGE_SIZE;
+    let (mut linux, mut memory, ring_fd, ring) = setup(8);
+    let first = linux.vfs.eventfd(3, 0).unwrap();
+    let second = linux.vfs.eventfd(4, 0).unwrap();
+    memory.unmap(0x3000, PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+    memory.write_array(0x2ffc, first.to_le_bytes()).unwrap();
+    let direct = caller(&linux, &memory);
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let wake = Arc::downgrade(&target);
+    let IoAttempt::Blocked(wait) = direct
+        .start(
+            427,
+            [ring_fd as u64, 2, 0x2ffc, 2, 0, 0],
+            &mut memory,
+            7,
+            &wake,
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("registration returns its execution slot")
+    };
+    assert!(ring.state.lock().unwrap().files.is_none());
+    linux.vfs.close(first).unwrap();
+    assert_eq!(linux.vfs.eventfd(9, 0).unwrap(), first);
+    page.finish();
+    memory.write_array(0x3000, second.to_le_bytes()).unwrap();
+    let attempt = direct.resume(wait, &mut memory);
+    assert_eq!(ready(&direct, attempt, &mut memory), Ok(0));
+    let files = ring.state.lock().unwrap().files.clone().unwrap();
+    assert_eq!(
+        files[0]
+            .as_ref()
+            .unwrap()
+            .direct_byte()
+            .unwrap()
+            .read(8)
+            .unwrap(),
+        3u64.to_le_bytes()
+    );
+    assert_eq!(
+        files[1]
+            .as_ref()
+            .unwrap()
+            .direct_byte()
+            .unwrap()
+            .read(8)
+            .unwrap(),
+        4u64.to_le_bytes()
+    );
+    assert_eq!(linux.vfs.read(first, 8).unwrap(), 9u64.to_le_bytes());
+}
+
+#[test]
+fn buffer_registration_reuses_original_iovec_after_its_length_page_arrives() {
+    use trames_memory::PAGE_SIZE;
+    let (linux, mut memory, ring_fd, ring) = setup(8);
+    memory.unmap(0x3000, PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+    memory.write_array(0x2ff8, 0x4000u64.to_le_bytes()).unwrap();
+    let direct = caller(&linux, &memory);
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let wake = Arc::downgrade(&target);
+    let IoAttempt::Blocked(wait) = direct
+        .start(
+            427,
+            [ring_fd as u64, 0, 0x2ff8, 1, 0, 0],
+            &mut memory,
+            7,
+            &wake,
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("original structural registration parks")
+    };
+    assert!(ring.state.lock().unwrap().buffers.is_none());
+    memory.write_array(0x2ff8, 0x4100u64.to_le_bytes()).unwrap();
+    page.finish();
+    memory.write_array(0x3000, 8u64.to_le_bytes()).unwrap();
+    let attempt = direct.resume(wait, &mut memory);
+    assert_eq!(ready(&direct, attempt, &mut memory), Ok(0));
+    let buffer = ring.state.lock().unwrap().buffers.as_ref().unwrap()[0].clone();
+    assert!(buffer.range(0x4000, 8).is_ok());
+    assert!(buffer.range(0x4100, 8).is_err());
+}
+
+#[test]
+fn probe_import_precedes_output_and_retains_its_input_prefix_across_a_page_wait() {
+    use trames_memory::PAGE_SIZE;
+    let (linux, mut memory, ring_fd, _) = setup(8);
+    memory.unmap(0x3000, PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+    let direct = caller(&linux, &memory);
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let wake = Arc::downgrade(&target);
+    let IoAttempt::Blocked(wait) = direct
+        .start(
+            427,
+            [ring_fd as u64, 8, 0x2ffc, 1, 0, 0],
+            &mut memory,
+            7,
+            &wake,
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("probe imports the complete zeroed input before producing output")
+    };
+    assert_eq!(memory.read_array::<4>(0x2ffc).unwrap(), [0; 4]);
+    memory.write(0x2ffc, b"KEEP").unwrap();
+    page.finish();
+    let attempt = direct.resume(wait, &mut memory);
+    assert_eq!(ready(&direct, attempt, &mut memory), Ok(0));
+    // The old zero input was already imported. The later output must replace
+    // this guest mutation, rather than reread it and reject the registration.
+    assert_eq!(
+        memory.read_array::<4>(0x2ffc).unwrap(),
+        [*trames_vfs::URING_OPS.last().unwrap(), 1, 0, 0]
+    );
+    assert_eq!(memory.read_array::<2>(0x3000 + 14).unwrap(), [1, 0]);
+}
+
+#[test]
+fn byte_cqe_waits_for_original_copy_even_with_nowait_and_fd_reuse() {
+    use trames_memory::PAGE_SIZE;
+    for nowait in [0u32, 8] {
+        let (mut linux, mut memory, ring_fd, ring) = setup(8);
+        memory.unmap(0x3000, PAGE_SIZE).unwrap();
+        let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+        let counter = linux.vfs.eventfd(0, trames_vfs::O_NONBLOCK).unwrap();
+        let value = 0x1122334455667788u64;
+        linux.vfs.write(counter, &value.to_le_bytes()).unwrap();
+        let original = linux.vfs.direct_descriptors().get(counter).unwrap();
+        let direct = caller(&linux, &memory);
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let wake = Arc::downgrade(&target);
+        let mut read = sqe(22, counter, 91);
+        read[16..24].copy_from_slice(&0x2ffcu64.to_le_bytes());
+        read[24..28].copy_from_slice(&8u32.to_le_bytes());
+        read[28..32].copy_from_slice(&nowait.to_le_bytes());
+        add(&mut memory, &ring, read);
+        complete(
+            direct
+                .start(
+                    426,
+                    [ring_fd as u64, 1, 0, 0, 0, 0],
+                    &mut memory,
+                    7,
+                    &wake,
+                    None,
+                )
+                .unwrap(),
+            1,
+        );
+        assert_eq!(
+            original.read(8),
+            Err(Errno(11)),
+            "the original event was consumed once"
+        );
+        assert_eq!(
+            memory.read_array::<4>(0x10000 + 68).unwrap(),
+            0u32.to_le_bytes(),
+            "user-copy waits do not become NOWAIT CQEs"
+        );
+        linux.vfs.close(counter).unwrap();
+        assert_eq!(linux.vfs.eventfd(1, 0).unwrap(), counter);
+        memory.write(0x2ffc, b"KEEP").unwrap();
+        page.finish();
+        complete(
+            direct
+                .start(
+                    426,
+                    [ring_fd as u64, 0, 1, 1, 0, 0],
+                    &mut memory,
+                    7,
+                    &wake,
+                    None,
+                )
+                .unwrap(),
+            0,
+        );
+        assert_eq!(cq(&mut memory, &ring), (91, 8));
+        let mut expected = value.to_le_bytes();
+        expected[..4].copy_from_slice(b"KEEP");
+        assert_eq!(memory.read_array::<8>(0x2ffc).unwrap(), expected);
+        assert_eq!(linux.vfs.read(counter, 8).unwrap(), 1u64.to_le_bytes());
+    }
+}
 
 #[test]
 fn nested_interest_changes_refresh_background_enter_and_cq_waits_after_numeric_reuse() {

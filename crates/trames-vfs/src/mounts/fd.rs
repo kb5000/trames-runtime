@@ -557,6 +557,7 @@ impl Vfs {
                     fs,
                     root,
                     root_key,
+                    root_entry: None,
                     kind: ctx.kind,
                     display: MountDisplay {
                         nsdelegate: None,
@@ -659,14 +660,20 @@ impl Vfs {
         key: Vec<u8>,
         cloexec: bool,
         tree: Option<Arc<DetachedTree>>,
+        entry: Option<Arc<fuse::Entry>>,
     ) -> Result<u32> {
         let reserved = self.shared_files().reserve()?;
+        let control = match tree {
+            Some(tree) => Some(events::SharedControl::MountTree(tree)),
+            None => fuse::File::path_reference(&mount.shared, &node, entry, O_PATH)
+                .map(events::SharedControl::FuseFile),
+        };
         let d = events::mounted_resource_descriptor(
             self.open_id(),
             O_PATH | if cloexec { O_CLOEXEC } else { 0 },
             FdKind::Node(key),
             Some(node),
-            tree.map(events::SharedControl::MountTree),
+            control,
             None,
             Some(OpenMount::Owner(mount)),
         );
@@ -683,6 +690,10 @@ impl Vfs {
             namespace: self.mounts.as_ref().ok_or(Errno(22))?.id(),
             members: SharedCell::new(members),
         });
+        let admin = self.mount_admin()?;
+        let _publication = self
+            .mount_registry
+            .publishing(&admin, &tree.members.borrow());
         self.register_mounts(&tree.members.borrow())?;
         root.anonymous_tree
             .set(TreeOrigin {
@@ -696,6 +707,7 @@ impl Vfs {
             root.root_key.clone(),
             cloexec,
             Some(tree),
+            root.root_entry.clone(),
         )
     }
     fn open_tree(&mut self, fd: i32, path: &[u8], flags: u32) -> Result<u32> {
@@ -717,6 +729,7 @@ impl Vfs {
                 p.key,
                 flags & O_CLOEXEC != 0,
                 None,
+                p.fuse_entry,
             );
         }
         if m.propagation().unbindable {
@@ -736,12 +749,12 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        let root = copy_mount_root(m, node, p.key.clone())?;
+        let root = copy_mount_root(m, node, p.key.clone(), p.fuse_entry.clone())?;
         root.inherited
             .fetch_and(!LOCK_ATTACHMENT, Ordering::Relaxed);
         let mut members = vec![root.clone()];
         if flags & RECURSIVE != 0 {
-            let source = tree.map_or_else(
+            let source = tree.as_ref().map_or_else(
                 || ns.0.borrow().mounts.clone(),
                 |t| t.members.borrow().clone(),
             );
@@ -767,6 +780,7 @@ impl Vfs {
                     *copy.parent.borrow_mut() = Some(Attachment {
                         parent: members[index].clone(),
                         node: link.node,
+                        fuse_entry: link.fuse_entry.clone(),
                         fallback: link.fallback,
                     });
                     originals.push(child.clone());
@@ -827,14 +841,21 @@ impl Vfs {
             return Err(Errno(22));
         }
         let mut members = tree.members.borrow_mut();
+        let admin = self.mount_admin()?;
+        let _publication = self.mount_registry.publishing(&admin, &members);
         let link = Attachment {
             parent,
             node,
+            fuse_entry: dst.fuse_entry.clone(),
             fallback: dst.key,
         };
         if let Some(parent_tree) = parent_tree {
-            *moved.parent.borrow_mut() = Some(link);
-            parent_tree.members.borrow_mut().append(&mut members);
+            let entry = link.fuse_entry.clone();
+            fuse::Entry::attach(entry.as_ref(), || {
+                *moved.parent.borrow_mut() = Some(link);
+                parent_tree.members.borrow_mut().append(&mut members);
+                Ok(())
+            })?;
         } else {
             let old = moved.propagation();
             if let Err(e) = self.publish_mounts_at(&ns, members.clone(), link, || {}) {
@@ -889,6 +910,59 @@ pub(crate) fn check_overlay_layer(vfs: &Vfs, at: &ResolvedPath) -> Result<()> {
     }
     Ok(())
 }
+pub(super) fn detached_namespace(
+    mount: &Arc<Mount>,
+    parents: &BTreeMap<u64, Option<Attachment>>,
+) -> Option<u64> {
+    let mut at = mount.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(at.id) {
+        if let Some(tree) = at
+            .anonymous_tree
+            .get()
+            .and_then(|origin| origin.tree.upgrade())
+        {
+            return Some(tree.namespace);
+        }
+        at = parents.get(&at.id)?.as_ref()?.parent.clone();
+    }
+    // A read before namespace admission may straddle two moves. Draft owners
+    // and live namespace membership still identify their original admission.
+    None
+}
+
+pub(super) fn remove_detached_members(
+    mounts: &[Arc<Mount>],
+    removed: &std::collections::BTreeSet<u64>,
+) {
+    let trees: BTreeMap<_, _> = mounts
+        .iter()
+        .filter(|mount| removed.contains(&mount.id))
+        .filter_map(|mount| topology_root(mount).anonymous_tree.get()?.tree.upgrade())
+        .map(|tree| (Arc::as_ptr(&tree) as usize, tree))
+        .collect();
+    for tree in trees.into_values() {
+        tree.members
+            .borrow_mut()
+            .retain(|mount| !removed.contains(&mount.id));
+    }
+}
+
+pub(super) fn restore_detached_members(root: &Arc<Mount>, members: Vec<Arc<Mount>>) {
+    if let Some(tree) = root
+        .anonymous_tree
+        .get()
+        .and_then(|origin| origin.tree.upgrade())
+    {
+        if Arc::ptr_eq(root, &tree.root) {
+            let mut original = tree.members.borrow_mut();
+            if original.is_empty() {
+                *original = members;
+            }
+        }
+    }
+}
+
 fn detached(mount: &Arc<Mount>, namespace: u64) -> Option<Arc<DetachedTree>> {
     topology_root(mount)
         .anonymous_tree

@@ -8,6 +8,7 @@
 use super::*;
 use std::sync::{atomic::AtomicBool, Mutex, Weak};
 pub mod abi;
+mod input;
 mod pool;
 mod protocol;
 #[cfg(test)]
@@ -88,7 +89,6 @@ struct State {
     deaths: BTreeMap<u64, Death>,
     max_threads: u32,
     requested_threads: u32,
-    last_error: (u32, u32, i32),
 }
 struct Thread {
     identity: u64,
@@ -99,6 +99,8 @@ struct Thread {
     looper: bool,
     registered: bool,
     waiting: bool,
+    error: (u32, u32, i32),
+    return_error: bool,
 }
 impl Default for Thread {
     fn default() -> Self {
@@ -111,11 +113,14 @@ impl Default for Thread {
             looper: false,
             registered: false,
             waiting: false,
+            error: (0, BR_OK, 0),
+            return_error: false,
         }
     }
 }
 enum Work {
     Bytes(Vec<u8>),
+    ReturnError(u32),
     Node(Arc<Node>),
     Transaction(Arc<Buffer>),
     Reply(Arc<Buffer>, Arc<Call>),
@@ -127,6 +132,7 @@ impl Work {
     fn size(&self) -> usize {
         match self {
             Self::Bytes(bytes) => bytes.len(),
+            Self::ReturnError(_) => 4,
             Self::Node(..) => 40,
             Self::Transaction(_) | Self::Reply(..) => 68,
             Self::Dead(..) => 4,
@@ -540,6 +546,7 @@ struct Buffer {
     node: Option<Arc<Node>>,
     call: Option<Arc<Call>>,
     async_active: AtomicBool,
+    received: AtomicBool,
 }
 struct FdFixup {
     offset: usize,
@@ -1086,6 +1093,7 @@ impl Connection {
             node,
             call,
             async_active: AtomicBool::new(false),
+            received: AtomicBool::new(false),
         }))
     }
     fn take_reply(&self, tid: u32) -> Result<Arc<Call>> {
@@ -1216,13 +1224,16 @@ impl Connection {
         Ok(())
     }
     fn free_buffer(&self, address: u64) -> Result<()> {
-        let buffer = self
-            .state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        if !state
             .buffers
-            .remove(&address)
-            .ok_or(Errno(22))?;
+            .get(&address)
+            .is_some_and(|buffer| buffer.received.load(Ordering::Relaxed))
+        {
+            return Err(Errno(22));
+        }
+        let buffer = state.buffers.remove(&address).unwrap();
+        drop(state);
         drop(buffer);
         Ok(())
     }

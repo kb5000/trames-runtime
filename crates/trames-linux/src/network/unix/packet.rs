@@ -16,10 +16,10 @@ impl DatagramState {
 #[derive(Clone)]
 pub(crate) enum PreparedTransfer<R> {
     Message(PreparedMessage<R>),
-    Packet(PreparedPacket),
+    Packet(PreparedPacket<R>),
 }
 #[derive(Clone)]
-pub(crate) struct PreparedPacket {
+pub(crate) struct PreparedPacket<R> {
     parts: Vec<(u64, usize)>,
     count: usize,
     output: Option<AddressOutput>,
@@ -27,6 +27,7 @@ pub(crate) struct PreparedPacket {
     send: Option<Vec<u8>>,
     destination: Option<Vec<u8>>,
     identity: [u32; 3],
+    pending: Option<std::sync::Arc<std::sync::Mutex<replay::Receive<R>>>>,
 }
 pub(crate) fn prepare_transfer<I: MessageIo>(
     number: u32,
@@ -43,12 +44,12 @@ pub(crate) fn prepare_transfer<I: MessageIo>(
     }
     Some(PreparedPacket::prepare(number, args, memory, io).map(PreparedTransfer::Packet))
 }
-impl PreparedPacket {
+impl<R: Clone + Default> PreparedPacket<R> {
     pub(super) fn prepare(
         number: u32,
         a: [u64; 6],
         memory: &impl CpuMemory,
-        io: &impl MessageIo,
+        io: &impl MessageIo<Rights = R>,
     ) -> Result<Self> {
         let sending = matches!(number, 64 | 66 | 206);
         let destination = if number == 206 && a[4] != 0 {
@@ -121,9 +122,17 @@ impl PreparedPacket {
             send: sending.then_some(bytes),
             destination,
             identity: io.sender_credentials(),
+            pending: (!sending && memory.async_faults_possible()).then(Default::default),
         })
     }
     fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.lock().unwrap().received.is_some())
+        {
+            return Ok(());
+        }
         if self.send.is_some() {
             return Ok(());
         }
@@ -144,7 +153,44 @@ impl PreparedPacket {
     fn progress(
         &self,
         memory: &mut impl CpuMemory,
-        io: &mut impl MessageIo,
+        io: &mut impl MessageIo<Rights = R>,
+    ) -> Option<Result<u64>> {
+        if let Some(pending) = &self.pending {
+            let mut pending = pending.lock().unwrap();
+            if let Some(result) = pending.finished {
+                return Some(result);
+            }
+            let replay::Receive {
+                received,
+                rights,
+                copies,
+                ..
+            } = &mut *pending;
+            let mut io = replay::Io {
+                original: io,
+                received,
+                rights,
+                sent: None,
+            };
+            let mut memory = crate::copy_replay::Writer::new(memory, copies);
+            let result = self.progress_body(&mut memory, &mut io);
+            if pending.copies.fault.is_none()
+                && result.is_some_and(|result| result != Err(Errno(11)))
+            {
+                pending.finished = result;
+                pending.received = None;
+            }
+            return result;
+        }
+        self.progress_body(memory, io)
+    }
+    fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        self.pending.as_ref()?.lock().unwrap().copies.fault.take()
+    }
+    fn progress_body(
+        &self,
+        memory: &mut impl CpuMemory,
+        io: &mut impl MessageIo<Rights = R>,
     ) -> Option<Result<u64>> {
         if self.send.is_some() {
             return self.send(io);
@@ -170,7 +216,7 @@ impl PreparedPacket {
             } as u64)
         })())
     }
-    pub(super) fn send(&self, io: &mut impl MessageIo) -> Option<Result<u64>> {
+    pub(super) fn send(&self, io: &mut impl MessageIo<Rights = R>) -> Option<Result<u64>> {
         if let Some(bytes) = &self.send {
             let rights = match io.send_rights(&[])? {
                 Ok(rights) => rights,
@@ -190,6 +236,12 @@ impl PreparedPacket {
     }
 }
 impl<R: Clone + Default> PreparedTransfer<R> {
+    pub(crate) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        match self {
+            Self::Message(message) => message.take_fault(),
+            Self::Packet(packet) => packet.take_fault(),
+        }
+    }
     pub fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
         match self {
             Self::Message(prepared) => prepared.recheck(memory),

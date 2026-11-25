@@ -108,11 +108,27 @@ pub(crate) struct Prepared {
     flags: u32,
     address_size: usize,
     transfer: Transfer,
+    pending: Option<Box<ReceiveCopy>>,
+}
+#[derive(Default)]
+struct ReceiveCopy {
+    packet: Option<trames_net::Received>,
+    copies: crate::copy_replay::Replay,
 }
 impl Prepared {
     /// Only a parked receive needs to revalidate its captured destinations.
     /// No guest header or send input is imported again after acceptance.
     pub fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
+        if self.transferred != 0 {
+            return Ok(());
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.packet.is_some())
+        {
+            return Ok(());
+        }
         let Transfer::Receive {
             buffer,
             address,
@@ -190,6 +206,7 @@ impl Prepared {
             return Err(Errno(9));
         }
         Ok(Self {
+            pending: memory.async_faults_possible().then(Default::default),
             transferred: 0,
             flags: 0,
             address_size: 0,
@@ -290,6 +307,7 @@ impl Prepared {
             _ => return Err(Errno(38)),
         };
         Ok(Self {
+            pending: memory.async_faults_possible().then(Default::default),
             transferred: 0,
             address_size,
             flags: a[if matches!(number, 206 | 207) { 3 } else { 2 }] as u32,
@@ -305,7 +323,46 @@ impl Prepared {
         memory: &mut impl CpuMemory,
         retained: bool,
         project_credentials: impl Fn([u32; 3]) -> [u32; 3],
+        send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize>,
+    ) -> Result<u64> {
+        if let Some(mut pending) = self.pending.take() {
+            let mut output = crate::copy_replay::Writer::new(memory, &mut pending.copies);
+            let result = self.progress_body(
+                socket,
+                &mut output,
+                retained,
+                project_credentials,
+                send,
+                &mut pending.packet,
+            );
+            if pending.copies.fault.is_none() {
+                pending.packet = None;
+                pending.copies = Default::default();
+            }
+            self.pending = Some(pending);
+            return result;
+        }
+        self.progress_body(
+            socket,
+            memory,
+            retained,
+            project_credentials,
+            send,
+            &mut None,
+        )
+    }
+    pub(crate) fn take_fault(&mut self) -> Option<trames_memory::PageFault> {
+        self.pending.as_mut()?.copies.fault.take()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn progress_body(
+        &mut self,
+        socket: &trames_vfs::SocketOperation,
+        memory: &mut impl CpuMemory,
+        retained: bool,
+        project_credentials: impl Fn([u32; 3]) -> [u32; 3],
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize>,
+        packet: &mut Option<trames_net::Received>,
     ) -> Result<u64> {
         match &self.transfer {
             Transfer::Send { bytes, peer, info } => loop {
@@ -355,16 +412,19 @@ impl Prepared {
                 } else {
                     self.transferred
                 };
-                let received = match socket.recv(buffer.size() - offset, flags) {
-                    Ok(packet) => packet,
-                    Err(e) if e.0 != 11 && self.transferred != 0 => {
-                        return Ok(self.transferred as u64)
-                    }
-                    Err(e) => return Err(net(e)),
-                };
+                if packet.is_none() {
+                    *packet = Some(match socket.recv(buffer.size() - offset, flags) {
+                        Ok(packet) => packet,
+                        Err(e) if e.0 != 11 && self.transferred != 0 => {
+                            return Ok(self.transferred as u64)
+                        }
+                        Err(e) => return Err(net(e)),
+                    });
+                }
+                let received = packet.as_ref().unwrap();
                 buffer.write_at(memory, offset, &received.data)?;
                 if let Some(output) = address {
-                    output.write_bytes(memory, &socket.received_address(&received))?;
+                    output.write_bytes(memory, &socket.received_address(received))?;
                 }
                 if let Some(output) = message {
                     if address.is_none() {

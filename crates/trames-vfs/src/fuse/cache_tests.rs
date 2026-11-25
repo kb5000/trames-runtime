@@ -24,7 +24,7 @@ fn completed(read: &Read) -> Arc<Page> {
 }
 fn contents(page: &Page) -> [u8; PAGE_SIZE as usize] {
     let mut bytes = [0; PAGE_SIZE as usize];
-    page.bytes.copy_read(0, &mut bytes);
+    page.bytes().copy_read(0, &mut bytes);
     bytes
 }
 
@@ -67,6 +67,40 @@ fn accepted_page_source_keeps_the_original_ofd_across_close_and_numeric_reuse() 
     assert_eq!(&flush[40..48], &9876u64.to_le_bytes());
     answer(c, &flush, &[]);
     assert_eq!(c.read(8192), Err(Errno(11)));
+}
+
+#[test]
+fn accepted_page_source_keeps_invalidated_output_without_refilling_a_mapped_generation() {
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let (original, file) = opened(&v, c);
+    let source = file.page_source(original.clone(), 0).unwrap();
+    let _actor =
+        crate::FileActorScope::enter(Arc::new(CredentialState::new(v.credentials.clone())), v.pid);
+    let Err(MemoryError::Pending(pending)) = source.load() else {
+        panic!("accepted cold source waits for its original request")
+    };
+    let request = receive(c, 15, 10);
+    let physical = file.attr.cache.mapped_page(0);
+    // Retain the physical identity as a concurrent mapping would. Invalidation
+    // must leave it stale, while this accepted non-mapping output can complete.
+    file.attr.cache.invalidate(0, PAGE_SIZE);
+    answer(c, &request, b"accepted");
+    assert!(pending.wait.ready());
+    let snapshot = source.load().unwrap();
+    let mut bytes = [0; PAGE_SIZE as usize];
+    snapshot.copy_read(0, &mut bytes);
+    assert_eq!(&bytes[..8], b"accepted");
+    assert!(bytes[8..].iter().all(|byte| *byte == 0));
+    assert!(!physical.valid());
+    assert!(!Arc::ptr_eq(&snapshot, physical.bytes()));
+    assert!(Arc::ptr_eq(&snapshot, &source.load().unwrap()));
+    let retry = file.read_page(&original, 0).unwrap();
+    answer(c, &receive(c, 15, 10), b"current");
+    assert_eq!(&contents(&completed(&retry))[..7], b"current");
+    snapshot.copy_read(0, &mut bytes);
+    assert_eq!(&bytes[..8], b"accepted");
+    file.attr.cache.release_mapping(&physical);
 }
 
 #[test]

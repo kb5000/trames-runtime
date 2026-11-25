@@ -105,6 +105,16 @@ impl FsHandle {
     pub(super) fn overlay_depth(&self) -> usize {
         self.overlay.as_ref().map_or(0, |overlay| overlay.depth)
     }
+    /// Persist metadata only on the accepted inode's original filesystem.
+    /// A tmpfs/host inode must not checkpoint an unrelated disk root or overlay.
+    pub fn checkpoint_metadata(&self, node: &NodeRef) -> Result<()> {
+        let n = node.borrow();
+        if n.volatile || n.links == 0 {
+            return Ok(());
+        }
+        drop(n);
+        self.borrow().checkpoint()
+    }
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
     }

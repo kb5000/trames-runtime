@@ -44,7 +44,7 @@ fn atomic_create_keeps_mode_descriptor_flags_and_the_granted_handle() {
 
 #[test]
 fn atomic_create_masks_only_in_the_live_callback_and_resamples_on_fallback() {
-    let (v, dev) = mounted();
+    let (mut v, dev) = mounted();
     let c = dev.connection().unwrap();
     let paths = v.path_queries();
     let files = FileEpoch::default().capture(&v, true);
@@ -72,11 +72,26 @@ fn atomic_create_masks_only_in_the_live_callback_and_resamples_on_fallback() {
     assert_eq!(&mknod[48..52], &0o020u32.to_le_bytes());
     answer(c, &mknod, &entry(80, 180, 0o100646));
     let work = waiting(work);
-    // The original parent survives through both creation callbacks. The OPEN
-    // request is queued before its parent lease is released.
+    // The original parent survives both creation callbacks and stays alive
+    // through the child's actual name/OFD reference, until its final release.
     answer(c, &receive(c, 14, 80), &[0; 16]);
-    receive(c, 2, 70);
-    assert!(matches!(finish(work), Ok(FileValue::Count(_))));
+    let FileValue::Count(fd) = finish(work).unwrap() else {
+        panic!("created file descriptor")
+    };
+    assert_eq!(c.read(8192), Err(Errno(11)));
+    v.close(fd as u32).unwrap();
+    let flush = receive(c, 25, 80);
+    answer(c, &flush, &[]);
+    receive(c, 18, 80);
+    let mut forgotten = Vec::new();
+    for _ in 0..2 {
+        let request = c.read(8192).unwrap();
+        assert_eq!(op(&request), 2);
+        assert_eq!(&request[40..], &1u64.to_le_bytes());
+        forgotten.push(u64::from_le_bytes(request[16..24].try_into().unwrap()));
+    }
+    forgotten.sort_unstable();
+    assert_eq!(forgotten, [70, 80]);
 }
 
 #[test]

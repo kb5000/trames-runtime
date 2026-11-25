@@ -68,6 +68,9 @@ const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// This has no Files root and never resolves a numeric FD after acceptance.
 pub struct DescriptorControl(Descriptor);
 impl DescriptorControl {
+    pub fn shared_file(&self) -> SharedFd {
+        SharedFd::new(self.0.open.borrow().shared.clone())
+    }
     pub fn perf_event(&self) -> Result<Option<Arc<perf::Event>>> {
         let open = self.0.open.borrow();
         if open.flags.get() & O_PATH != 0 {
@@ -87,13 +90,31 @@ impl DescriptorControl {
             _ => Err(Errno(9)),
         }
     }
+    pub(super) fn retained_pidfd(&self) -> Result<(SharedFd, Arc<PidFd>, u32)> {
+        let open = self.0.open.borrow();
+        match &open.control {
+            Some(events::SharedControl::Pid(pid)) if open.flags.get() & O_PATH == 0 => Ok((
+                SharedFd::new(open.shared.clone()),
+                pid.clone(),
+                open.flags.get(),
+            )),
+            _ => Err(Errno(9)),
+        }
+    }
 
     pub fn status_ioctl_request(request: u32) -> bool {
         matches!(request, 0x5421 | 0x5450..=0x5452 | 0x8901..=0x8904)
     }
 
-    /// Per-slot CLOEXEC and OFD controls accept the descriptor once. A concurrent
-    /// close/dup2 cannot redirect a guest pointer access to a replacement file.
+    pub fn status_control(&self) -> StatusControl {
+        let open = self.0.open.borrow();
+        StatusControl {
+            file: Some(SharedFd::new(open.shared.clone())),
+            flags: open.flags.clone(),
+            cloexec: self.0.cloexec.clone(),
+        }
+    }
+    /// Controls keep the accepted OFD and original slot bit across user copies.
     pub fn status_ioctl(
         &self,
         fd: u32,
@@ -102,43 +123,8 @@ impl DescriptorControl {
         memory: &mut impl trames_memory::CpuMemory,
         owners: &impl AsyncOwners,
     ) -> Result<u64> {
-        let open = self.0.open.borrow().shared.clone();
-        if open.flags.get() & O_PATH != 0 {
-            return Err(Errno(9));
-        }
-        open.check_device_ioctl(request)?;
-        match request {
-            0x5450 | 0x5451 => self.0.cloexec.set(request == 0x5451),
-            0x5421 | 0x5452 => {
-                let enabled = memory.read_array::<4>(argument).map_err(|_| Errno(14))? != [0; 4];
-                if request == 0x5421 {
-                    open.flags.nonblocking(enabled)?;
-                } else {
-                    let _update = open.flags.lock_update();
-                    if (open.flags.get() & 0x2000 != 0) != enabled {
-                        if !Self::change_async(&open, fd, enabled)? {
-                            return Err(Errno(25));
-                        }
-                        open.flags.set_async(enabled);
-                    }
-                }
-            }
-            0x8901..=0x8904 if open.kind == FdKind::Socket => {
-                if request <= 0x8902 {
-                    let pid =
-                        u32::from_le_bytes(memory.read_array(argument).map_err(|_| Errno(14))?);
-                    open.flags
-                        .owner_control(8, u64::from(pid), memory, owners)?;
-                } else {
-                    let pid = open.flags.owner_control(9, 0, memory, owners)? as u32;
-                    memory
-                        .write_array(argument, pid.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-            }
-            _ => return Err(Errno(25)),
-        }
-        Ok(0)
+        self.status_control()
+            .ioctl(fd, request, argument, memory, owners)
     }
 
     fn change_async(open: &Arc<SharedOpenDescription>, fd: u32, enabled: bool) -> Result<bool> {
@@ -240,6 +226,82 @@ impl DescriptorControl {
         }
     }
 }
+/// Thread-safe ownership of one accepted OFD and its original descriptor bit.
+/// Flag-only embeddings retain their existing status object without a Files root.
+pub struct StatusControl {
+    file: Option<SharedFd>,
+    flags: StatusFlags,
+    cloexec: CloseOnExec,
+}
+impl StatusControl {
+    pub fn fcntl(
+        &self,
+        command: u32,
+        argument: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+        owners: &impl AsyncOwners,
+    ) -> Result<u64> {
+        self.flags.owner_control(command, argument, memory, owners)
+    }
+    pub fn ioctl(
+        &self,
+        fd: u32,
+        request: u32,
+        argument: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+        owners: &impl AsyncOwners,
+    ) -> Result<u64> {
+        self.check_ioctl(request)?;
+        self.ioctl_accepted(fd, request, argument, memory, owners)
+    }
+    pub fn check_ioctl(&self, request: u32) -> Result<()> {
+        self.file.as_ref().ok_or(Errno(9))?.check_ioctl(request)
+    }
+    /// The original entry check completed before this invocation's user copy.
+    pub fn ioctl_accepted(
+        &self,
+        fd: u32,
+        request: u32,
+        argument: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+        owners: &impl AsyncOwners,
+    ) -> Result<u64> {
+        let open = &self.file.as_ref().ok_or(Errno(9))?.open;
+        match request {
+            0x5450 | 0x5451 => self.cloexec.set(request == 0x5451),
+            0x5421 | 0x5452 => {
+                let enabled = memory.read_array::<4>(argument).map_err(|_| Errno(14))? != [0; 4];
+                if request == 0x5421 {
+                    open.flags.nonblocking(enabled)?;
+                } else {
+                    let _update = open.flags.lock_update();
+                    if (open.flags.get() & 0x2000 != 0) != enabled {
+                        if !DescriptorControl::change_async(open, fd, enabled)? {
+                            return Err(Errno(25));
+                        }
+                        open.flags.set_async(enabled);
+                    }
+                }
+            }
+            0x8901..=0x8904 if open.kind == FdKind::Socket => {
+                if request <= 0x8902 {
+                    let pid =
+                        u32::from_le_bytes(memory.read_array(argument).map_err(|_| Errno(14))?);
+                    open.flags
+                        .owner_control(8, u64::from(pid), memory, owners)?;
+                } else {
+                    let pid = open.flags.owner_control(9, 0, memory, owners)? as u32;
+                    memory
+                        .write_array(argument, pid.to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+            }
+            _ => return Err(Errno(25)),
+        }
+        Ok(0)
+    }
+}
+
 pub(super) fn check_status(
     open: &OpenDescription,
     credentials: &Credentials,
@@ -335,6 +397,20 @@ pub(super) struct DescriptorFlags {
     pub(super) cloexec: CloseOnExec,
 }
 impl FdFlags {
+    pub fn status_control(&self, fd: u32) -> Result<StatusControl> {
+        if self.1.is_some() {
+            return self
+                .descriptor_control(fd)
+                .map(|control| control.status_control());
+        }
+        self.with_flags(fd, |flags, cloexec| {
+            Ok(StatusControl {
+                file: None,
+                flags: flags.clone(),
+                cloexec: cloexec.clone(),
+            })
+        })
+    }
     pub fn descriptor_control(&self, fd: u32) -> Result<DescriptorControl> {
         self.1
             .as_ref()

@@ -18,9 +18,19 @@ impl NamespaceTarget {
         Self::Ordinary(path, trailing)
     }
     pub(crate) fn unresolved(v: &Vfs, fd: i32, path: &[u8]) -> Result<Self> {
-        v.start_path_walk(fd, path, true, true, 0, false, None)
-            .map(Box::new)
-            .map(Self::Walk)
+        let mut walk = v.start_path_walk(fd, path, true, true, 0, false, None)?;
+        walk.retry = Some(PathRetry::capture(
+            v,
+            fd,
+            path,
+            true,
+            true,
+            0,
+            false,
+            PathOperation::ResolveDirectory,
+            None,
+        ));
+        Ok(Self::Walk(Box::new(walk)))
     }
 }
 
@@ -120,6 +130,9 @@ impl Parent {
         };
         let mut names = names;
         let name = names.pop_back().ok_or(Errno(16))?;
+        if let Some(retry) = &mut walk.retry {
+            retry.parent();
+        }
         walk.parts = names;
         walk.follow_final = true;
         walk.trailing = true;
@@ -339,6 +352,7 @@ impl PendingNamespace {
                     mount: Some(Mount::resource_projection(path.mount.clone())),
                     proc_binding: None,
                     directory_inode: None,
+                    fuse_entry: None,
                     indexed_position: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_position: None,

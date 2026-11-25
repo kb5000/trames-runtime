@@ -4,7 +4,7 @@ use trames_memory::{
     Memory, MemoryError, PageBacking, PageSource, PageWait, Permissions, SharedPage, PAGE_SIZE,
 };
 
-pub(in crate::direct) struct Deferred {
+pub(crate) struct Deferred {
     wait: Arc<PageWait>,
     bytes: Mutex<Option<Arc<SharedPage>>>,
     identity: u64,
@@ -17,7 +17,7 @@ impl Deferred {
             identity: trames_memory::new_backing_identity(),
         })
     }
-    pub(in crate::direct) fn finish(&self) {
+    pub(crate) fn finish(&self) {
         *self.bytes.lock().unwrap() = Some(Arc::new(SharedPage::new([0; PAGE_SIZE as usize])));
         self.wait.finish();
     }
@@ -78,7 +78,7 @@ fn destination() -> (Memory, Arc<Deferred>, u64) {
     let page = install(&mut memory, 0x10000 + PAGE_SIZE);
     (memory, page, 0x10000 + PAGE_SIZE - 2)
 }
-pub(in crate::direct) fn install(memory: &mut Memory, address: u64) -> Arc<Deferred> {
+pub(crate) fn install(memory: &mut Memory, address: u64) -> Arc<Deferred> {
     let page = Deferred::new();
     memory
         .map_backed(
@@ -91,6 +91,155 @@ pub(in crate::direct) fn install(memory: &mut Memory, address: u64) -> Arc<Defer
         .unwrap();
     page
 }
+#[test]
+fn cancellation_releases_original_read_position_while_old_copy_snapshots_remain() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let mut vfs = trames_vfs::Vfs::default();
+    vfs.import_file(b"/original", b"abcdefgh".to_vec()).unwrap();
+    let fd = vfs.open_at(-100, b"/original", 0, 0).unwrap();
+    let duplicate = vfs.dup(fd, 0, false).unwrap();
+    let original = vfs
+        .shared_files()
+        .lookup(fd)
+        .unwrap()
+        .unwrap()
+        .file_target()
+        .unwrap();
+    let trames_vfs::FileOutcome::Complete(reply) = trames_vfs::FileWork::new(
+        &vfs.path_queries(),
+        original,
+        trames_vfs::FileCommand::Read {
+            count: 8,
+            offset: None,
+        },
+    )
+    .run() else {
+        panic!("resident original read");
+    };
+    let (mut memory, page, address) = destination();
+    let mut copy =
+        FileCopyout::new(&FileOutput::Scalar(address), reply.result).retain(reply.resources);
+    assert_eq!(copy.progress(&mut memory).unwrap_err().address, address + 2);
+    let accepted = FilePending::copyout(copy);
+    let retired = accepted.clone();
+    assert_eq!(vfs.seek(duplicate, 0, 1), Err(Errno(11)));
+    accepted.cancel_import();
+    assert_eq!(vfs.seek(duplicate, 0, 1), Ok(2));
+    memory.write(address, b"zz").unwrap();
+    page.finish();
+    let direct = DirectSyscalls::default();
+    assert!(matches!(
+        direct.start_retained_file(
+            retired,
+            63,
+            [fd as u64, address, 8, 0, 0, 0],
+            &mut memory,
+            1,
+            &Arc::downgrade(&target)
+        ),
+        IoAttempt::Complete(Err(Errno(4)))
+    ));
+    assert_eq!(memory.read_array::<2>(address).unwrap(), *b"zz");
+    assert_eq!(memory.read_array::<6>(address + 2).unwrap(), [0; 6]);
+    assert_eq!(vfs.seek(duplicate, 0, 1), Ok(2));
+}
+
+#[test]
+fn cancelled_completion_discards_a_late_read_reply_and_its_original_position() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let mut vfs = trames_vfs::Vfs::default();
+    vfs.import_file(b"/original", b"abcdefgh".to_vec()).unwrap();
+    let fd = vfs.open_at(-100, b"/original", 0, 0).unwrap();
+    let duplicate = vfs.dup(fd, 0, false).unwrap();
+    let original = vfs
+        .shared_files()
+        .lookup(fd)
+        .unwrap()
+        .unwrap()
+        .file_target()
+        .unwrap();
+    let work = trames_vfs::FileWork::new(
+        &vfs.path_queries(),
+        original.clone(),
+        trames_vfs::FileCommand::Read {
+            count: 8,
+            offset: None,
+        },
+    );
+    let result = Arc::new(FileResult::default());
+    let pending = FilePending::new(result.clone(), FileOutput::Scalar(0x10000), original);
+    let retired = pending.clone();
+    result.begin();
+    pending.cancel_import();
+    result.complete(work.run());
+    assert!(result.finished());
+    assert!(
+        result.take().is_none(),
+        "late bytes cannot retain the old position"
+    );
+    assert_eq!(vfs.seek(duplicate, 0, 1), Ok(0));
+    let mut memory = Memory::default();
+    memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+    let wake: Arc<dyn IoWake> = Arc::new(Target);
+    let direct = DirectSyscalls::default();
+    assert!(matches!(
+        direct.start_retained_file(
+            retired,
+            63,
+            [fd as u64, 0x10000, 8, 0, 0, 0],
+            &mut memory,
+            1,
+            &Arc::downgrade(&wake)
+        ),
+        IoAttempt::Complete(Err(Errno(4)))
+    ));
+    assert_eq!(memory.read_array::<8>(0x10000).unwrap(), [0; 8]);
+}
+
+#[test]
+fn pipe_copy_cancellation_commits_only_the_prefix_and_releases_the_original_reservation() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let mut vfs = trames_vfs::Vfs::default();
+    let [reader, writer] = vfs.pipe(0).unwrap();
+    let alias = vfs.dup(reader, 0, false).unwrap();
+    vfs.write(writer, b"abcdefgh").unwrap();
+    let direct = DirectSyscalls::new(vfs.direct_descriptors());
+    let (mut memory, page, address) = destination();
+    let args = [reader as u64, address, 8, 0, 0, 0];
+    let Some(IoAttempt::Blocked(wait)) =
+        direct.start(63, args, &mut memory, 1, &Arc::downgrade(&target), None)
+    else {
+        panic!("the original pipe copy must wait for its output page")
+    };
+    let stale = wait.file_pending().unwrap();
+    assert_eq!(memory.read_array::<2>(address).unwrap(), *b"ab");
+    assert_eq!(vfs.read(alias, 8), Err(Errno(11)));
+    vfs.close(reader).unwrap();
+    assert_eq!(vfs.eventfd(99, 0).unwrap(), reader);
+    wait.cancel_copies();
+    assert_eq!(vfs.read(alias, 8).unwrap(), b"cdefgh");
+    memory.write(address, b"ZZ").unwrap();
+    page.finish();
+    assert!(matches!(
+        direct.start_retained_file(stale, 63, args, &mut memory, 1, &Arc::downgrade(&target)),
+        IoAttempt::Complete(Err(Errno(4)))
+    ));
+    assert_eq!(memory.read_array::<2>(address).unwrap(), *b"ZZ");
+    assert_eq!(memory.read_array::<6>(address + 2).unwrap(), [0; 6]);
+    assert_eq!(vfs.read(reader, 8).unwrap(), 99u64.to_le_bytes());
+}
+
 #[test]
 fn output_wait_keeps_its_cursor_instead_of_overwriting_an_already_copied_prefix() {
     for worker in [false, true] {
@@ -255,6 +404,294 @@ fn accepted_file_result_survives_page_wait_fd_reuse_and_source_rebinding_once() 
             Ok(expected),
             "only the copied prefix advances the original OFD"
         );
+    }
+}
+
+#[test]
+fn proc_cgroup_and_mqueue_reads_commit_only_copied_bytes_and_wake_original_position_waiters() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    for kind in 0..4 {
+        for cancel in [false, true] {
+            let mut v = trames_vfs::Vfs::default();
+            v.set_runtime_info(
+                1,
+                trames_vfs::RuntimeInfo {
+                    processes: vec![trames_vfs::ProcessInfo {
+                        pid: 1,
+                        tgid: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let fd = match kind {
+                0 => v.open_at(-100, b"/proc/sys/kernel/hostname", 0, 0).unwrap(),
+                1 => v.open_at(-100, b"/proc/self/mountinfo", 0, 0).unwrap(),
+                2 => {
+                    v.mkdir_at(-100, b"/sys/fs/cgroup/copy-position", 0o755)
+                        .unwrap();
+                    v.open_at(
+                        -100,
+                        b"/sys/fs/cgroup/copy-position/cgroup.events",
+                        trames_vfs::O_NONBLOCK,
+                        0,
+                    )
+                    .unwrap()
+                }
+                _ => v
+                    .mq_open(
+                        b"copy-position",
+                        0x40 | 2 | trames_vfs::O_NONBLOCK,
+                        0o600,
+                        Some([2, 128]),
+                    )
+                    .unwrap(),
+            };
+            let expected = v.pread(fd, 8, 0).unwrap();
+            assert!(expected.len() > 2);
+            let duplicate = v.dup(fd, 0, false).unwrap();
+            let original = v
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .file_target()
+                .unwrap();
+            let paths = v.path_queries();
+            let command = trames_vfs::FileCommand::Read {
+                count: 8,
+                offset: None,
+            };
+            let trames_vfs::FileOutcome::Complete(reply) =
+                trames_vfs::FileWork::new(&paths, original.clone(), command.clone()).run()
+            else {
+                panic!("resident original control read");
+            };
+            assert!(matches!(&reply.result, Ok(trames_vfs::FileValue::Read(_))));
+            let mut copy = FileCopyout::new(&FileOutput::Scalar(0x10ffe), reply.result);
+            let mut memory = Memory::default();
+            memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+            let page = install(&mut memory, 0x11000);
+            assert_eq!(copy.progress(&mut memory).unwrap_err().address, 0x11000);
+            assert_eq!(v.seek(duplicate, 0, 1), Err(Errno(11)));
+            let trames_vfs::FileOutcome::Waiting(next) =
+                trames_vfs::FileWork::new(&paths, original, command).run()
+            else {
+                panic!("second read waits even with O_NONBLOCK");
+            };
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let _sources = next.wait_sources(&signal).unwrap();
+            signal.reset();
+            v.import_file(b"/replacement", b"replacement".to_vec())
+                .unwrap();
+            v.shared_files().close_range(fd, fd, 0, 1).unwrap();
+            assert_eq!(v.open_at(-100, b"/replacement", 0, 0).unwrap(), fd);
+            let copied = if cancel {
+                drop(copy);
+                2
+            } else {
+                page.finish();
+                assert_eq!(copy.progress(&mut memory), Ok(Ok(expected.len() as u64)));
+                drop(copy);
+                expected.len()
+            };
+            assert!(
+                signal.ready(),
+                "the original position gate wakes without polling"
+            );
+            assert_eq!(v.seek(duplicate, 0, 1), Ok(copied as u64));
+            assert_eq!(v.seek(fd, 0, 1), Ok(0), "output cannot advance a reused FD");
+            let remaining = v.pread(duplicate, 8, copied as u64).unwrap();
+            let trames_vfs::FileOutcome::Complete(reply) = next.run() else {
+                panic!("original gate released");
+            };
+            assert_eq!(reply.result.unwrap().into_bytes().unwrap(), remaining);
+            assert_eq!(
+                v.seek(duplicate, 0, 1),
+                Ok((copied + remaining.len()) as u64)
+            );
+        }
+    }
+}
+
+#[test]
+fn epoll_output_page_wait_keeps_original_events_across_oneshot_and_epoll_fd_reuse() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let mut v = trames_vfs::Vfs::default();
+    let event = v.eventfd(1, 0).unwrap();
+    let epoll = v.epoll_create(0).unwrap();
+    v.epoll_ctl(epoll, 1, event, 1 | 0x4000_0000, 55).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x10000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+    let args = [epoll as u64, 0x10ffe, 1, 0, 0, 0];
+    let accepted = Arc::new(
+        crate::RetainedWait::prepare_worker(&v.direct_descriptors(), &memory, 22, args, None)
+            .unwrap()
+            .unwrap(),
+    );
+    memory.unmap(0x11000, PAGE_SIZE).unwrap();
+    let page = install(&mut memory, 0x11000);
+    let direct = DirectSyscalls::new(v.direct_descriptors());
+    let IoAttempt::Blocked(wait) = direct.start_retained_poll(
+        accepted,
+        args,
+        &mut memory,
+        1,
+        &Arc::downgrade(&target),
+        None,
+    ) else {
+        panic!("accepted epoll output releases its CPU slot");
+    };
+    assert_eq!(wait.interruptible_file_wait(), Some(false));
+    assert!(wait.notification_external());
+    assert_eq!(
+        wait.wake_deadline(),
+        None,
+        "expired epoll deadline cannot poll its missing output page"
+    );
+    assert_eq!(
+        v.epoll_wait(epoll, 1, |_, _| Ok(None)),
+        Err(Errno(11)),
+        "another consumer waits on the original copy admission"
+    );
+    memory.write(0x10ffe, b"XY").unwrap();
+    v.shared_files().close_range(epoll, epoll, 0, 1).unwrap();
+    assert_eq!(v.epoll_create(0).unwrap(), epoll);
+    v.epoll_ctl(epoll, 1, event, 1, 99).unwrap();
+    page.finish();
+    assert!(matches!(
+        direct.resume(wait, &mut memory),
+        IoAttempt::Complete(Ok(1))
+    ));
+    assert_eq!(memory.read_array::<2>(0x10ffe).unwrap(), *b"XY");
+    assert_eq!(
+        memory.read_array::<8>(0x11006).unwrap(),
+        55u64.to_le_bytes()
+    );
+    assert_eq!(
+        v.epoll_wait(epoll, 1, |_, _| Ok(None)).unwrap(),
+        vec![(1, 99)],
+        "new epoll was never sampled by the old copy"
+    );
+    assert_eq!(direct.completed.get(), 1);
+}
+
+#[test]
+fn poll_timeout_output_page_wait_preserves_prefix_and_the_original_ready_result() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let mut v = trames_vfs::Vfs::default();
+    let event = v.eventfd(1, 0).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x10000, 4 * PAGE_SIZE, Permissions::RW).unwrap();
+    memory
+        .write_array(0x13000, (event as u64 | (1u64 << 32)).to_le_bytes())
+        .unwrap();
+    memory.write_array(0x10ffc, 1u64.to_le_bytes()).unwrap();
+    memory.write_array(0x11004, 0u64.to_le_bytes()).unwrap();
+    let args = [0x13000, 1, 0x10ffc, 0, 0, 0];
+    let accepted = Arc::new(
+        crate::RetainedWait::prepare_worker(&v.direct_descriptors(), &memory, 73, args, None)
+            .unwrap()
+            .unwrap(),
+    );
+    memory.unmap(0x11000, PAGE_SIZE).unwrap();
+    let page = install(&mut memory, 0x11000);
+    let direct = DirectSyscalls::new(v.direct_descriptors());
+    let IoAttempt::Blocked(wait) = direct.start_retained_poll(
+        accepted,
+        args,
+        &mut memory,
+        1,
+        &Arc::downgrade(&target),
+        None,
+    ) else {
+        panic!("final timeout copy retains the already accepted poll result");
+    };
+    assert_eq!(wait.wake_deadline(), None);
+    assert_eq!(memory.read_array::<2>(0x13006).unwrap(), 1u16.to_le_bytes());
+    memory.write(0x10ffc, b"KEEP").unwrap();
+    v.read(event, 8).unwrap();
+    page.finish();
+    assert!(matches!(
+        direct.resume(wait, &mut memory),
+        IoAttempt::Complete(Ok(1))
+    ));
+    assert_eq!(memory.read_array::<4>(0x10ffc).unwrap(), *b"KEEP");
+    assert_eq!(direct.completed.get(), 1);
+}
+
+#[test]
+fn epoll_control_import_retains_read_fragments_and_resolves_fds_after_the_input_copy() {
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    for invalid_epoll in [false, true] {
+        let mut v = trames_vfs::Vfs::default();
+        let event = v.eventfd(1, 0).unwrap();
+        let epoll = v.epoll_create(0).unwrap();
+        let duplicate = v.dup(epoll, 0, false).unwrap();
+        let mut memory = Memory::default();
+        memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x10ff8, 1u32.to_le_bytes()).unwrap();
+        let page = install(&mut memory, 0x11000);
+        let direct = DirectSyscalls::new(v.direct_descriptors()).with_membership(v.shared_files());
+        let args = [
+            if invalid_epoll {
+                u32::MAX as u64
+            } else {
+                epoll as u64
+            },
+            1,
+            event as u64,
+            0x10ff8,
+            0,
+            0,
+        ];
+        assert_eq!(
+            direct.invoke_epoll_control(21, args, &memory),
+            None,
+            "read input before reporting an invalid epoll descriptor"
+        );
+        let IoAttempt::Blocked(wait) = direct
+            .start_file_call(21, args, &mut memory, 1, &Arc::downgrade(&target))
+            .unwrap()
+        else {
+            panic!("original epoll_ctl import waits for its reached input page");
+        };
+        memory.write_array(0x10ff8, 4u32.to_le_bytes()).unwrap();
+        v.shared_files().close_range(epoll, epoll, 0, 1).unwrap();
+        assert_eq!(v.epoll_create(0).unwrap(), epoll);
+        page.finish();
+        memory.write_array(0x11000, 77u64.to_le_bytes()).unwrap();
+        let result = direct.resume(wait, &mut memory);
+        if invalid_epoll {
+            assert!(matches!(result, IoAttempt::Complete(Err(Errno(9)))));
+        } else {
+            assert!(matches!(result, IoAttempt::Complete(Ok(0))));
+            assert_eq!(
+                v.epoll_wait(epoll, 1, |_, _| Ok(None)).unwrap(),
+                vec![(1, 77)],
+                "accepted event mask survives, while later fget reaches the current epoll"
+            );
+        }
+        assert!(v
+            .epoll_wait(duplicate, 1, |_, _| Ok(None))
+            .unwrap()
+            .is_empty());
     }
 }
 

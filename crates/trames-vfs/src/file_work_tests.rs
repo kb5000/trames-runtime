@@ -43,6 +43,56 @@ fn disk() -> (std::path::PathBuf, Vfs) {
     (path, v)
 }
 #[test]
+fn an_idle_position_subscription_covers_a_new_reader_before_the_ready_check() {
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let mut v = Vfs::default();
+    v.import_file(b"/original", b"abc".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/original", 0, 0).unwrap();
+    let file = target(&v, fd);
+    let paths = v.path_queries();
+    let read = || {
+        FileWork::new(
+            &paths,
+            file.clone(),
+            FileCommand::Read {
+                count: 1,
+                offset: None,
+            },
+        )
+    };
+    let first = value(read()).unwrap();
+    let FileOutcome::Waiting(waiting) = read().run() else {
+        panic!("the accepted read owns the original position");
+    };
+    drop(first); // Cancel before copy: the original position is idle at zero.
+    let wake: Arc<dyn IoWake> = Arc::new(Wake);
+    let signal = IoSignal::new(1, Arc::downgrade(&wake));
+    let _subscriptions = waiting.wait_sources(&signal).unwrap();
+    let next = value(read()).unwrap();
+    assert!(
+        !waiting.ready(),
+        "another reader acquired the idle position"
+    );
+    assert!(!signal.ready());
+    v.close(fd).unwrap();
+    assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+    assert!(
+        !signal.ready(),
+        "numeric close does not release the position"
+    );
+    assert_eq!(next.into_bytes().unwrap(), b"a");
+    assert!(
+        signal.ready(),
+        "the original completion must wake its waiter"
+    );
+    assert_eq!(value(waiting).unwrap().into_bytes().unwrap(), b"b");
+    assert_eq!(file.0.open.file_position.snapshot(), 2);
+    assert_eq!(v.read(fd, 8).unwrap(), 99u64.to_le_bytes());
+}
+#[test]
 fn concurrent_growth_has_one_capacity_account_and_failed_growth_rolls_back() {
     for persistent in [false, true] {
         let (directory, mut v) = if persistent {
@@ -258,7 +308,12 @@ fn file_copy_keeps_imported_input_across_output_layout_changes_and_fd_reuse() {
         target(&v, output),
         FileCommand::Copy {
             input: target(&v, source),
-            transfer: RefCell::new(FileCopy::new(Ok(Some(0)), Ok(Some(0)), 2 * PAGE_SIZE, true)),
+            transfer: Arc::new(std::sync::Mutex::new(FileCopy::new(
+                Ok(Some(0)),
+                Ok(Some(0)),
+                2 * PAGE_SIZE,
+                true,
+            ))),
         },
     );
     let FileOutcome::Layout(work) = work.run() else {
@@ -375,7 +430,12 @@ fn same_inode_forward_copy_repeats_only_at_eof_and_preserves_offsets() {
         let count = storage::MAX_TRANSFER as u64 + 17;
         let command = FileCommand::Copy {
             input: target(&v, fd),
-            transfer: RefCell::new(FileCopy::new(Ok(Some(2)), Ok(None), count, false)),
+            transfer: Arc::new(std::sync::Mutex::new(FileCopy::new(
+                Ok(Some(2)),
+                Ok(None),
+                count,
+                false,
+            ))),
         };
         let work = FileWork::from_vfs(&v, target(&v, fd), command);
         assert!(
@@ -418,7 +478,12 @@ fn file_copy_resumes_after_a_committed_chunk_and_a_layout_wait() {
         target(&v, output),
         FileCommand::Copy {
             input: target(&v, source),
-            transfer: RefCell::new(FileCopy::new(Ok(None), Ok(None), (block + 7) as u64, true)),
+            transfer: Arc::new(std::sync::Mutex::new(FileCopy::new(
+                Ok(None),
+                Ok(None),
+                (block + 7) as u64,
+                true,
+            ))),
         },
     );
     let FileOutcome::Layout(work) = work.run() else {

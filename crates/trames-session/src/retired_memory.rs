@@ -11,6 +11,8 @@ use trames_shared::{IoSignal, IoSubscription, IoWake};
 #[derive(Default)]
 pub(crate) struct RetiredMemory {
     pending: Mutex<BTreeMap<u64, Pending>>,
+    cleanup: Mutex<BTreeMap<u64, CleanupEntry>>,
+    layouts: Mutex<Option<Weak<trames_linux::FileLayouts>>>,
     #[cfg(all(test, trames_interpreter_conformance))]
     owner: OnceLock<(Arc<dyn IoWake>, Arc<IoSignal>)>,
     executor: Mutex<Option<Weak<IoSignal>>>,
@@ -36,6 +38,9 @@ impl Drop for Driver {
 }
 
 #[cfg(all(test, trames_interpreter_conformance))]
+#[path = "retired_memory_close_tests.rs"]
+mod close_tests;
+#[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -60,6 +65,78 @@ mod tests {
         drop(memory.share());
         let view = memory.parallel_view(&mut Default::default()).unwrap();
         (memory, view)
+    }
+    #[test]
+    fn cancelled_mapping_on_a_shared_old_mm_uses_weak_custody_and_original_idle_wake() {
+        let retired = Arc::new(RetiredMemory::default());
+        let (_target, signal, _events) = wake();
+        let _driver = retired.bind_reader(signal);
+        let mut memory = Memory::default();
+        let objects = trames_memory::SharedAnonymousPages::fixed_mapping(1);
+        memory
+            .map_backed(0x1000, objects.clone(), true, Permissions::RW, false)
+            .unwrap();
+        let lease = memory.mapping_lease(objects);
+        let alias = memory.share();
+        let id = memory.coordinator_ownership().0;
+        let view = memory.parallel_view(&mut Default::default()).unwrap();
+        drop(lease);
+        retired.retire(alias).unwrap();
+        assert_eq!(
+            memory.coordinator_ownership().1,
+            1,
+            "cleanup is not an extra original mm owner"
+        );
+        assert_eq!(retired.cleanup_domains(), vec![id]);
+        // Admission is deliberately reentrant on the owning host thread.
+        // Hold custody on a distinct caller to exercise a genuinely busy mm.
+        std::thread::scope(|scope| {
+            let holder = memory.share();
+            let (entered, ready) = mpsc::channel();
+            let (release, done) = mpsc::channel();
+            scope.spawn(move || {
+                let _held = holder.try_admit().unwrap();
+                entered.send(()).unwrap();
+                done.recv().unwrap();
+            });
+            ready.recv().unwrap();
+            retired.pump().unwrap();
+            assert!(!retired.is_empty());
+            assert!(
+                retired.cleanup_domains().is_empty(),
+                "busy custody waits on its original resource"
+            );
+            release.send(()).unwrap();
+        });
+        assert_eq!(retired.cleanup_domains(), vec![id]);
+        retired.pump().unwrap();
+        assert!(
+            !retired.is_empty(),
+            "the existing execution View still owns its mapping generation"
+        );
+        drop(view);
+        retired.pump().unwrap();
+        assert!(retired.is_empty());
+        assert!(memory.validate_mapped(0x1000, PAGE_SIZE).is_err());
+        assert_eq!(memory.coordinator_ownership().1, 1);
+    }
+    #[test]
+    fn weak_mapping_cleanup_does_not_keep_an_old_mm_alive_after_its_last_owner() {
+        let retired = Arc::new(RetiredMemory::default());
+        let mut memory = Memory::default();
+        let objects = trames_memory::SharedAnonymousPages::fixed_mapping(1);
+        memory
+            .map_backed(0x1000, objects.clone(), true, Permissions::RW, false)
+            .unwrap();
+        let lease = memory.mapping_lease(objects);
+        let alias = memory.share();
+        let view = memory.parallel_view(&mut Default::default()).unwrap();
+        drop(lease);
+        retired.retire(alias).unwrap();
+        drop(memory);
+        retired.pump().unwrap();
+        assert!(retired.is_empty());
+        assert_eq!(view.read_array::<4>(0x1000).unwrap(), [0; 4]);
     }
     #[test]
     fn last_borrower_wake_survives_subscriber_changes_and_repeated_retirement() {
@@ -174,6 +251,29 @@ struct Pending {
     signal: Arc<IoSignal>,
     _idle: IoSubscription,
     custody: Option<IoSubscription>,
+    reaped: bool,
+    closing: Closing,
+}
+// Keep membership published while one executor owns the original work. A
+// concurrent retire marks another pass instead of replacing checked-out state.
+struct CleanupEntry {
+    signal: Arc<IoSignal>,
+    state: Option<CleanupPending>,
+    running: bool,
+    again: bool,
+}
+struct CleanupPending {
+    root: trames_memory::SharedRoot,
+    signal: Arc<IoSignal>,
+    subscriptions: Vec<IoSubscription>,
+    reaped: bool,
+    closing: Closing,
+}
+#[derive(Default)]
+struct Closing {
+    resources: Vec<Arc<dyn trames_memory::SyncResource>>,
+    result: Option<Arc<trames_linux::FileResult>>,
+    subscription: Option<IoSubscription>,
 }
 impl IoWake for RetiredMemory {
     fn wake_io(&self, _: &Arc<IoSignal>) {
@@ -181,6 +281,38 @@ impl IoWake for RetiredMemory {
     }
 }
 impl RetiredMemory {
+    pub fn bind_layouts(&self, layouts: &Arc<trames_linux::FileLayouts>) {
+        *self.layouts.lock().unwrap() = Some(Arc::downgrade(layouts));
+    }
+    fn finish_closing(
+        &self,
+        closing: &mut Closing,
+        signal: &Arc<IoSignal>,
+    ) -> Result<bool, MemoryError> {
+        if let Some(result) = &closing.result {
+            closing.subscription = Some(result.subscribe(signal));
+            if !result.ready() {
+                return Ok(false);
+            }
+            closing.result = None;
+            closing.subscription = None;
+        }
+        if closing.resources.is_empty() {
+            return Ok(true);
+        }
+        let layouts = self
+            .layouts
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(MemoryError::BackingIo(95))?;
+        let result = layouts.close_mappings(std::mem::take(&mut closing.resources), 0);
+        closing.subscription = Some(result.subscribe(signal));
+        let finished = result.ready();
+        closing.result = Some(result);
+        Ok(finished)
+    }
     /// The legacy outside-epoch driver observes this same resource. It is not
     /// needed for completion while an execution epoch has an active subscriber.
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -197,6 +329,12 @@ impl RetiredMemory {
             .unwrap()
             .values()
             .any(|p| p.signal.ready())
+            || self
+                .cleanup
+                .lock()
+                .unwrap()
+                .values()
+                .any(|entry| !entry.running && entry.signal.ready())
     }
     fn notify(&self) {
         let executor = self
@@ -208,7 +346,6 @@ impl RetiredMemory {
         if let Some(executor) = executor {
             executor.notify();
         } else {
-            #[cfg(all(test, trames_interpreter_conformance))]
             #[cfg(all(test, trames_interpreter_conformance))]
             if let Some((_, signal)) = self.owner.get() {
                 signal.notify();
@@ -227,18 +364,57 @@ impl RetiredMemory {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub fn is_empty(&self) -> bool {
-        self.pending.lock().unwrap().is_empty()
+        self.pending.lock().unwrap().is_empty() && self.cleanup.lock().unwrap().is_empty()
     }
     pub fn retire(self: &Arc<Self>, mut memory: Memory) -> Result<(), MemoryError> {
         let (id, owners) = memory.coordinator_ownership();
         if owners != 1 {
+            if memory.mapping_cleanup_pending() {
+                let target: Arc<dyn IoWake> = self.clone();
+                let signal = IoSignal::new(0, Arc::downgrade(&target));
+                let signal = {
+                    let mut cleanup = self.cleanup.lock().unwrap();
+                    match cleanup.entry(id) {
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().again = true;
+                            entry.get().signal.clone()
+                        }
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let state = CleanupPending {
+                                root: memory.shared_root().expect("shared original mm"),
+                                signal: signal.clone(),
+                                subscriptions: Vec::new(),
+                                reaped: false,
+                                closing: Default::default(),
+                            };
+                            entry.insert(CleanupEntry {
+                                signal: signal.clone(),
+                                state: Some(state),
+                                running: false,
+                                again: false,
+                            });
+                            signal
+                        }
+                    }
+                };
+                signal.notify();
+            }
             return Ok(());
         }
         memory.retire_memory_report();
-        if memory.parallel_views_quiescent() {
-            return memory.commit_parallel();
+        let mut closing = Closing::default();
+        let reaped = memory.parallel_views_quiescent();
+        if reaped {
+            memory.reap_mapping_cleanup()?;
+            memory.commit_parallel()?;
+            closing.resources = memory.take_closed_resources();
+            closing.resources.extend(memory.close_resources());
+            if closing.resources.is_empty() {
+                return Ok(());
+            }
+        } else {
+            memory.commit_retired_parallel()?;
         }
-        memory.commit_retired_parallel()?;
         let target: Arc<dyn IoWake> = self.clone();
         let signal = IoSignal::new(0, Arc::downgrade(&target));
         let idle = memory.subscribe_parallel_idle(&signal);
@@ -253,6 +429,8 @@ impl RetiredMemory {
             signal,
             _idle: idle,
             custody: None,
+            reaped,
+            closing,
         });
         Ok(())
     }
@@ -265,10 +443,88 @@ impl RetiredMemory {
             self.notify();
         }
     }
+    fn take_cleanup(&self, id: u64) -> Option<CleanupPending> {
+        let mut cleanup = self.cleanup.lock().unwrap();
+        let entry = cleanup.get_mut(&id)?;
+        if entry.running || !entry.signal.ready() {
+            return None;
+        }
+        let mut pending = entry.state.take().expect("unclaimed original cleanup");
+        entry.running = true;
+        if std::mem::take(&mut entry.again) {
+            pending.reaped = false;
+        }
+        Some(pending)
+    }
+    fn publish_cleanup(&self, id: u64, mut pending: CleanupPending, finished: bool) {
+        let signal = pending.signal.clone();
+        let mut removed = None;
+        let again = {
+            let mut cleanup = self.cleanup.lock().unwrap();
+            let entry = cleanup
+                .get_mut(&id)
+                .expect("original cleanup membership remains published");
+            let again = std::mem::take(&mut entry.again);
+            if finished && !again {
+                removed = cleanup.remove(&id);
+            } else {
+                if again {
+                    pending.reaped = false;
+                }
+                entry.running = false;
+                entry.state = Some(pending);
+            }
+            again
+        };
+        drop(removed);
+        if again {
+            signal.notify();
+        } else if !finished && signal.ready() {
+            self.notify();
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn pump(&self) -> Result<(), MemoryError> {
+        self.pump_with_pause(|_| {})
+    }
+    pub fn pump_with_pause(&self, mut pause: impl FnMut(u64)) -> Result<(), MemoryError> {
         #[cfg(all(test, trames_interpreter_conformance))]
         if let Some((_, signal)) = self.owner.get() {
             signal.reset();
+        }
+        let cleanup: Vec<_> = self
+            .cleanup
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(&id, entry)| (!entry.running && entry.signal.ready()).then_some(id))
+            .collect();
+        for id in cleanup {
+            let Some(mut pending) = self.take_cleanup(id) else {
+                continue;
+            };
+            pending.signal.reset();
+            let result = (|| {
+                if !pending.reaped {
+                    pause(id);
+                    let status = pending.root.try_reap_mapping_cleanup(&pending.signal)?;
+                    pending.reaped = status.finished;
+                    pending.subscriptions = status.subscriptions;
+                    pending.closing.resources.extend(status.resources);
+                }
+                if !pending.reaped {
+                    return Ok(false);
+                }
+                self.finish_closing(&mut pending.closing, &pending.signal)
+            })();
+            match result {
+                Ok(finished) => self.publish_cleanup(id, pending, finished),
+                Err(error) => {
+                    pending.signal.notify();
+                    self.publish_cleanup(id, pending, false);
+                    return Err(error);
+                }
+            }
         }
         let ready: Vec<_> = self
             .pending
@@ -282,6 +538,18 @@ impl RetiredMemory {
                 continue;
             };
             pending.signal.reset();
+            if pending.reaped {
+                match self.finish_closing(&mut pending.closing, &pending.signal) {
+                    Ok(true) => {}
+                    Ok(false) => self.publish(pending),
+                    Err(error) => {
+                        pending.signal.notify();
+                        self.publish(pending);
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
             let permit = pending.memory.try_admit().or_else(|| {
                 pending.custody = pending.memory.subscribe_custody(&pending.signal);
                 pending.memory.try_admit()
@@ -292,16 +560,55 @@ impl RetiredMemory {
             };
             pending.custody = None;
             if pending.memory.parallel_views_quiescent() {
-                if let Err(error) = pending.memory.commit_parallel() {
-                    pending.signal.notify();
-                    self.publish(pending);
-                    return Err(error);
+                let result = (|| {
+                    if !pending.memory.reap_mapping_cleanup()? {
+                        return Ok(false);
+                    }
+                    pending.memory.commit_parallel()?;
+                    pending
+                        .closing
+                        .resources
+                        .extend(pending.memory.take_closed_resources());
+                    // A retained View can dirty the original inode after an
+                    // earlier exit/exec flush. Its final publication must have
+                    // its own close before the last original mm is released.
+                    pending
+                        .closing
+                        .resources
+                        .extend(pending.memory.close_resources());
+                    pending.reaped = true;
+                    self.finish_closing(&mut pending.closing, &pending.signal)
+                })();
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => self.publish(pending),
+                    Err(error) => {
+                        pending.signal.notify();
+                        self.publish(pending);
+                        return Err(error);
+                    }
                 }
             } else {
                 self.publish(pending);
             }
         }
         Ok(())
+    }
+    /// Cancellation on an old shared mm needs the existing affected-mm pause,
+    /// even when that mm still belongs to a CLONE_VM peer outside an exec group.
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn cleanup_domains(&self) -> Vec<u64> {
+        self.cleanup
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(&id, entry)| {
+                (!entry.running
+                    && entry.signal.ready()
+                    && (entry.again || entry.state.as_ref().is_some_and(|state| !state.reaped)))
+                .then_some(id)
+            })
+            .collect()
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub fn contains(&self, id: u64) -> bool {

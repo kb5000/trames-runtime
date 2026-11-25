@@ -14,8 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 use trames_engine::{Cpu, DecodeStats, SliceOutcome};
+mod delivery;
 mod domains;
+#[cfg(all(test, trames_interpreter_conformance))]
+mod maintenance_tests;
 mod parked;
+pub(super) use delivery::{Delivered, Delivery};
 pub(super) use domains::{Checkpoint, Domain};
 
 #[derive(Clone)]
@@ -29,6 +33,7 @@ pub(super) enum WaitState {
     Policy(Arc<PolicyWait>),
     Barrier(Arc<crate::barrier::Wait>),
     Page(Arc<PageWait>),
+    Delivery(Arc<Delivery>),
     /// Retry the retained pending CPU syscall after original task/mm custody.
     /// This is not a completed guest wait and must not overwrite its arguments.
     Custody(Arc<crate::process::tasks::AdmissionWait>),
@@ -167,14 +172,23 @@ impl CompletionWait {
     }
 }
 pub(super) struct ChildWait {
-    pub request: trames_kernel::children::Wait,
+    pub number: u32,
+    pub args: [u64; 6],
+    call: Mutex<trames_kernel::children::WaitCall>,
     subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
+    wake: Mutex<Option<Arc<trames_vfs::IoSignal>>>,
 }
 impl ChildWait {
     pub fn new(request: trames_kernel::children::Wait) -> Arc<Self> {
+        Self::accepted(trames_kernel::children::WaitCall::accepted(request))
+    }
+    pub fn accepted(call: trames_kernel::children::WaitCall) -> Arc<Self> {
         Arc::new(Self {
-            request,
+            number: call.number,
+            args: call.args,
+            call: Mutex::new(call),
             subscriptions: Mutex::default(),
+            wake: Mutex::default(),
         })
     }
     pub fn bind(
@@ -184,26 +198,314 @@ impl ChildWait {
         signal: &Arc<trames_vfs::IoSignal>,
     ) {
         let mut subscriptions = task.subscribe(signal);
-        subscriptions.push(family.subscribe(signal));
+        let call = self.call.lock().unwrap();
+        let fault = call.fault();
+        subscriptions.push(call.subscribe(family, signal));
+        drop(call);
+        if let Some(fault) = &fault {
+            subscriptions.push(fault.wait.subscribe(signal));
+        }
         *self.subscriptions.lock().unwrap() = subscriptions;
+        *self.wake.lock().unwrap() = Some(signal.clone());
+        if fault.is_some_and(|fault| fault.wait.ready()) {
+            signal.notify();
+        }
+    }
+    pub fn ready(
+        &self,
+        family: &Arc<trames_kernel::children::Children>,
+        namespace: &trames_vfs::PidNamespace,
+        group: u32,
+    ) -> bool {
+        self.call.lock().unwrap().ready(family, namespace, group)
+    }
+    pub fn interruptible(&self) -> bool {
+        self.call.lock().unwrap().interruptible()
+    }
+    pub fn external(&self) -> bool {
+        self.call.lock().unwrap().fault().is_some()
+    }
+    pub fn interrupt(
+        &self,
+        memory: &mut impl trames_memory::CpuMemory,
+    ) -> (
+        Option<Result<u64, trames_vfs::Errno>>,
+        Option<trames_memory::PageFault>,
+    ) {
+        let mut call = self.call.lock().unwrap();
+        let result = call.interrupt(memory);
+        (result, call.fault())
+    }
+    pub fn check(
+        &self,
+        family: &Arc<trames_kernel::children::Children>,
+        task: &trames_kernel::signal::IoTask,
+        namespace: &trames_vfs::PidNamespace,
+        group: u32,
+        memory: &mut impl trames_memory::CpuMemory,
+        signal: Option<&Arc<trames_vfs::IoSignal>>,
+    ) -> Option<Result<u64, trames_vfs::Errno>> {
+        let mut call = self.call.lock().unwrap();
+        let previous = call.fault();
+        let result = call.check(family, namespace, group, memory);
+        let changed = previous != call.fault();
+        drop(call);
+        if changed {
+            let signal = signal
+                .cloned()
+                .or_else(|| self.wake.lock().unwrap().clone());
+            if let Some(signal) = signal {
+                self.bind(family, task, &signal);
+            }
+        }
+        result
     }
 }
 pub(super) struct SignalWait {
-    pub request: trames_kernel::signal::SignalWait,
+    call: Mutex<Option<SignalCall>>,
     subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
+    wake: Mutex<Option<Arc<trames_vfs::IoSignal>>>,
+}
+enum SignalCall {
+    Wait(trames_kernel::signal::WaitCall),
+    Control(trames_kernel::signal::ControlCall),
+    Limit(Box<trames_kernel::limits::Call>),
+    Timer(Box<trames_kernel::timers::Call>),
+    Query(Box<trames_kernel::query::Call>),
+    Scheduling(Box<trames_kernel::signal::SchedulingCall>),
+    Send(Box<trames_kernel::signal::SendCall>),
+    Perf(Box<trames_kernel::perf::OpenCall>),
+    FdControl(Box<trames_kernel::signal::FdControlCall>),
+    TaskCopy(Box<trames_linux::TaskCopyCall>),
+}
+impl SignalCall {
+    fn completion(&self) -> Option<Arc<trames_kernel::completion::Completion>> {
+        match self {
+            Self::Scheduling(call) => call.completion(),
+            _ => None,
+        }
+    }
+    fn fault(&self) -> Option<trames_memory::PageFault> {
+        match self {
+            Self::Wait(call) => call.fault(),
+            Self::Control(call) => call.fault(),
+            Self::Limit(call) => call.fault(),
+            Self::Timer(call) => call.fault(),
+            Self::Query(call) => call.fault(),
+            Self::Scheduling(call) => call.fault(),
+            Self::Send(call) => call.fault(),
+            Self::Perf(call) => call.fault(),
+            Self::FdControl(call) => call.fault(),
+            Self::TaskCopy(call) => call.fault(),
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Wait(call) => call.deadline(),
+            Self::Control(_)
+            | Self::Limit(_)
+            | Self::Timer(_)
+            | Self::Query(_)
+            | Self::Scheduling(_)
+            | Self::Send(_)
+            | Self::Perf(_)
+            | Self::FdControl(_)
+            | Self::TaskCopy(_) => None,
+        }
+    }
+    fn interruptible(&self) -> bool {
+        match self {
+            Self::Wait(call) => call.interruptible(),
+            Self::Control(_)
+            | Self::Limit(_)
+            | Self::Timer(_)
+            | Self::Query(_)
+            | Self::Scheduling(_)
+            | Self::Send(_)
+            | Self::Perf(_)
+            | Self::FdControl(_)
+            | Self::TaskCopy(_) => false,
+        }
+    }
+    fn ready(&self, task: &trames_kernel::signal::IoTask) -> bool {
+        match self {
+            Self::Wait(call) => call.ready(task),
+            Self::Control(call) => call.ready(),
+            Self::Limit(call) => call.ready(),
+            Self::Timer(call) => call.ready(),
+            Self::Query(call) => call.ready(),
+            Self::Scheduling(call) => call.ready(),
+            Self::Send(call) => call.ready(),
+            Self::Perf(call) => call.ready(),
+            Self::FdControl(call) => call.ready(),
+            Self::TaskCopy(call) => call.ready(),
+        }
+    }
+    fn check(
+        &mut self,
+        task: &Arc<trames_kernel::signal::IoTask>,
+        memory: &mut impl trames_memory::CpuMemory,
+        namespace: &trames_vfs::PidNamespace,
+    ) -> Option<Result<u64, trames_vfs::Errno>> {
+        match self {
+            Self::Wait(call) => call.check(task, memory, namespace),
+            Self::Control(call) => call.check(task, memory),
+            Self::Limit(call) => call.check(memory),
+            Self::Timer(call) => call.check(memory),
+            Self::Query(call) => call.check(memory),
+            Self::Scheduling(call) => call.check(memory),
+            Self::Send(call) => call.check(memory),
+            Self::Perf(call) => call.check(memory),
+            Self::FdControl(call) => call.check(memory),
+            Self::TaskCopy(call) => call.check(memory),
+        }
+    }
 }
 impl SignalWait {
     pub fn new(request: trames_kernel::signal::SignalWait) -> Arc<Self> {
+        Self::accepted(trames_kernel::signal::WaitCall::accepted(request))
+    }
+    pub fn accepted(call: trames_kernel::signal::WaitCall) -> Arc<Self> {
+        Self::from_call(SignalCall::Wait(call))
+    }
+    pub fn control(call: trames_kernel::signal::ControlCall) -> Arc<Self> {
+        Self::from_call(SignalCall::Control(call))
+    }
+    pub fn limit(call: trames_kernel::limits::Call) -> Arc<Self> {
+        Self::from_call(SignalCall::Limit(Box::new(call)))
+    }
+    pub fn timer(call: trames_kernel::timers::Call) -> Arc<Self> {
+        Self::from_call(SignalCall::Timer(Box::new(call)))
+    }
+    pub fn query(call: trames_kernel::query::Call) -> Arc<Self> {
+        Self::from_call(SignalCall::Query(Box::new(call)))
+    }
+    pub fn scheduling(call: trames_kernel::signal::SchedulingCall) -> Arc<Self> {
+        Self::from_call(SignalCall::Scheduling(Box::new(call)))
+    }
+    pub fn send(call: trames_kernel::signal::SendCall) -> Arc<Self> {
+        Self::from_call(SignalCall::Send(Box::new(call)))
+    }
+    pub fn perf(call: trames_kernel::perf::OpenCall) -> Arc<Self> {
+        Self::from_call(SignalCall::Perf(Box::new(call)))
+    }
+    pub fn fd_control(call: trames_kernel::signal::FdControlCall) -> Arc<Self> {
+        Self::from_call(SignalCall::FdControl(Box::new(call)))
+    }
+    pub fn task_copy(call: trames_linux::TaskCopyCall) -> Arc<Self> {
+        Self::from_call(SignalCall::TaskCopy(Box::new(call)))
+    }
+    fn from_call(call: SignalCall) -> Arc<Self> {
         Arc::new(Self {
-            request,
+            call: Mutex::new(Some(call)),
             subscriptions: Mutex::default(),
+            wake: Mutex::default(),
         })
     }
+    pub fn cancel(&self) {
+        let call = self.call.lock().unwrap().take();
+        self.subscriptions.lock().unwrap().clear();
+        self.wake.lock().unwrap().take();
+        drop(call);
+    }
     pub fn bind(&self, task: &trames_kernel::signal::IoTask, signal: &Arc<trames_vfs::IoSignal>) {
-        *self.subscriptions.lock().unwrap() = task.subscribe(signal);
+        let slot = self.call.lock().unwrap();
+        let Some(call) = slot.as_ref() else {
+            drop(slot);
+            signal.notify();
+            return;
+        };
+        let fault = call.fault();
+        let completion = call.completion();
+        let mut subscriptions = task.subscribe(signal);
+        if let Some(fault) = &fault {
+            subscriptions.push(fault.wait.subscribe(signal));
+        }
+        if let Some(completion) = &completion {
+            subscriptions.push(completion.subscribe(signal));
+        }
+        *self.subscriptions.lock().unwrap() = subscriptions;
+        *self.wake.lock().unwrap() = Some(signal.clone());
+        let ready = fault.is_some_and(|fault| fault.wait.ready())
+            || completion.is_some_and(|completion| completion.finished());
+        drop(slot);
+        if ready {
+            signal.notify();
+        }
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(SignalCall::deadline)
+    }
+    pub fn ready(&self, task: &trames_kernel::signal::IoTask) -> bool {
+        self.call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|call| call.ready(task))
+    }
+    pub fn interruptible(&self) -> bool {
+        self.call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(SignalCall::interruptible)
+    }
+    pub fn external(&self) -> bool {
+        self.call
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|call| call.fault().is_some())
+    }
+    pub fn check(
+        &self,
+        task: &Arc<trames_kernel::signal::IoTask>,
+        memory: &mut impl trames_memory::CpuMemory,
+        namespace: &trames_vfs::PidNamespace,
+        signal: Option<&Arc<trames_vfs::IoSignal>>,
+    ) -> Option<Result<u64, trames_vfs::Errno>> {
+        let mut slot = self.call.lock().unwrap();
+        let Some(call) = slot.as_mut() else {
+            return Some(Err(trames_vfs::Errno(4)));
+        };
+        let previous = call.fault();
+        let completion = call
+            .completion()
+            .map(|completion| Arc::as_ptr(&completion) as usize);
+        let result = call.check(task, memory, namespace);
+        let changed = previous != call.fault()
+            || completion
+                != call
+                    .completion()
+                    .map(|completion| Arc::as_ptr(&completion) as usize);
+        drop(slot);
+        if result.is_some() {
+            self.subscriptions.lock().unwrap().clear();
+            self.wake.lock().unwrap().take();
+        } else if changed {
+            let signal = signal
+                .cloned()
+                .or_else(|| self.wake.lock().unwrap().clone());
+            if let Some(signal) = signal {
+                self.bind(task, &signal);
+            }
+        }
+        result
     }
 }
 impl WaitState {
+    pub fn copy_pending(&self) -> bool {
+        match self {
+            Self::Signal(wait) => !wait.interruptible(),
+            Self::Child(wait) => !wait.interruptible(),
+            Self::Delivery(_) => true,
+            _ => false,
+        }
+    }
     fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Futex { deadline, .. } => *deadline,
@@ -216,8 +518,9 @@ impl WaitState {
             | Self::Policy(_)
             | Self::Barrier(_)
             | Self::Page(_)
+            | Self::Delivery(_)
             | Self::Custody(_) => None,
-            Self::Signal(wait) => wait.request.deadline(),
+            Self::Signal(wait) => wait.deadline(),
         }
     }
     fn woken(&self) -> bool {
@@ -247,6 +550,7 @@ impl WaitState {
 }
 #[derive(Clone)]
 pub(super) struct IoCall {
+    pub binder: Option<trames_linux::RetainedBinder>,
     pub aio: Option<trames_linux::RetainedAio>,
     pub message: Option<trames_linux::RetainedMessage>,
     pub number: u32,
@@ -265,6 +569,7 @@ pub(super) struct IoCall {
 impl IoCall {
     pub fn from_wait(wait: Arc<trames_linux::RetainedWait>) -> Self {
         Self {
+            binder: None,
             number: wait.number,
             args: wait.args,
             deadline: wait.deadline,
@@ -287,6 +592,7 @@ impl IoCall {
         args: [u64; 6],
     ) -> Self {
         Self {
+            binder: None,
             number,
             args,
             flock: None,
@@ -307,6 +613,7 @@ impl IoCall {
     pub fn from_byte(file: trames_linux::RetainedByte, number: u32, args: [u64; 6]) -> Self {
         let (number, args) = file.local_message_entry().unwrap_or((number, args));
         Self {
+            binder: None,
             number,
             args,
             deadline: None,
@@ -325,6 +632,7 @@ impl IoCall {
     }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
         Self {
+            binder: None,
             number: call.number,
             args: call.args,
             deadline: call.deadline,
@@ -345,6 +653,7 @@ impl IoCall {
 impl From<&trames_linux::PendingIo> for IoCall {
     fn from(io: &trames_linux::PendingIo) -> Self {
         Self {
+            binder: io.binder.clone(),
             number: io.number,
             args: io.args,
             flock: io.flock.clone(),
@@ -635,7 +944,13 @@ impl<C: Cpu> Job<C> {
                         | WaitState::Barrier(_)
                         | WaitState::Page(_)
                 )
-            ) || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
+            ) || self.waiting.as_ref().is_some_and(WaitState::copy_pending)
+                || self
+                    .work
+                    .syscalls
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.io_signals.has_pending_frame())
+                || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
                 || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -644,10 +959,21 @@ impl<C: Cpu> Job<C> {
                     .as_ref()
                     .is_some_and(|p| p.compile.is_some())
                 || self.io.as_ref().is_some_and(|io| {
-                    io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible())
+                    io.number == 2
+                        || io.aio.as_ref().is_some_and(|aio| !aio.interruptible())
+                        || io
+                            .binder
+                            .as_ref()
+                            .is_some_and(|binder| !binder.interruptible())
+                        || io.interruptible_file_wait() == Some(false)
                 })
                 || self.retry.as_ref().is_some_and(|io| {
                     io.number == 2
+                        || io.aio.as_ref().is_some_and(|aio| !aio.interruptible())
+                        || io
+                            .binder
+                            .as_ref()
+                            .is_some_and(|binder| !binder.interruptible())
                         || io.file_checkpoint.is_some()
                         || io.file.as_ref().is_some_and(|f| !f.interruptible())
                 }),
@@ -672,9 +998,7 @@ impl<C: Cpu> Job<C> {
             self.io
                 .as_ref()
                 .filter(|io| {
-                    !stopped
-                        || io.number == 2
-                        || io.file_pending().is_some_and(|f| !f.interruptible())
+                    !stopped || io.number == 2 || io.interruptible_file_wait() == Some(false)
                 })
                 .and_then(|io| io.wake_deadline()),
             self.gpu_pending
@@ -693,6 +1017,7 @@ impl<C: Cpu> Job<C> {
             .syscalls
             .as_ref()
             .is_some_and(|s| s.io_signals.trace_control_pending())
+            && self.stop_hold() != Some(true)
         {
             return true;
         }
@@ -705,6 +1030,19 @@ impl<C: Cpu> Job<C> {
             .as_ref()
             .filter(|s| s.io_signals.lifecycle().termination().is_some())
         {
+            if self
+                .io
+                .as_ref()
+                .and_then(|io| io.aio.as_ref())
+                .is_some_and(|call| call.exit_waiting())
+            {
+                return self.io.as_ref().is_some_and(|io| {
+                    io.signal.ready()
+                        || io
+                            .wake_deadline()
+                            .is_some_and(|deadline| deadline <= Instant::now())
+                });
+            }
             return !snapshot.io_signals.exit_stop_held();
         }
         if self.stopped() {
@@ -723,9 +1061,14 @@ impl<C: Cpu> Job<C> {
                     || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
                 || matches!(&self.waiting, Some(WaitState::Page(wait)) if wait.ready())
+                || matches!(&self.waiting, Some(WaitState::Delivery(wait)) if wait.ready())
+                || self.work.syscalls.as_ref().is_some_and(|snapshot| {
+                    matches!(&self.waiting, Some(WaitState::Signal(wait)) if !wait.interruptible() && wait.ready(&snapshot.io_signals))
+                        || matches!(&self.waiting, Some(WaitState::Child(wait)) if !wait.interruptible() && wait.ready(&snapshot.children, &snapshot.io_routes.namespace, snapshot.io_signals.group()))
+                })
                 || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished() && !self.work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_stopped()))
                 || self.io.as_ref().is_some_and(|io| {
-                    (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
+                    (io.number == 2 || io.interruptible_file_wait() == Some(false))
                         && io.signal.ready()
                 });
         }
@@ -738,6 +1081,9 @@ impl<C: Cpu> Job<C> {
         if matches!(&self.waiting, Some(WaitState::Page(wait)) if wait.ready()) {
             return true;
         }
+        if matches!(&self.waiting, Some(WaitState::Delivery(wait)) if wait.ready()) {
+            return true;
+        }
         if matches!(&self.waiting,Some(WaitState::ClockSleep(w)) if w.ready()) {
             return true;
         }
@@ -748,8 +1094,7 @@ impl<C: Cpu> Job<C> {
         }
         if let Some(WaitState::Child(wait)) = &self.waiting {
             if self.work.syscalls.as_ref().is_some_and(|s| {
-                s.children
-                    .ready(wait.request, &s.io_routes.namespace, s.io_signals.group())
+                wait.ready(&s.children, &s.io_routes.namespace, s.io_signals.group())
             }) {
                 return true;
             }
@@ -759,7 +1104,7 @@ impl<C: Cpu> Job<C> {
                 .work
                 .syscalls
                 .as_ref()
-                .is_some_and(|s| wait.request.ready(&s.io_signals))
+                .is_some_and(|s| wait.ready(&s.io_signals))
             {
                 return true;
             }
@@ -771,17 +1116,22 @@ impl<C: Cpu> Job<C> {
                 (action.handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || action.handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_) | WaitState::Page(_)))
+                        && !(self.waiting.as_ref().is_some_and(WaitState::copy_pending)
+                            || s.io_signals.has_pending_frame()
+                            || matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_) | WaitState::Page(_)))
                             || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
                                 .retry
                                 .as_ref()
-                                .is_some_and(|call| call.file.is_some() || call.number == 2)
+                                .is_some_and(|call| call.file.is_some() || call.number == 2
+                                    || call.binder.as_ref().is_some_and(|binder|!binder.interruptible())
+                                    || call.aio.as_ref().is_some_and(|aio|!aio.interruptible()))
                             || self
                                 .io
                                 .as_ref()
-                                .is_some_and(|io| io.file_pending().is_some() || io.number == 2))
+                                .is_some_and(|io| io.file_pending().is_some() || io.number == 2
+                                    || io.interruptible_file_wait() == Some(false)))
             })
         }) || self.uring.as_ref().is_some_and(|ring| {
             ring.signal.ready() || ring.deadline().is_some_and(|d| d <= Instant::now())
@@ -1350,6 +1700,9 @@ impl<C: Cpu> Epoch<C> {
             if let Some(WaitState::Signal(wait)) = &job.waiting {
                 wait.bind(&snapshot.io_signals, &signal);
             }
+            if let Some(WaitState::Delivery(wait)) = &job.waiting {
+                wait.bind(&signal);
+            }
             if let Some(WaitState::Child(wait)) = &job.waiting {
                 wait.bind(&snapshot.children, &snapshot.io_signals, &signal);
             }
@@ -1902,9 +2255,13 @@ impl<C: Cpu> Epoch<C> {
             if let Some(timers) = self.timers.get().filter(|t| t.due()) {
                 // Signal callbacks may acquire this queue. Timer maintenance
                 // runs on this existing executor, always outside its mutex.
+                // Keep this producer live after the deadline leaves the timer
+                // index and before its signal publishes a runnable task.
+                q.completing += 1;
                 drop(q);
                 timers.tick();
                 q = self.queues.lock().unwrap();
+                q.completing -= 1;
                 // Completion may have acquired/notified this queue while the
                 // callback ran. Do not dispatch or register a new sleep after it.
                 if self.control.stopped() {
@@ -1912,12 +2269,16 @@ impl<C: Cpu> Epoch<C> {
                 }
             }
             if self.protocols.due() {
+                // Protocol progress can consume its deadline before publishing
+                // the resulting readiness through the original queue callback.
+                q.completing += 1;
                 drop(q);
                 let result = self.protocols.progress(&|| {
                     trames_vfs::IoWake::host_events(self)?
                         .ok_or_else(|| std::io::Error::other("missing host events"))
                 });
                 q = self.queues.lock().unwrap();
+                q.completing -= 1;
                 if let Err(error) = result {
                     let _ = self.host_error.set(Arc::new(error));
                     self.control.close(crate::execution_control::End::Failed);
@@ -2684,6 +3045,39 @@ mod tests {
     use super::*;
     use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
     #[test]
+    fn cancelled_control_binding_notifies_after_releasing_its_original_receipt_lock() {
+        struct Wake {
+            wait: std::sync::Weak<SignalWait>,
+            called: AtomicBool,
+        }
+        impl trames_vfs::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+                let wait = self.wait.upgrade().unwrap();
+                assert!(
+                    wait.call.try_lock().is_ok(),
+                    "scheduling callback cannot run under the accepted call lock"
+                );
+                self.called.store(true, Ordering::Relaxed);
+            }
+        }
+        let wait = SignalWait::control(trames_kernel::signal::ControlCall::new(
+            136,
+            [0; 6],
+            0,
+            trames_kernel::signal::Signals::default().actions.shared(),
+            Arc::default(),
+        ));
+        wait.cancel();
+        let wake = Arc::new(Wake {
+            wait: Arc::downgrade(&wait),
+            called: AtomicBool::new(false),
+        });
+        let target: Arc<dyn trames_vfs::IoWake> = wake.clone();
+        let signal = trames_vfs::IoSignal::new(1, Arc::downgrade(&target));
+        wait.bind(&trames_kernel::signal::IoTask::default(), &signal);
+        assert!(wake.called.load(Ordering::Relaxed));
+    }
+    #[test]
     fn terminal_idle_probe_rechecks_new_waits_returns_and_admissions() {
         for transition in 0..6 {
             let epoch = Epoch::new(Arc::new(Control::new(1000)));
@@ -2868,6 +3262,7 @@ mod tests {
         let result = Arc::new(trames_linux::FileResult::default());
         result.complete(trames_vfs::FileOutcome::Waiting(work));
         current.retry = Some(IoCall {
+            binder: None,
             file: Some(trames_linux::FilePending::new(
                 result,
                 trames_linux::FileOutput::None,

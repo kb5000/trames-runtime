@@ -29,6 +29,7 @@ pub(super) struct ExitResources<'a> {
 }
 impl ExitResources<'_> {
     pub fn retire(&self, status: i32, last: bool, memory: &mut impl CpuMemory) -> Exit {
+        self.task.discard_frame();
         self.task.rseq.clear();
         self.parents.retire_with(
             self.task,
@@ -709,9 +710,9 @@ impl Snapshot {
     }
     pub fn begin_child_wait(
         &self,
-        request: trames_kernel::children::Wait,
+        request: trames_kernel::children::WaitCall,
     ) -> crate::run_queue::WaitState {
-        let wait = crate::run_queue::ChildWait::new(request);
+        let wait = crate::run_queue::ChildWait::accepted(request);
         wait.bind(
             &self.children,
             &self.io_signals,
@@ -721,42 +722,51 @@ impl Snapshot {
     }
     pub fn begin_signal_wait(
         &self,
-        request: trames_kernel::signal::SignalWait,
+        request: trames_kernel::signal::WaitCall,
     ) -> crate::run_queue::WaitState {
-        if let trames_kernel::signal::SignalWait::Suspend { mask } = request {
-            let mut context = self.io_signals.context.lock().unwrap();
-            self.saved_wait_mask.set(Some(context.mask));
-            context.wait_mask = self.saved_wait_mask.get();
-            context.mask = mask;
-            self.io_signals.publish_mask(mask);
+        let wait = crate::run_queue::SignalWait::accepted(request);
+        if let Some(signal) = &self.io_wake {
+            wait.bind(&self.io_signals, signal);
         }
-        let wait = crate::run_queue::SignalWait::new(request);
-        wait.bind(
-            &self.io_signals,
-            self.io_wake.as_ref().expect("task wait wake"),
-        );
         crate::run_queue::WaitState::Signal(wait)
     }
     /// Only a blocked accepted event wait changes task mask state. The calling
     /// task owns this Snapshot; its Cell avoids locks for unmasked completions.
     pub fn begin_wait_mask(&self, wait: &trames_linux::RetainedWait) {
-        if let Some(mask) = wait.mask {
+        if let Some(mask) = wait.outer_mask() {
             let mask = mask & !trames_kernel::signal::UNBLOCKABLE;
             if self.saved_wait_mask.get().is_none() {
                 let mut context = self.io_signals.context.lock().unwrap();
-                self.saved_wait_mask.set(Some(context.mask));
+                if context.wait_mask.is_none() {
+                    context.wait_generation = context.wait_generation.wrapping_add(1);
+                }
+                self.saved_wait_mask
+                    .set(Some(context.wait_mask.unwrap_or(context.mask)));
                 context.wait_mask = self.saved_wait_mask.get();
                 context.mask = mask;
                 self.io_signals.publish_mask(mask);
             }
         }
     }
-    pub fn finish_wait_mask(&self) {
-        if let Some(mask) = self.saved_wait_mask.take() {
+    pub fn finish_wait_mask(&self) -> bool {
+        let mut restored = false;
+        if self.saved_wait_mask.take().is_some() {
             let mut context = self.io_signals.context.lock().unwrap();
-            context.mask = mask;
-            context.wait_mask = None;
-            self.io_signals.publish_mask(mask);
+            if let Some(mask) = context.wait_mask.take() {
+                context.mask = mask;
+                context.wait_generation = context.wait_generation.wrapping_add(1);
+                self.io_signals.publish_mask(mask);
+                restored = true;
+            }
+        }
+        restored
+    }
+    pub fn finish_event_mask(&self, result: Result<u64, Errno>) {
+        if result == Err(Errno(4)) {
+            self.saved_wait_mask
+                .set(self.io_signals.context.lock().unwrap().wait_mask);
+        } else {
+            self.finish_wait_mask();
         }
     }
     pub fn frozen(&self) -> bool {
@@ -830,19 +840,30 @@ impl Snapshot {
         Some(caught)
     }
     pub fn io_frame(&self) -> trames_kernel::signal::FrameState {
+        self.io_frame_context().0
+    }
+    fn io_frame_context(&self) -> (trames_kernel::signal::FrameState, Option<u64>) {
         let context = *self.io_signals.context.lock().unwrap();
-        trames_kernel::signal::FrameState {
-            actions: self.actions.shared(),
-            mask: context.mask,
-            frames: context.frames,
-            alt_stack: context.alt_stack,
-        }
+        (
+            trames_kernel::signal::FrameState {
+                actions: self.actions.shared(),
+                mask: context.mask,
+                frames: context.frames,
+                alt_stack: context.alt_stack,
+            },
+            context.wait_mask,
+        )
     }
     fn commit_io_frame(&self, frame: trames_kernel::signal::FrameState) {
         self.io_signals.publish_mask(frame.mask);
-        *self.io_signals.context.lock().unwrap() = trames_kernel::signal::IoContext {
+        let mut context = self.io_signals.context.lock().unwrap();
+        if context.wait_mask != self.saved_wait_mask.get() {
+            context.wait_generation = context.wait_generation.wrapping_add(1);
+        }
+        *context = trames_kernel::signal::IoContext {
             mask: frame.mask,
             wait_mask: self.saved_wait_mask.get(),
+            wait_generation: context.wait_generation,
             frames: frame.frames,
             alt_stack: frame.alt_stack,
         };
@@ -854,105 +875,218 @@ impl Snapshot {
         sig: u32,
         mut info: trames_kernel::signal::Info,
         action: trames_kernel::signal::Action,
-    ) -> Result<(), Errno> {
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
         if info.timer.is_none() && info.fault.is_none() && info.poll.is_none() {
             info.sender = self.io_routes.namespace.local(info.sender);
         }
-        let mut frame = self.io_frame();
-        let mut state = cpu.architectural_state();
-        state.pc = self.io_signals.rseq.signal(memory, state.pc)?;
+        let (frame, restore_mask) = self.io_frame_context();
+        let state = cpu.architectural_state();
         let sme = cpu
             .sme_config()
             .map(|c| (c, cpu.sme_state(), C::features().hwcap2 & (1 << 37) != 0));
-        frame.enter_sme_restoring(
-            &mut state,
-            memory,
+        let progress = self.io_signals.start_frame(
+            frame,
+            &state,
             sig,
             info,
             action,
             sme,
-            self.saved_wait_mask.get(),
-        )?;
+            restore_mask,
+            memory,
+        );
+        self.apply_io_frame(cpu, progress)
+            .map(|(fault, _)| fault)
+            .map_err(|(error, _)| error)
+    }
+    pub fn finish_delivery<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        memory: &mut impl CpuMemory,
+        trace: &mut crate::syscall_trace::Trace,
+        delivered: crate::run_queue::Delivered,
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
+        if let Some(completion) = delivered.completion {
+            if completion.restart {
+                trace.restart();
+                for (index, value) in completion.args.into_iter().enumerate() {
+                    cpu.set_x(index, value);
+                }
+                cpu.set_pc(cpu.pc().wrapping_sub(4));
+            } else {
+                if completion.account_io {
+                    self.io_signals.io.complete(
+                        completion.number.expect("original I/O entry"),
+                        completion.args[3],
+                        completion.result,
+                    );
+                }
+                trace.finish(
+                    cpu,
+                    completion
+                        .result
+                        .unwrap_or_else(|error| 0u64.wrapping_sub(error.0 as u64)),
+                );
+            }
+        }
+        self.enter_io_signal(
+            cpu,
+            memory,
+            delivered.sig,
+            *delivered.info,
+            delivered.action,
+        )
+    }
+    pub fn resume_io_frame<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        memory: &mut impl CpuMemory,
+    ) -> Result<(Option<trames_memory::PageFault>, bool), (Errno, bool)> {
+        let progress = self
+            .io_signals
+            .resume_frame(memory)
+            .expect("accepted original handler entry");
+        self.apply_io_frame(cpu, progress)
+    }
+    fn apply_io_frame<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        progress: trames_kernel::signal::FrameProgress,
+    ) -> Result<(Option<trames_memory::PageFault>, bool), (Errno, bool)> {
+        let completed = match progress {
+            trames_kernel::signal::FrameProgress::Complete(completed) => completed,
+            trames_kernel::signal::FrameProgress::Page(fault) => return Ok((Some(fault), false)),
+            trames_kernel::signal::FrameProgress::EntryPage { fault, pc } => {
+                Self::set_rseq_pc(cpu, pc);
+                return Ok((Some(fault), false));
+            }
+            trames_kernel::signal::FrameProgress::Rseq(progress) => {
+                let (pc, fault, failed) = match progress {
+                    trames_kernel::rseq::ResumeProgress::Complete(pc) => (pc, None, false),
+                    trames_kernel::rseq::ResumeProgress::Page { fault, pc } => {
+                        (pc, Some(fault), false)
+                    }
+                    trames_kernel::rseq::ResumeProgress::Error { pc, .. } => (pc, None, true),
+                };
+                Self::set_rseq_pc(cpu, pc);
+                if failed {
+                    self.actions.force_frame_signal(
+                        &self.io_signals,
+                        None,
+                        trames_kernel::signal::Fault {
+                            signal: 11,
+                            code: 128,
+                            address: 0,
+                        },
+                    );
+                }
+                return Ok((fault, false));
+            }
+            trames_kernel::signal::FrameProgress::ReturnPage { fault, partial } => {
+                self.apply_partial_frame(cpu, partial);
+                return Ok((Some(fault), false));
+            }
+            trames_kernel::signal::FrameProgress::Error { signal, pc, .. } => {
+                if let Some(pc) = pc {
+                    Self::set_rseq_pc(cpu, pc);
+                }
+                self.actions.failed_frame(&self.io_signals, signal);
+                return Ok((None, false));
+            }
+            trames_kernel::signal::FrameProgress::ReturnError { fault, partial, .. } => {
+                self.apply_partial_frame(cpu, partial);
+                self.actions
+                    .force_frame_signal(&self.io_signals, None, fault);
+                cpu.set_x(0, 0);
+                return Ok((None, true));
+            }
+        };
         self.saved_wait_mask.take();
-        let has_sme = sme.is_some();
-        cpu.restore_architectural_state(&state);
-        if has_sme {
+        cpu.restore_architectural_state(&completed.state);
+        if let Some(registers) = completed.restored_sme {
+            cpu.set_sme_state(registers);
+        } else if completed.clear_sme {
             cpu.set_sme_state(None);
         }
-        self.commit_io_frame(frame);
-        Ok(())
+        self.commit_io_frame(completed.frame);
+        Ok((None, completed.returned))
+    }
+    fn apply_partial_frame<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        partial: trames_kernel::signal::FrameCommit,
+    ) {
+        cpu.restore_architectural_state(&partial.state);
+        if let Some(registers) = partial.restored_sme {
+            cpu.set_sme_state(registers);
+        }
+        self.io_signals.publish_mask(partial.frame.mask);
+        let mut context = self.io_signals.context.lock().unwrap();
+        context.mask = partial.frame.mask;
+        context.frames = partial.frame.frames;
+        context.alt_stack = partial.frame.alt_stack;
     }
     pub fn resume_rseq<C: Cpu>(
         &self,
         cpu: &mut C,
         memory: &mut impl CpuMemory,
         index: usize,
-    ) -> bool {
-        match self.io_signals.rseq.resume(memory, cpu.pc(), index as u32) {
-            Ok(pc) => {
-                if pc != cpu.pc() {
-                    cpu.clear_exclusive();
-                    cpu.set_pc(pc);
-                }
-                true
-            }
-            Err(_) => {
-                let fault = trames_kernel::signal::Fault {
-                    signal: 11,
-                    code: 128,
-                    address: 0,
-                };
-                let caught = if self.io_signals.is_traced() {
-                    self.io_signals.inbox.discard(11);
-                    self.io_signals
-                        .inbox
-                        .enqueue(
-                            11,
-                            trames_kernel::signal::Info {
-                                code: 128,
-                                fault: Some(0),
-                                ..Default::default()
-                            },
-                        )
-                        .is_ok()
-                } else {
-                    fault.queue(
-                        &self.actions,
-                        self.io_signals.mask(),
-                        &self.io_signals.inbox,
-                    )
-                };
-                if !caught {
-                    self.io_signals.lifecycle().request_exit(11);
-                }
-                false
-            }
+    ) -> Result<bool, trames_memory::PageFault> {
+        // A signal may have been consumed by another reader after EINTR.
+        // Restore its deferred mask only at an actual user return.
+        if self.finish_wait_mask() {
+            return Ok(false);
         }
+        let Some(progress) = self
+            .io_signals
+            .start_rseq_resume(cpu.pc(), index as u32, memory)
+        else {
+            return Ok(true);
+        };
+        let complete = matches!(
+            &progress,
+            trames_kernel::signal::FrameProgress::Rseq(
+                trames_kernel::rseq::ResumeProgress::Complete(_)
+            )
+        );
+        let (fault, _) = self
+            .apply_io_frame(cpu, progress)
+            .expect("rseq progress has its native forced signal path");
+        if let Some(fault) = fault {
+            Err(fault)
+        } else {
+            Ok(complete)
+        }
+    }
+    fn set_rseq_pc<C: Cpu>(cpu: &mut C, pc: u64) {
+        if cpu.pc() != pc {
+            cpu.clear_exclusive();
+            cpu.set_pc(pc);
+        }
+    }
+    pub fn bad_sigreturn<C: Cpu>(&self, cpu: &mut C, memory: &impl CpuMemory) {
+        self.actions.force_frame_signal(
+            &self.io_signals,
+            None,
+            trames_kernel::signal::Fault::bad_frame(cpu.sp(), memory),
+        );
+        cpu.set_x(0, 0);
     }
     pub fn return_io_signal<C: Cpu>(
         &self,
         cpu: &mut C,
-        memory: &impl CpuMemory,
-    ) -> Result<(), Errno> {
-        let mut frame = self.io_frame();
-        let mut state = cpu.architectural_state();
-        let registers = if let Some(config) = cpu.sme_config() {
-            Some(frame.restore_sme(
-                &mut state,
-                memory,
-                config,
-                C::features().hwcap2 & (1 << 37) != 0,
-            )?)
-        } else {
-            frame.restore(&mut state, memory)?;
-            None
-        };
-        cpu.restore_architectural_state(&state);
-        if let Some(registers) = registers {
-            cpu.set_sme_state(registers);
-        }
-        self.commit_io_frame(frame);
-        Ok(())
+        memory: &mut impl CpuMemory,
+    ) -> Result<Option<trames_memory::PageFault>, Errno> {
+        let progress = self.io_signals.start_frame_return(
+            self.io_frame(),
+            cpu.architectural_state(),
+            cpu.sme_config(),
+            C::features().hwcap2 & (1 << 37) != 0,
+            cpu.sme_state(),
+            memory,
+        );
+        self.apply_io_frame(cpu, progress)
+            .map(|(fault, _)| fault)
+            .map_err(|(error, _)| error)
     }
     fn futex_wait<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 449 | 455)
@@ -1032,18 +1166,6 @@ impl Snapshot {
         matches!(cpu.x(8) as u32, 454 | 456)
             || cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5 | 7 | 8)
     }
-    pub fn timer_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
-        (self.seccomp.mode() != 0
-            && self.timers.is_some()
-            && trames_kernel::timers::timer_call(cpu.x(8) as u32))
-        .then(|| {
-            self.seccomp.entry_decision(
-                cpu.x(8) as u32,
-                cpu.pc(),
-                std::array::from_fn(|i| cpu.x(i)),
-            )
-        })
-    }
     pub fn event_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0 && trames_linux::event_wait(cpu.x(8) as u32)).then(|| {
             self.seccomp.entry_decision(
@@ -1055,10 +1177,11 @@ impl Snapshot {
     }
     pub fn task_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
-            && (matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
+            && (matches!(cpu.x(8) as u32, 95 | 260 | 132..=137 | 293)
                 || self.signal_send(cpu)
                 || self.thread_call(cpu)
-                || self.limit_call(cpu.x(8) as u32)))
+                || self.limit_call(cpu.x(8) as u32)
+                || self.timers.is_some() && trames_kernel::timers::timer_call(cpu.x(8) as u32)))
         .then(|| {
             self.seccomp.entry_decision(
                 cpu.x(8) as u32,
@@ -1072,9 +1195,14 @@ impl Snapshot {
     }
     pub fn thread_call<C: Cpu>(&self, cpu: &C) -> bool {
         match cpu.x(8) as u32 {
+            number @ (25 | 29) => trames_kernel::signal::FdControlCall::entry(
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+            ),
+            219 => self.namespaces.is_some(),
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
-            142 | 153 | 165 | 241 | 434 | 438 => true,
+            100 | 142 | 153 | 165 | 241 | 434 | 438 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -1161,7 +1289,7 @@ impl Snapshot {
             return true;
         }
         if trames_kernel::timers::timer_call(cpu.x(8) as u32)
-            || matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
+            || matches!(cpu.x(8) as u32, 95 | 260 | 132..=137 | 293)
             || self.signal_send(cpu)
             || self.thread_call(cpu)
             || self.limit_call(cpu.x(8) as u32)
@@ -1264,10 +1392,10 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
             ),
-            153 => trames_kernel::usage::times(
+            153 => trames_kernel::usage::times_since(
                 &self.io_signals,
                 &self.children,
-                self.started.elapsed(),
+                self.started,
                 cpu.x(0),
                 memory,
             ),
@@ -1330,7 +1458,7 @@ impl Snapshot {
                 self.io_routes
                     .send(&self.io_signals, number, std::array::from_fn(|i| cpu.x(i)))?
             }
-            25 if matches!(cpu.x(1), 8..=11 | 15 | 16) => {
+            25 if matches!(cpu.x(1) as u32, 8..=11 | 15 | 16) => {
                 self.direct.record_fd_control();
                 let domain = self.io_signals.credentials().read().landlock.clone();
                 let owners = self.io_routes.async_owners(&domain);
@@ -1477,19 +1605,21 @@ impl Snapshot {
             136 => self
                 .io_signals
                 .pending_call(std::array::from_fn(|i| cpu.x(i)), memory),
-            number @ 160..=162 => trames_linux::uts_call_for_task(
+            number @ 160..=162 => self.direct.invoke_uts(
                 self.uts.as_ref()?,
                 &self.personality,
                 number,
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
-            ),
+            )?,
             number @ (163 | 164 | 261) => {
                 self.limits
                     .as_ref()?
                     .call(number, std::array::from_fn(|i| cpu.x(i)), memory)
             }
-            278 => trames_linux::getrandom(std::array::from_fn(|i| cpu.x(i)), memory),
+            278 => self
+                .direct
+                .invoke_entropy(std::array::from_fn(|i| cpu.x(i)), memory)?,
             166 => Ok(self.umask.swap(cpu.x(0) as u32) as u64),
             214 if cpu.x(0) == 0 => Ok(self.program_break.get()),
             173 => Ok(self
@@ -1503,54 +1633,33 @@ impl Snapshot {
                 .user_identity(number)
                 .unwrap_or(self.identities[(number - 172) as usize])),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
-            169 => trames_linux::gettimeofday(memory, cpu.x(0), cpu.x(1)),
+            169 => self.direct.invoke_time(
+                169,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+                self.started,
+                None,
+                None,
+            )?,
             99 | 100 => self.io_routes.robust_list(
                 &self.io_signals,
                 cpu.x(8) as u32,
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
             ),
-            number @ (113 | 114) => {
-                if let Some(elapsed) = self.io_routes.cpu_clock(&self.io_signals, cpu.x(0)) {
-                    elapsed.and_then(|elapsed| {
-                        trames_linux::cpu_clock_read(memory, number, cpu.x(1), elapsed)
-                    })
-                } else {
-                    trames_linux::clock_read(
-                        memory,
-                        number,
-                        cpu.x(0),
-                        cpu.x(1),
-                        self.started,
-                        self.direct.boot_clock(),
-                        Some(&self.io_signals.proc_view),
-                    )
-                }
-            }
-            168 => (|| {
-                let cpu_address = cpu.x(0);
-                let node_address = cpu.x(1);
-                // As on the coordinator, validate both destinations before
-                // either store. Writes use the interpreter's exact view/model.
-                for address in [cpu_address, node_address] {
-                    if address != 0 {
-                        memory
-                            .check(address, 4, Access::Write)
-                            .map_err(|_| Errno(14))?;
-                    }
-                }
-                if cpu_address != 0 {
-                    memory
-                        .write_array(cpu_address, self.processor.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                if node_address != 0 {
-                    memory
-                        .write_array(node_address, 0u32.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                Ok(0)
-            })(),
+            number @ (113 | 114) => self.direct.invoke_time(
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+                self.started,
+                self.io_routes.cpu_clock(&self.io_signals, cpu.x(0)),
+                Some(&self.io_signals.proc_view),
+            )?,
+            168 => self.direct.invoke_getcpu(
+                std::array::from_fn(|i| cpu.x(i)),
+                self.processor,
+                memory,
+            )?,
             _ if self.unknown_entry(cpu) => Ok(self.diagnostics.as_ref()?.unsupported(
                 cpu.x(8) as u32,
                 cpu.pc(),
@@ -2211,7 +2320,7 @@ mod tests {
             snapshot.invoke(&cpu, &mut view),
             Some(0u64.wrapping_sub(14))
         );
-        assert_eq!(view.read_array::<8>(0x1ff8).unwrap(), [0x5a; 8]);
+        assert!(view.read_u64(0x1ff8).unwrap() <= snapshot.started.elapsed().as_secs());
         cpu.set_x(0, 2);
         cpu.set_x(1, 0);
         assert_eq!(
@@ -2237,7 +2346,7 @@ mod tests {
             snapshot.invoke(&cpu, &mut view),
             Some(0u64.wrapping_sub(14))
         );
-        assert_eq!(view.read_array::<8>(0x1ff8).unwrap(), [0x5a; 8]);
+        assert_eq!(view.read_array::<4>(0x1ff8).unwrap(), 3u32.to_le_bytes());
         cpu.set_x(1, 0x1ffc);
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
         drop(view);

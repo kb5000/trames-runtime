@@ -12,6 +12,13 @@ use std::{
 use trames_vfs::{AsyncOwner, AsyncOwners, IoSignal, PidNamespace};
 #[path = "io_guest.rs"]
 mod guest;
+#[cfg(test)]
+#[path = "mask_tests.rs"]
+mod mask_tests;
+pub use guest::SendCall;
+#[path = "io_fd_control_call.rs"]
+mod fd_control;
+pub use fd_control::FdControlCall;
 #[path = "io_job.rs"]
 mod job;
 #[path = "io_proc.rs"]
@@ -21,6 +28,7 @@ mod ptrace;
 pub use ptrace::ExecPeerExit;
 #[path = "io_scheduling.rs"]
 mod scheduling;
+pub use scheduling::Call as SchedulingCall;
 #[path = "io_terminal.rs"]
 mod terminal;
 
@@ -97,7 +105,7 @@ impl Inbox {
         }
         Ok(())
     }
-    fn enqueue_quiet(&self, sig: u32, info: Info) -> Result<bool, Errno> {
+    pub(super) fn enqueue_quiet(&self, sig: u32, info: Info) -> Result<bool, Errno> {
         let mut pending = self.pending.lock().unwrap();
         if sig < 32 && pending.contains_key(&sig) {
             return Ok(false);
@@ -135,6 +143,13 @@ impl Inbox {
         pending.resume_observed(sig, info);
         self.bits.store(pending.bits(), Ordering::Relaxed);
     }
+    fn restore_delivery(&self, sig: u32, info: RetainedInfo) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.restore(sig, info);
+        self.bits.store(pending.bits(), Ordering::Relaxed);
+        drop(pending);
+        self.changed();
+    }
 
     pub fn discard(&self, sig: u32) {
         let mut pending = self.pending.lock().unwrap();
@@ -146,7 +161,7 @@ impl Inbox {
         drop(pending);
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
-    fn changed(&self) {
+    pub(super) fn changed(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
         self.readiness.notify_atomic();
     }
@@ -203,6 +218,7 @@ impl Inbox {
 pub struct IoContext {
     pub mask: u64,
     pub wait_mask: Option<u64>,
+    pub wait_generation: u64,
     pub frames: u32,
     pub alt_stack: AltStack,
 }
@@ -235,6 +251,8 @@ pub struct IoTask {
     terminal_task: std::sync::OnceLock<Weak<dyn trames_vfs::TerminalTask>>,
     published_session: AtomicU32,
     pub context: Mutex<IoContext>,
+    pub(super) frame: Mutex<Option<Box<super::frame_entry::Entry>>>,
+    pub(super) frame_pending: AtomicBool,
     mask: AtomicU64,
     live: AtomicBool,
     presence: std::sync::OnceLock<crate::task::Visibility>,
@@ -283,6 +301,8 @@ impl Default for IoTask {
             terminal_task: Default::default(),
             published_session: AtomicU32::new(0),
             context: Default::default(),
+            frame: Default::default(),
+            frame_pending: AtomicBool::new(false),
             mask: AtomicU64::new(0),
             live: AtomicBool::new(true),
             presence: Default::default(),
@@ -571,6 +591,7 @@ impl IoTask {
         }
     }
     pub fn exit(&self) {
+        self.discard_frame();
         self.rseq.clear();
         self.trace_thread_exit(0);
         self.lifecycle()
@@ -701,12 +722,67 @@ impl IoTask {
             self.inbox.take(sig)
         }
     }
+    pub fn restore_delivery(&self, sig: u32, shared: bool, info: RetainedInfo) {
+        if shared {
+            self.process().restore_delivery(sig, info);
+        } else {
+            self.inbox.restore_delivery(sig, info);
+        }
+    }
 }
 struct Policy {
     actions: Actions,
     namespace: PidNamespace,
 }
+struct TemporaryMask {
+    task: Arc<IoTask>,
+    generation: u64,
+    active: AtomicBool,
+}
+impl trames_vfs::TemporaryMask for TemporaryMask {
+    fn signal_pending(&self) -> bool {
+        self.task.ready()
+    }
+    fn interrupted(&self) {
+        self.active.store(false, Ordering::Relaxed);
+    }
+    fn finish(&self) {
+        if !self.active.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let mut context = self.task.context.lock().unwrap();
+        if context.wait_generation != self.generation {
+            return;
+        }
+        if let Some(mask) = context.wait_mask.take() {
+            context.wait_generation = context.wait_generation.wrapping_add(1);
+            context.mask = mask;
+            self.task.publish_mask(mask);
+        }
+    }
+}
+impl Drop for TemporaryMask {
+    fn drop(&mut self) {
+        trames_vfs::TemporaryMask::finish(self);
+    }
+}
 impl trames_vfs::TaskSignal for IoTask {
+    fn temporary_mask(self: Arc<Self>, mask: u64) -> Option<Arc<dyn trames_vfs::TemporaryMask>> {
+        let generation = {
+            let mut context = self.context.lock().unwrap();
+            let original = context.wait_mask.unwrap_or(context.mask);
+            context.wait_generation = context.wait_generation.wrapping_add(1);
+            context.wait_mask = Some(original);
+            context.mask = mask & !UNBLOCKABLE;
+            self.publish_mask(context.mask);
+            context.wait_generation
+        };
+        Some(Arc::new(TemporaryMask {
+            task: self,
+            generation,
+            active: AtomicBool::new(true),
+        }))
+    }
     fn cpu_elapsed(&self) -> std::time::Duration {
         self.proc_view.elapsed()
     }
@@ -1002,7 +1078,7 @@ impl IoDirectory {
         }
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct IoRoutes {
     pub directory: Arc<IoDirectory>,
     pub namespace: PidNamespace,
@@ -1160,9 +1236,14 @@ impl AsyncOwner for Owner {
 }
 impl Signals {
     pub fn begin_io(&self) {
-        *self.io.context.lock().unwrap() = IoContext {
+        let mut context = self.io.context.lock().unwrap();
+        if context.wait_mask != self.wait_mask {
+            context.wait_generation = context.wait_generation.wrapping_add(1);
+        }
+        *context = IoContext {
             mask: self.mask,
             wait_mask: self.wait_mask,
+            wait_generation: context.wait_generation,
             frames: self.frames,
             alt_stack: self.alt_stack,
         };
@@ -1207,35 +1288,32 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &mut impl trames_memory::CpuMemory,
     ) -> Result<u64, Errno> {
-        let addresses = caller.thread_addresses().ok_or(Errno(3))?;
         if number == 99 {
             if a[1] != 24 {
                 return Err(Errno(22));
             }
-            addresses.set_robust(a[0]);
+            caller.thread_addresses().ok_or(Errno(3))?.set_robust(a[0]);
         } else {
-            let head = if a[0] as u32 == 0 {
-                addresses.robust()
-            } else {
-                self.address_target(caller, a[0] as u32)?
-                    .thread_addresses()
-                    .ok_or(Errno(3))?
-                    .robust()
-            };
+            let head = self.robust_head(caller, a[0] as u32)?;
             memory
-                .check(a[1], 8, trames_memory::Access::Write)
-                .map_err(|_| Errno(14))?;
-            memory
-                .check(a[2], 8, trames_memory::Access::Write)
+                .write_array(a[2], 24u64.to_le_bytes())
                 .map_err(|_| Errno(14))?;
             memory
                 .write_array(a[1], head.to_le_bytes())
                 .map_err(|_| Errno(14))?;
-            memory
-                .write_array(a[2], 24u64.to_le_bytes())
-                .map_err(|_| Errno(14))?;
         }
         Ok(0)
+    }
+    pub(crate) fn robust_head(&self, caller: &IoTask, pid: u32) -> Result<u64, Errno> {
+        if pid == 0 {
+            Ok(caller.thread_addresses().ok_or(Errno(3))?.robust())
+        } else {
+            Ok(self
+                .address_target(caller, pid)?
+                .thread_addresses()
+                .ok_or(Errno(3))?
+                .robust())
+        }
     }
     pub fn cpu_clock(
         &self,

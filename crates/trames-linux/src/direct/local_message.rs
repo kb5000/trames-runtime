@@ -4,6 +4,57 @@ use super::*;
 mod batch;
 use batch::Batch;
 use std::sync::atomic::{AtomicUsize, Ordering};
+pub(super) struct Preparing {
+    fd: trames_vfs::DirectFd,
+    factory: trames_vfs::DescriptorFactory,
+    identity: [u32; 3],
+    standalone: bool,
+    input: std::sync::Mutex<file_input::Bytes>,
+    rights: std::sync::OnceLock<Result<trames_vfs::SharedRights, Errno>>,
+    pub(super) ready: std::sync::OnceLock<RetainedByte>,
+    pub(super) fault: std::sync::Mutex<Option<trames_memory::PageFault>>,
+    pub(super) deadline: Option<Instant>,
+}
+impl Preparing {
+    fn attempt(
+        &self,
+        direct: &DirectSyscalls,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        original_paths: Option<&trames_vfs::Vfs>,
+    ) -> Option<Result<u64, Errno>> {
+        if self.ready.get().is_none() {
+            let input = self.input.lock().unwrap();
+            let reader = file_input::Reader::new(memory, &input);
+            let result = direct.prepare_local_context_cached(
+                &self.fd,
+                number,
+                args,
+                &reader,
+                (&self.factory, self.identity),
+                self.standalone,
+                Some(&self.rights),
+            );
+            if let Some(fault) = reader.fault() {
+                *self.fault.lock().unwrap() = Some(fault);
+                return Some(Err(Errno(14)));
+            }
+            let result = match result? {
+                Ok(result) => result,
+                Err(error) => return Some(Err(error)),
+            };
+            let _ = self.ready.set(result);
+        }
+        direct.transfer_retained_body(
+            self.ready.get().unwrap(),
+            number,
+            args,
+            memory,
+            original_paths,
+        )
+    }
+}
 // Keep the existing single-message records inline in their Arc allocation.
 // Boxing them would add an allocation to every normal message for a cold batch.
 #[allow(clippy::large_enum_variant)]
@@ -33,6 +84,15 @@ struct Message<'a> {
     paths: Option<&'a trames_vfs::PathQueries>,
     original_paths: Option<&'a trames_vfs::Vfs>,
     receive_flags: u32,
+}
+impl AcceptedMessage {
+    pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        match &self.transfer {
+            Transfer::Single { prepared, .. } => prepared.take_fault(),
+            Transfer::StreamSend { .. } => None,
+            Transfer::Batch(batch) => batch.take_fault(),
+        }
+    }
 }
 impl crate::network::unix::MessageIo for Message<'_> {
     type Rights = trames_vfs::SharedRights;
@@ -167,6 +227,38 @@ impl AcceptedMessage {
     }
 }
 impl DirectSyscalls {
+    pub(super) fn transfer_pipe_write(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        write: &std::sync::Mutex<PipeWrite>,
+    ) -> Result<u64, Errno> {
+        let mut write = write.lock().unwrap();
+        if write.written == write.bytes.len() {
+            return Ok(write.written as u64);
+        }
+        match fd.write(&write.bytes[write.written..]) {
+            Ok(n) => {
+                write.written += n;
+                if write.written == write.bytes.len() || fd.nonblocking() {
+                    Ok(write.written as u64)
+                } else {
+                    Err(Errno(11))
+                }
+            }
+            Err(error) => {
+                if error == Errno(32) && write.written != 0 {
+                    if let Some(task) = &self.task_signal {
+                        task.raise(13);
+                    }
+                }
+                if error != Errno(11) && write.written != 0 {
+                    Ok(write.written as u64)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
     fn prepare_local_fd(
         &self,
         fd: &trames_vfs::DirectFd,
@@ -188,6 +280,47 @@ impl DirectSyscalls {
         memory: &impl CpuMemory,
         (factory, identity): (&trames_vfs::DescriptorFactory, [u32; 3]),
         standalone: bool,
+    ) -> Option<Result<RetainedByte, Errno>> {
+        if memory.async_faults_possible() {
+            return Some(Ok(RetainedByte {
+                fd: fd.clone(),
+                operation: ByteOperation::Preparing(Arc::new(Preparing {
+                    fd: fd.clone(),
+                    factory: factory.clone(),
+                    identity,
+                    standalone,
+                    deadline: RetainedByte {
+                        fd: fd.clone(),
+                        operation: ByteOperation::Plain,
+                    }
+                    .socket_deadline(number),
+                    input: Default::default(),
+                    rights: Default::default(),
+                    ready: Default::default(),
+                    fault: Default::default(),
+                })),
+            }));
+        }
+        self.prepare_local_context_cached(
+            fd,
+            number,
+            args,
+            memory,
+            (factory, identity),
+            standalone,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_local_context_cached(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+        (factory, identity): (&trames_vfs::DescriptorFactory, [u32; 3]),
+        standalone: bool,
+        rights: Option<&std::sync::OnceLock<Result<trames_vfs::SharedRights, Errno>>>,
     ) -> Option<Result<RetainedByte, Errno>> {
         if StreamWrite::accepts(fd, number, args) {
             return Some(
@@ -216,7 +349,7 @@ impl DirectSyscalls {
         } else {
             None
         };
-        let io = Message {
+        let mut io = Message {
             factory,
             fd,
             identity,
@@ -225,34 +358,41 @@ impl DirectSyscalls {
             original_paths: None,
             receive_flags: 0,
         };
-        Some(
-            crate::network::unix::prepare_transfer(byte_number(number), args, memory, &io)?.map(
-                |prepared| RetainedByte {
-                    fd: fd.clone(),
-                    operation: ByteOperation::Message(Arc::new(AcceptedMessage {
-                        transfer: match prepared {
-                            crate::network::unix::PreparedTransfer::Message(message)
-                                if standalone
-                                    && number == 211
-                                    && fd.local_kind() == 1
-                                    && !fd.nonblocking()
-                                    && args[2] & 0x40 == 0 =>
-                            {
-                                Transfer::StreamSend {
-                                    message,
-                                    written: 0.into(),
-                                }
-                            }
-                            prepared => Transfer::Single { prepared, datagram },
-                        },
-                        factory: factory.clone(),
-                        identity,
-                        number,
-                        args,
-                    })),
+        let prepared = if let Some(rights) = rights {
+            crate::network::unix::prepare_transfer_cached(
+                byte_number(number),
+                args,
+                memory,
+                &mut io,
+                rights,
+            )
+        } else {
+            crate::network::unix::prepare_transfer(byte_number(number), args, memory, &io)
+        };
+        Some(prepared?.map(|prepared| RetainedByte {
+            fd: fd.clone(),
+            operation: ByteOperation::Message(Arc::new(AcceptedMessage {
+                transfer: match prepared {
+                    crate::network::unix::PreparedTransfer::Message(message)
+                        if standalone
+                            && number == 211
+                            && fd.local_kind() == 1
+                            && !fd.nonblocking()
+                            && args[2] & 0x40 == 0 =>
+                    {
+                        Transfer::StreamSend {
+                            message,
+                            written: 0.into(),
+                        }
+                    }
+                    prepared => Transfer::Single { prepared, datagram },
                 },
-            ),
-        )
+                factory: factory.clone(),
+                identity,
+                number,
+                args,
+            })),
+        }))
     }
     pub(super) fn start_local_message(
         &self,
@@ -318,6 +458,28 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> Option<Result<u64, Errno>> {
+        if let ByteOperation::Preparing(preparing) = &file.operation {
+            return preparing.attempt(self, number, args, memory, original_paths);
+        }
+        if let ByteOperation::Read(read) = &file.operation {
+            return read.lock().unwrap().attempt(self, number, args, memory);
+        }
+        if let ByteOperation::Input(input) = &file.operation {
+            return input
+                .lock()
+                .unwrap()
+                .attempt(self, number, args, memory, original_paths);
+        }
+        self.transfer_retained_body(file, number, args, memory, original_paths)
+    }
+    pub(super) fn transfer_retained_body(
+        &self,
+        file: &RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        original_paths: Option<&trames_vfs::Vfs>,
+    ) -> Option<Result<u64, Errno>> {
         if matches!(number, 286 | 287) {
             if let Err(error) = crate::file_calls::vector_flags(args[5]) {
                 return Some(Err(error));
@@ -327,8 +489,13 @@ impl DirectSyscalls {
             } else {
                 None
             };
-            let result =
-                self.transfer_retained(file, byte_number(number), args, memory, original_paths)?;
+            let result = self.transfer_retained_body(
+                file,
+                byte_number(number),
+                args,
+                memory,
+                original_paths,
+            )?;
             return Some(result.and_then(|count| {
                 if let Some(paths) = paths {
                     paths.retained_control(
@@ -447,6 +614,14 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if memory.async_faults_possible() {
+            let file = match self.prepare_local_fd(fd, number, args, memory)? {
+                Ok(file) => file,
+                Err(error) => return Some(Err(error)),
+            };
+            self.prepare_retained_byte(number, args, file);
+            return None;
+        }
         let factory = self.resources.as_ref()?;
         crate::network::unix::message(
             number,

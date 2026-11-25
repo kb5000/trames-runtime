@@ -1673,6 +1673,42 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
 }
 
 #[test]
+fn tmpfs_metadata_uses_its_original_mount_without_publishing_the_disk_root() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/ram", 0o755).unwrap();
+    v.mount(None, b"/ram", Some(b"tmpfs"), 0, None).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/ram/file", 0o102, 0o600).unwrap();
+    let control = v.open_at(AT_FDCWD, b"/control", 0o102, 0o600).unwrap();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let times = Some([[123, 456], [789, 123]]);
+    v.chmod_at(AT_FDCWD, b"/ram/file", 0o640).unwrap();
+    v.chown_at(AT_FDCWD, b"/ram/file", 1000, 1000, false)
+        .unwrap();
+    v.set_times(AT_FDCWD, Some(b"/ram/file"), times).unwrap();
+    v.umount(b"/ram", 2).unwrap();
+    v.chmod_fd(fd, 0o660).unwrap();
+    v.chown_fd(fd, 1001, 1001).unwrap();
+    v.set_times(fd as i32, None, times).unwrap();
+    let stat = v.stat_fd(fd).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o7777,
+        0o660
+    );
+    assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 1001);
+    assert_eq!(u64::from_le_bytes(stat[72..80].try_into().unwrap()), 123);
+    assert_eq!(u64::from_le_bytes(stat[88..96].try_into().unwrap()), 789);
+    // The target disk inode still reports checkpoint errors and rolls back.
+    let original = v.stat_fd(control).unwrap();
+    assert!(v.chmod_fd(control, 0o777).is_err());
+    assert!(v.chown_fd(control, 1001, 1001).is_err());
+    assert!(v.set_times(control as i32, None, times).is_err());
+    assert_eq!(v.stat_fd(control).unwrap(), original);
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+}
+
+#[test]
 fn data_sync_preserves_grown_data_without_namespace_publication_on_both_paths() {
     let dir = Temp::new();
     let mut v = dir.open();

@@ -168,26 +168,49 @@ pub struct Attr {
     exclude_user: bool,
     exclude_kernel: bool,
 }
+pub enum AttrInput {
+    Value(Attr),
+    SizeError,
+}
 impl Attr {
     /// copy_struct_from_user-compatible size negotiation, including a zero
     /// legacy size and zero-filled future tails. No event/FD effects yet.
     pub fn read(memory: &mut impl trames_memory::CpuMemory, address: u64) -> Result<Self> {
-        let header = memory.read_array::<8>(address).map_err(|_| Errno(14))?;
-        let supplied = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        match Self::import(memory, address)? {
+            AttrInput::Value(attr) => Ok(attr),
+            AttrInput::SizeError => {
+                let size = address.checked_add(4).ok_or(Errno(14))?;
+                let _ = memory.write_array(size, 136u32.to_le_bytes());
+                Err(Errno(7))
+            }
+        }
+    }
+    pub fn import(memory: &impl trames_memory::CpuMemory, address: u64) -> Result<AttrInput> {
+        let size_at = address.checked_add(4).ok_or(Errno(14))?;
+        let supplied = u32::from_le_bytes(memory.read_array::<4>(size_at).map_err(|_| Errno(14))?);
         let size = if supplied == 0 { 64 } else { supplied as usize };
         let expected = 136usize;
         if !(64..=4096).contains(&size) {
-            return Self::size_error(memory, address);
+            return Ok(AttrInput::SizeError);
         }
-        let mut bytes = vec![0; size.max(expected)];
+        let mut bytes = [0; 136];
         memory
-            .read(address, &mut bytes[..size])
+            .read(address, &mut bytes[..size.min(expected)])
             .map_err(|_| Errno(14))?;
-        if bytes[expected..size.max(expected)]
-            .iter()
-            .any(|&byte| byte != 0)
-        {
-            return Self::size_error(memory, address);
+        let mut offset = expected;
+        let mut tail = [0; 64];
+        while offset < size {
+            let count = (size - offset).min(tail.len());
+            memory
+                .read(
+                    address.checked_add(offset as u64).ok_or(Errno(14))?,
+                    &mut tail[..count],
+                )
+                .map_err(|_| Errno(14))?;
+            if tail[..count].iter().any(|byte| *byte != 0) {
+                return Ok(AttrInput::SizeError);
+            }
+            offset += count;
         }
         let word = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let kind = u32::from_le_bytes(bytes[..4].try_into().unwrap());
@@ -254,7 +277,7 @@ impl Attr {
         } else {
             period
         };
-        Ok(Self {
+        Ok(AttrInput::Value(Self {
             config,
             format,
             disabled: flags & 1 != 0,
@@ -272,13 +295,7 @@ impl Attr {
             frequency: requested_frequency,
             exclude_user: flags & (1 << 4) != 0,
             exclude_kernel: flags & (1 << 5) != 0,
-        })
-    }
-    fn size_error(memory: &mut impl trames_memory::CpuMemory, address: u64) -> Result<Self> {
-        memory
-            .write_array(address + 4, 136u32.to_le_bytes())
-            .map_err(|_| Errno(14))?;
-        Err(Errno(7))
+        }))
     }
 }
 
@@ -715,8 +732,34 @@ impl DescriptorFactory {
         cpus: usize,
     ) -> Result<u32> {
         self.check_perf_attr(&attr)?;
-        let slot = self.files.reserve()?;
-        let settings = self
+        self.reserve_perf()?
+            .publish(attr, clock, leader, output, cloexec, cpus)
+    }
+    pub fn reserve_perf(&self) -> Result<Reservation<'_>> {
+        Ok(Reservation {
+            slot: self.files.reserve()?,
+            factory: self,
+        })
+    }
+}
+/// A private descriptor slot, held while the original group/task are resolved.
+/// User input has already completed; this reservation never needs a worker.
+pub struct Reservation<'a> {
+    slot: fd_table::ReservedFd,
+    factory: &'a DescriptorFactory,
+}
+impl Reservation<'_> {
+    pub fn publish(
+        self,
+        attr: Attr,
+        clock: Clock,
+        leader: Option<&Arc<Event>>,
+        output: Option<&Arc<Event>>,
+        cloexec: bool,
+        cpus: usize,
+    ) -> Result<u32> {
+        let factory = self.factory;
+        let settings = factory
             .credentials
             .user_namespace
             .overflow()
@@ -728,18 +771,19 @@ impl DescriptorFactory {
             clock,
             leader,
             output,
-            self.pid_namespace.clone(),
+            factory.pid_namespace.clone(),
             cpus,
             settings,
         )?;
         let description = events::anonymous_descriptor(
-            self.open_id(),
+            factory.open_id(),
             if cloexec { O_CLOEXEC } else { 0 },
             events::Anonymous::Perf(event),
         );
-        slot.publish(description, None)
+        self.slot.publish(description, None)
     }
 }
+
 impl FdFlags {
     pub fn perf_event(&self, fd: u32) -> Result<Option<Arc<Event>>> {
         self.descriptor_control(fd)?.perf_event()

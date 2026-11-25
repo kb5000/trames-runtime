@@ -2,6 +2,9 @@
 //! Source/owner scheduling ABI over original task identities and attributes.
 use super::*;
 use crate::scheduling::RESET_ON_FORK;
+#[path = "io_scheduling_call.rs"]
+mod retained;
+pub use retained::Call;
 
 impl IoRoutes {
     fn schedule_target(&self, source: &Arc<IoTask>, pid: u32) -> Result<Arc<IoTask>, Errno> {
@@ -132,39 +135,75 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<(u64, Option<Arc<crate::completion::Completion>>), Errno> {
-        let mut migration = None;
-        let value = self.scheduling_value(source, cpus, number, a, memory, &mut migration)?;
-        Ok((value, migration))
+        let input = retained::Input::read(number, a, memory)?;
+        let mut prepared = self.scheduling_prepared(source, cpus, number, a, input);
+        if prepared.output.progress(memory).is_err() && !prepared.size_error {
+            return Err(Errno(14));
+        }
+        prepared.value.map(|value| (value, prepared.migration))
     }
+    fn scheduling_prepared(
+        &self,
+        source: &Arc<IoTask>,
+        cpus: usize,
+        number: u32,
+        args: [u64; 6],
+        input: retained::Input,
+    ) -> retained::Prepared {
+        let mut output = crate::user_copy::Output::default();
+        let mut migration = None;
+        let size_error = matches!(&input, retained::Input::SizeError);
+        let value = if size_error {
+            output.scalar(args[1], &FairAttr::SIZE.to_le_bytes());
+            Err(Errno(7))
+        } else {
+            self.scheduling_value(
+                source,
+                cpus,
+                number,
+                args,
+                input,
+                &mut output,
+                &mut migration,
+            )
+        };
+        retained::Prepared {
+            output,
+            value,
+            migration,
+            size_error,
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
     fn scheduling_value(
         &self,
         source: &Arc<IoTask>,
         cpus: usize,
         number: u32,
         a: [u64; 6],
-        memory: &mut impl CpuMemory,
+        input: retained::Input,
+        memory: &mut crate::user_copy::Output,
         migration: &mut Option<Arc<crate::completion::Completion>>,
     ) -> Result<u64, Errno> {
         if matches!(number, 30 | 31) {
             return self.io_priority(source, number, a);
         }
         if matches!(number, 274 | 275) {
-            if (a[0] as i32) < 0 || a[1] == 0 {
-                return Err(Errno(22));
-            }
             if number == 274 {
-                if a[2] as u32 != 0 {
-                    return Err(Errno(22));
-                }
-                let attr = FairAttr::read(memory, a[1])?;
+                let retained::Input::Attribute(attr) = input else {
+                    unreachable!("accepted sched_attr");
+                };
                 let target = self.schedule_target(source, a[0] as u32)?;
                 return attr.apply(source, &target);
             }
-            let size = a[2] as u32;
-            if !(FairAttr::SIZE..=4096).contains(&size) || a[3] as u32 != 0 {
-                return Err(Errno(22));
-            }
             let target = self.schedule_target(source, a[0] as u32)?;
+            let address = a[1] & 0x00ff_ffff_ffff_ffff;
+            let size = a[2] as u32 as u64;
+            if address >= trames_memory::ADDRESS_LIMIT
+                || size > trames_memory::ADDRESS_LIMIT - address
+            {
+                return Err(Errno(14));
+            }
             return FairAttr::write(&target, memory, a[1]);
         }
         if matches!(number, 125 | 126) {
@@ -209,17 +248,14 @@ impl IoRoutes {
             return error.map_or(Ok(0), Err);
         }
         let target = self.schedule_target(source, a[0] as u32)?;
-        if matches!(number, 118..=119 | 121) && (if number == 119 { a[2] } else { a[1] }) == 0 {
-            return Err(Errno(22));
-        }
         if number == 122 {
             check_scheduler_owner(source, &target)?;
         }
         match number {
             118 | 119 => {
-                let pointer = if number == 118 { a[1] } else { a[2] };
-                let priority =
-                    i32::from_le_bytes(memory.read_array::<4>(pointer).map_err(|_| Errno(14))?);
+                let retained::Input::Priority(priority) = input else {
+                    unreachable!("accepted sched_param");
+                };
                 let requested = (number == 119).then_some(a[1] as u32);
                 let attr = FairAttr {
                     policy: requested.map(|p| p & !RESET_ON_FORK),
@@ -235,13 +271,9 @@ impl IoRoutes {
                 .map(|()| 0)
                 .map_err(|_| Errno(14)),
             122 => {
-                if a[1] == 0 {
-                    return Err(Errno(22));
-                }
-                let mut bytes = [0; 8];
-                memory
-                    .read(a[2], &mut bytes[..a[1].min(8) as usize])
-                    .map_err(|_| Errno(14))?;
+                let retained::Input::Affinity(bytes) = input else {
+                    unreachable!("accepted cpu mask");
+                };
                 let valid = if cpus >= 64 {
                     u64::MAX
                 } else {
@@ -257,15 +289,10 @@ impl IoRoutes {
                 *migration = target.lifecycle().affinity(&target, mask);
                 Ok(0)
             }
-            123 => {
-                if a[1] < 8 || a[1] & 7 != 0 {
-                    return Err(Errno(22));
-                }
-                memory
-                    .write_array(a[2], target.effective_affinity().to_le_bytes())
-                    .map(|()| 8)
-                    .map_err(|_| Errno(14))
-            }
+            123 => memory
+                .write_array(a[2], target.effective_affinity().to_le_bytes())
+                .map(|()| 8)
+                .map_err(|_| Errno(14)),
             _ => Err(Errno(38)),
         }
     }
@@ -294,37 +321,32 @@ struct FairAttr {
 impl FairAttr {
     const SIZE: u32 = 48;
 
-    fn read(memory: &mut impl CpuMemory, addr: u64) -> Result<Self, Errno> {
-        let mut size = u32::from_le_bytes(memory.read_array(addr).map_err(|_| Errno(14))?);
+    fn read(memory: &impl CpuMemory, addr: u64) -> Result<retained::Input, Errno> {
+        let mut size = u32::from_le_bytes(memory.read_array::<4>(addr).map_err(|_| Errno(14))?);
         if size == 0 {
             size = Self::SIZE;
         }
-        let mut incompatible = !(Self::SIZE..=4096).contains(&size);
-        if !incompatible && size > Self::SIZE {
-            let mut offset = Self::SIZE;
-            let mut tail = [0u8; 64];
-            while offset < size {
-                let n = ((size - offset) as usize).min(tail.len());
-                memory
-                    .read(
-                        addr.checked_add(u64::from(offset)).ok_or(Errno(14))?,
-                        &mut tail[..n],
-                    )
-                    .map_err(|_| Errno(14))?;
-                if tail[..n].iter().any(|&byte| byte != 0) {
-                    incompatible = true;
-                    break;
-                }
-                offset += n as u32;
-            }
+        if !(Self::SIZE..=4096).contains(&size) {
+            return Ok(retained::Input::SizeError);
         }
-        if incompatible {
-            memory
-                .write_array(addr, Self::SIZE.to_le_bytes())
-                .map_err(|_| Errno(14))?;
-            return Err(Errno(7));
-        }
+        // copy_struct_from_user copies the supported body before examining an
+        // unknown tail; a later page wait must not reread that accepted body.
         let bytes: [u8; 48] = memory.read_array(addr).map_err(|_| Errno(14))?;
+        let mut offset = Self::SIZE;
+        let mut tail = [0; 64];
+        while offset < size {
+            let count = ((size - offset) as usize).min(tail.len());
+            memory
+                .read(
+                    addr.checked_add(offset as u64).ok_or(Errno(14))?,
+                    &mut tail[..count],
+                )
+                .map_err(|_| Errno(14))?;
+            if tail[..count].iter().any(|byte| *byte != 0) {
+                return Ok(retained::Input::SizeError);
+            }
+            offset += count as u32;
+        }
         let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
         let flags = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         const RESET: u64 = 1;
@@ -350,12 +372,15 @@ impl FairAttr {
                 },
             ));
         }
-        Ok(Self {
+        if (word(4) as i32) < 0 {
+            return Err(Errno(22));
+        }
+        Ok(retained::Input::Attribute(Self {
             policy,
             reset: Some(flags & RESET != 0),
             nice: (flags & KEEP_PARAMS == 0).then(|| (word(16) as i32).clamp(-20, 19)),
             priority: word(20),
-        })
+        }))
     }
 
     fn apply(&self, source: &IoTask, target: &IoTask) -> Result<u64, Errno> {
@@ -514,8 +539,18 @@ mod tests {
         let mut memory = memory();
         let call = |n, a, m: &mut Memory| routes.scheduling(&source.io, 4, n, a, m);
         assert_eq!(call(120, [0; 6], &mut memory), Ok(0));
-        assert_eq!(call(122, [2, 8, 0, 0, 0, 0], &mut memory), Err(Errno(1)));
-        assert_eq!(call(122, [999, 8, 0, 0, 0, 0], &mut memory), Err(Errno(3)));
+        // Linux imports the user CPU mask before looking up/authorizing pid.
+        assert_eq!(call(122, [2, 8, 0, 0, 0, 0], &mut memory), Err(Errno(14)));
+        assert_eq!(call(122, [999, 8, 0, 0, 0, 0], &mut memory), Err(Errno(14)));
+        memory.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(122, [2, 8, 0x1000, 0, 0, 0], &mut memory),
+            Err(Errno(1))
+        );
+        assert_eq!(
+            call(122, [999, 8, 0x1000, 0, 0, 0], &mut memory),
+            Err(Errno(3))
+        );
         assert_eq!(
             call(120, [u32::MAX as u64, 0, 0, 0, 0, 0], &mut memory),
             Err(Errno(22))

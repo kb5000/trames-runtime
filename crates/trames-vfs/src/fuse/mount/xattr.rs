@@ -40,6 +40,7 @@ pub(super) struct Xattr {
     generic_permission: bool,
     credentials: Credentials,
     transaction: Option<inode::Write>,
+    waiting: Option<inode::WriteWait>,
     waiting_lock: bool,
     acl: Option<posix::Claim>,
     cached_acl: Option<Option<Arc<Vec<u8>>>>,
@@ -78,14 +79,14 @@ impl Xattr {
         self.waiting_lock
     }
     pub(super) fn lock_ready(&self) -> bool {
-        !inode::attr(&self.node).writing()
+        inode::attr(&self.node).write_ready()
     }
     pub(super) fn subscribe_lock(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         inode::attr(&self.node).subscribe_write(signal)
     }
     fn begin(&mut self, node: u64) -> Result<Option<Arc<Request>>> {
         if self._writer.is_some() && self.transaction.is_none() {
-            let Some(transaction) = inode::attr(&self.node).try_write() else {
+            let Some(transaction) = inode::attr(&self.node).enter_write(&mut self.waiting) else {
                 self.waiting_lock = true;
                 return Ok(None);
             };
@@ -450,6 +451,7 @@ impl Metadata {
             generic_permission,
             credentials: v.credentials.clone(),
             transaction: None,
+            waiting: None,
             waiting_lock: false,
             acl,
             cached_acl,
@@ -479,6 +481,7 @@ impl Metadata {
             dev: mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
+            retry: None,
         }))
     }
     pub(super) fn cached_xattr(&mut self) -> Result<FileValue> {

@@ -439,6 +439,12 @@ pub struct DirectFd {
     _file: Option<SharedFd>,
     pub(super) origin: Option<OfdIdentity>,
 }
+/// One accepted poll lookup, including an original OFD whose caller-context
+/// provider must be attached later. Missing capability never becomes EBADF.
+pub enum PollBinding {
+    Direct(DirectFd),
+    Original(SharedFd),
+}
 impl DirectFd {
     fn resource_device(open: &SharedOpenDescription) -> Option<pseudo::Device> {
         let node = open.node.as_ref()?;
@@ -706,7 +712,10 @@ impl DirectFd {
             live: live.clone(),
         }))
     }
-    fn source_poll(open: OpenHandle, reader: Option<&Arc<dyn SignalReader>>) -> Option<Self> {
+    pub(super) fn source_poll(
+        open: OpenHandle,
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> Option<Self> {
         let view = open.borrow();
         let mut fd = if let Some(events::Anonymous::Signal(mask)) = &view.anonymous {
             Self::signal(
@@ -738,12 +747,21 @@ impl DirectFd {
             return true;
         }
         stack[depth] = id;
-        epoll.snapshot().iter().all(|(_, _, resource)| {
+        epoll.snapshot().iter().all(|(_, state, resource)| {
+            if !state.lock().unwrap().armed {
+                return true;
+            }
             match resource.resolve_with(epoll.signal_reader.as_ref()) {
                 Some(fd) => fd.epoll_complete(stack, depth + 1),
                 None => !resource.live(),
             }
         })
+    }
+    pub(super) fn epoll_has_providers(&self) -> bool {
+        self.epoll_complete(&mut [0; 5], 0)
+    }
+    pub fn poll_has_providers(&self) -> bool {
+        self.epoll_has_providers()
     }
     pub fn refresh_epoll(&self) -> Option<Self> {
         let ByteResource::Epoll(epoll) = &self.resource else {
@@ -1465,6 +1483,24 @@ impl DirectFd {
         };
         epoll.live.wait_with(max, epoll.signal_reader.as_ref())
     }
+    pub fn epoll_delivery(&self) -> Result<crate::EpollDelivery> {
+        let ByteResource::Epoll(epoll) = &self.resource else {
+            return Err(Errno(22));
+        };
+        Ok(crate::EpollDelivery::new(self.clone(), epoll.live.clone()))
+    }
+    pub fn observe_epolls(&self, observations: &mut crate::EpollObservations) {
+        if let ByteResource::Epoll(epoll) = &self.resource {
+            observations.collect(&epoll.live, self.shared_file());
+        }
+    }
+    pub(super) fn epoll_signal_reader(&self) -> Option<&Arc<dyn SignalReader>> {
+        if let ByteResource::Epoll(epoll) = &self.resource {
+            epoll.signal_reader.as_ref()
+        } else {
+            None
+        }
+    }
     pub fn epoll_revision(&self) -> Option<u64> {
         if let ByteResource::Epoll(epoll) = &self.resource {
             Some(epoll.live.revision())
@@ -1605,6 +1641,9 @@ impl DirectFd {
                     .file_position
                     .lock()
                     .unwrap();
+                if position.pending != 0 {
+                    return Err(Errno(11));
+                }
                 let value = match whence {
                     0 => offset as i128,
                     2 => {
@@ -1638,6 +1677,23 @@ impl DirectFd {
     }
     pub fn read(&self, count: usize) -> Result<Vec<u8>> {
         self.read_attempt(count).unwrap_or(Err(Errno(95)))
+    }
+    /// A pipe read retains the original prefix until guest copyout commits it.
+    /// Page waits and cancellation release the unconsumed bytes to that pipe.
+    pub fn read_reply(&self, count: usize) -> Option<Result<ReadReply>> {
+        let ByteResource::Pipe { data, read, .. } = &self.resource else {
+            return None;
+        };
+        if !read || !fd_can_read(self.flags) {
+            return Some(Err(Errno(9)));
+        }
+        if count == 0 {
+            return None;
+        }
+        Some(
+            stream_transfer::ReadLease::take(data.clone(), count)
+                .map(|(lease, bytes)| ReadReply::new(bytes, lease)),
+        )
     }
     /// None requests the original owner before consuming any bytes or rights.
     pub fn read_attempt(&self, count: usize) -> Option<Result<Vec<u8>>> {
@@ -1675,6 +1731,9 @@ impl DirectFd {
                     .file_position
                     .lock()
                     .unwrap();
+                if position.pending != 0 {
+                    return Some(Err(Errno(11)));
+                }
                 file.cgroup_read(caller, position.value, count)
                     .and_then(|bytes| {
                         let bytes = bytes.ok_or(Errno(19))?;
@@ -1684,7 +1743,7 @@ impl DirectFd {
             }
             ByteResource::Cgroup(_, None) => return None,
             ByteResource::MessageQueue(q) => {
-                Ok(q.read(&self._file.as_ref()?.open.file_position, count))
+                q.read(&self._file.as_ref()?.open.file_position, count)
             }
             ByteResource::Fuse(file) => file.connection().and_then(|c| c.read(count)),
             ByteResource::Tun(file) => file.read(count).map_err(|e| Errno(e.0)),
@@ -1812,6 +1871,9 @@ impl DirectFd {
                     .file_position
                     .lock()
                     .unwrap();
+                if position.pending != 0 {
+                    return Err(Errno(11));
+                }
                 let count = file.cgroup_write(caller, bytes)?.ok_or(Errno(19))?;
                 position.value = position.value.saturating_add(count as u64);
                 Ok(count)
@@ -1859,6 +1921,9 @@ pub struct DirectFds(
     pub(super) Option<cgroup::CgroupAccess>,
 );
 impl DirectFds {
+    pub fn with_files(&self, files: SharedFiles) -> Self {
+        Self(self.0.clone(), Some(files), self.2.clone(), self.3.clone())
+    }
     pub fn descriptor_limit(&self) -> u32 {
         self.1
             .as_ref()
@@ -1925,27 +1990,47 @@ impl DirectFds {
     /// Poll/select admission distinguishes an invalid numeric descriptor from
     /// an actual missing provider. Accept one original OFD and no Files copy.
     pub fn polling(&self, fd: u32) -> Option<Result<DirectFd>> {
+        match self.capture_poll(fd)? {
+            Ok(PollBinding::Direct(fd)) => Some(Ok(fd)),
+            Ok(PollBinding::Original(_)) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+    pub fn capture_poll(&self, fd: u32) -> Option<Result<PollBinding>> {
         let Some(files) = &self.1 else {
-            return self.get(fd).map(Ok);
+            return self.get(fd).map(|fd| Ok(PollBinding::Direct(fd)));
         };
         let original = match files.observation_descriptor(fd) {
             Ok(file) => file.open,
             Err(error) => return Some(Err(error)),
         };
-        let fresh = DirectFd::source_poll(original.clone(), self.2.as_ref()).or_else(|| {
-            let cached = self.0.get(fd as usize)?.as_ref()?;
-            cached
-                .ofd_identity()
-                .matches(&original.borrow().shared)
-                .then(|| cached.clone())
-        })?;
-        Some(Ok(fresh
-            .bind_context(self.2.as_ref(), self.3.as_ref())
-            .refresh_epoll()?))
+        let fresh = DirectFd::source_poll(original.clone(), self.2.as_ref())
+            .or_else(|| {
+                let cached = self.0.get(fd as usize)?.as_ref()?;
+                cached
+                    .ofd_identity()
+                    .matches(&original.borrow().shared)
+                    .then(|| cached.clone())
+            })
+            .and_then(|fresh| {
+                fresh
+                    .bind_context(self.2.as_ref(), self.3.as_ref())
+                    .refresh_epoll()
+            });
+        Some(Ok(match fresh {
+            Some(fd) => PollBinding::Direct(fd),
+            None => PollBinding::Original(SharedFd::new(original.borrow().shared.clone())),
+        }))
     }
     /// Accept the original epoll core and its caller's real poll providers.
     /// Interest updates never rebuild a copied owner watch table.
     pub fn epoll(&self, fd: u32) -> Option<Result<DirectFd>> {
+        match self.epoll_original(fd)? {
+            Ok(fd) => fd.refresh_epoll().map(Ok),
+            Err(error) => Some(Err(error)),
+        }
+    }
+    pub fn epoll_original(&self, fd: u32) -> Option<Result<DirectFd>> {
         let Some(files) = &self.1 else {
             return self.get(fd).filter(DirectFd::is_epoll).map(Ok);
         };
@@ -1954,7 +2039,7 @@ impl DirectFds {
             Err(error) => return Some(Err(error)),
         };
         let accepted = DirectFd::source_poll(OpenHandle::Shared(open), self.2.as_ref())?;
-        Some(Ok(accepted.refresh_epoll()?))
+        Some(Ok(accepted))
     }
     fn get_raw(&self, fd: u32) -> Option<DirectFd> {
         if let Some(result) = self.1.as_ref().and_then(|files| files.poll_lookup(fd)) {
@@ -2005,11 +2090,22 @@ impl DirectFds {
         events: u32,
         data: u64,
     ) -> Option<Result<()>> {
+        self.prepare_epoll_control(fd, op, target, events, data)
+            .map(|result| result.and_then(|call| call.run_blocking()))
+    }
+    pub fn prepare_epoll_control(
+        &self,
+        fd: u32,
+        op: u32,
+        target: u32,
+        events: u32,
+        data: u64,
+    ) -> Option<Result<crate::EpollControl>> {
         let files = self.1.as_ref()?;
         Some((|| {
             let epoll = files.observation_descriptor(fd)?.open;
             let target_open = files.observation_descriptor(target)?.open;
-            epoll::control(epoll, target_open, target, op, events, data)
+            epoll::prepare_control(epoll, target_open, target, op, events, data)
         })())
     }
     fn candidates(&self) -> Vec<DirectFd> {
@@ -2206,6 +2302,33 @@ fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
 impl RetainedFd {
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
         native_wait_open(&self.0.open.borrow())
+    }
+}
+impl SharedFd {
+    pub fn subscribe_poll(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
+        self.clone()
+            .direct_poll()
+            .map_or_else(Vec::new, |fd| fd.subscribe(signal))
+    }
+    pub fn waits_for_stdin(&self) -> bool {
+        fn original(open: &OpenDescription) -> bool {
+            if open.kind == FdKind::Stdin {
+                return true;
+            }
+            let Some(events::Anonymous::Epoll(live)) = &open.anonymous else {
+                return false;
+            };
+            let Some(_walk) = epoll::Traversal::enter(live) else {
+                return false;
+            };
+            live.snapshot().iter().any(|(_, state, resource)| {
+                state.lock().unwrap().armed
+                    && resource
+                        .original_open()
+                        .is_some_and(|open| original(&open.borrow()))
+            })
+        }
+        original(&OpenDescription::shared_projection(self.open.clone()))
     }
 }
 

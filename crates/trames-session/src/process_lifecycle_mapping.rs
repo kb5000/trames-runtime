@@ -80,6 +80,11 @@ impl<C: Cpu> Lifecycle<C> {
                 .expect("original mapping task")
                 .clone();
             let p = &mut *original.write();
+            let _file_actor = trames_vfs::FileActorScope::enter_with_sync(
+                p.signals.io.credentials().clone(),
+                job.work.pid,
+                Some(self.layouts.sync_executor()),
+            );
             let batch = batch && !p.signals.io.is_traced();
             if p.signals.io.lifecycle().termination().is_some() {
                 job.checkpoint = None;
@@ -136,32 +141,50 @@ impl<C: Cpu> Lifecycle<C> {
                 job.work.trace.begin(pid, number, args(&p.cpu));
                 if matches!(
                     call,
-                    crate::structural::Memory::AioSetup | crate::structural::Memory::AioDestroy
+                    crate::structural::Memory::AioSetup
+                        | crate::structural::Memory::AioDestroy
+                        | crate::structural::Memory::Register { operation: 0 | 22 }
                 ) {
-                    let direct = &job
-                        .work
-                        .syscalls
-                        .as_ref()
-                        .expect("original AIO domain")
-                        .direct;
-                    let attempt = direct
-                        .start(
-                            number,
-                            args(&p.cpu),
-                            &mut p.memory,
-                            pid,
-                            &epoch.io_target,
-                            None,
-                        )
-                        .expect("accepted AIO mapping");
+                    let retained = job
+                        .retry
+                        .as_mut()
+                        .and_then(|call| call.file_checkpoint.take());
+                    let attempt = if let Some(file) = retained {
+                        job.retry = None;
+                        let original_args = args(&p.cpu);
+                        self.file_boundary(epoch, job, p, file, number, original_args)
+                    } else {
+                        let direct = &job
+                            .work
+                            .syscalls
+                            .as_ref()
+                            .expect("original memory registration domain")
+                            .direct;
+                        direct
+                            .start(
+                                number,
+                                args(&p.cpu),
+                                &mut p.memory,
+                                pid,
+                                &epoch.io_target,
+                                None,
+                            )
+                            .expect("accepted original memory operation")
+                    };
                     match attempt {
                         trames_linux::IoAttempt::Complete(result) => {
                             p.cpu.set_x(0, result.unwrap_or_else(super::super::error))
                         }
-                        trames_linux::IoAttempt::Blocked(wait) => {
-                            // The VMA is already detached. Only this task waits for
-                            // the old batch; peers must resume to finish their copyout.
+                        trames_linux::IoAttempt::Blocked(mut wait) => {
+                            // Only this task waits for the accepted import or
+                            // detached context; peers resume to finish its I/O.
                             p.memory.memory_report();
+                            let closed = p.memory.take_closed_resources();
+                            if !closed.is_empty() {
+                                wait.retain_aio_mapping_close(
+                                    self.layouts.close_mappings(closed, 0),
+                                );
+                            }
                             job.io = Some(wait);
                             break;
                         }
@@ -173,6 +196,32 @@ impl<C: Cpu> Lifecycle<C> {
                         &mut p.memory,
                         &mut trames_linux::CapturedOutput::default(),
                     );
+                }
+                let closed = p.memory.take_closed_resources();
+                if !closed.is_empty() {
+                    let direct = &job
+                        .work
+                        .syscalls
+                        .as_ref()
+                        .expect("original mapping source")
+                        .direct;
+                    match direct.start_mapping_close(
+                        closed,
+                        p.cpu.x(0),
+                        number,
+                        args(&p.cpu),
+                        &mut p.memory,
+                        pid,
+                        &epoch.io_target,
+                    ) {
+                        trames_linux::IoAttempt::Complete(value) => {
+                            p.cpu.set_x(0, value.unwrap_or_else(super::super::error));
+                        }
+                        trames_linux::IoAttempt::Blocked(wait) => {
+                            job.io = Some(wait);
+                        }
+                        _ => unreachable!("retained VMA-close completion"),
+                    }
                 }
                 p.memory.memory_report();
                 let elapsed = began.elapsed();
@@ -188,6 +237,7 @@ impl<C: Cpu> Lifecycle<C> {
                 report.time[3] += elapsed;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !batch
+                    || job.io.is_some()
                     || p.stopped()
                     || p.frozen(pid)
                     || p.seccomp.mode() != 0

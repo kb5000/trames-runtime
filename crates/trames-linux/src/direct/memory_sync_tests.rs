@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
 };
-use trames_memory::{Memory, MemoryError, Permissions, SharedPage, PAGE_SIZE};
+use trames_memory::{Memory, MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE};
 
 struct Probe {
     id: u64,
@@ -12,6 +12,7 @@ struct Probe {
     page: Arc<SharedPage>,
     calls: AtomicUsize,
     result: i32,
+    close: Option<Arc<dyn trames_memory::SyncResource>>,
 }
 impl Probe {
     fn new(result: i32) -> Arc<Self> {
@@ -21,6 +22,7 @@ impl Probe {
             page: Arc::new(SharedPage::zero()),
             calls: AtomicUsize::new(0),
             result,
+            close: None,
         })
     }
     fn map(self: &Arc<Self>, memory: &mut Memory, base: u64) {
@@ -60,6 +62,9 @@ impl PageBacking for Probe {
     }
     fn sync_key(&self) -> Option<u64> {
         Some(self.id)
+    }
+    fn close_resource(&self) -> Option<Arc<dyn trames_memory::SyncResource>> {
+        self.close.clone()
     }
     fn version(&self) -> u64 {
         0
@@ -249,12 +254,21 @@ fn mapped_sync_cancelled_wait_and_dropped_layout_owner_do_not_form_a_resource_cy
         let source = DirectSyscalls::default().with_file_layouts(layouts.clone());
         let wake = target();
         let args = [0x1000, 2 * PAGE_SIZE, 4, 0, 0, 0];
+        let reader = first
+            .layout
+            .as_ref()
+            .unwrap()
+            .try_read(memory.memory_report())
+            .unwrap();
         let Some(IoAttempt::Blocked(wait)) =
             source.start_file_call(227, args, &mut memory, 1, &Arc::downgrade(&wake))
         else {
             panic!("native work")
         };
         let pending = wait.file_pending().unwrap();
+        if admitted {
+            drop(reader);
+        }
         let host = admitted.then(|| queue.take(&layouts));
         drop((wait, source, layouts, wake));
         assert!(
@@ -326,6 +340,7 @@ fn msync_missing_original_layout_capability_defers_before_callback_effects() {
         page: Arc::new(SharedPage::zero()),
         calls: AtomicUsize::new(0),
         result: 0,
+        close: None,
     });
     let mut memory = Memory::default();
     probe.map(&mut memory, 0x1000);
@@ -354,4 +369,130 @@ fn msync_missing_original_layout_capability_defers_before_callback_effects() {
         ),
         Some(IoAttempt::Complete(Err(Errno(22))))
     ));
+}
+
+struct CloseProbe {
+    layout: Arc<trames_memory::layout::Layout>,
+    calls: AtomicUsize,
+    error: u32,
+}
+impl trames_memory::SyncResource for CloseProbe {
+    fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        Some(self.layout.clone())
+    }
+    fn sync(&self) -> Result<(), MemoryError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.error == 0 {
+            Ok(())
+        } else {
+            Err(MemoryError::BackingIo(self.error))
+        }
+    }
+}
+fn closing(error: u32) -> (Arc<Probe>, Arc<CloseProbe>) {
+    let close = Arc::new(CloseProbe {
+        layout: Arc::default(),
+        calls: AtomicUsize::new(0),
+        error,
+    });
+    let mut backing = Probe::new(0);
+    Arc::get_mut(&mut backing).unwrap().close = Some(close.clone());
+    (backing, close)
+}
+
+#[test]
+fn vma_close_keeps_original_result_and_continues_other_inodes_after_writeback_error() {
+    let (first, failed) = closing(5);
+    let (second, passed) = closing(0);
+    let (private, untouched) = closing(0);
+    let mut memory = Memory::default();
+    first.map(&mut memory, 0x1000);
+    first.map(&mut memory, 0x2000);
+    second.map(&mut memory, 0x3000);
+    memory
+        .map_backed(0x5000, vec![private], false, Permissions::RW, false)
+        .unwrap();
+    assert_eq!(memory.close_resources().len(), 2);
+    assert!(memory.unmap(0x1001, PAGE_SIZE).is_err());
+    assert!(memory.take_closed_resources().is_empty());
+    memory.unmap(0x1000, 5 * PAGE_SIZE).unwrap();
+    let resources = memory.take_closed_resources();
+    assert_eq!(
+        resources.len(),
+        2,
+        "aliases coalesce and private COW never writes back"
+    );
+    first.map(&mut memory, 0x1000);
+    let queue = Arc::new(Queue::default());
+    let layouts = crate::FileLayouts::new(queue.clone());
+    let result = layouts.close_mappings(resources, 0x1234);
+    for _ in 0..2 {
+        assert!(!result.ready());
+        let (task, admission) = queue.take(&layouts);
+        task.run(admission);
+    }
+    assert_eq!(failed.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(passed.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(untouched.calls.load(Ordering::Relaxed), 0);
+    let Some(trames_vfs::FileOutcome::Complete(reply)) = result.take() else {
+        panic!("original close result")
+    };
+    assert!(matches!(
+        reply.result,
+        Ok(trames_vfs::FileValue::Count(0x1234))
+    ));
+    assert!(memory.take_closed_resources().is_empty());
+}
+
+#[test]
+fn fixed_replacement_and_remap_shrink_capture_the_detached_original_inode_once() {
+    let (original, _) = closing(0);
+    let mut memory = Memory::default();
+    memory
+        .map_backed(
+            0x1000,
+            vec![original.clone(), original],
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+    memory
+        .remap(0x1000, 2 * PAGE_SIZE, 0x1000, PAGE_SIZE, false)
+        .unwrap();
+    assert_eq!(memory.take_closed_resources().len(), 1);
+    memory
+        .map_fixed(0x1000, PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    assert_eq!(memory.take_closed_resources().len(), 1);
+    memory.unmap(0x1000, 2 * PAGE_SIZE).unwrap();
+    assert!(memory.take_closed_resources().is_empty());
+}
+
+#[test]
+fn failed_close_executor_releases_waiters_without_changing_the_completed_vma_result() {
+    let (original, close) = closing(0);
+    let mut memory = Memory::default();
+    original.map(&mut memory, 0x1000);
+    memory.unmap(0x1000, PAGE_SIZE).unwrap();
+    let queue = Arc::new(Queue::default());
+    let layouts = crate::FileLayouts::new(queue.clone());
+    let notified = Arc::new(AtomicUsize::new(0));
+    let observed = notified.clone();
+    let result = layouts.close_mappings_notify(
+        memory.take_closed_resources(),
+        77,
+        Some(Box::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })),
+    );
+    let (task, admission) = queue.take(&layouts);
+    task.fail();
+    drop(admission);
+    assert_eq!(close.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(notified.load(Ordering::Relaxed), 1);
+    let Some(trames_vfs::FileOutcome::Complete(reply)) = result.take() else {
+        panic!("close failure wakes task")
+    };
+    assert!(matches!(reply.result, Ok(trames_vfs::FileValue::Count(77))));
 }

@@ -636,6 +636,7 @@ impl Memory {
         snapshot.identity = self.identity;
         snapshot.code_revision = self.code_revision;
         snapshot.external_code = self.has_external_code;
+        snapshot.async_sources = self.has_async_sources;
         if executable_changed {
             snapshot.backing_revision = backing_revision;
         }

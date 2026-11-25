@@ -9,6 +9,11 @@ pub(super) struct Batch {
 }
 #[derive(Default)]
 struct State {
+    fault: Option<trames_memory::PageFault>,
+    sent: Option<u64>,
+    copy: Option<crate::copy_replay::Replay>,
+    finish_copy: Option<crate::copy_replay::Replay>,
+    input: Option<Box<file_input::Bytes>>,
     completed: u64,
     active: Option<RetainedByte>,
     requested: u64,
@@ -17,6 +22,9 @@ struct State {
     pipe: bool,
 }
 impl Batch {
+    pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
+        self.state.lock().unwrap().fault.take()
+    }
     pub fn new(number: u32, args: [u64; 6], memory: &impl CpuMemory) -> Result<Self, Errno> {
         if args[3] as u32 & 0x8000_0000 != 0 {
             return Err(Errno(22));
@@ -45,7 +53,19 @@ impl Batch {
         if state.completed == 0 {
             return None;
         }
-        let result = self.finish(Ok(state.completed), memory);
+        let result = Ok(state.completed);
+        state.terminal = Some(result);
+        let result = if memory.async_faults_possible() {
+            let copies = state.finish_copy.get_or_insert_with(Default::default);
+            let result = self.finish(result, &mut crate::copy_replay::Writer::new(memory, copies));
+            if let Some(fault) = copies.fault.take() {
+                state.fault = Some(fault);
+                return Some(Err(Errno(14)));
+            }
+            result
+        } else {
+            self.finish(result, memory)
+        };
         state.terminal = Some(result);
         state.finished = true;
         Some(result)
@@ -94,7 +114,18 @@ impl Batch {
         loop {
             if let Some(result) = state.terminal {
                 let result = if !state.finished {
-                    self.finish(result, memory)
+                    if memory.async_faults_possible() {
+                        let copies = state.finish_copy.get_or_insert_with(Default::default);
+                        let mut output = crate::copy_replay::Writer::new(memory, copies);
+                        let result = self.finish(result, &mut output);
+                        if let Some(fault) = copies.fault.take() {
+                            state.fault = Some(fault);
+                            return Some(Err(Errno(14)));
+                        }
+                        result
+                    } else {
+                        self.finish(result, memory)
+                    }
                 } else {
                     result
                 };
@@ -117,7 +148,18 @@ impl Batch {
                 let item_args = [a[0], header, flags as u64, 0, 0, 0];
                 if state.active.is_none() {
                     if !receive {
-                        state.requested = crate::network_batch::requested(memory, header)?;
+                        state.requested = if memory.async_faults_possible() {
+                            let input = state.input.get_or_insert_with(Default::default);
+                            let reader = file_input::Reader::new(memory, input);
+                            let result = crate::network_batch::requested(&reader, header);
+                            if let Some(fault) = reader.fault() {
+                                state.fault = Some(fault);
+                                return Err(Errno(14));
+                            }
+                            result?
+                        } else {
+                            crate::network_batch::requested(memory, header)?
+                        };
                     }
                     match direct.prepare_local_context(
                         fd,
@@ -135,28 +177,52 @@ impl Batch {
                         }
                     }
                 }
-                let sent = direct
-                    .transfer_retained(
-                        state.active.as_ref().expect("accepted item"),
-                        operation,
-                        item_args,
-                        memory,
-                        original_paths,
-                    )
-                    .unwrap_or_else(|| {
-                        deferred = true;
-                        Err(Errno(11))
-                    })?;
+                let sent = if let Some(sent) = state.sent {
+                    sent
+                } else {
+                    direct
+                        .transfer_retained(
+                            state.active.as_ref().expect("accepted item"),
+                            operation,
+                            item_args,
+                            memory,
+                            original_paths,
+                        )
+                        .unwrap_or_else(|| {
+                            deferred = true;
+                            Err(Errno(11))
+                        })?
+                };
+                state.sent = Some(sent);
                 // Match Linux: msg_len copyout follows transport effects.
                 // A later EFAULT cannot undo delivery or replay this packet.
-                memory
-                    .write(
-                        header.checked_add(56).ok_or(Errno(14))?,
-                        &(sent as u32).to_le_bytes(),
-                    )
-                    .map_err(|_| Errno(14))?;
+                let address = header.checked_add(56).ok_or(Errno(14))?;
+                let copied = if memory.async_faults_possible() {
+                    let copies = state.copy.get_or_insert_with(Default::default);
+                    crate::copy_replay::Writer::new(memory, copies)
+                        .write(address, &(sent as u32).to_le_bytes())
+                } else {
+                    memory.write(address, &(sent as u32).to_le_bytes())
+                };
+                match copied {
+                    Ok(()) => {}
+                    Err(trames_memory::MemoryError::Pending(fault)) => {
+                        state.fault = Some(fault);
+                        return Err(Errno(14));
+                    }
+                    Err(_) => return Err(Errno(14)),
+                }
                 Ok(sent)
             })();
+            if state.fault.is_none() {
+                state.fault = state
+                    .active
+                    .as_ref()
+                    .and_then(RetainedByte::take_input_fault);
+            }
+            if state.fault.is_some() {
+                return Some(Err(Errno(14)));
+            }
             if deferred {
                 return None;
             }
@@ -166,6 +232,9 @@ impl Batch {
                         || self.receive.as_ref().is_some_and(|r| r.expired());
                     state.completed += 1;
                     state.active = None;
+                    state.sent = None;
+                    state.copy = None;
+                    state.input = None;
                     if short {
                         state.terminal = Some(Ok(state.completed));
                     }

@@ -101,7 +101,7 @@ pub(super) fn live_groups(namespaces: &[MountNamespace]) -> BTreeSet<u64> {
         .filter_map(|m| Some(m.propagation().shared?.id))
         .collect()
 }
-fn normalize(mounts: &[Arc<Mount>]) {
+pub(super) fn normalize(mounts: &[Arc<Mount>]) {
     let alive = mounts
         .iter()
         .filter_map(|m| Some(m.propagation().shared?.id))
@@ -406,6 +406,7 @@ impl Vfs {
             *copy.parent.borrow_mut() = Some(Attachment {
                 parent: parent.clone(),
                 node: attachment.node.clone(),
+                fuse_entry: attachment.fuse_entry.clone(),
                 fallback: key,
             });
             let peer = parent.propagation().shared.map_or(0, |g| g.id);
@@ -437,34 +438,54 @@ impl Vfs {
                 *copies[&mount.id].parent.borrow_mut() = Some(Attachment {
                     parent: copies[&a.parent.id].clone(),
                     node: a.node,
+                    fuse_entry: a.fuse_entry.clone(),
                     fallback: a.fallback,
                 });
             }
             plans.push((ns, added.iter().map(|m| copies[&m.id].clone()).collect()));
         }
-        root.set_propagation(state);
-        *root.parent.borrow_mut() = Some(attachment);
-        for (_, mounts) in &plans {
-            self.register_mounts(mounts)?;
-        }
-        // Apply superblock options after all fallible validation and before mount watchers wake.
-        apply_options();
-        // A propagated mount goes beneath the mount already visible at
-        // that dentry. Keeping a single parent edge per mountpoint also lets
-        // unmount uncover the original tree without losing its descendants.
-        for (previous, below) in covered {
-            *previous.parent.borrow_mut() = Some(Attachment {
-                node: below.root.clone(),
-                fallback: below.root_path(),
-                parent: below,
-            });
-        }
-        for (ns, mounts) in plans {
-            let mut table = ns.0.borrow_mut();
-            table.mounts.extend(mounts);
-            let events = table.events.clone();
-            drop(table);
-            events.changed();
+        let entry = attachment.fuse_entry.clone();
+        let admin = namespace.0.borrow().admin.clone();
+        let publishing: Vec<_> = plans
+            .iter()
+            .flat_map(|(_, mounts)| mounts.iter().cloned())
+            .collect();
+        let _publication = self.mount_registry.publishing(&admin, &publishing);
+        self.reap_detached_mounts();
+        let events = fuse::Entry::attach(entry.as_ref(), || {
+            root.set_propagation(state);
+            *root.parent.borrow_mut() = Some(attachment);
+            for (_, mounts) in &plans {
+                self.register_mounts_unreaped(mounts)?;
+            }
+            // Apply superblock options after all fallible validation and before mount watchers wake.
+            apply_options();
+            // A propagated mount goes beneath the mount already visible at
+            // that dentry. Keeping a single parent edge per mountpoint also lets
+            // unmount uncover the original tree without losing its descendants.
+            for (previous, below) in covered {
+                *previous.parent.borrow_mut() = Some(Attachment {
+                    node: below.root.clone(),
+                    fuse_entry: below
+                        .root_entry
+                        .clone()
+                        .or_else(|| fuse::Entry::directory(&below.root)),
+                    fallback: below.root_path(),
+                    parent: below,
+                });
+            }
+            let mut changed = Vec::new();
+            for (ns, mounts) in plans {
+                let mut table = ns.0.borrow_mut();
+                table.mounts.extend(mounts);
+                let events = table.events.clone();
+                drop(table);
+                changed.push(events);
+            }
+            Ok(changed)
+        })?;
+        for event in events {
+            event.changed();
         }
         Ok(())
     }
