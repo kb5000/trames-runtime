@@ -485,6 +485,7 @@ struct Compile {
 
 pub struct Backend {
     native_images: bool,
+    native_pointer_imports: bool,
     image_files: Option<Arc<dyn trames_graphics::ImageFds>>,
     completion: Arc<trames_shared::Readiness>,
     waits: BTreeMap<u64, completion::Wait>,
@@ -536,6 +537,7 @@ impl Backend {
         Self {
             budget,
             native_images: false,
+            native_pointer_imports: true,
             image_files: None,
             domain: DOMAIN.fetch_add(1, Ordering::Relaxed),
             graphs: BTreeMap::new(),
@@ -581,6 +583,13 @@ impl Backend {
     }
     pub fn with_native_images(mut self) -> Self {
         self.native_images = true;
+        self
+    }
+    /// Configure the CPU embedding's original allocation-alias contract once.
+    /// File-backed dedicated buffers retain direct sharing even when opaque
+    /// driver pointers need the existing coherent data-transfer path.
+    pub fn with_native_pointer_imports(mut self, enabled: bool) -> Self {
+        self.native_pointer_imports = enabled;
         self
     }
     pub fn authenticate_images(&mut self, files: Option<Arc<dyn trames_graphics::ImageFds>>) {
@@ -1112,17 +1121,21 @@ impl Backend {
             && a[5] == shared_memory::MAP_SHARED
             && !memory.can_import_mapping()
             && self.objects.get(&a[1]).is_some_and(|o| {
-                o.host_allocation.borrow().is_some()
-                    || o.flags
-                        & (vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT)
-                            .as_raw()
-                        == (vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT)
-                            .as_raw()
+                if let Some(owner) = o.host_allocation.borrow().as_ref() {
+                    owner.importable(self.native_pointer_imports)
+                } else {
+                    self.native_pointer_imports
+                        && o.flags
+                            & (vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT)
+                                .as_raw()
+                            == (vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT)
+                                .as_raw()
                         && o.allocation_size
                             .get()
                             .is_multiple_of(trames_memory::host_mapping_granule() as u64)
+                }
             })
         {
             return Ok(Invocation::Checkpoint);
@@ -2353,6 +2366,9 @@ impl Backend {
                     let Some(owner) = mem.host_allocation.borrow().clone() else {
                         return Ok(false);
                     };
+                    if !owner.importable(self.native_pointer_imports) {
+                        return Ok(false);
+                    }
                     let page = trames_memory::PAGE_SIZE;
                     let padding = a[2] % page;
                     if a[4] % page != padding {

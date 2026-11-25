@@ -647,6 +647,7 @@ impl<C: Cpu> Process<C> {
             .gpu(|| {
                 trames_vulkan::Context::new(
                     trames_vulkan::Backend::with_budget(budget.clone())
+                        .with_native_pointer_imports(C::NATIVE_POINTER_IMPORTS)
                         .with_native_images()
                         .with_display(display.clone())
                         .with_wayland(self.linux.vfs.wayland_server()),

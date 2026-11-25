@@ -119,6 +119,13 @@ impl Allocation {
     pub(super) fn owns_native(&self) -> bool {
         matches!(self.storage, Storage::Native { .. })
     }
+    pub(super) fn importable(&self, native_pointers: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self.storage, Storage::File(_)) {
+            return true;
+        }
+        native_pointers
+    }
     pub(super) fn pointer(&self) -> *mut u8 {
         self.pointer as *mut u8
     }

@@ -98,6 +98,10 @@ pub use trames_execution::ExecutionInterrupt;
 /// worker. Interpreter states retain their decoder and deferred flags in place.
 pub trait Cpu: Registers + Default + Clone + Send + 'static {
     type Engine: Default;
+    /// Whether execution can alias retained native allocations without a file
+    /// descriptor. Backends needing a second revocable file alias opt out at
+    /// compile time; this never adds an ordinary memory-access check.
+    const NATIVE_POINTER_IMPORTS: bool = true;
     /// Optional coherent counter for the common Linux monotonic clock vDSO.
     /// Without a counter the vDSO delegates clock reads to Linux syscalls.
     fn clock_sample() -> Option<ClockSample> {

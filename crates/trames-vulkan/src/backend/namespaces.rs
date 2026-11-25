@@ -8,6 +8,7 @@ impl Backend {
         let mut graph = Self::with_budget(self.budget.clone());
         graph.display = self.display.clone();
         graph.native_images = self.native_images;
+        graph.native_pointer_imports = self.native_pointer_imports;
         graph.completion = self.completion.clone();
         graph.wayland.server = self.wayland.server.clone();
         graph
