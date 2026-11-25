@@ -33,6 +33,134 @@ fn forgotten(c: &Connection, expected: &[u64]) {
 }
 
 #[test]
+fn socket_bind_retains_original_ofd_inode_and_exclusion_across_daemon_wait() {
+    for kind in [1, 2] {
+        let (mut v, dev) = mounted();
+        let c = dev.connection().unwrap();
+        let fd = v.local_create(kind, 0).unwrap();
+        let socket = v.descriptor_factory().local_operation(fd).unwrap().unwrap();
+        let paths = v.path_queries();
+        let address = b"\x01\0/mnt/socket\0".to_vec();
+        let work = call(
+            &paths,
+            NamespaceCall::LocalBind {
+                socket: socket.clone(),
+                address: address.clone(),
+            },
+        );
+        attributes(c, 1, 0o40755, 0);
+        let work = waiting(work);
+        let work = absent(c, 1, work);
+        let request = receive(c, 8, 1);
+        assert_eq!(
+            u32::from_le_bytes(request[40..44].try_into().unwrap()) & 0o170000,
+            0o140000
+        );
+        let second = call(
+            &paths,
+            NamespaceCall::LocalBind {
+                socket: socket.clone(),
+                address: b"\x01\0/mnt/other\0".to_vec(),
+            },
+        );
+        assert!(!second.ready());
+        assert_eq!(c.read(8192), Err(Errno(11)));
+        v.close(fd).unwrap();
+        assert_eq!(v.eventfd(0, 0).unwrap(), fd);
+        answer(c, &request, &entry(80, 180, 0o140755));
+        count(work);
+        assert_eq!(
+            v.umount(b"/mnt", 0),
+            Err(Errno(16)),
+            "bound pathname retains its original mount"
+        );
+        assert!(second.ready());
+        assert!(matches!(finish(second), Err(Errno(22))));
+        assert_eq!(
+            c.read(8192),
+            Err(Errno(11)),
+            "live socket retains its weak-cache inode"
+        );
+        if kind == 1 {
+            v.descriptor_factory().local_listen(&socket, 1).unwrap();
+        }
+        let client_fd = v.local_create(kind, 0).unwrap();
+        let client = v
+            .descriptor_factory()
+            .local_operation(client_fd)
+            .unwrap()
+            .unwrap();
+        let connecting = call(
+            &paths,
+            NamespaceCall::LocalConnect {
+                socket: client.clone(),
+                address: address.clone(),
+                identity: [1, 0, 0],
+            },
+        );
+        answer(c, &receive(c, 1, 1), &entry(80, 180, 0o140755));
+        let FileValue::LocalConnection(connection) = finish(connecting).unwrap() else {
+            panic!("accepted connect");
+        };
+        connection.attempt().unwrap();
+        receive(c, 2, 80); // The connect lookup releases its own reference.
+        if kind == 2 {
+            let send = call(
+                &paths,
+                NamespaceCall::LocalDatagram {
+                    socket: client.clone(),
+                    address: Some(address),
+                },
+            );
+            answer(c, &receive(c, 1, 1), &entry(80, 180, 0o140755));
+            let FileValue::LocalDatagram(target) = finish(send).unwrap() else {
+                panic!("accepted datagram");
+            };
+            let selected = std::sync::OnceLock::from(target);
+            assert_eq!(
+                client.send_datagram(
+                    &selected,
+                    b"packet",
+                    0,
+                    Default::default(),
+                    [1, 0, 0],
+                    false,
+                    || panic!("target was already accepted")
+                ),
+                Some(Ok(6))
+            );
+        }
+        drop(connection);
+    }
+}
+
+#[test]
+fn socket_bind_cancellation_releases_only_its_own_admission() {
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let fd = v.descriptor_factory().local_create(1, 0).unwrap();
+    let socket = v.descriptor_factory().local_operation(fd).unwrap().unwrap();
+    let paths = v.path_queries();
+    let command = || NamespaceCall::LocalBind {
+        socket: socket.clone(),
+        address: b"\x01\0/mnt/socket\0".to_vec(),
+    };
+    let work = call(&paths, command());
+    attributes(c, 1, 0o40755, 0);
+    let work = waiting(work);
+    let work = absent(c, 1, work);
+    let request = receive(c, 8, 1);
+    let blocked = call(&paths, command());
+    assert!(!blocked.ready());
+    drop(work);
+    assert!(blocked.ready());
+    answer(c, &request, &entry(80, 180, 0o140755));
+    forgotten(c, &[80]);
+    drop(blocked);
+    assert_eq!(socket.name(false).unwrap(), [1, 0]);
+}
+
+#[test]
 fn nested_mkdir_retains_parent_and_passes_original_mask_and_name() {
     let (mut v, dev) = mounted();
     v.set_umask(0o027);

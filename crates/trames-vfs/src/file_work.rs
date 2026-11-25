@@ -434,6 +434,8 @@ pub enum FileCommand {
     },
 }
 pub enum FileValue {
+    LocalConnection(LocalConnection),
+    LocalDatagram(LocalDatagram),
     Read(ReadReply),
     Directory(fuse::DirectoryReply),
     FuseStat([u8; 128], StatMount),

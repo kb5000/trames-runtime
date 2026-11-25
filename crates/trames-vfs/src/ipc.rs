@@ -2,6 +2,7 @@
 //! Bounded guest AF_UNIX endpoints. No guest pathname reaches host sockets.
 use super::*;
 mod binding;
+pub(crate) use binding::{BindLease, BindLock};
 pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
 mod control;
@@ -141,6 +142,7 @@ pub struct LocalResource {
     namespace: Arc<SharedCell<LocalNamespace>>,
     network: Arc<linux_namespace::RootNetwork>,
     pathname_binding: std::sync::OnceLock<binding::OwnedBinding>,
+    pub(crate) bind_lock: Arc<binding::BindLock>,
     channel: LocalChannel,
     transition: std::sync::Mutex<()>,
     datagram_connected: std::sync::atomic::AtomicBool,
@@ -302,6 +304,7 @@ impl LocalResource {
             namespace: network.local.clone(),
             network,
             pathname_binding: std::sync::OnceLock::new(),
+            bind_lock: Arc::default(),
             channel: LocalChannel::new(kind),
             transition: std::sync::Mutex::new(()),
             datagram_connected: std::sync::atomic::AtomicBool::new(false),

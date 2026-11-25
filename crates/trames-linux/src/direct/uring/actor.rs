@@ -341,19 +341,43 @@ impl Execution {
                     }
                 }
                 let socket = call.socket.as_mut().unwrap();
-                let result =
-                    if matches!(s.opcode(), 16 | 56) && request.file.as_ref()?.socket().is_none() {
-                        socket.uring_attempt(memory, Some(&*self.paths.lock().unwrap()))
+                let mut result = if call.file.is_some() {
+                    None
+                } else if matches!(s.opcode(), 16 | 56) && request.file.as_ref()?.socket().is_none()
+                {
+                    socket.uring_attempt(memory, Some(&*self.paths.lock().unwrap()))
+                } else {
+                    socket.uring_attempt(memory, None)
+                };
+                if matches!(s.opcode(), 16 | 56) && (call.file.is_some() || result.is_none()) {
+                    let work = if call.file.is_none() {
+                        socket.path_work()
                     } else {
-                        socket.uring_attempt(memory, None)
+                        None
                     };
+                    if call.file.is_some() || work.is_some() {
+                        match file::namespace(self, &mut call.file, work)? {
+                            file::NamespaceReply::Waiting => return Some(Err(Errno(11))),
+                            file::NamespaceReply::Complete(value) => {
+                                if let Err(error) = socket.accept_path(value) {
+                                    request.error = Some(error);
+                                    return Some(Err(error));
+                                }
+                            }
+                        }
+                        result = socket.uring_attempt(memory, Some(&*self.paths.lock().unwrap()));
+                    }
+                }
                 let result = match result {
                     Some(result) => result,
-                    None if memory.async_faults_possible() && matches!(s.opcode(), 26 | 27) => {
+                    None if matches!(s.opcode(), 26 | 27) => {
                         return byte::network(self, call, request, memory)
                     }
                     None => return None,
                 };
+                if socket.path_error() && matches!(result, Err(Errno(11))) {
+                    request.error = Some(Errno(11));
+                }
                 if let Some(fault) = socket.take_fault() {
                     call.page = Some(fault.wait);
                     return Some(Err(Errno(11)));
@@ -578,6 +602,7 @@ impl UringActor {
             }
         }
         let selection = request.selection.clone();
+        let terminal_error = request.error;
         if request.sqe.multishot()
             && matches!(request.sqe.opcode(), 26 | 27)
             && matches!(result, Some(Ok(_)))
@@ -593,6 +618,7 @@ impl UringActor {
                 call.file.as_ref().map(|f| f.wait_revision),
             );
         original.selection = selection;
+        original.error = terminal_error;
         original.copy_pending = copy_pending;
         self.accepted.lock().unwrap().insert(key, call);
         if changed {

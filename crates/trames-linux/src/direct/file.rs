@@ -166,6 +166,8 @@ impl FileResult {
 
 #[derive(Clone)]
 pub enum FileOutput {
+    SocketPath(Box<RetainedSocket>),
+    LocalMessage(Box<RetainedByte>),
     Directory(u64),
     Readlink(u64, u64),
     FuseStat(u32, [u64; 6]),
@@ -765,6 +767,21 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        match output {
+            FileOutput::SocketPath(mut call) => {
+                if let Err(error) = call.accept_path(reply.result) {
+                    return self.complete_socket(Err(error));
+                }
+                return self.start_retained_socket(*call, memory, pid, target);
+            }
+            FileOutput::LocalMessage(file) => {
+                if let Err(error) = file.accept_datagram_path(reply.result) {
+                    return IoAttempt::Complete(Err(error));
+                }
+                return self.start_retained_byte(*file, number, args, memory, pid, target);
+            }
+            _ => {}
+        }
         self.deliver_copyout(
             self.accept_file_reply(reply, output),
             number,
@@ -832,6 +849,27 @@ impl DirectSyscalls {
         output: FileOutput,
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        match output {
+            FileOutput::SocketPath(mut call) => {
+                if let Err(error) = call.accept_path(reply.result) {
+                    return Some(Err(error));
+                }
+                *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
+                    number,
+                    args,
+                    action: PreparedAction::Socket(*call),
+                });
+                return None;
+            }
+            FileOutput::LocalMessage(file) => {
+                if let Err(error) = file.accept_datagram_path(reply.result) {
+                    return Some(Err(error));
+                }
+                self.prepare_retained_byte(number, args, *file);
+                return None;
+            }
+            _ => {}
+        }
         self.finish_file_copyout(number, args, self.accept_file_reply(reply, output), memory)
     }
     pub(super) fn finish_file_copyout(
@@ -908,7 +946,7 @@ impl DirectSyscalls {
         })
     }
     #[allow(clippy::too_many_arguments)] // Original accepted ABI/output plus source wake target.
-    fn submit_file_work(
+    pub(super) fn submit_file_work(
         &self,
         work: trames_vfs::FileWork,
         output: FileOutput,
@@ -2403,3 +2441,5 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
 #[cfg(test)]
 #[path = "file_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(super) use tests::{fuse_socket_error_step, mount_socket_fuse};

@@ -162,6 +162,11 @@ impl FileIo {
                 let FileDependency::Resource(work) = *self.dependency.take().unwrap() else {
                     unreachable!();
                 };
+                if let Some(executor) = execution.disk.as_ref().filter(|_| work.host_work()) {
+                    self.result.begin();
+                    executor.submit_file(work, self.result.clone());
+                    return self.result.take();
+                }
                 Some(work.run())
             }
             Some(FileDependency::Layout { ticket, .. }) => {
@@ -237,6 +242,8 @@ impl FileIo {
                         return self.finish_read(value, reply.resources, request, memory)
                     }
                     FileValue::FuseStat(..)
+                    | FileValue::LocalConnection(_)
+                    | FileValue::LocalDatagram(_)
                     | FileValue::Stat(_)
                     | FileValue::Transfer { .. }
                     | FileValue::Directory(_) => {
@@ -248,6 +255,88 @@ impl FileIo {
                     !matches!(request.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
                         || n == request.requested,
                 ))
+            }
+        }
+    }
+}
+/// Socket pathname operations use the same original FileWork, native pool and
+/// readiness subscriptions as ordinary file requests. No ring polling bridge
+/// or service task owns their daemon wait.
+pub(super) enum NamespaceReply {
+    Waiting,
+    Complete(Result<FileValue>),
+}
+pub(super) fn namespace(
+    execution: &Execution,
+    slot: &mut Option<FileIo>,
+    work: Option<FileWork>,
+) -> Option<NamespaceReply> {
+    if slot.is_none() {
+        let work = work?;
+        let io = FileIo {
+            result: Arc::default(),
+            wait_revision: 0,
+            dependency: None,
+            parts: Vec::new(),
+            buffer: None,
+            address: 0,
+            copyout: None,
+        };
+        if let Some(executor) = execution.disk.as_ref().filter(|_| work.host_work()) {
+            executor.submit_file(work, io.result.clone());
+        } else {
+            io.result.complete(work.run());
+        }
+        *slot = Some(io);
+    }
+    let mut outcome = slot.as_mut().unwrap().take_outcome(execution);
+    loop {
+        match outcome {
+            None => return Some(NamespaceReply::Waiting),
+            Some(FileOutcome::Complete(reply)) => {
+                *slot = None;
+                return Some(NamespaceReply::Complete(reply.result));
+            }
+            Some(FileOutcome::Waiting(work)) => {
+                let io = slot.as_mut().unwrap();
+                io.dependency = Some(Box::new(FileDependency::Resource(work)));
+                io.wait_revision = io.wait_revision.wrapping_add(1);
+                return Some(NamespaceReply::Waiting);
+            }
+            Some(FileOutcome::Owner(work)) => {
+                let mut joined = None;
+                execution
+                    .paths
+                    .lock()
+                    .unwrap()
+                    .uring_original(None, |view| {
+                        joined = Some(work.resume_owner(view));
+                        Ok(())
+                    });
+                outcome = joined;
+            }
+            Some(FileOutcome::Layout(work)) => {
+                let io = slot.as_mut().unwrap();
+                if let Some(layouts) = &execution.layouts {
+                    match layouts.submit(work, io.result.clone()) {
+                        Ok(()) => return Some(NamespaceReply::Waiting),
+                        Err(work) => {
+                            let ticket = work.begin_layout().expect("accepted socket path layout");
+                            io.dependency = Some(Box::new(FileDependency::Layout {
+                                work,
+                                ticket: Some(ticket),
+                            }));
+                        }
+                    }
+                } else {
+                    let ticket = work.begin_layout().expect("accepted socket path layout");
+                    io.dependency = Some(Box::new(FileDependency::Layout {
+                        work,
+                        ticket: Some(ticket),
+                    }));
+                }
+                io.wait_revision = io.wait_revision.wrapping_add(1);
+                return Some(NamespaceReply::Waiting);
             }
         }
     }

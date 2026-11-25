@@ -26,6 +26,19 @@ pub(super) struct AcceptedPaths {
 }
 
 pub enum NamespaceCall {
+    LocalBind {
+        socket: LocalOperation,
+        address: Vec<u8>,
+    },
+    LocalConnect {
+        socket: LocalOperation,
+        address: Vec<u8>,
+        identity: [u32; 3],
+    },
+    LocalDatagram {
+        socket: LocalOperation,
+        address: Option<Vec<u8>>,
+    },
     MountFd(MountFdCall),
     MountQuery(MountQuery),
     MqOpen {
@@ -137,6 +150,7 @@ impl NamespaceCall {
         matches!(
             self,
             Self::Mkdir { .. }
+                | Self::LocalBind { .. }
                 | Self::Mknod { .. }
                 | Self::Symlink { .. }
                 | Self::Unlink { .. }
@@ -153,6 +167,32 @@ impl NamespaceCall {
     }
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
+            Self::LocalBind { address, .. } | Self::LocalConnect { address, .. }
+                if address.len() > 2 && address[2] != 0 =>
+            {
+                let end = address[2..]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map_or(address.len(), |i| i + 2);
+                vec![(
+                    AT_FDCWD,
+                    Some(&address[2..end]),
+                    !matches!(self, Self::LocalBind { .. }),
+                )]
+            }
+            Self::LocalDatagram {
+                address: Some(address),
+                ..
+            } if address.len() > 2 && address[2] != 0 => {
+                let end = address[2..]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map_or(address.len(), |i| i + 2);
+                vec![(AT_FDCWD, Some(&address[2..end]), true)]
+            }
+            Self::LocalBind { .. } | Self::LocalConnect { .. } | Self::LocalDatagram { .. } => {
+                Vec::new()
+            }
             Self::MountFd(call) => call.operands(),
             Self::Memfd(_) | Self::MqOpen { .. } | Self::MqUnlink(_) | Self::MountQuery(_) => {
                 Vec::new()
@@ -266,7 +306,10 @@ impl NamespaceCall {
     fn retains_paths(&self) -> bool {
         matches!(
             self,
-            Self::Mount { .. }
+            Self::LocalBind { .. }
+                | Self::LocalConnect { .. }
+                | Self::LocalDatagram { .. }
+                | Self::Mount { .. }
                 | Self::Link { .. }
                 | Self::Umount { .. }
                 | Self::PivotRoot { .. }
@@ -306,6 +349,21 @@ impl NamespaceCall {
     }
     pub fn execute(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
+            Self::LocalBind { socket, address } => v.local_bind_entered(socket.core(), address)?,
+            Self::LocalConnect {
+                socket,
+                address,
+                identity,
+            } => {
+                return v
+                    .local_connection_core(socket.core(), address, *identity)
+                    .map(FileValue::LocalConnection)
+            }
+            Self::LocalDatagram { socket, address } => {
+                return v
+                    .local_datagram_core(socket.core(), address.as_deref())
+                    .map(FileValue::LocalDatagram)
+            }
             Self::MqOpen {
                 name,
                 flags,
@@ -448,6 +506,7 @@ impl NamespaceCall {
     }
 }
 pub(super) struct NamespaceWork {
+    bind: Option<ipc::BindLease>,
     call: NamespaceCall,
     revalidated: bool,
     host_work: bool,
@@ -642,6 +701,7 @@ impl PathQueries {
                 .retains_paths()
                 .then(|| Arc::new(SharedCell::default()));
             let mut work = NamespaceWork {
+                bind: None,
                 call,
                 revalidated: false,
                 paths,
@@ -683,6 +743,7 @@ impl PathQueries {
         FileWork::namespace(
             paths,
             NamespaceWork {
+                bind: None,
                 call,
                 revalidated: false,
                 paths: accepted_paths,
@@ -794,14 +855,29 @@ impl NamespaceWork {
         }
     }
     pub(super) fn waiting(&self) -> bool {
-        self.waiting.is_some() || self.fuse.is_some() || self.parents.is_some()
+        self.bind_wait().is_some()
+            || self.waiting.is_some()
+            || self.fuse.is_some()
+            || self.parents.is_some()
+    }
+    fn bind_wait(&self) -> Option<&Arc<ipc::BindLock>> {
+        match &self.call {
+            NamespaceCall::LocalBind { socket, .. } if self.bind.is_none() => {
+                Some(&socket.bind_lock)
+            }
+            _ => None,
+        }
     }
     pub(super) fn ready(&self) -> bool {
-        self.waiting.as_ref().is_none_or(|admin| admin.ready())
+        self.bind_wait().is_none_or(|bind| bind.ready())
+            && self.waiting.as_ref().is_none_or(|admin| admin.ready())
             && self.fuse.as_ref().is_none_or(|f| f.ready())
             && self.parents.as_ref().is_none_or(|parents| parents.ready())
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
+        if let Some(bind) = self.bind_wait() {
+            return Some(bind.subscribe(signal));
+        }
         self.waiting
             .as_ref()
             .map(|admin| admin.subscribe(signal))
@@ -811,6 +887,12 @@ impl NamespaceWork {
         self.execute(&mut paths.view.borrow_mut())
     }
     fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
+        if let Some(bind) = self.bind_wait() {
+            let Some(lease) = bind.try_enter() else {
+                return NamespaceRun::Waiting;
+            };
+            self.bind = Some(lease);
+        }
         let native = self.host_work();
         if self.owner_work() {
             return NamespaceRun::Owner;

@@ -71,17 +71,17 @@ static void transfer(const char *base, unsigned sample) {
         sample, (unsigned long long)write_ns, (unsigned long long)sync_ns,
         (unsigned long long)warm_ns, (unsigned long long)reopen_ns);
 }
-static void ordinary(const char *base, unsigned sample) {
+static void ordinary(const char *base, unsigned sample, unsigned scale) {
     char path[1024];
     CHECK(snprintf(path, sizeof(path), "%s/plain-%d", base, getpid()) < (int)sizeof(path));
     int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
     CHECK(fd >= 0);
     uint64_t start = now(), value = 0x12345678;
-    for (unsigned i = 0; i < 200000; ++i) { value ^= value << 13; value ^= value >> 7; value ^= value << 17; }
+    for (unsigned i = 0; i < 200000 * scale; ++i) { value ^= value << 13; value ^= value >> 7; value ^= value << 17; }
     uint64_t cpu_ns = now() - start;
     struct stat fs;
     start = now();
-    for (unsigned i = 0; i < 1000; ++i) {
+    for (unsigned i = 0; i < 1000 * scale; ++i) {
         CHECK(stat(path, &fs) == 0);
         int other = open(path, O_RDONLY);
         CHECK(other >= 0 && close(other) == 0);
@@ -89,7 +89,7 @@ static void ordinary(const char *base, unsigned sample) {
     uint64_t metadata_ns = now() - start;
     memset(input, 0x5a, 4096);
     start = now();
-    for (unsigned i = 0; i < 512; ++i) {
+    for (unsigned i = 0; i < 512 * scale; ++i) {
         CHECK(pwrite(fd, input, 4096, 0) == 4096);
         CHECK(pread(fd, output, 4096, 0) == 4096);
         CHECK(memcmp(input, output, 4096) == 0);
@@ -98,7 +98,7 @@ static void ordinary(const char *base, unsigned sample) {
     int pipes[2];
     CHECK(pipe(pipes) == 0);
     start = now();
-    for (unsigned i = 0; i < 512; ++i) {
+    for (unsigned i = 0; i < 512 * scale; ++i) {
         CHECK(write(pipes[1], input, 4096) == 4096);
         CHECK(read(pipes[0], output, 4096) == 4096);
         CHECK(memcmp(input, output, 4096) == 0);
@@ -113,10 +113,12 @@ static void ordinary(const char *base, unsigned sample) {
 int main(int argc, char **argv) {
     CHECK(argc >= 3);
     if (!strcmp(argv[1], "ready")) { ready(argv[2]); return 0; }
-    CHECK(argc == 4);
+    CHECK(argc == 4 || argc == 5);
+    unsigned scale = argc == 5 ? (unsigned)strtoul(argv[4], NULL, 10) : 1;
+    CHECK(scale >= 1 && scale <= 100);
     unsigned sample = (unsigned)strtoul(argv[3], NULL, 10);
     if (!strcmp(argv[1], "transfer")) transfer(argv[2], sample);
-    else if (!strcmp(argv[1], "ordinary")) ordinary(argv[2], sample);
+    else if (!strcmp(argv[1], "ordinary")) ordinary(argv[2], sample, scale);
     else CHECK(0);
     return 0;
 }

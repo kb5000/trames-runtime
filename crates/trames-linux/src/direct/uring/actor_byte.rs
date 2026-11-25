@@ -56,7 +56,8 @@ pub(super) fn execute(
     }
     let file = request.file.as_ref()?;
     let direct = DirectSyscalls::new(execution.descriptors.clone())
-        .with_resources(execution.factory.clone());
+        .with_resources(execution.factory.clone())
+        .with_paths(execution.paths.lock().unwrap().retain_context());
     if call.byte.is_none() {
         let bytes = call.input.get_or_insert_with(Default::default);
         let reader = file_input::Reader::new(memory, bytes);
@@ -131,7 +132,7 @@ pub(super) fn execute(
 pub(super) fn network(
     execution: &Execution,
     call: &mut Accepted,
-    request: &Request,
+    request: &mut Request,
     memory: &mut impl CpuMemory,
 ) -> Option<Result<(i32, bool)>> {
     let s = &request.sqe;
@@ -156,7 +157,32 @@ pub(super) fn network(
     let ByteIo::Network(accepted) = call.byte.as_ref().unwrap() else {
         unreachable!("message byte lifetime")
     };
-    let result = direct.transfer_retained(accepted, number, args, memory, None)?;
+    let result = if call.file.is_some() {
+        None
+    } else {
+        direct.transfer_retained(accepted, number, args, memory, None)
+    };
+    let result = if let Some(result) = result {
+        result
+    } else {
+        let work = if call.file.is_none() {
+            accepted.take_datagram_work()
+        } else {
+            None
+        };
+        match file::namespace(execution, &mut call.file, work)? {
+            file::NamespaceReply::Waiting => return Some(Err(Errno(11))),
+            file::NamespaceReply::Complete(result) => {
+                if let Err(error) = accepted.accept_datagram_path(result) {
+                    return Some(Err(error));
+                }
+            }
+        }
+        direct.transfer_retained(accepted, number, args, memory, None)?
+    };
+    if accepted.datagram_path_failed() && matches!(result, Err(Errno(11))) {
+        request.error = Some(Errno(11));
+    }
     if let Some(fault) = accepted.take_input_fault() {
         call.page = Some(fault.wait);
         return Some(Err(Errno(11)));

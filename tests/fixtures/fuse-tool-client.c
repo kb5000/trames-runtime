@@ -14,6 +14,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/sysmacros.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -135,6 +138,91 @@ static void metadata(const char *base) {
     CHECK(msync(pages, 16384, MS_SYNC) == 0);
     CHECK(munmap(pages, 16384) == 0);
     finish(fd);
+}
+static void special(const char *base) {
+    CHECK(snprintf(path, sizeof(path), "%s/local-fifo", base) < (int)sizeof(path));
+    CHECK(mkfifo(path, 0600) == 0);
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && S_ISFIFO(st.st_mode));
+    errno = 0;
+    CHECK(open(path, O_WRONLY | O_NONBLOCK) == -1 && errno == ENXIO);
+    int reader = open(path, O_RDONLY | O_NONBLOCK);
+    CHECK(reader >= 0);
+    int writer = open(path, O_WRONLY | O_NONBLOCK);
+    CHECK(writer >= 0);
+    CHECK(write(writer, "fifo", 4) == 4 && read(reader, received, 4) == 4);
+    CHECK(!memcmp(received, "fifo", 4));
+    errno = 0;
+    CHECK(lseek(reader, 0, SEEK_SET) == -1 && errno == ESPIPE);
+    CHECK(unlink(path) == 0);
+    CHECK(write(writer, "kept", 4) == 4 && read(reader, received, 4) == 4);
+    CHECK(!memcmp(received, "kept", 4));
+    CHECK(close(writer) == 0 && read(reader, received, 1) == 0 && close(reader) == 0);
+
+    CHECK(snprintf(path, sizeof(path), "%s/local-null", base) < (int)sizeof(path));
+    CHECK(mknod(path, S_IFCHR | 0600, makedev(1, 3)) == 0);
+    CHECK(stat(path, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(1, 3));
+    struct statfs fs;
+    CHECK(statfs(base, &fs) == 0);
+    errno = 0;
+    int null = open(path, O_RDWR);
+    if (fs.f_flags & MS_NODEV) CHECK(null == -1 && errno == EACCES);
+    else {
+        CHECK(null >= 0 && read(null, received, 1) == 0);
+        CHECK(write(null, "discard", 7) == 7 && close(null) == 0);
+    }
+    CHECK(unlink(path) == 0);
+
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/local-socket", base) < (int)sizeof(address.sun_path));
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0 && bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(stat(address.sun_path, &st) == 0 && S_ISSOCK(st.st_mode));
+    CHECK(listen(listener, 1) == 0);
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(client >= 0 && connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    int peer = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    CHECK(peer >= 0 && write(client, "unix", 4) == 4 && read(peer, received, 4) == 4);
+    CHECK(!memcmp(received, "unix", 4));
+    errno = 0;
+    CHECK(umount("/work/view") == -1 && errno == EBUSY);
+    CHECK(unlink(address.sun_path) == 0);
+    CHECK(close(peer) == 0 && close(client) == 0 && close(listener) == 0);
+
+    CHECK(snprintf(path, sizeof(path), "%s/socket-escape", base) < (int)sizeof(path));
+    CHECK(symlink("/work/source", path) == 0);
+    CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/socket-escape/escaped-socket", base) < (int)sizeof(address.sun_path));
+    listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0 && client >= 0 && bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(stat("/work/source/escaped-socket", &st) == 0 && S_ISSOCK(st.st_mode));
+    CHECK(listen(listener, 1) == 0 && connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    peer = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    CHECK(peer >= 0 && close(peer) == 0 && close(client) == 0 && close(listener) == 0);
+    CHECK(unlink("/work/source/escaped-socket") == 0 && unlink(path) == 0);
+
+    CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/local-datagram", base) < (int)sizeof(address.sun_path));
+    int receiver = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int sender = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(receiver >= 0 && sender >= 0);
+    CHECK(bind(receiver, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(sendto(sender, "sendto", 6, 0, (struct sockaddr *)&address, sizeof(address)) == 6);
+    CHECK(recv(receiver, received, sizeof(received), 0) == 6 && !memcmp(received, "sendto", 6));
+    struct iovec vector = {.iov_base = "sendmsg", .iov_len = 7};
+    struct mmsghdr messages[2] = {
+        {.msg_hdr = {.msg_name = &address, .msg_namelen = sizeof(address), .msg_iov = &vector, .msg_iovlen = 1}},
+        {.msg_hdr = {.msg_name = &address, .msg_namelen = sizeof(address), .msg_iov = &vector, .msg_iovlen = 1}}
+    };
+    CHECK(sendmsg(sender, &messages[0].msg_hdr, 0) == 7);
+    CHECK(recv(receiver, received, sizeof(received), 0) == 7 && !memcmp(received, "sendmsg", 7));
+    CHECK(sendmmsg(sender, messages, 2, 0) == 2 && messages[0].msg_len == 7 && messages[1].msg_len == 7);
+    CHECK(recv(receiver, received, sizeof(received), 0) == 7 && !memcmp(received, "sendmsg", 7));
+    CHECK(recv(receiver, received, sizeof(received), 0) == 7 && !memcmp(received, "sendmsg", 7));
+    CHECK(connect(sender, (struct sockaddr *)&address, sizeof(address)) == 0);
+    CHECK(unlink(address.sun_path) == 0);
+    CHECK(send(sender, "retained", 8, 0) == 8);
+    CHECK(recv(receiver, received, sizeof(received), 0) == 8 && !memcmp(received, "retained", 8));
+    CHECK(close(sender) == 0 && close(receiver) == 0);
 }
 static void aio_copy(const char *base) {
     int source = new_file(base, "aio-source", 16);
@@ -267,6 +355,34 @@ static void ring_io(const char *base) {
     }
     CHECK(seen == 7);
     __atomic_store_n((uint32_t *)(cq + params.cq_off.head), 3, __ATOMIC_RELEASE);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/ring-socket", base) < (int)sizeof(address.sun_path));
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0 && client >= 0);
+    // BIND=56 is newer than some distro userspace headers; the original
+    // Linux reference validates the actual kernel opcode, without a fallback.
+    uint32_t sq_mask = *(uint32_t *)(sq + params.sq_off.ring_mask);
+    uint32_t cq_mask = *(uint32_t *)(cq + params.cq_off.ring_mask);
+    entries[3 & sq_mask] = (struct io_uring_sqe){.opcode = 56, .fd = listener,
+        .addr = (uintptr_t)&address, .off = sizeof(address), .user_data = 103};
+    array[3 & sq_mask] = 3 & sq_mask;
+    __atomic_store_n((uint32_t *)(sq + params.sq_off.tail), 4, __ATOMIC_RELEASE);
+    CHECK(syscall(SYS_io_uring_enter, ring, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0) == 1);
+    CHECK(completed[3 & cq_mask].user_data == 103 && completed[3 & cq_mask].res == 0);
+    __atomic_store_n((uint32_t *)(cq + params.cq_off.head), 4, __ATOMIC_RELEASE);
+    CHECK(listen(listener, 1) == 0);
+    entries[4 & sq_mask] = (struct io_uring_sqe){.opcode = IORING_OP_CONNECT, .fd = client,
+        .addr = (uintptr_t)&address, .off = sizeof(address), .user_data = 104};
+    array[4 & sq_mask] = 4 & sq_mask;
+    __atomic_store_n((uint32_t *)(sq + params.sq_off.tail), 5, __ATOMIC_RELEASE);
+    CHECK(syscall(SYS_io_uring_enter, ring, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0) == 1);
+    CHECK(completed[4 & cq_mask].user_data == 104 && completed[4 & cq_mask].res == 0);
+    __atomic_store_n((uint32_t *)(cq + params.cq_off.head), 5, __ATOMIC_RELEASE);
+    int peer = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    CHECK(peer >= 0 && write(client, "ring", 4) == 4 && read(peer, received, 4) == 4);
+    CHECK(!memcmp(received, "ring", 4) && unlink(address.sun_path) == 0);
+    CHECK(close(peer) == 0 && close(client) == 0 && close(listener) == 0);
     CHECK(munmap(entries, entries_size) == 0 && munmap(sq, sq_size) == 0 && munmap(cq, cq_size) == 0);
     CHECK(close(ring) == 0);
     for (unsigned i = 0; i < 3; ++i) {
@@ -348,6 +464,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(scenario, "copyout")) copyout(argv[2]);
     else if (!strcmp(scenario, "metadata")) metadata(argv[2]);
     else if (!strcmp(scenario, "aio")) aio_copy(argv[2]);
+    else if (!strcmp(scenario, "special")) special(argv[2]);
     else if (!strcmp(scenario, "transfer")) transfer(argv[2]);
     else if (!strcmp(scenario, "copy")) copy_io(argv[2]);
     else if (!strcmp(scenario, "cached")) cached_io(argv[2]);

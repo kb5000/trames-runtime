@@ -5,6 +5,50 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Identity(AtomicBool);
 
+/// unix_bind's per-socket exclusion survives a FUSE daemon wait. Scheduler
+/// callers subscribe and release their execution slot; standalone embeddings
+/// retain the ordinary blocking API without a helper thread.
+#[derive(Default)]
+pub(crate) struct BindLock {
+    busy: AtomicBool,
+    changed: Arc<Readiness>,
+    wait: std::sync::Mutex<()>,
+    condition: std::sync::Condvar,
+}
+pub(crate) struct BindLease(Arc<BindLock>);
+impl BindLock {
+    pub(crate) fn try_enter(self: &Arc<Self>) -> Option<BindLease> {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| BindLease(self.clone()))
+    }
+    pub(super) fn enter(self: &Arc<Self>) -> BindLease {
+        let mut wait = self.wait.lock().unwrap();
+        loop {
+            if let Some(lease) = self.try_enter() {
+                return lease;
+            }
+            wait = self.condition.wait(wait).unwrap();
+        }
+    }
+    pub(crate) fn ready(&self) -> bool {
+        !self.busy.load(Ordering::Acquire)
+    }
+    pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.changed.subscribe(signal)
+    }
+}
+impl Drop for BindLease {
+    fn drop(&mut self) {
+        let wait = self.0.wait.lock().unwrap();
+        self.0.busy.store(false, Ordering::Release);
+        self.0.condition.notify_all();
+        drop(wait);
+        self.0.changed.notify_atomic();
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PathBinding(std::sync::Weak<Identity>);
 impl PathBinding {
@@ -31,6 +75,8 @@ impl PathBindings {
         let binding = OwnedBinding {
             identity,
             routes: self.clone(),
+            inode: None,
+            usage: None,
         };
         self.0
             .borrow_mut()
@@ -51,8 +97,19 @@ impl PathBindings {
 pub(super) struct OwnedBinding {
     identity: Arc<Identity>,
     routes: PathBindings,
+    // FUSE's inode cache is weak. A live socket retains its original inode so
+    // later LOOKUPs and hard links recover this binding, rather than an empty
+    // socket inode with the same daemon nodeid.
+    inode: Option<NodeRef>,
+    usage: Option<mounts::MountUse>,
 }
 impl OwnedBinding {
+    pub(super) fn retain_inode(&mut self, node: NodeRef) {
+        self.inode = Some(node);
+    }
+    pub(super) fn retain_mount(&mut self, mount: &Arc<mounts::MountIdentity>) {
+        self.usage = Some(mounts::MountUse::new(mount.clone()));
+    }
     pub(super) fn path(&self) -> PathBinding {
         PathBinding(Arc::downgrade(&self.identity))
     }
@@ -153,11 +210,31 @@ mod tests {
         let server = listener(&mut v, b"/socket");
         let original = path(&v, b"/socket");
         v.checkpoint().unwrap();
-        // Release the exclusive disk lock, keeping the actual socket alive.
+        // The live pathname now correctly retains its filesystem, including
+        // the private volume lock. Restore a separate checkpoint copy rather
+        // than incorrectly assuming that dropping Vfs releases a live mount.
+        let restored_dir = dir.with_extension("restored");
+        fn copy(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &to.join(entry.file_name()));
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        copy(&dir, &restored_dir);
         drop(v);
+        assert!(matches!(
+            Vfs::open_disk(&dir, DiskOptions::default()),
+            Err(Errno(16))
+        ));
         // Even while the old socket is live, a separately restored guest must
         // not recover its host identity or its socket control reference.
-        let restored = Vfs::open_disk(&dir, DiskOptions::default()).unwrap();
+        let restored = Vfs::open_disk(&restored_dir, DiskOptions::default()).unwrap();
         assert!(!path(&restored, b"/socket").is_live());
         assert!(original.is_live());
         let client = restored.new_local(1).unwrap();
@@ -167,6 +244,7 @@ mod tests {
         );
         drop((client, restored, server));
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(restored_dir).unwrap();
     }
 
     #[test]

@@ -51,12 +51,26 @@ impl PathPlan {
 }
 
 pub(crate) enum Action {
-    Mkdir { mode: u32 },
-    Mknod { mode: u32, device: u32 },
+    Mkdir {
+        mode: u32,
+    },
+    Mknod {
+        mode: u32,
+        device: u32,
+    },
+    SocketBind {
+        socket: Arc<LocalResource>,
+        name: Vec<u8>,
+        bindings: ipc::PathBindings,
+    },
     Symlink(Vec<u8>),
     Link(Box<crate::namespace::LinkSource>),
-    Unlink { directory: bool },
-    Rename { flags: u32 },
+    Unlink {
+        directory: bool,
+    },
+    Rename {
+        flags: u32,
+    },
 }
 struct Frame {
     node: u64,
@@ -497,7 +511,11 @@ impl Mutation {
         }
         self.phase = if matches!(
             self.action,
-            Action::Mkdir { .. } | Action::Mknod { .. } | Action::Symlink(_) | Action::Link(_)
+            Action::Mkdir { .. }
+                | Action::Mknod { .. }
+                | Action::SocketBind { .. }
+                | Action::Symlink(_)
+                | Action::Link(_)
         ) {
             Phase::CreateEntry
         } else {
@@ -539,6 +557,17 @@ impl Mutation {
                 body.extend(umask.to_le_bytes());
                 body.extend([0; 4]);
                 (8, mode & 0o170000)
+            }
+            Action::SocketBind { socket, .. } => {
+                body.extend(
+                    (0o140000
+                        | (socket.inode_permissions.load(Ordering::Relaxed) & !callback_mask))
+                        .to_le_bytes(),
+                );
+                body.extend(0u32.to_le_bytes());
+                body.extend(umask.to_le_bytes());
+                body.extend([0; 4]);
+                (8, 0o140000)
             }
             Action::Symlink(_) => (6, 0o120000),
             Action::Link(source) => {
@@ -1099,7 +1128,7 @@ impl Mutation {
                         entry.validity,
                     )?;
                 } else {
-                    let _inode = self.source.path.fs.leaf_inode(
+                    let inode = self.source.path.fs.leaf_inode(
                         entry._reference.as_ref().unwrap(),
                         entry.generation,
                         parent,
@@ -1107,6 +1136,19 @@ impl Mutation {
                         0,
                         entry.validity,
                     )?;
+                    if let Action::SocketBind {
+                        socket,
+                        name,
+                        bindings,
+                    } = &self.action
+                    {
+                        socket.publish_fuse_binding(
+                            bindings,
+                            inode,
+                            name.clone(),
+                            &self.source.path.mount.identity,
+                        );
+                    }
                 }
                 self.source.path.fs.inode_changed(parent);
                 Ok(Step::Complete(FileValue::Count(0)))

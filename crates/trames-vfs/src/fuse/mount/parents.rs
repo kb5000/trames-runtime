@@ -330,6 +330,7 @@ impl PendingNamespace {
                     action,
                     Action::Mkdir { .. }
                         | Action::Mknod { .. }
+                        | Action::SocketBind { .. }
                         | Action::Symlink(_)
                         | Action::Link(_)
                 ) {
@@ -374,6 +375,9 @@ impl PendingNamespace {
             Action::Mkdir { mode, .. } => v.mkdir_resolved(source, mode)?,
             Action::Mknod { mode, device, .. } => {
                 v.mknod_resolved(source, mode, device as u64, self.source.trailing)?
+            }
+            Action::SocketBind { socket, name, .. } => {
+                v.local_bind_resolved(&socket, name, source, self.source.trailing)?
             }
             Action::Symlink(target) => v.symlink_resolved(source, &target, self.source.trailing)?,
             Action::Link(original) => {

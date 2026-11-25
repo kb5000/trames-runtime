@@ -21,6 +21,7 @@ pub struct RetainedSocket {
     accepted_address: Option<Vec<u8>>,
     message: Option<Arc<ip_message::Message>>,
     post_sync: Option<(trames_vfs::SharedFd, bool)>,
+    pathname: Option<Arc<std::sync::Mutex<Option<trames_vfs::FileWork>>>>,
     preparing: Option<Arc<std::sync::Mutex<SocketInput>>>,
 }
 #[derive(Default)]
@@ -39,6 +40,47 @@ struct AcceptedOutput {
     copies: crate::copy_replay::Replay,
 }
 impl RetainedSocket {
+    pub(super) fn path_error(&self) -> bool {
+        matches!(self.number, 200 | 203)
+            && matches!(
+                &self.socket,
+                Control::Unix {
+                    address: Some(_),
+                    ..
+                }
+            )
+    }
+    pub(super) fn path_work(&self) -> Option<trames_vfs::FileWork> {
+        self.pathname.as_ref()?.lock().unwrap().take()
+    }
+    pub(super) fn accept_path(
+        &mut self,
+        result: Result<trames_vfs::FileValue, Errno>,
+    ) -> Result<(), Errno> {
+        self.pathname = None;
+        let Control::Unix {
+            address,
+            connection,
+            ..
+        } = &mut self.socket
+        else {
+            unreachable!("Unix pathname result");
+        };
+        match result {
+            Ok(trames_vfs::FileValue::Count(0)) if self.number == 200 => {
+                *address = None;
+                Ok(())
+            }
+            Ok(trames_vfs::FileValue::LocalConnection(prepared)) if self.number == 203 => {
+                *connection = Some(prepared);
+                *address = None;
+                Ok(())
+            }
+            Err(Errno(17)) if self.number == 200 => Err(Errno(98)),
+            Err(error) => Err(error),
+            _ => unreachable!("accepted Unix pathname operation"),
+        }
+    }
     pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
         self.preparing
             .as_ref()
@@ -101,6 +143,7 @@ impl RetainedSocket {
                 accepted_address: request.path.clone(),
                 message,
                 post_sync: None,
+                pathname: None,
                 preparing: (memory.async_faults_possible()
                     && matches!(number, 202 | 242 | 206 | 207))
                 .then(Arc::default),
@@ -447,25 +490,47 @@ impl RetainedSocket {
                 address,
                 connection,
             } => {
-                if self.number == 200 {
-                    return paths?
-                        .local_bind(socket, address.as_deref().expect("accepted bind address"))
-                        .map(|result| result.map(|()| 0));
-                }
-                if self.number == 203 {
-                    if connection.is_none() {
-                        match paths?.local_connection(
-                            socket,
-                            address.as_deref().expect("accepted connect address"),
-                            self.factory.local_peer_identity(),
-                        )? {
-                            Ok(prepared) => {
+                if matches!(self.number, 200 | 203) && address.is_some() {
+                    if self.pathname.is_some() {
+                        return None;
+                    }
+                    let call = if self.number == 200 {
+                        trames_vfs::NamespaceCall::LocalBind {
+                            socket: socket.clone(),
+                            address: address.as_ref().unwrap().clone(),
+                        }
+                    } else {
+                        trames_vfs::NamespaceCall::LocalConnect {
+                            socket: socket.clone(),
+                            address: address.as_ref().unwrap().clone(),
+                            identity: self.factory.local_peer_identity(),
+                        }
+                    };
+                    match paths?.namespace_attempt(call) {
+                        trames_vfs::NamespaceAttempt::Complete(reply) => match reply.result {
+                            Ok(trames_vfs::FileValue::Count(0)) if self.number == 200 => {
+                                *address = None;
+                            }
+                            Ok(trames_vfs::FileValue::LocalConnection(prepared))
+                                if self.number == 203 =>
+                            {
                                 *connection = Some(prepared);
                                 *address = None;
                             }
+                            Err(Errno(17)) if self.number == 200 => return Some(Err(Errno(98))),
                             Err(error) => return Some(Err(error)),
+                            _ => unreachable!("accepted Unix namespace reply"),
+                        },
+                        trames_vfs::NamespaceAttempt::Retained(work) => {
+                            self.pathname = Some(Arc::new(std::sync::Mutex::new(Some(work))));
+                            return None;
                         }
                     }
+                }
+                if self.number == 200 {
+                    return Some(Ok(0));
+                }
+                if self.number == 203 {
                     return Some(connection.as_ref().unwrap().attempt().map(|()| 0));
                 }
                 if matches!(self.number, 201 | 210) {
@@ -488,7 +553,8 @@ impl RetainedSocket {
         }
     }
     fn waits(&self, result: &Result<u64, Errno>) -> bool {
-        (matches!(self.number, 202 | 203 | 242) || self.message.is_some())
+        !self.path_error()
+            && (matches!(self.number, 202 | 203 | 242) || self.message.is_some())
             && self.blocking()
             && (matches!(result, Err(Errno(11)))
                 || self.number == 203 && matches!(result, Err(Errno(115))))
@@ -543,6 +609,7 @@ impl DirectSyscalls {
                 accepted_address: None,
                 message,
                 post_sync: None,
+                pathname: None,
                 preparing: memory.async_faults_possible().then(|| {
                     Arc::new(std::sync::Mutex::new(SocketInput {
                         raw: true,
@@ -588,6 +655,7 @@ impl DirectSyscalls {
                 accepted_address: None,
                 message,
                 post_sync: (number == 287 && args[5] & 6 != 0).then_some((file, args[5] & 4 == 0)),
+                pathname: None,
                 preparing: memory.async_faults_possible().then(|| {
                     Arc::new(std::sync::Mutex::new(SocketInput {
                         raw: true,
@@ -691,6 +759,7 @@ impl DirectSyscalls {
                 accepted_address: None,
                 message,
                 post_sync: None,
+                pathname: None,
                 preparing: memory.async_faults_possible().then(Arc::default),
             })
         })())
@@ -708,7 +777,7 @@ impl DirectSyscalls {
             Err(error) => self.complete_socket(Err(error)),
         })
     }
-    fn complete_socket(&self, result: Result<u64, Errno>) -> IoAttempt {
+    pub(super) fn complete_socket(&self, result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
         IoAttempt::Complete(result)
@@ -750,7 +819,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
-            return IoAttempt::SocketCheckpoint(call);
+            return self.socket_path_work(call, memory, pid, target);
         };
         if let Some(fault) = call.take_fault() {
             return self.park_socket_page(call, fault, pid, target);
@@ -845,7 +914,12 @@ impl DirectSyscalls {
     fn retry_socket(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         let call = pending.retained_socket.as_mut().unwrap();
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
-            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+            return self.socket_path_work(
+                pending.retained_socket.take().unwrap(),
+                memory,
+                pending.signal.pid,
+                &pending.target,
+            );
         };
         if let Some(fault) = call.take_fault() {
             return self.park_socket_page(
@@ -899,6 +973,17 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if let Some(work) = call.path_work() {
+            return self.submit_file_work(
+                work,
+                FileOutput::SocketPath(Box::new(call.clone())),
+                call.number,
+                call.args,
+                memory,
+                pid,
+                target,
+            );
+        }
         if let Control::Unix {
             socket,
             address,
@@ -938,7 +1023,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
-            return IoAttempt::SocketCheckpoint(call);
+            return self.socket_path_work(call, memory, pid, target);
         };
         if let Some(fault) = call.take_fault() {
             return self.park_socket_page(call, fault, pid, target);
@@ -955,6 +1040,27 @@ impl DirectSyscalls {
             return self.start_retained_socket(call, memory, pid, target);
         }
         IoAttempt::Blocked(self.socket_wait(call, pid, target))
+    }
+    fn socket_path_work(
+        &self,
+        call: RetainedSocket,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let Some(work) = call.path_work() else {
+            return IoAttempt::SocketCheckpoint(call);
+        };
+        let (number, args) = (call.number, call.args);
+        self.submit_file_work(
+            work,
+            FileOutput::SocketPath(Box::new(call)),
+            number,
+            args,
+            memory,
+            pid,
+            target,
+        )
     }
 }
 

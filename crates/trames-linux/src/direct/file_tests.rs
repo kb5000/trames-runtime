@@ -27,6 +27,119 @@ fn fuse_reply(v: &mut trames_vfs::Vfs, fd: u32, request: &[u8], payload: &[u8]) 
     bytes.extend(payload);
     assert_eq!(v.write(fd, &bytes), Ok(bytes.len()));
 }
+fn fuse_error(v: &mut trames_vfs::Vfs, fd: u32, request: &[u8], error: i32) {
+    let mut bytes = 16u32.to_le_bytes().to_vec();
+    bytes.extend((-error).to_le_bytes());
+    bytes.extend(&request[8..16]);
+    assert_eq!(v.write(fd, &bytes), Ok(bytes.len()));
+}
+pub(in crate::direct) fn mount_socket_fuse(v: &mut trames_vfs::Vfs) -> u32 {
+    v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+    v.mkdir_at(-100, b"/mnt", 0o755).unwrap();
+    let daemon = v.open_at(-100, b"/dev/fuse", 2, 0).unwrap();
+    v.mount(
+        None,
+        b"/mnt",
+        Some(b"fuse"),
+        0,
+        Some(format!("fd={daemon},rootmode=40755,user_id=0,group_id=0").as_bytes()),
+    )
+    .unwrap();
+    let init = fuse_receive(v, daemon, 26);
+    let mut version = [0; 64];
+    version[..4].copy_from_slice(&7u32.to_le_bytes());
+    version[4..8].copy_from_slice(&31u32.to_le_bytes());
+    fuse_reply(v, daemon, &init, &version);
+    daemon
+}
+pub(in crate::direct) fn fuse_socket_error_step(
+    v: &mut trames_vfs::Vfs,
+    daemon: u32,
+    bind: bool,
+) -> bool {
+    let request = v.read(daemon, 128 * 1024).unwrap();
+    match u32::from_le_bytes(request[4..8].try_into().unwrap()) {
+        3 => {
+            let mut attr = [0; 104];
+            attr[..8].copy_from_slice(&1u64.to_le_bytes());
+            attr[16..24].copy_from_slice(&1u64.to_le_bytes());
+            attr[76..80].copy_from_slice(&0o40755u32.to_le_bytes());
+            fuse_reply(v, daemon, &request, &attr);
+            false
+        }
+        1 if bind => {
+            fuse_error(v, daemon, &request, 2);
+            false
+        }
+        1 | 8 => {
+            fuse_error(v, daemon, &request, 11);
+            true
+        }
+        opcode => panic!("unexpected socket pathname opcode {opcode}"),
+    }
+}
+
+#[test]
+fn fuse_socket_namespace_eagain_completes_instead_of_waiting_or_replaying() {
+    for number in [200, 203, 206, 211, 269] {
+        let mut v = trames_vfs::Vfs::default();
+        v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        let daemon = mount_socket_fuse(&mut v);
+        let fd = v
+            .local_create(if number >= 206 { 2 } else { 1 }, 0)
+            .unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_resources(v.descriptor_factory())
+            .with_paths(v.path_queries());
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let address = b"\x01\0/mnt/socket\0";
+        memory.write(0x1100, address).unwrap();
+        memory.write(0x1200, b"data").unwrap();
+        memory.write(0x1300, &0x1200u64.to_le_bytes()).unwrap();
+        memory.write(0x1308, &4u64.to_le_bytes()).unwrap();
+        memory.write(0x1400, &0x1100u64.to_le_bytes()).unwrap();
+        memory
+            .write(0x1408, &(address.len() as u32).to_le_bytes())
+            .unwrap();
+        memory.write(0x1410, &0x1300u64.to_le_bytes()).unwrap();
+        memory.write(0x1418, &1u64.to_le_bytes()).unwrap();
+        let args = match number {
+            200 | 203 => [fd as u64, 0x1100, address.len() as u64, 0, 0, 0],
+            206 => [fd as u64, 0x1200, 4, 0, 0x1100, address.len() as u64],
+            211 => [fd as u64, 0x1400, 0, 0, 0, 0],
+            _ => [fd as u64, 0x1400, 1, 0, 0, 0],
+        };
+        let target = t();
+        let mut attempt = if number < 206 {
+            direct
+                .start_socket_control(number, args, &mut memory, 1, &Arc::downgrade(&target))
+                .unwrap()
+        } else {
+            direct
+                .start_local_message(number, args, &mut memory, 1, &Arc::downgrade(&target))
+                .unwrap()
+        };
+        let mut terminal = false;
+        for _ in 0..8 {
+            terminal = fuse_socket_error_step(&mut v, daemon, number == 200);
+            attempt = resume_fuse(attempt, number, args, &mut memory, &target);
+            if terminal {
+                break;
+            }
+        }
+        assert!(terminal);
+        assert!(
+            matches!(attempt, IoAttempt::Complete(Err(Errno(11)))),
+            "namespace errno must terminate syscall {number}"
+        );
+        assert_eq!(
+            v.read(daemon, 8192),
+            Err(Errno(11)),
+            "no replayed lookup/mknod"
+        );
+    }
+}
 fn fuse_receive(v: &mut trames_vfs::Vfs, fd: u32, opcode: u32) -> Vec<u8> {
     let bytes = v.read(fd, 128 * 1024).unwrap();
     assert_eq!(&bytes[4..8], &opcode.to_le_bytes());

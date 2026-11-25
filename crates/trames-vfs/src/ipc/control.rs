@@ -120,6 +120,21 @@ impl Vfs {
         socket: &Arc<LocalResource>,
         bytes: &[u8],
     ) -> Result<()> {
+        let _binding = if let Some(query) = &self.query {
+            match socket.bind_lock.try_enter() {
+                Some(lease) => lease,
+                None => return query.defer(),
+            }
+        } else {
+            socket.bind_lock.enter()
+        };
+        self.local_bind_entered(socket, bytes)
+    }
+    pub(crate) fn local_bind_entered(
+        &mut self,
+        socket: &Arc<LocalResource>,
+        bytes: &[u8],
+    ) -> Result<()> {
         let _transition = socket.transition.lock().unwrap();
         if socket.name.borrow().len() != 2 {
             return Err(Errno(22));
@@ -142,32 +157,86 @@ impl Vfs {
                     return Err(Errno(98));
                 }
             } else {
-                let p = self.resolve_final(-100, &name[2..name.len() - 1], false)?;
-                match self.node(&p) {
-                    Ok(_) => return Err(Errno(98)),
-                    Err(Errno(2)) => {}
-                    Err(e) => return Err(e),
+                let (p, fuse) =
+                    self.capture_fuse_path(AT_FDCWD, &name[2..name.len() - 1], false)?;
+                if let Some(plan) = fuse {
+                    return self.defer_fuse_namespace(
+                        plan,
+                        fuse::NamespaceAction::SocketBind {
+                            socket: socket.clone(),
+                            name,
+                            bindings: self.path_bindings.clone(),
+                        },
+                        None,
+                        landlock::MAKE_SOCK,
+                    );
                 }
-                self.check_parent_write(&p)?;
-                let binding = self.path_bindings.bind(socket);
-                // Search/insert must not overwrite another concurrent binder.
-                self.insert_entry(
-                    p,
-                    Content::Socket(binding.path()),
-                    0o140000 | (socket.inode_permissions.load(Ordering::Relaxed) & !self.umask()),
-                    true,
-                )
-                .map_err(|error| if error == Errno(17) { Errno(98) } else { error })?;
-                let _ = socket.pathname_binding.set(binding);
+                let trailing = name.last() == Some(&0) && name.get(name.len() - 2) == Some(&b'/');
+                drop(_transition);
+                return self.local_bind_resolved(socket, name, p, trailing);
             }
             name
         };
-        *socket.name.borrow_mut() = name;
-        // Packets queued before bind retain their original unbound address.
-        // Future sends share a new immutable source snapshot.
-        *socket.datagram_source.borrow_mut() = None;
+        socket.publish_bound_name(name);
         Ok(())
     }
+    pub(crate) fn local_bind_resolved(
+        &mut self,
+        socket: &Arc<LocalResource>,
+        name: Vec<u8>,
+        path: ResolvedPath,
+        trailing: bool,
+    ) -> Result<()> {
+        let _transition = socket.transition.lock().unwrap();
+        if socket.name.borrow().len() != 2 {
+            return Err(Errno(22));
+        }
+        match self.node(&path) {
+            Ok(_) => return Err(Errno(98)),
+            Err(Errno(2)) if trailing => return Err(Errno(2)),
+            Err(Errno(2)) => {}
+            Err(error) => return Err(error),
+        }
+        self.check_parent_write(&path)?;
+        let mut binding = self.path_bindings.bind(socket);
+        if let Some(mount) = &path.mount {
+            binding.retain_mount(&mount.identity);
+        }
+        self.insert_entry(
+            path,
+            Content::Socket(binding.path()),
+            0o140000 | (socket.inode_permissions.load(Ordering::Relaxed) & !self.umask()),
+            true,
+        )
+        .map_err(|error| if error == Errno(17) { Errno(98) } else { error })?;
+        let _ = socket.pathname_binding.set(binding);
+        socket.publish_bound_name(name);
+        Ok(())
+    }
+}
+impl LocalResource {
+    pub(crate) fn publish_fuse_binding(
+        self: &Arc<Self>,
+        bindings: &PathBindings,
+        inode: NodeRef,
+        name: Vec<u8>,
+        mount: &Arc<mounts::MountIdentity>,
+    ) {
+        let mut binding = bindings.bind(self);
+        inode.borrow_mut().content = Content::Socket(binding.path());
+        binding.retain_inode(inode);
+        binding.retain_mount(mount);
+        let _ = self.pathname_binding.set(binding);
+        self.publish_bound_name(name);
+    }
+    pub(crate) fn publish_bound_name(&self, name: Vec<u8>) {
+        *self.name.borrow_mut() = name;
+        // Packets queued before bind retain their original unbound address.
+        // Future sends share a new immutable source snapshot.
+        *self.datagram_source.borrow_mut() = None;
+    }
+}
+impl Vfs {
     pub(crate) fn local_destination_core(
         &self,
         socket: &Arc<LocalResource>,

@@ -6,6 +6,7 @@ profile=$1
 repeats=${2:-5}
 workers=${3:-1}
 diagnostic=${4:-0}
+scale=${5:-1}
 mkdir -p /work
 mount -t tmpfs -o size=64m none /work
 mkdir /work/source /work/view /work/plain
@@ -37,7 +38,11 @@ while test "$sample" -le "$repeats"; do
     count=0
     children=
     while test "$count" -lt "$workers"; do
-        timeout -s KILL 40 /opt/fuse-tool/client ordinary /work/plain "$sample" &
+        if test "$scale" -eq 1; then
+            timeout -s KILL 60 /opt/fuse-tool/client ordinary /work/plain "$sample" &
+        else
+            timeout -s KILL 60 /opt/fuse-tool/client ordinary /work/plain "$sample" "$scale" &
+        fi
         children="$children $!"
         count=$((count + 1))
     done

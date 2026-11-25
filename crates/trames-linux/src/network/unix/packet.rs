@@ -4,12 +4,16 @@ use super::*;
 pub(crate) struct DatagramState {
     pub source: trames_vfs::LocalOperation,
     pub target: std::sync::OnceLock<trames_vfs::LocalDatagram>,
+    pub path: std::sync::Mutex<Option<trames_vfs::FileWork>>,
+    pub failure: std::sync::OnceLock<Errno>,
 }
 impl DatagramState {
     pub fn new(source: trames_vfs::LocalOperation) -> Self {
         Self {
             source,
             target: Default::default(),
+            path: Default::default(),
+            failure: Default::default(),
         }
     }
 }

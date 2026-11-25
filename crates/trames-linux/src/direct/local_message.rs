@@ -85,6 +85,43 @@ struct Message<'a> {
     original_paths: Option<&'a trames_vfs::Vfs>,
     receive_flags: u32,
 }
+impl Message<'_> {
+    fn resolve_datagram(
+        &self,
+        datagram: &crate::network::unix::DatagramState,
+        destination: Option<&[u8]>,
+    ) -> Option<Result<trames_vfs::LocalDatagram, Errno>> {
+        if let Some(error) = datagram.failure.get() {
+            return Some(Err(*error));
+        }
+        let Some(paths) = self.paths else {
+            return self
+                .original_paths
+                .map(|vfs| vfs.resolve_local_datagram(&datagram.source, destination));
+        };
+        let mut pending = datagram.path.lock().unwrap();
+        if pending.is_some() {
+            return None;
+        }
+        match paths.namespace_attempt(trames_vfs::NamespaceCall::LocalDatagram {
+            socket: datagram.source.clone(),
+            address: destination.map(<[u8]>::to_vec),
+        }) {
+            trames_vfs::NamespaceAttempt::Complete(reply) => {
+                return Some(match reply.result {
+                    Ok(trames_vfs::FileValue::LocalDatagram(target)) => Ok(target),
+                    Err(error) => {
+                        let _ = datagram.failure.set(error);
+                        Err(error)
+                    }
+                    _ => unreachable!("accepted datagram pathname reply"),
+                })
+            }
+            trames_vfs::NamespaceAttempt::Retained(work) => *pending = Some(work),
+        }
+        None
+    }
+}
 impl AcceptedMessage {
     pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
         match &self.transfer {
@@ -142,13 +179,7 @@ impl crate::network::unix::MessageIo for Message<'_> {
                 rights,
                 identity,
                 false,
-                || {
-                    if let Some(vfs) = self.original_paths {
-                        Some(vfs.resolve_local_datagram(&datagram.source, destination))
-                    } else {
-                        self.paths?.local_datagram(&datagram.source, destination)
-                    }
-                },
+                || self.resolve_datagram(datagram, destination),
             );
         }
         if destination.is_some() && self.fd.local_kind() != 5 {
@@ -172,13 +203,7 @@ impl crate::network::unix::MessageIo for Message<'_> {
                 rights,
                 identity,
                 true,
-                || {
-                    if let Some(vfs) = self.original_paths {
-                        Some(vfs.resolve_local_datagram(&datagram.source, destination))
-                    } else {
-                        self.paths?.local_datagram(&datagram.source, destination)
-                    }
-                },
+                || self.resolve_datagram(datagram, destination),
             );
         }
         if destination.is_some() && self.fd.local_kind() != 5 {
@@ -642,6 +667,63 @@ impl DirectSyscalls {
     }
 }
 impl RetainedByte {
+    pub(super) fn datagram_path_failed(&self) -> bool {
+        if let ByteOperation::Preparing(input) = &self.operation {
+            return input.ready.get().is_some_and(Self::datagram_path_failed);
+        }
+        match self.message().map(|message| &message.transfer) {
+            Some(Transfer::Single {
+                datagram: Some(datagram),
+                ..
+            }) => datagram.failure.get().is_some(),
+            Some(Transfer::Batch(batch)) => batch.datagram_path_failed(),
+            _ => false,
+        }
+    }
+    pub(super) fn take_datagram_work(&self) -> Option<trames_vfs::FileWork> {
+        if let ByteOperation::Preparing(input) = &self.operation {
+            return input.ready.get()?.take_datagram_work();
+        }
+        match &self.message()?.transfer {
+            Transfer::Single {
+                datagram: Some(datagram),
+                ..
+            } => datagram.path.lock().unwrap().take(),
+            Transfer::Batch(batch) => batch.take_datagram_work(),
+            _ => None,
+        }
+    }
+    pub(super) fn accept_datagram_path(
+        &self,
+        result: Result<trames_vfs::FileValue, Errno>,
+    ) -> Result<(), Errno> {
+        if let ByteOperation::Preparing(input) = &self.operation {
+            return input
+                .ready
+                .get()
+                .expect("accepted message input")
+                .accept_datagram_path(result);
+        }
+        match &self.message().expect("accepted datagram message").transfer {
+            Transfer::Single {
+                datagram: Some(datagram),
+                ..
+            } => {
+                match result {
+                    Ok(trames_vfs::FileValue::LocalDatagram(target)) => {
+                        let _ = datagram.target.set(target);
+                    }
+                    Err(error) => {
+                        let _ = datagram.failure.set(error);
+                    }
+                    _ => unreachable!("accepted datagram path result"),
+                }
+                Ok(())
+            }
+            Transfer::Batch(batch) => batch.accept_datagram_path(result),
+            _ => unreachable!("accepted datagram path"),
+        }
+    }
     pub(super) fn datagram_target(&self) -> Option<&trames_vfs::LocalDatagram> {
         match &self.message()?.transfer {
             Transfer::Single { datagram, .. } => datagram.as_ref()?.target.get(),

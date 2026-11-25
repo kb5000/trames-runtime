@@ -130,6 +130,9 @@ impl FileCopyout {
         };
         use trames_vfs::FileValue as Value;
         match value {
+            Value::LocalConnection(_) | Value::LocalDatagram(_) => {
+                unreachable!("pathname transport result is resumed before copyout")
+            }
             Value::Read(reply) => {
                 let (bytes, position) = reply.into_parts();
                 copy = Self::new(output, Ok(Value::Bytes(bytes)));

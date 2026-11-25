@@ -57,11 +57,11 @@ run() {
     if "$@"; then printf 'CASE %s PASS\n' "$label";
     else code=$?; printf 'CASE %s FAIL %s\n' "$label" "$code"; failed=1; fi
 }
-for scenario in ${2:-busybox mapping copyout metadata aio copy transfer cached ring}; do
+for scenario in ${2:-busybox mapping copyout metadata special aio copy transfer cached ring}; do
     case "$scenario" in
         busybox) run busybox timeout -s KILL 20 /bin/sh "$0" --busybox "$base" ;;
         transfer) run transfer timeout -s KILL 60 /opt/fuse-tool/client transfer "$base" ;;
-        mapping|copyout|metadata|aio|copy|cached|ring) run "$scenario" timeout -s KILL 20 /opt/fuse-tool/client "$scenario" "$base" ;;
+        mapping|copyout|metadata|special|aio|copy|cached|ring) run "$scenario" timeout -s KILL 20 /opt/fuse-tool/client "$scenario" "$base" ;;
         *) exit 2 ;;
     esac
 done

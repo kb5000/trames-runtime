@@ -69,6 +69,46 @@ fn scalar(op: u8, fd: u32, address: u64, length: u32, tag: u64) -> [u8; 64] {
     s
 }
 #[test]
+fn socket_path_eagain_is_a_terminal_cqe_after_the_original_fuse_wait() {
+    use crate::direct::file::{fuse_socket_error_step, mount_socket_fuse};
+    for opcode in [16, 56] {
+        let (mut l, mut memory, ring_fd, ring) = setup(8);
+        let daemon = mount_socket_fuse(&mut l.vfs);
+        let socket = l.vfs.local_create(1, 0).unwrap();
+        let address = b"\x01\0/mnt/socket\0";
+        memory.write(0x2100, address).unwrap();
+        let direct = direct(&l, &memory, &mut UringEpoch::default(), &Default::default());
+        let target = target();
+        let mut item = scalar(opcode, socket, 0x2100, 0, 901);
+        item[8..16].copy_from_slice(&(address.len() as u64).to_le_bytes());
+        add(&mut memory, &ring, item);
+        let mut attempt = enter(&direct, ring_fd, 1, 1, &mut memory, &target);
+        let mut terminal = false;
+        for _ in 0..8 {
+            let IoAttempt::Blocked(wait) = attempt else {
+                panic!("FUSE pathname must retain original ring request");
+            };
+            terminal = fuse_socket_error_step(&mut l.vfs, daemon, opcode == 56);
+            attempt = direct.urings.resume(wait, &mut memory);
+            if terminal {
+                break;
+            }
+        }
+        assert!(terminal);
+        assert!(
+            matches!(attempt, IoAttempt::Complete(Ok(1))),
+            "EAGAIN must complete the original submission"
+        );
+        assert_eq!(cq(&mut memory, &ring), (901, -11));
+        assert!(ring.state.lock().unwrap().pending.is_empty());
+        assert_eq!(
+            l.vfs.read(daemon, 8192),
+            Err(Errno(11)),
+            "no replay or busy poll"
+        );
+    }
+}
+#[test]
 fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenance() {
     for cancel in [false, true] {
         let (mut l, mut m, fd, ring) = setup(16);

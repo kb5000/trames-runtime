@@ -2621,6 +2621,9 @@ impl DirectSyscalls {
             return self.park_byte_page(file, fault, number, args, pid, target);
         }
         match result {
+            Some(Err(Errno(11))) if file.datagram_path_failed() => {
+                return self.complete_byte(&file, Err(Errno(11)))
+            }
             Some(Err(Errno(11)))
                 if self.terminal_stop.get()
                     || !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
@@ -2641,11 +2644,22 @@ impl DirectSyscalls {
                 return self.complete_byte(&file, result);
             }
             None => {
+                if let Some(work) = file.take_datagram_work() {
+                    return self.submit_file_work(
+                        work,
+                        FileOutput::LocalMessage(Box::new(file)),
+                        number,
+                        args,
+                        memory,
+                        pid,
+                        target,
+                    );
+                }
                 return if file.message().is_some() || file.fd.is_pty() || file.fd.is_unix() {
                     IoAttempt::ByteCheckpoint(file)
                 } else {
                     IoAttempt::Checkpoint
-                }
+                };
             }
         }
         let signal = IoSignal::new(pid, target.clone());
@@ -2930,6 +2944,18 @@ impl DirectSyscalls {
             let Some(result) =
                 self.transfer_retained(file, pending.number, pending.args, memory, original_paths)
             else {
+                if let Some(work) = file.take_datagram_work() {
+                    let file = pending.retained_byte.take().unwrap();
+                    return self.submit_file_work(
+                        work,
+                        FileOutput::LocalMessage(Box::new(file)),
+                        pending.number,
+                        pending.args,
+                        memory,
+                        pending.signal.pid,
+                        &pending.target,
+                    );
+                }
                 if file.fd.is_pty() || file.fd.is_unix() {
                     return IoAttempt::ByteCheckpoint(pending.retained_byte.take().unwrap());
                 }

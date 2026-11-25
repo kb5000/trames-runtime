@@ -22,6 +22,34 @@ struct State {
     pipe: bool,
 }
 impl Batch {
+    pub(super) fn datagram_path_failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .is_some_and(RetainedByte::datagram_path_failed)
+    }
+    pub(super) fn take_datagram_work(&self) -> Option<trames_vfs::FileWork> {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()?
+            .take_datagram_work()
+    }
+    pub(super) fn accept_datagram_path(
+        &self,
+        result: Result<trames_vfs::FileValue, Errno>,
+    ) -> Result<(), Errno> {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .expect("accepted batch item")
+            .accept_datagram_path(result)
+    }
     pub(super) fn take_fault(&self) -> Option<trames_memory::PageFault> {
         self.state.lock().unwrap().fault.take()
     }
