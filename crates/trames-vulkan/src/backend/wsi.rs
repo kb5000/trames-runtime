@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Standard guest display WSI over a native-only, retained Metal target.
+//! Standard guest display WSI over a retained host Metal/XCB/Wayland target.
 use super::*;
 use crate::display::Target;
 
@@ -106,16 +106,17 @@ impl Backend {
                 .display
                 .target()
                 .ok_or(Failure::Vk(vk::Result::ERROR_SURFACE_LOST_KHR))?;
+            if instance.surface_extension != Some(target.extension()) {
+                return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT.into());
+            }
             let owner = self.id();
             target
                 .owner
                 .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| Failure::Vk(vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR))?;
-            let info = vk::MetalSurfaceCreateInfoEXT::default().layer(target.layer as *const _);
-            let raw = match unsafe {
-                ash::ext::metal_surface::Instance::new(&instance._entry, &instance.native)
-                    .create_metal_surface(&info, None)
-            } {
+            // SAFETY: the enabled platform matches; target owns the original
+            // host resources through Surface and every dependent Swapchain.
+            let raw = match unsafe { target.surface(&instance._entry, &instance.native) } {
                 Ok(raw) => raw,
                 Err(e) => {
                     target.owner.store(0, Ordering::Release);

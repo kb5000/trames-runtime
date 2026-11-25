@@ -17,11 +17,72 @@ pub(crate) trait SuspensionFence: Send + Sync {
     fn resume(&self);
 }
 pub(crate) struct Target {
-    pub layer: usize,
+    pub window: Window,
     pub width: u32,
     pub height: u32,
-    pub owner: AtomicU64,
+    pub owner: Arc<AtomicU64>,
     pub presented: AtomicU64,
+    // Native surfaces/swapchains retain this capability after host detach.
+    _lease: Option<Arc<dyn Send + Sync>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Window {
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    Metal(usize),
+    #[cfg(target_os = "linux")]
+    Xcb { connection: usize, window: u32 },
+    #[cfg(target_os = "linux")]
+    Wayland { display: usize, surface: usize },
+}
+impl Target {
+    pub fn extension(&self) -> &'static std::ffi::CStr {
+        match self.window {
+            Window::Metal(_) => ash::ext::metal_surface::NAME,
+            #[cfg(target_os = "linux")]
+            Window::Xcb { .. } => ash::khr::xcb_surface::NAME,
+            #[cfg(target_os = "linux")]
+            Window::Wayland { .. } => ash::khr::wayland_surface::NAME,
+        }
+    }
+    /// # Safety
+    /// The caller enabled extension() on this live instance. The target retains
+    /// its original host window/connection until every surface lease is gone.
+    pub unsafe fn surface(
+        &self,
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+    ) -> Result<ash::vk::SurfaceKHR, ash::vk::Result> {
+        use ash::vk;
+        match self.window {
+            #[cfg(target_vendor = "apple")]
+            Window::Metal(layer) => unsafe {
+                ash::ext::metal_surface::Instance::new(entry, instance).create_metal_surface(
+                    &vk::MetalSurfaceCreateInfoEXT::default().layer(layer as *const _),
+                    None,
+                )
+            },
+            #[cfg(not(target_vendor = "apple"))]
+            Window::Metal(_) => Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT),
+            #[cfg(target_os = "linux")]
+            Window::Xcb { connection, window } => unsafe {
+                ash::khr::xcb_surface::Instance::new(entry, instance).create_xcb_surface(
+                    &vk::XcbSurfaceCreateInfoKHR::default()
+                        .connection(connection as *mut _)
+                        .window(window),
+                    None,
+                )
+            },
+            #[cfg(target_os = "linux")]
+            Window::Wayland { display, surface } => unsafe {
+                ash::khr::wayland_surface::Instance::new(entry, instance).create_wayland_surface(
+                    &vk::WaylandSurfaceCreateInfoKHR::default()
+                        .display(display as *mut _)
+                        .surface(surface as *mut _),
+                    None,
+                )
+            },
+        }
+    }
 }
 #[cfg(target_vendor = "apple")]
 #[link(name = "objc")]
@@ -32,8 +93,8 @@ unsafe extern "C" {
 impl Drop for Target {
     fn drop(&mut self) {
         #[cfg(target_vendor = "apple")]
-        unsafe {
-            objc_release(self.layer as *mut std::ffi::c_void);
+        match self.window {
+            Window::Metal(layer) => unsafe { objc_release(layer as *mut std::ffi::c_void) },
         }
     }
 }
@@ -89,14 +150,102 @@ impl Display {
                 objc_retain(layer);
             }
             *slot = Some(Arc::new(Target {
-                layer: layer as usize,
+                window: Window::Metal(layer as usize),
                 width,
                 height,
-                owner: AtomicU64::new(0),
+                owner: Arc::default(),
                 presented: AtomicU64::new(0),
+                _lease: None,
             }));
             Ok(())
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn attach_linux(
+        &self,
+        window: Window,
+        width: u32,
+        height: u32,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Result<(), &'static str> {
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            return Err("invalid display dimensions");
+        }
+        let mut slot = self.0.lock().map_err(|_| "display lock failed")?;
+        let owner = slot
+            .as_ref()
+            .filter(|old| {
+                old.window == window
+                    && old
+                        ._lease
+                        .as_ref()
+                        .is_some_and(|previous| Arc::ptr_eq(previous, &lease))
+            })
+            .map(|old| old.owner.clone())
+            .unwrap_or_default();
+        *slot = Some(Arc::new(Target {
+            window,
+            width,
+            height,
+            owner,
+            presented: AtomicU64::new(0),
+            _lease: Some(lease),
+        }));
+        Ok(())
+    }
+    /// Attach an original host X11 capability; no guest handle is accepted.
+    /// # Safety
+    /// The nonnull libxcb connection and nonzero window belong to the same X
+    /// server. lease keeps both valid through its last drop, including after
+    /// detach. Their native API permits use by Vulkan on execution workers.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn attach_xcb(
+        &self,
+        connection: *mut std::ffi::c_void,
+        window: u32,
+        width: u32,
+        height: u32,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Result<(), &'static str> {
+        if connection.is_null() || window == 0 {
+            return Err("invalid XCB display target");
+        }
+        self.attach_linux(
+            Window::Xcb {
+                connection: connection as usize,
+                window,
+            },
+            width,
+            height,
+            lease,
+        )
+    }
+    /// Attach an already configured original host Wayland capability.
+    /// # Safety
+    /// display and surface are live libwayland objects on the same connection;
+    /// lease owns both until its final drop. The host observes the WSI protocol
+    /// ordering rules and never attaches another producer's buffer to surface.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn attach_wayland(
+        &self,
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Result<(), &'static str> {
+        if display.is_null() || surface.is_null() {
+            return Err("invalid Wayland display target");
+        }
+        self.attach_linux(
+            Window::Wayland {
+                display: display as usize,
+                surface: surface as usize,
+            },
+            width,
+            height,
+            lease,
+        )
     }
     pub fn detach(&self) {
         if let Ok(mut target) = self.0.lock() {
@@ -124,11 +273,12 @@ mod tests {
         let display = Display::default();
         assert_eq!(display.info(), (0, 0, 0));
         let target = Arc::new(Target {
-            layer: 0,
+            window: Window::Metal(0),
             width: 1024,
             height: 768,
-            owner: AtomicU64::new(0),
+            owner: Arc::default(),
             presented: AtomicU64::new(3),
+            _lease: None,
         });
         *display.0.lock().unwrap() = Some(target.clone());
         assert_eq!(display.info(), (1024, 768, 3));
@@ -155,5 +305,34 @@ mod tests {
         for (width, height) in [(0, 768), (1024, 0), (4097, 768), (1024, 4097)] {
             assert!(unsafe { display.attach(pointer, width, height) }.is_err());
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_detach_retains_native_lease_and_resize_cannot_steal_surface_claim() {
+        let display = Display::default();
+        let lease: Arc<dyn Send + Sync> = Arc::new(());
+        let weak = Arc::downgrade(&lease);
+        let window = Window::Xcb {
+            connection: 1,
+            window: 2,
+        };
+        // Metadata-only test; these sentinels are never submitted to a driver.
+        display
+            .attach_linux(window, 640, 480, lease.clone())
+            .unwrap();
+        let old = display.target().unwrap();
+        assert_eq!(old.extension(), ash::khr::xcb_surface::NAME);
+        old.owner.store(17, Ordering::Relaxed);
+        display.attach_linux(window, 800, 600, lease).unwrap();
+        let resized = display.target().unwrap();
+        assert!(!display.current(&old));
+        assert!(display.current(&resized));
+        assert!(Arc::ptr_eq(&old.owner, &resized.owner));
+        assert_eq!(resized.owner.load(Ordering::Relaxed), 17);
+        display.detach();
+        drop(resized);
+        assert!(weak.upgrade().is_some());
+        drop(old);
+        assert!(weak.upgrade().is_none());
     }
 }

@@ -76,6 +76,7 @@ struct Instance {
     native: ash::Instance,
     _entry: Entry,
     queries2: bool,
+    surface_extension: Option<&'static std::ffi::CStr>,
 }
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -1434,15 +1435,24 @@ impl Backend {
             if a[1] == 2 && self.wayland.server.is_none() {
                 return unsupported();
             }
-            if a[1] == 1 {
-                if self.display.target().is_none() {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED.into());
+            let surface_extension = if a[1] == 1 {
+                let target = self
+                    .display
+                    .target()
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let platform = target.extension();
+                for name in [ash::khr::surface::NAME, platform] {
+                    if !extensions.iter().any(
+                        |e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == name,
+                    ) {
+                        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT.into());
+                    }
+                    names.push(name.as_ptr());
                 }
-                names.extend([
-                    ash::khr::surface::NAME.as_ptr(),
-                    ash::ext::metal_surface::NAME.as_ptr(),
-                ]);
-            }
+                Some(platform)
+            } else {
+                None
+            };
             let simulator = cfg!(all(target_os = "ios", target_abi = "sim"));
             if simulator {
                 if !extensions.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == ash::ext::layer_settings::NAME) {
@@ -1490,6 +1500,7 @@ impl Backend {
                 native,
                 _entry: entry,
                 queries2,
+                surface_extension,
             });
             let devices = unsafe { instance.native.enumerate_physical_devices() }?;
             self.physical = devices
