@@ -1832,7 +1832,7 @@ impl Vfs {
             .and_then(|mount| mount.fs.fuse.as_ref().map(|fs| (mount, fs)))
         {
             fs.check(&self.credentials)?;
-            return if path.key() == mount.root_path() {
+            return if path.key() == mount.root_path_view().as_ref() {
                 Ok(mount.root.clone())
             } else {
                 Err(Errno(95))
@@ -2596,7 +2596,7 @@ impl Vfs {
                 {
                     // One daemon-owned component suspends the same VFS walk.
                     // A bind mount's root may be a non-root FUSE directory.
-                    if current.key != m.root_path() {
+                    if current.key.as_slice() != m.root_path_view().as_ref() {
                         let operation = match operation {
                             ResolveOperation::CaptureFuse(captured) => {
                                 let mut names = parts;

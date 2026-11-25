@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
+use std::borrow::Cow;
 pub(super) mod admin;
 mod detach;
 pub(crate) mod fd;
@@ -36,7 +37,7 @@ fn hides_locked_child(mounts: &[Arc<Mount>], parent: &Arc<Mount>, key: &[u8]) ->
                 .parent
                 .borrow()
                 .as_ref()
-                .is_some_and(|a| Arc::ptr_eq(&a.parent, parent) && below(&a.key(), key))
+                .is_some_and(|a| Arc::ptr_eq(&a.parent, parent) && below(&a.key_view(), key))
     })
 }
 // This is an environment-wide setting applied separately to each mount table.
@@ -149,6 +150,9 @@ pub(super) struct Attachment {
 }
 impl Attachment {
     fn key(&self) -> Vec<u8> {
+        self.key_view().into_owned()
+    }
+    fn key_view(&self) -> Cow<'_, [u8]> {
         if self.node.borrow().volatile
             || self
                 .parent
@@ -158,11 +162,11 @@ impl Attachment {
                 .get(&self.fallback)
                 .is_some_and(|n| Arc::ptr_eq(n, &self.node))
         {
-            return self.fallback.clone();
+            return Cow::Borrowed(&self.fallback);
         }
         self.parent
             .key_of(&self.node)
-            .unwrap_or_else(|| self.fallback.clone())
+            .map_or(Cow::Borrowed(&self.fallback), Cow::Owned)
     }
 }
 #[derive(Clone, Default)]
@@ -551,21 +555,26 @@ impl MountData {
         if let Some(host) = &self.fs.host {
             return host.key_of(&self.fs, node).ok();
         }
-        let root = self.root_path();
+        let root = self.root_path_view();
         let fs = self.fs.borrow();
         let result = node.borrow().path_in(&fs.paths, &root);
         result
     }
     pub(super) fn root_path(&self) -> Vec<u8> {
+        self.root_path_view().into_owned()
+    }
+    // A validated immutable key can be borrowed for comparisons. A moved root
+    // still uses the same inode-based search and returns its owned current path.
+    pub(super) fn root_path_view(&self) -> Cow<'_, [u8]> {
         if !self.root.directory && self.fs.fuse.is_some() {
             // A daemon file has no entry in the local namespace index. The
             // accepted mount key is a label; the retained inode selects I/O.
-            return self.root_key.clone();
+            return Cow::Borrowed(&self.root_key);
         }
         // Proc/sysfs inodes live in PseudoFs, never in the backing disk's path
         // map. Their immutable mount keys cannot be found by scanning that map.
         if matches!(self.kind, Kind::Proc | Kind::Sysfs) && self.root.borrow().volatile {
-            return self.root_key.clone();
+            return Cow::Borrowed(&self.root_key);
         }
         let fs = self.fs.borrow();
         if fs
@@ -573,12 +582,12 @@ impl MountData {
             .get(&self.root_key)
             .is_some_and(|n| Arc::ptr_eq(n, &self.root))
         {
-            return self.root_key.clone();
+            return Cow::Borrowed(&self.root_key);
         }
         self.root
             .borrow()
             .path_in(&fs.paths, b"/")
-            .unwrap_or_else(|| self.root_key.clone())
+            .map_or(Cow::Borrowed(&self.root_key), Cow::Owned)
     }
 }
 pub(super) struct Table {
@@ -1181,7 +1190,9 @@ impl Vfs {
             };
             #[cfg(all(feature = "hostfs", unix))]
             let native_node = if current.fs.host.is_some() {
-                if path.host_position.is_none() && path.key == current.root_path() {
+                if path.host_position.is_none()
+                    && path.key.as_slice() == current.root_path_view().as_ref()
+                {
                     Some(current.root.clone())
                 } else {
                     match self.node(&path) {
@@ -1218,7 +1229,7 @@ impl Vfs {
                                         .as_ref()
                                         .is_some_and(|node| Arc::ptr_eq(node, &a.node));
                                 }
-                                a.key() == path.key
+                                a.key_view().as_ref() == path.key.as_slice()
                             }
                         })
                 });
@@ -1306,7 +1317,7 @@ impl Vfs {
             let Some(m) = &at.mount else {
                 return Ok(at.parent());
             };
-            if at.key != m.root_path() {
+            if at.key.as_slice() != m.root_path_view().as_ref() {
                 if let Some(parent) = at
                     .directory_inode
                     .as_ref()
@@ -1355,7 +1366,7 @@ impl Vfs {
                 .ok();
         }
         if let Some(mount) = &path.mount {
-            if path.key == mount.root_path() {
+            if path.key.as_slice() == mount.root_path_view().as_ref() {
                 let attachment = mount.parent.borrow().clone()?;
                 return Some(ResolvedPath {
                     directory_inode: None,
@@ -1415,17 +1426,18 @@ impl Vfs {
                 return Ok(if out.is_empty() { b"/".to_vec() } else { out });
             }
             let m = at.mount.as_ref().ok_or(Errno(2))?;
-            let prefix = m.root_path();
+            let prefix = m.root_path_view();
             if !at.key.starts_with(&prefix) {
                 return Err(Errno(2));
             }
-            let cut = if at.key == prefix {
+            let cut = if at.key.as_slice() == prefix.as_ref() {
                 prefix.len()
-            } else if prefix == b"/" {
+            } else if prefix.as_ref() == b"/" {
                 0
             } else {
                 prefix.len()
             };
+            drop(prefix);
             let mut tail = at.key[cut..].to_vec();
             tail.extend(suffix);
             suffix = tail;
@@ -1592,7 +1604,7 @@ impl Vfs {
         }
         path.mount
             .as_ref()
-            .is_some_and(|m| path.key == m.root_path())
+            .is_some_and(|m| path.key.as_slice() == m.root_path_view().as_ref())
     }
     pub(super) fn empty_data_at(&self, path: &ResolvedPath) -> Result<storage::FileData> {
         Self::filesystem_empty_data(&mut path.filesystem(self).borrow_mut())
@@ -1982,7 +1994,7 @@ impl Vfs {
                             break;
                         };
                         if Arc::ptr_eq(&a.parent, m) {
-                            let key = a.key();
+                            let key = a.key_view();
                             if below(&key, &source.key) {
                                 additions.push(child.clone());
                             }
@@ -2246,7 +2258,7 @@ impl Vfs {
                     && child.parent.borrow().as_ref().is_some_and(|a| {
                         // sysfs deliberately exposes an empty mountpoint for cgroupfs.
                         Arc::ptr_eq(&a.parent, m)
-                            && !(kind == Kind::Sysfs && a.key() == b"/sys/fs/cgroup")
+                            && !(kind == Kind::Sysfs && a.key_view().as_ref() == b"/sys/fs/cgroup")
                     })
             }) {
                 continue;
@@ -2755,7 +2767,7 @@ impl Mount {
         let root = match self.kind {
             Kind::Cgroup => linux_namespace::relative_cgroup_path(cgroup_root, &filesystem_root),
             Kind::Proc | Kind::Sysfs | Kind::Devpts => self
-                .root_path()
+                .root_path_view()
                 .strip_prefix(self.root_key.as_slice())
                 .unwrap_or(b"/")
                 .to_vec(),
@@ -2802,7 +2814,8 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
     };
     let mut text = String::new();
     for m in &table.mounts {
-        let Some(mut target) = mount_absolute(m, &m.root_path(), &table.root, table.mounts.len())
+        let Some(mut target) =
+            mount_absolute(m, &m.root_path_view(), &table.root, table.mounts.len())
         else {
             continue;
         };
@@ -3348,17 +3361,18 @@ pub(super) fn mount_absolute(
     let mut key = key.to_vec();
     let mut suffix = Vec::new();
     for _ in 0..=max_steps {
-        let base = at.root_path();
+        let base = at.root_path_view();
         if !below(&key, &base) {
             return None;
         }
-        let cut = if key == base {
+        let cut = if key.as_slice() == base.as_ref() {
             base.len()
-        } else if base == b"/" {
+        } else if base.as_ref() == b"/" {
             0
         } else {
             base.len()
         };
+        drop(base);
         let mut tail = key[cut..].to_vec();
         tail.extend(suffix);
         suffix = tail;

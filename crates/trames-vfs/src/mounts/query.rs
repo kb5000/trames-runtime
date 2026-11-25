@@ -48,7 +48,7 @@ impl ViewRoot {
     }
 
     fn mountpoint(&self, mount: &Arc<Mount>) -> Option<Vec<u8>> {
-        let mut path = mount_absolute(mount, &mount.root_path(), &self.mount, self.steps)?;
+        let mut path = mount_absolute(mount, &mount.root_path_view(), &self.mount, self.steps)?;
         if !below(&path, &self.path) {
             return None;
         }
@@ -120,14 +120,14 @@ impl Vfs {
             } else {
                 ViewRoot::new(
                     default_root.clone(),
-                    &default_root.root_path(),
+                    &default_root.root_path_view(),
                     mounts.len(),
                 )?
             }
         } else {
             ViewRoot::new(
                 default_root.clone(),
-                &default_root.root_path(),
+                &default_root.root_path_view(),
                 mounts.len(),
             )?
         };
@@ -155,7 +155,7 @@ impl Vfs {
                 } else {
                     let m = lookup(query.mount)?;
                     permitted(root.mountpoint(m).as_deref())?;
-                    subtree = ViewRoot::new(m.clone(), &m.root_path(), mounts.len())?;
+                    subtree = ViewRoot::new(m.clone(), &m.root_path_view(), mounts.len())?;
                     &subtree
                 };
                 if count == 0 {
