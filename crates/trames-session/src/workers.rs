@@ -654,7 +654,7 @@ impl<C: Cpu> Starter<C> {
                                 // stop here, on the owning worker, before the next signal or instruction.
                                 if work.trace.take_return(|| !snapshot.io_signals.trace_stopped())
                                     && (snapshot.io_signals.trace_syscall_stop(false,||work.cpu.architectural_state())
-                                        || snapshot.io_signals.trace_single_step() && snapshot.io_signals.trace_step_stop(|| work.cpu.architectural_state())) {
+                                        || snapshot.io_signals.trace_single_step() && snapshot.io_signals.trace_syscall_step_stop(|| work.cpu.architectural_state())) {
                                     maintenance=true;break SliceOutcome::Yield {instructions:0};
                                 }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
@@ -966,6 +966,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 credit = claimed;
                             }
                             let stepping = work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_single_step());
+                            if stepping && work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_pending_step_stop(|| work.cpu.architectural_state())) {
+                                maintenance=true;break SliceOutcome::Yield {instructions:0};
+                            }
                             let budget = if stepping && C::EXACT_INSTRUCTIONS { credit.min(1) } else { credit };
                             work.cpu.set_single_step(stepping);
                             if !running {

@@ -59,6 +59,7 @@ enum StopOrigin<'a> {
     Normal,
     Control,
     Step,
+    SyscallStep,
     Fork(u32),
     Clone(u32),
     Vfork(u32),
@@ -91,6 +92,7 @@ struct Relationship {
     stop: Option<Arc<TraceStop>>,
     options: u64,
     trace_syscalls: bool,
+    step_pending: bool,
     exit_reported: bool,
     former_tid: Option<u32>,
 }
@@ -441,6 +443,27 @@ impl IoTask {
     ) -> bool {
         self.publish_trace_stop(5, None, None, None, StopOrigin::Step, registers)
     }
+    pub fn trace_syscall_step_stop(
+        &self,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        self.publish_trace_stop(5, None, None, None, StopOrigin::SyscallStep, registers)
+    }
+    /// After syscall completion arm64 has one pending debug exception before
+    /// the next user instruction. Deliver it on the original worker for every
+    /// execution backend; no instruction budget or extra execution is charged.
+    pub fn trace_pending_step_stop(
+        &self,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        let pending = self.trace.get().is_some_and(|slot| {
+            let mut slot = slot.lock().unwrap();
+            slot.relationship
+                .as_mut()
+                .is_some_and(|rel| rel.stop.is_none() && std::mem::take(&mut rel.step_pending))
+        });
+        pending && self.trace_step_stop(registers)
+    }
 
     pub fn trace_control_pending(&self) -> bool {
         self.trace_control.load(Ordering::Acquire)
@@ -750,6 +773,7 @@ impl IoTask {
             stop: None,
             options,
             trace_syscalls: false,
+            step_pending: false,
             exit_reported: false,
             former_tid: None,
         });
@@ -937,6 +961,9 @@ impl IoTask {
             });
         }
         let cpu = registers();
+        if matches!(origin, StopOrigin::SyscallStep) {
+            rel.step_pending = true;
+        }
         let signal = match shared {
             Some(shared) => match (if shared { self.process() } else { &self.inbox })
                 .take_selected(|pending| pending.remove_for_trace(sig))
@@ -949,6 +976,11 @@ impl IoTask {
                 fault: Some(cpu.pc),
                 ..Default::default()
             })),
+            // Native arm64 syscall-completion stepping uses plain SIGTRAP,
+            // distinct from an architectural instruction's TRAP_TRACE.
+            None if matches!(origin, StopOrigin::SyscallStep) => {
+                Some(RetainedInfo::debugger(Info::default()))
+            }
             None => None,
         };
         let status = if let Some(status) = control_status {
@@ -1130,6 +1162,7 @@ impl IoRoutes {
             stop: None,
             options,
             trace_syscalls: false,
+            step_pending: false,
             exit_reported: false,
             former_tid: None,
         });
@@ -1259,6 +1292,9 @@ impl IoRoutes {
                             rel.child.trace_event(None)
                         };
                         rel.trace_syscalls = request == PTRACE_SYSCALL;
+                        if request != PTRACE_SINGLESTEP {
+                            rel.step_pending = false;
+                        }
                         target
                             .trace_step
                             .store(request == PTRACE_SINGLESTEP, Ordering::Relaxed);
