@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "description": "Offline application workflows; each case has its own disposable rootfs.",
+  "cases": [
+    {
+      "id": "shell.pipeline",
+      "domain": "process",
+      "tier": "smoke",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/cmp",
+        "/usr/bin/sort",
+        "/usr/bin/tr",
+        "/usr/bin/uniq"
+      ],
+      "script": "printf 'pear\\napple\\npear\\n' | sort | uniq > sorted\nprintf 'apple\\npear\\n' > expected\ncmp sorted expected\nvalue=$(printf abc | tr a-z A-Z)\ntest \"$value\" = ABC\nprintf 'shell: ok\\n'",
+      "stdout": "shell: ok\n",
+      "artifacts": [
+        "/work/sorted"
+      ]
+    },
+    {
+      "id": "coreutils.files",
+      "domain": "files",
+      "tier": "smoke",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/cmp",
+        "/usr/bin/cp",
+        "/usr/bin/find",
+        "/usr/bin/ln",
+        "/usr/bin/mkdir",
+        "/usr/bin/mv",
+        "/usr/bin/stat",
+        "/usr/bin/wc"
+      ],
+      "script": "mkdir data\nprintf 'payload\\n' > data/original\ncp data/original data/copy\nmv data/copy data/moved\nln data/original data/hard\nln -s original data/link\ncmp data/moved data/link\ntest \"$(stat -c %s data/hard)\" = 8\ntest \"$(find data -type f | wc -l)\" = 3\nprintf 'files: ok\\n'",
+      "stdout": "files: ok\n",
+      "artifacts": [
+        "/work/data/moved"
+      ]
+    },
+    {
+      "id": "text.filters",
+      "domain": "files",
+      "tier": "smoke",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/awk",
+        "/usr/bin/cut",
+        "/usr/bin/grep",
+        "/usr/bin/sed"
+      ],
+      "script": "printf 'one:3\\ntwo:5\\n' > input\ngrep '^two:' input > selected\nsed 's/two/TWO/' selected > replaced\ntest \"$(cut -d: -f1 replaced)\" = TWO\ntest \"$(awk -F: '{s += $2} END {print s}' input)\" = 8\nprintf 'text: ok\\n'",
+      "stdout": "text: ok\n"
+    },
+    {
+      "id": "archive.roundtrip",
+      "domain": "files",
+      "tier": "smoke",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/bzip2",
+        "/usr/bin/cmp",
+        "/usr/bin/gzip",
+        "/usr/bin/mkdir",
+        "/usr/bin/tar",
+        "/usr/bin/xz"
+      ],
+      "script": "mkdir source restored\nprintf 'archive payload\\n' > source/value\ntar -cf payload.tar source\ngzip -c payload.tar > payload.gz\ngzip -dc payload.gz > recovered.tar\ncmp payload.tar recovered.tar\nbzip2 -c payload.tar > payload.bz2\nbzip2 -dc payload.bz2 > recovered.tar\ncmp payload.tar recovered.tar\nxz -c payload.tar > payload.xz\nxz -dc payload.xz > recovered.tar\ncmp payload.tar recovered.tar\ntar -xf recovered.tar -C restored\ncmp source/value restored/source/value\nprintf 'archive: ok\\n'",
+      "stdout": "archive: ok\n",
+      "artifacts": [
+        "/work/restored/source/value"
+      ]
+    },
+    {
+      "id": "hash.base64",
+      "domain": "memory",
+      "tier": "smoke",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/base64",
+        "/usr/bin/cmp",
+        "/usr/bin/cut",
+        "/usr/bin/sha256sum"
+      ],
+      "script": "printf abc > input\nbase64 input > encoded\nbase64 -d encoded > decoded\ncmp input decoded\ntest \"$(sha256sum decoded | cut -d' ' -f1)\" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nprintf 'hash: ok\\n'",
+      "stdout": "hash: ok\n",
+      "artifacts": [
+        "/work/decoded"
+      ]
+    },
+    {
+      "id": "python.stdlib",
+      "domain": "files",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/python3"
+      ],
+      "script": "python3 - <<'PY'\nimport gzip, hashlib, json, pathlib, sqlite3\np=pathlib.Path('data.json'); p.write_text(json.dumps({'answer':42},sort_keys=True))\nassert json.loads(p.read_text())['answer']==42\npayload=b'trames python payload'*1000\nassert gzip.decompress(gzip.compress(payload))==payload\nassert len(hashlib.sha256(payload).digest())==32\nc=sqlite3.connect('data.sqlite'); c.execute('create table t (v integer)'); c.executemany('insert into t values (?)',[(1,),(2,),(3,)])\nc.commit(); assert c.execute('select sum(v) from t').fetchone()[0]==6; c.close()\nprint('python: ok')\nPY",
+      "stdout": "python: ok\n",
+      "artifacts": [
+        "/work/data.json"
+      ]
+    },
+    {
+      "id": "python.process-threads",
+      "domain": "process",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/python3"
+      ],
+      "script": "python3 - <<'PY'\nimport concurrent.futures, os, socket, subprocess, sys\np=subprocess.run([sys.executable,'-c','import sys;sys.stdout.buffer.write(sys.stdin.buffer.read()[::-1])'],input=b'payload'*20000,capture_output=True,check=True)\nassert p.stdout==(b'payload'*20000)[::-1]\na,b=socket.socketpair(); a.sendall(b'socketpair'); assert b.recv(32)==b'socketpair'; a.close(); b.close()\nwith concurrent.futures.ThreadPoolExecutor(4) as pool: assert sum(pool.map(lambda n:n*n,range(100)))==328350\npid=os.fork()\nif pid==0: os._exit(17)\nassert os.waitpid(pid,0)[1]==17<<8\nprint('python-process: ok')\nPY",
+      "stdout": "python-process: ok\n"
+    },
+    {
+      "id": "git.local-workflow",
+      "domain": "process",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/cmp",
+        "/usr/bin/git",
+        "/usr/bin/git-upload-pack"
+      ],
+      "script": "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null\ngit init -q -b main repo\ngit -C repo config user.email acceptance@localhost\ngit -C repo config user.name Acceptance\nprintf 'tracked payload\\n' > repo/file\ngit -C repo add file\ngit -C repo commit -qm initial\ngit -C repo checkout -qb feature\nprintf 'feature\\n' >> repo/file\ngit -C repo commit -qam feature\ngit -C repo checkout -q main\ngit -C repo merge -q --ff-only feature\ngit clone -q --no-local file:///work/repo clone\ncmp repo/file clone/file\ntest \"$(git -C clone rev-list --count HEAD)\" = 2\nprintf 'git: ok\\n'",
+      "stdout": "git: ok\n",
+      "artifacts": [
+        "/work/clone/file"
+      ]
+    },
+    {
+      "id": "curl.file-transfer",
+      "domain": "files",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/cmp",
+        "/usr/bin/curl"
+      ],
+      "script": "printf 'curl file payload\\n' > input\ncurl --fail --silent --show-error file:///work/input -o downloaded\ncmp input downloaded\nprintf 'curl-file: ok\\n'",
+      "stdout": "curl-file: ok\n",
+      "artifacts": [
+        "/work/downloaded"
+      ]
+    },
+    {
+      "id": "ssh.key-roundtrip",
+      "domain": "random",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/cmp",
+        "/usr/bin/cut",
+        "/usr/bin/ssh-keygen"
+      ],
+      "script": "ssh-keygen -q -t ed25519 -N '' -C acceptance -f key\nssh-keygen -y -f key > derived\ncut -d' ' -f1,2 key.pub > original\ncut -d' ' -f1,2 derived > actual\ncmp actual original\nprintf 'ssh-key: ok\\n'",
+      "stdout": "ssh-key: ok\n"
+    },
+    {
+      "id": "node.workers",
+      "domain": "process",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/node"
+      ],
+      "script": "node - <<'JS'\nconst assert=require('assert'),fs=require('fs'),crypto=require('crypto'),{Worker}=require('worker_threads'),{execFileSync}=require('child_process');\nfs.writeFileSync('node.txt','node payload'); assert.equal(fs.readFileSync('node.txt','utf8'),'node payload');\nassert.equal(crypto.createHash('sha256').update('abc').digest('hex'),'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');\nassert.equal(execFileSync(process.execPath,['-e','process.stdout.write(\"child\")']).toString(),'child');\nconst w=new Worker('require(\"worker_threads\").parentPort.postMessage(42)',{eval:true}); w.on('message',n=>{assert.equal(n,42); console.log('node: ok')}); w.on('error',e=>{throw e});\nJS",
+      "stdout": "node: ok\n",
+      "artifacts": [
+        "/work/node.txt"
+      ]
+    },
+    {
+      "id": "build.gcc-make",
+      "domain": "process",
+      "tier": "apps",
+      "requires": [
+        "/bin/sh",
+        "/usr/bin/as",
+        "/usr/bin/cmp",
+        "/usr/bin/gcc",
+        "/usr/bin/ld",
+        "/usr/bin/make"
+      ],
+      "script": "printf '#include <stdio.h>\\nint main(void){puts(\"compiled: ok\");return 0;}\\n' > hello.c\nprintf 'all:\\n\\tgcc hello.c -o hello\\n' > Makefile\nmake -s\n./hello > result\nprintf 'compiled: ok\\n' > expected\ncmp expected result\nprintf 'build: ok\\n'",
+      "stdout": "build: ok\n",
+      "artifacts": [
+        "/work/result"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+name: Shared acceptance harness and native application references
+on:
+  push:
+    paths: ['tests/acceptance/**', '.github/workflows/acceptance.yml']
+  pull_request:
+    paths: ['tests/acceptance/**', '.github/workflows/acceptance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  harness:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/acceptance/harness_test.py
+  native-applications:
+    name: Native application reference (${{ matrix.os }}) — no Trames hardware claim
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install reference programs, outside the immutable test bundle
+        run: sudo apt-get update -qq && sudo apt-get install -y build-essential python3 git curl openssh-client nodejs gzip bzip2 xz-utils
+      - run: python3 tests/acceptance/prepare.py --output target/acceptance-bundle
+      - run: tar -czf target/acceptance-bundle.tar.gz -C target acceptance-bundle
+      - name: Run each workflow in a fresh native namespace/rootfs
+        run: sudo python3 tests/acceptance/run.py --backend native --bundle target/acceptance-bundle --output target/acceptance-native
+      - name: Produce JUnit and coverage table
+        if: always()
+        run: python3 tests/acceptance/report.py --input native=target/acceptance-native --output target/acceptance-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-application-evidence-${{ matrix.os }}
+          path: |
+            target/acceptance-native/
+            target/acceptance-report/
+            target/acceptance-bundle/bundle.json
+            target/acceptance-bundle.tar.gz
+          if-no-files-found: error
+          retention-days: 14
