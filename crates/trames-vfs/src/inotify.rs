@@ -140,6 +140,36 @@ impl Link {
 /// delivery runs afterwards and cannot keep the inode or its watches alive.
 #[derive(Clone, Default)]
 pub(crate) struct Notifications(Vec<Notification>);
+/// Live watch identity captured before resource admission. Sending never needs
+/// the inode borrow and includes watches registered after this capture.
+pub(super) struct LiveNotifications {
+    source: std::sync::Weak<Source>,
+    links: Vec<std::sync::Weak<Link>>,
+}
+impl LiveNotifications {
+    pub(super) fn capture(node: &Node) -> Self {
+        Self {
+            source: Arc::downgrade(node.notifications.source.get_or_init(Default::default)),
+            links: node
+                .notifications
+                .links
+                .iter()
+                .map(Arc::downgrade)
+                .collect(),
+        }
+    }
+    pub(super) fn send(&self, mask: u32) {
+        if let Some(source) = self.source.upgrade() {
+            if source.deleted.load(Ordering::Relaxed) {
+                return;
+            }
+            source.send(mask, 0, b"", false);
+            for link in self.links.iter().filter_map(std::sync::Weak::upgrade) {
+                link.send(mask);
+            }
+        }
+    }
+}
 #[derive(Clone)]
 struct Notification {
     queue: std::sync::Weak<Queue>,

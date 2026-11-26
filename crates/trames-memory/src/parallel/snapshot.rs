@@ -364,6 +364,36 @@ impl Memory {
         if self.has_parallel_users() {
             return 0;
         }
+        if self.parallel_cache.as_ref().is_some_and(|cache| {
+            cache
+                .snapshot
+                .dirty_pages
+                .iter()
+                .any(|word| word.load(Ordering::Relaxed) != 0)
+        }) {
+            return 0;
+        }
+        let generation = backing::private_invalidation_revision();
+        let invalidated: BTreeSet<_> =
+            if self.has_backings && self.private_invalidation_revision != generation {
+                self.pages
+                    .iter()
+                    .filter_map(|(&base, &index)| {
+                        self.frames[index]
+                            .as_mut()
+                            .unwrap()
+                            .refresh_private_backing()
+                            .then_some(base)
+                    })
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+        self.private_invalidation_revision = generation;
+        if !invalidated.is_empty() {
+            self.parallel_mappings.extend(invalidated.iter().copied());
+            self.invalidate_translations();
+        }
         self.anonymous.prune(&self.anonymous_retired);
         let changes = self.anonymous_index_changes();
         let Some(cache) = &mut self.parallel_cache else {
@@ -390,10 +420,20 @@ impl Memory {
             .iter()
             .copied()
             .filter(|base| {
-                self.pages.get(base).is_none_or(|&index| {
-                    let page = self.frames[index].as_ref().unwrap();
-                    page.backing.is_none() && page.bytes.is_zero() && !page.charge.resident()
-                }) && snapshot.pages.contains_key(base)
+                let Some(&slot) = snapshot.pages.get(base) else {
+                    return false;
+                };
+                let previous = &snapshot.frames[slot];
+                invalidated.contains(base)
+                    || self.pages.get(base).is_none_or(|&index| {
+                        let page = self.frames[index].as_ref().unwrap();
+                        (page.backing.is_none() && page.bytes.is_zero() && !page.charge.resident())
+                            || !Arc::ptr_eq(&page.charge, &previous.charge)
+                            || (previous.direct && !direct_matches(page, previous))
+                            || previous.bytes.source.as_ref().is_some_and(|source| {
+                                source.generation() != previous.bytes.source_generation
+                            })
+                    })
             })
             .collect();
         for base in &retired {

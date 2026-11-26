@@ -388,11 +388,11 @@ impl Dispatch<wl_shm::WlShm, ()> for State {
 impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
     fn request(
         state: &mut Self,
-        _: &Client,
+        client: &Client,
         r: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
         data: &Mutex<Pool>,
-        _: &DisplayHandle,
+        handle: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
         let Ok(mut pool) = data.lock() else { return };
@@ -440,27 +440,42 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                     r.post_error(1u32, "shared memory buffer exceeds pool");
                     return;
                 }
-                let map = pool.file.map(offset as usize, bytes.unwrap());
-                match map {
-                    Ok(mapping) => {
-                        let pixels = Arc::new(ShmBuffer {
-                            id: state.id(),
-                            file: pool.file.clone(),
-                            mapping,
-                            width: width as u32,
-                            height: height as u32,
-                            stride: stride as u32,
-                            alpha,
-                        });
+                let request = crate::shm::Import {
+                    id: state.id(),
+                    file: pool.file.clone(),
+                    offset: offset as usize,
+                    length: bytes.unwrap(),
+                    width: width as u32,
+                    height: height as u32,
+                    stride: stride as u32,
+                    alpha,
+                };
+                match request.map() {
+                    Ok(pixels) => {
                         init.init(
                             id,
                             BufferData {
-                                pixels,
+                                pixels: std::sync::OnceLock::from(pixels),
                                 lease: Mutex::default(),
                             },
                         );
                     }
                     Err(error) => {
+                        if let Some(wait) = trames_shared::ResourcePending::from_io(&error) {
+                            let buffer = init.init(
+                                id,
+                                BufferData {
+                                    pixels: std::sync::OnceLock::new(),
+                                    lease: Mutex::default(),
+                                },
+                            );
+                            let pending =
+                                crate::shm::Pending::new(request, buffer, r.clone(), client, wait);
+                            if state.shm.defer(&handle.backend_handle(), pending).is_err() {
+                                r.post_error(1u32, "shared memory import cannot be resumed");
+                            }
+                            return;
+                        }
                         eprintln!("trames Wayland SHM mapping failed: offset={offset} bytes={} pool={} length={} capacity={} allocated={} error={error:?}", bytes.unwrap(), pool.size, pool.file.len(), pool.file.capacity(), pool.file.allocated());
                         r.post_error(1u32, "shared memory mapping failed");
                     }

@@ -48,7 +48,9 @@ impl<D> InnerBackend<D> {
         ))]
         let poll_fd = kqueue().map_err(Into::into).map_err(InitError::Io)?;
 
-        Ok(Self { state: Arc::new(Mutex::new(State::new(poll_fd))) })
+        Ok(Self {
+            state: Arc::new(Mutex::new(State::new(poll_fd))),
+        })
     }
 
     pub fn flush(&self, client: Option<ClientId>) -> std::io::Result<()> {
@@ -56,7 +58,11 @@ impl<D> InnerBackend<D> {
     }
 
     pub fn handle(&self) -> Handle {
-        Handle { handle: InnerHandle { state: self.state.clone() as Arc<_> } }
+        Handle {
+            handle: InnerHandle {
+                state: self.state.clone() as Arc<_>,
+            },
+        }
     }
 
     pub fn poll_fd(&self) -> BorrowedFd<'_> {
@@ -153,6 +159,9 @@ impl<D> InnerBackend<D> {
             let action = {
                 let state = &mut *state;
                 if let Ok(client) = state.clients.get_client_mut(client_id.clone()) {
+                    if !client.dispatch_enabled && !client.killed {
+                        break;
+                    }
                     let (message, object) = match client.next_request() {
                         Ok(v) => v,
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -169,7 +178,9 @@ impl<D> InnerBackend<D> {
                                 target_os = "redox"
                             ))]
                             {
-                                epoll::delete(&state.poll_fd, client)?;
+                                if client.dispatch_enabled {
+                                    epoll::delete(&state.poll_fd, client)?;
+                                }
                             }
 
                             #[cfg(any(
@@ -190,8 +201,10 @@ impl<D> InnerBackend<D> {
                                 );
 
                                 let events: &mut [Event] = &mut [];
-                                unsafe {
-                                    kevent(&state.poll_fd, &[evt], events, None).map(|_| ())?;
+                                if client.dispatch_enabled {
+                                    unsafe {
+                                        kevent(&state.poll_fd, &[evt], events, None).map(|_| ())?;
+                                    }
                                 }
                             }
                             return Err(e);
@@ -205,7 +218,12 @@ impl<D> InnerBackend<D> {
                         if let Some((client, global, object, handler)) =
                             client.handle_registry_request(message, &mut state.registry)
                         {
-                            DispatchAction::Bind { client, global, object, handler }
+                            DispatchAction::Bind {
+                                client,
+                                global,
+                                object,
+                                handler,
+                            }
                         } else {
                             continue;
                         }
@@ -253,9 +271,13 @@ impl<D> InnerBackend<D> {
                     let ret = object.data.user_data.clone().request(
                         &handle.clone(),
                         data,
-                        ClientId { id: client_id.clone() },
+                        ClientId {
+                            id: client_id.clone(),
+                        },
                         Message {
-                            sender_id: ObjectId { id: object_id.clone() },
+                            sender_id: ObjectId {
+                                id: object_id.clone(),
+                            },
                             opcode,
                             args: arguments,
                         },
@@ -264,8 +286,12 @@ impl<D> InnerBackend<D> {
                         object.data.user_data.clone().destroyed(
                             &handle.clone(),
                             data,
-                            ClientId { id: client_id.clone() },
-                            ObjectId { id: object_id.clone() },
+                            ClientId {
+                                id: client_id.clone(),
+                            },
+                            ObjectId {
+                                id: object_id.clone(),
+                            },
                         );
                     }
                     // acquire the lock again and continue
@@ -306,7 +332,12 @@ impl<D> InnerBackend<D> {
                     std::mem::drop(object);
                     state = self.state.lock().unwrap();
                 }
-                DispatchAction::Bind { object, client, global, handler } => {
+                DispatchAction::Bind {
+                    object,
+                    client,
+                    global,
+                    handler,
+                } => {
                     // temporarily unlock the state Mutex while this request is dispatched
                     std::mem::drop(state);
                     let child_data = handler.bind(
@@ -319,7 +350,10 @@ impl<D> InnerBackend<D> {
                     // acquire the lock again and continue
                     state = self.state.lock().unwrap();
                     if let Ok(client) = state.clients.get_client_mut(client.clone()) {
-                        client.map.with(object.id, |obj| obj.data.user_data = child_data).unwrap();
+                        client
+                            .map
+                            .with(object.id, |obj| obj.data.user_data = child_data)
+                            .unwrap();
                     }
                 }
             }

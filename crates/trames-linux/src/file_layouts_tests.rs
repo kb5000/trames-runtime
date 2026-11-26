@@ -99,6 +99,168 @@ impl Queue {
         job.run(admission);
     }
 }
+
+struct DeferredSync {
+    layout: Arc<Layout>,
+    wait: Arc<trames_memory::PageWait>,
+    cursor: std::sync::atomic::AtomicUsize,
+    errors: std::sync::atomic::AtomicUsize,
+}
+impl trames_memory::SyncResource for DeferredSync {
+    fn layout(&self) -> Option<Arc<Layout>> {
+        Some(self.layout.clone())
+    }
+    fn sync(&self) -> Result<(), trames_memory::MemoryError> {
+        if !self.wait.ready() {
+            assert_eq!(self.cursor.swap(1, std::sync::atomic::Ordering::Relaxed), 0);
+            Err(self.wait.fault(0))
+        } else {
+            assert_eq!(self.cursor.swap(2, std::sync::atomic::Ordering::Relaxed), 1);
+            Ok(())
+        }
+    }
+    fn failed(&self, _: trames_memory::MemoryError) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+struct SyncDone(Arc<Mutex<Vec<Result<(), trames_memory::MemoryError>>>>);
+impl trames_memory::SyncCompletion for SyncDone {
+    fn complete(self: Box<Self>, result: Result<(), trames_memory::MemoryError>) {
+        self.0.lock().unwrap().push(result);
+    }
+}
+
+#[test]
+fn pending_sync_releases_layout_and_keeps_original_progress_until_resource_completion() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let queue = Arc::new(Queue::default());
+    let layouts = FileLayouts::new(queue.clone());
+    let resource = Arc::new(DeferredSync {
+        layout: Arc::default(),
+        wait: Arc::default(),
+        cursor: 0.into(),
+        errors: 0.into(),
+    });
+    let done = Arc::new(Mutex::new(Vec::new()));
+    layouts
+        .sync_executor()
+        .submit(resource.clone(), Box::new(SyncDone(done.clone())));
+    queue.run(&layouts);
+    assert_eq!(resource.cursor.load(Relaxed), 1);
+    assert!(done.lock().unwrap().is_empty());
+    assert!(layouts.pending() && queue.0.lock().unwrap().is_empty());
+    assert!(layouts.take_owner().is_empty());
+    assert!(
+        layouts.take_owner().is_empty(),
+        "no resource notification, no retry"
+    );
+    let memory = trames_memory::Memory::default();
+    let reader = resource.layout.try_read(memory.memory_report()).unwrap();
+    resource.wait.finish();
+    assert!(layouts.take_owner().is_empty());
+    let request = layouts.take_owner().pop().unwrap();
+    let request = match layouts.try_submit(request) {
+        Err(request) => request,
+        Ok(()) => panic!("the new reader still owns original publication"),
+    };
+    drop(reader);
+    assert!(layouts.try_submit(request).is_ok());
+    queue.run(&layouts);
+    assert_eq!(resource.cursor.load(Relaxed), 2);
+    assert_eq!(done.lock().unwrap().as_slice(), &[Ok(())]);
+    assert!(!layouts.pending());
+    assert_eq!(resource.errors.load(Relaxed), 0);
+}
+
+#[test]
+fn retiring_a_resource_wait_fails_the_original_sync_once_and_removes_its_subscription() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let queue = Arc::new(Queue::default());
+    let layouts = FileLayouts::new(queue.clone());
+    let resource = Arc::new(DeferredSync {
+        layout: Arc::default(),
+        wait: Arc::default(),
+        cursor: 0.into(),
+        errors: 0.into(),
+    });
+    let done = Arc::new(Mutex::new(Vec::new()));
+    layouts
+        .sync_executor()
+        .submit(resource.clone(), Box::new(SyncDone(done.clone())));
+    queue.run(&layouts);
+    assert!(layouts.pending());
+    drop(layouts);
+    assert_eq!(
+        done.lock().unwrap().as_slice(),
+        &[Err(trames_memory::MemoryError::BackingIo(5))]
+    );
+    assert_eq!(resource.errors.load(Relaxed), 1);
+    resource.wait.finish();
+    assert!(queue.0.lock().unwrap().is_empty());
+    assert_eq!(resource.cursor.load(Relaxed), 1);
+}
+
+#[test]
+fn resource_deadline_uses_the_existing_layout_driver_without_holding_publication() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    struct Resource {
+        ready: AtomicBool,
+        deadline: Mutex<Instant>,
+    }
+    impl trames_shared::ResourceWait for Resource {
+        fn ready(&self) -> bool {
+            self.ready.load(Relaxed)
+        }
+        fn subscribe(&self, _: &Arc<IoSignal>) -> Vec<IoSubscription> {
+            Vec::new()
+        }
+        fn deadline(&self) -> Option<Instant> {
+            Some(*self.deadline.lock().unwrap())
+        }
+    }
+    struct Target;
+    impl IoWake for Target {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Target);
+    let queue = Arc::new(Queue::default());
+    let layouts = FileLayouts::new(queue.clone());
+    let driver = layouts.bind_reader(IoSignal::new(0, Arc::downgrade(&target)));
+    let now = Instant::now();
+    let wait = Arc::new(Resource {
+        ready: AtomicBool::new(false),
+        deadline: Mutex::new(now + std::time::Duration::from_secs(600)),
+    });
+    let resource = Arc::new(DeferredSync {
+        layout: Arc::default(),
+        wait: trames_memory::PageWait::resource(wait.clone()),
+        cursor: 0.into(),
+        errors: 0.into(),
+    });
+    let done = Arc::new(Mutex::new(Vec::new()));
+    layouts
+        .sync_executor()
+        .submit(resource.clone(), Box::new(SyncDone(done.clone())));
+    queue.run(&layouts);
+    assert!(driver.ready());
+    assert!(driver.take_ready().is_empty());
+    assert!(!driver.ready());
+    assert_eq!(
+        driver.deadline(),
+        Some(now + std::time::Duration::from_secs(600))
+    );
+    wait.ready.store(true, Relaxed);
+    *wait.deadline.lock().unwrap() = now;
+    assert!(
+        driver.ready(),
+        "deadline expiry needs no configuration notification"
+    );
+    assert!(driver.take_ready().is_empty());
+    assert_eq!(queue.0.lock().unwrap().len(), 1);
+    queue.run(&layouts);
+    assert_eq!(done.lock().unwrap().as_slice(), &[Ok(())]);
+}
 fn packet(unique: u64, code: i32, body: &[u8]) -> Vec<u8> {
     let mut bytes = ((16 + body.len()) as u32).to_le_bytes().to_vec();
     bytes.extend(code.to_le_bytes());

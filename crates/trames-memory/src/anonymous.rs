@@ -1157,6 +1157,80 @@ mod native_tests {
         (m, r)
     }
     #[test]
+    fn cgroup_policy_preserves_populated_native_bytes_and_charges_only_new_pages() {
+        let (mut m, mut registry) = setup(ADDRESS_LIMIT as usize);
+        let native = Native::new();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let old_version = view.hardware_view_version().0;
+        unsafe {
+            view.export_hardware_range(0x200000, || Ok(native.clone()))
+                .unwrap()
+                .unwrap();
+            native
+                .pointer()
+                .add(3 * PAGE_SIZE as usize)
+                .cast::<u64>()
+                .write(713);
+        }
+        native.resident.store(PAGE_SIZE as usize, Ordering::Relaxed);
+        let group = crate::MemoryCgroup::new(None);
+        let other = crate::MemoryCgroup::new(None);
+        group.set_limit(PAGE_SIZE as usize);
+        let target = Arc::new(crate::CgroupMemoryTarget::default());
+        target.set(Some(group.clone()));
+        let _scope = target.scope();
+        assert_eq!(
+            m.set_cgroup_controlled(true),
+            Err(MemoryError::InvalidRange)
+        );
+        drop(view);
+        m.commit_parallel().unwrap();
+        m.set_cgroup_controlled(true).unwrap();
+        assert_eq!(m.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
+        assert_eq!(
+            group.current(),
+            0,
+            "already populated native granule stays root-owned"
+        );
+        assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
+        m.write_array(0x204000, [41]).unwrap();
+        assert_eq!(group.current(), PAGE_SIZE as usize);
+        assert_eq!(m.write_array(0x205000, [42]), Err(MemoryError::Limit));
+        target.set(Some(other.clone()));
+        m.write_array(0x206000, [43]).unwrap();
+        assert_eq!(group.current(), PAGE_SIZE as usize);
+        assert_eq!(other.current(), PAGE_SIZE as usize);
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        assert_ne!(view.hardware_view_version().0, old_version);
+        assert!(!view.hardware_ranges_enabled());
+        assert!(unsafe {
+            view.export_hardware_range(0x200000, || panic!("controlled coarse export"))
+        }
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            view.read_array::<8>(0x203000).unwrap(),
+            713u64.to_le_bytes()
+        );
+        drop(view);
+        m.commit_parallel().unwrap();
+        target.set(None);
+        m.set_cgroup_controlled(false).unwrap();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        assert!(
+            view.hardware_ranges_enabled(),
+            "root can admit untouched extents again"
+        );
+        assert_eq!(view.read_array::<1>(0x204000), Ok([41]));
+        drop(view);
+        drop(m);
+        assert_eq!(group.current(), 0);
+        assert_eq!(other.current(), 0);
+    }
+    #[test]
     fn native_ranges_share_late_bytes_and_never_charge_unreached_addresses() {
         let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);
         let native = Native::new();

@@ -12,6 +12,10 @@ pub struct HostEdit {
 pub struct HostExport {
     node: NodeRef,
 }
+mod export;
+pub use export::HostExportWork;
+mod edit;
+pub use edit::HostEditWork;
 impl Vfs {
     /// Conditional editor saves are restricted to the same private filesystem
     /// as before. Retain its original inode/path and mapping admission once.
@@ -54,7 +58,8 @@ impl HostEdit {
     /// byte locks then protect validation through the path swap. Mapped bytes
     /// require the caller's original LayoutExclusive. No new I/O lock is added.
     /// Return true from validate for an already-applied retry, false to replace.
-    pub fn replace(
+    #[cfg(test)]
+    fn replace(
         self,
         vfs: &mut Vfs,
         admission: &trames_memory::layout::LayoutExclusive,
@@ -72,18 +77,35 @@ impl HostEdit {
             Err(error) => Err(error),
         }
     }
-    pub(super) fn replace_unchecked(self, vfs: &mut Vfs, reader: &mut impl Read) -> Result<u64> {
-        let (data, count) = vfs.stage_import(reader)?;
-        self.commit(vfs, Some(data), false, |_, _| Ok(false))?;
-        Ok(count)
-    }
-    fn commit(
+    pub(super) fn commit(
         &self,
         vfs: &Vfs,
         staged_data: Option<storage::FileData>,
         checked: bool,
         validate: impl FnOnce(u64, &mut dyn Read) -> Result<bool>,
     ) -> Result<u64> {
+        self.commit_inner(vfs, staged_data, checked, None, validate)
+            .map(|inode| inode.expect("unversioned edit completes without a retry"))
+    }
+    pub(super) fn commit_versioned(
+        &self,
+        vfs: &Vfs,
+        staged_data: Option<storage::FileData>,
+        version: &storage::DataVersion,
+        already_applied: bool,
+    ) -> Result<Option<u64>> {
+        self.commit_inner(vfs, staged_data, true, Some(version), |_, _| {
+            Ok(already_applied)
+        })
+    }
+    fn commit_inner(
+        &self,
+        vfs: &Vfs,
+        staged_data: Option<storage::FileData>,
+        checked: bool,
+        version: Option<&storage::DataVersion>,
+        validate: impl FnOnce(u64, &mut dyn Read) -> Result<bool>,
+    ) -> Result<Option<u64>> {
         let _namespace = self.filesystem.namespace.lock().unwrap();
         vfs.check_parent_write(&self.path)?;
         if vfs.node(&self.path).is_ok() {
@@ -113,6 +135,11 @@ impl HostEdit {
         let Content::File(data) = &old.content else {
             return Err(Errno(21));
         };
+        if let Some(version) = version {
+            if !version.matches(data)? {
+                return Ok(None);
+            }
+        }
         let inode = old.inode;
         let replace = |bytes: &mut dyn Read| {
             if validate(inode, bytes)? {
@@ -180,7 +207,7 @@ impl HostEdit {
             replace(&mut Reader { data, offset: 0 })?
         };
         let Some(staged) = replaced else {
-            return Ok(inode);
+            return Ok(Some(inode));
         };
         let replacing_original = current
             .as_ref()
@@ -225,7 +252,7 @@ impl HostEdit {
         if let Some((parent, name)) = vfs.notification_parent(&self.path) {
             inotify::link(&staged, &parent, &name);
         }
-        Ok(inode)
+        Ok(Some(inode))
     }
 }
 impl HostExport {
@@ -240,7 +267,8 @@ impl HostExport {
     }
     /// The caller retains original backing admission while consuming mapped
     /// bytes. No pathname or guest descriptor lookup is repeated after waiting.
-    pub fn write_to(&self, writer: &mut impl Write) -> Result<u64> {
+    #[cfg(test)]
+    fn write_to(&self, writer: &mut impl Write) -> Result<u64> {
         let node = self.node.borrow();
         let Content::File(data) = &node.content else {
             return Err(Errno(21));
@@ -256,6 +284,20 @@ impl HostExport {
         }
         writer.flush().map_err(storage::host_errno)?;
         Ok(offset)
+    }
+}
+
+pub(super) fn read_sync(node: NodeRef) -> Result<Vec<u8>> {
+    let mut work = HostExport { node }.into_work(Vec::new());
+    let mut wait = host_sync::Wait::default();
+    loop {
+        let admission = wait.layout(&work.layout())?;
+        let result = work.run(&admission, || false);
+        drop(admission);
+        if result?.is_some() {
+            return Ok(work.into_writer());
+        }
+        wait.page(work.wait().expect("original file comparison wait"))?;
     }
 }
 
@@ -289,6 +331,7 @@ mod tests {
             Ok(true)
         })
         .unwrap();
+        drop(admission);
         assert_eq!(read(&v, b"/file"), b"done");
         assert_eq!(v.capacity().used_bytes, 4);
     }
@@ -319,6 +362,7 @@ mod tests {
             Ok(false)
         });
         assert!(result.is_err());
+        drop(admission);
         assert_eq!(read(&v, b"/file"), b"old");
         assert_eq!(v.capacity().used_bytes, used);
         assert!(!v
@@ -392,6 +436,7 @@ mod tests {
                 Ok(false)
             })
             .unwrap();
+        drop(admission);
         assert_eq!(read(&v, b"/file"), b"new");
         assert_eq!(read(&v, b"/alias"), b"old");
         assert_eq!(v.read(fd, 100).unwrap(), b"old");
@@ -428,8 +473,8 @@ mod tests {
             }),
             Err(Errno(116))
         );
-        assert_eq!(read(&v, b"/file"), b"changed");
         drop(admission);
+        assert_eq!(read(&v, b"/file"), b"changed");
         let edit = v.host_edit(b"/file").unwrap();
         let admission = admit(&edit);
         let before = v.stat_at(AT_FDCWD, b"/file").unwrap();

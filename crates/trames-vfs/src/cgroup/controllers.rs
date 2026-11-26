@@ -5,14 +5,17 @@ pub(super) const PIDS: u8 = 1;
 pub(super) const CPU: u8 = 2;
 pub(super) const CPUSET: u8 = 4;
 pub(super) const MEMORY: u8 = 8;
-pub(super) const CONTROLLERS: [(&str, u8); 4] = [
+pub(super) const IO: u8 = 16;
+pub(super) const CONTROLLERS: [(&str, u8); 5] = [
     ("cpuset", CPUSET),
     ("cpu", CPU),
+    ("io", IO),
     ("memory", MEMORY),
     ("pids", PIDS),
 ];
 
 const CPU_FILES: &[(&str, u32)] = &[("cpu.max", 0o644), ("cpu.weight", 0o644)];
+const IO_FILES: &[(&str, u32)] = &[("io.max", 0o644), ("io.stat", 0o444)];
 const CPUSET_FILES: &[(&str, u32)] = &[
     ("cpuset.cpus", 0o644),
     ("cpuset.cpus.effective", 0o444),
@@ -25,6 +28,8 @@ const MEMORY_FILES: &[(&str, u32)] = &[
     ("memory.high", 0o644),
     ("memory.events", 0o444),
     ("memory.events.local", 0o444),
+    ("memory.stat", 0o444),
+    ("memory.reclaim", 0o200),
     ("memory.oom.group", 0o644),
 ];
 
@@ -33,6 +38,7 @@ pub(super) struct ControllerChange {
     pub events: Vec<Arc<ControlEvents>>,
     pub nodes: Vec<NodeRef>,
     pub reschedule: Vec<Arc<Member>>,
+    pub io_retired: Vec<Arc<io::Group>>,
 }
 
 pub(super) struct CpuBandwidth(Mutex<Bandwidth>);
@@ -230,11 +236,14 @@ pub(super) fn memory_limit(text: &str) -> Result<usize> {
     } else {
         &text[..text.len() - 1]
     };
-    let bytes = number
-        .parse::<usize>()
-        .map_err(|_| Errno(22))?
-        .checked_mul(1usize << shift)
-        .ok_or(Errno(34))?;
+    let bytes = if number.is_empty() {
+        Ok(0)
+    } else {
+        number.parse::<usize>()
+    }
+    .map_err(|_| Errno(22))?
+    .checked_mul(1usize << shift)
+    .ok_or(Errno(34))?;
     Ok(bytes & !(trames_memory::PAGE_SIZE as usize - 1))
 }
 
@@ -250,7 +259,7 @@ impl Cgroups {
     pub(super) fn available_controllers(&self, id: u64) -> u8 {
         self.groups[&id]
             .parent
-            .map_or(PIDS | CPU | CPUSET | MEMORY, |parent| {
+            .map_or(PIDS | CPU | CPUSET | MEMORY | IO, |parent| {
                 self.groups[&parent].subtree
             })
     }
@@ -260,6 +269,14 @@ impl Cgroups {
             .ancestors
             .iter()
             .find_map(|id| self.groups[id].memory.clone())
+    }
+    pub(super) fn io_at(&self, id: u64) -> Arc<io::Group> {
+        self.groups[&id]
+            .location
+            .ancestors
+            .iter()
+            .find_map(|id| self.groups[id].io.clone())
+            .expect("original root IO account")
     }
     pub(super) fn effective_cpus(&self, id: u64, possible: u64) -> u64 {
         self.groups[&id]
@@ -380,9 +397,13 @@ impl Cgroups {
         self.groups.get_mut(&id).unwrap().subtree = next;
         let mut events = Vec::new();
         let mut nodes = Vec::new();
+        let mut io_retired = Vec::new();
         for child in children {
             for (_, bit) in CONTROLLERS {
                 if changed & bit != 0 {
+                    if bit == IO {
+                        io_retired.extend(self.groups[&child].io.iter().cloned());
+                    }
                     let (retired, removed) =
                         self.install_controller(child, bit, next & bit != 0, owner);
                     events.extend(retired);
@@ -390,16 +411,27 @@ impl Cgroups {
                 }
             }
         }
-        if changed & MEMORY != 0 {
-            for task in self.tasks.values() {
-                task.memory.set(self.memory_at(task.group()));
-            }
-        }
         let mut reschedule = if changed & CPUSET != 0 {
             self.publish_cpuset()
         } else {
             Vec::new()
         };
+        if changed & MEMORY != 0 {
+            reschedule.extend(
+                self.tasks
+                    .values()
+                    .filter(|task| task.memory.set(self.memory_at(task.group())))
+                    .cloned(),
+            );
+        }
+        if changed & IO != 0 {
+            reschedule.extend(
+                self.tasks
+                    .values()
+                    .filter(|task| task.io.set(self.io_at(task.group())))
+                    .cloned(),
+            );
+        }
         if changed & CPU != 0 {
             reschedule.extend(
                 self.tasks
@@ -412,6 +444,7 @@ impl Cgroups {
             events,
             nodes,
             reschedule,
+            io_retired,
         })
     }
     pub(super) fn install_controller(
@@ -437,12 +470,40 @@ impl Cgroups {
                 let parent = self.groups[&id].parent.expect("controllers below root");
                 let memory =
                     enable.then(|| trames_memory::MemoryCgroup::new(self.memory_at(parent)));
-                self.groups.get_mut(&id).unwrap().memory = memory;
+                let group = self.groups.get_mut(&id).unwrap();
+                if let Some(previous) = std::mem::replace(&mut group.memory, memory) {
+                    group.retired.memory(&previous);
+                }
                 MEMORY_FILES
+            }
+            IO => {
+                let parent = self.groups[&id].parent.expect("controllers below root");
+                let next = enable.then(|| io::Group::new(Some(&self.io_at(parent))));
+                let group = self.groups.get_mut(&id).unwrap();
+                if let Some(previous) = std::mem::replace(&mut group.io, next) {
+                    group.retired.io(&previous);
+                    previous.retire_state();
+                }
+                IO_FILES
             }
             _ => unreachable!("known controller"),
         };
-        self.install_files(id, files, enable, owner)
+        let result = self.install_files(id, files, enable, owner);
+        if bit == MEMORY && enable {
+            let group = &self.groups[&id];
+            if let Some(memory) = &group.memory {
+                for (name, local) in [
+                    (b"memory.events".as_slice(), false),
+                    (b"memory.events.local".as_slice(), true),
+                ] {
+                    if let Some(event) = group.files.get(name) {
+                        let observer: Arc<dyn trames_memory::CgroupMemoryEvents> = event.clone();
+                        memory.observe_events(local, &observer);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 

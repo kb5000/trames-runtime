@@ -120,6 +120,61 @@ fn ack(c: &Connection, write: &[u8]) {
 }
 
 #[test]
+fn cgroup_pressure_flushes_original_dirty_owners_and_executor_failure_is_bounded() {
+    use trames_memory::{CgroupMemoryTarget, MemoryCgroup};
+    let (v, device) = mounted();
+    let c = device.connection().unwrap();
+    let executor = Executor::new();
+    let _actor = FileActorScope::enter_with_sync(
+        Arc::new(CredentialState::new(v.credentials.clone())),
+        v.pid,
+        Some(executor.clone()),
+    );
+    let first = MemoryCgroup::new(None);
+    let second = MemoryCgroup::new(None);
+    let target = Arc::new(CgroupMemoryTarget::default());
+    target.set(Some(first.clone()));
+    let _scope = target.scope();
+    let (file, pages) = mapped(&v, c);
+    load(c, &executor, &pages[0], b'a');
+    pages[0].write(0, b"first").unwrap();
+    let pin = pages[0].shared_page().unwrap();
+    target.set(Some(second.clone()));
+    load(c, &executor, &pages[1], b'b');
+    pages[1].write(0, b"second").unwrap();
+    let wait = first.writeback(PAGE_SIZE as usize).unwrap();
+    let other = first.writeback(PAGE_SIZE as usize).unwrap();
+    assert_eq!(executor.jobs.lock().unwrap().len(), 1);
+    executor.step();
+    let write = receive(c, 16, 10);
+    assert_eq!(&write[48..56], &0u64.to_le_bytes());
+    assert_eq!(&write[80..85], b"first");
+    assert!(!wait.ready());
+    ack(c, &write);
+    executor.resume();
+    assert!(wait.ready() && other.ready());
+    assert!(!pages[0].proc_dirty() && pages[1].proc_dirty());
+    assert_eq!(
+        first.current(),
+        PAGE_SIZE as usize,
+        "a mapped physical pin is still allocated"
+    );
+    assert!(first.writeback(PAGE_SIZE as usize).is_none());
+    assert!(!pages[0].native_resident());
+    assert_eq!(first.reclaimed_bytes(), 0);
+    drop(pin);
+    assert_eq!(first.current(), 0);
+    assert_eq!(first.reclaimed_bytes(), PAGE_SIZE as usize);
+    let cancelled = second.writeback(PAGE_SIZE as usize).unwrap();
+    executor.close();
+    assert!(cancelled.ready());
+    assert!(pages[1].proc_dirty());
+    assert_eq!(second.current(), PAGE_SIZE as usize);
+    assert!(second.writeback(PAGE_SIZE as usize).is_none());
+    assert!(file.attr.cache.dirty());
+}
+
+#[test]
 fn mapped_writeback_waits_for_each_original_reply_and_fsync_under_layout_admission() {
     let (v, device) = mounted();
     let c = device.connection().unwrap();

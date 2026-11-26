@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
+#[path = "file_read_resource_tests.rs"]
+mod read_resources;
 struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<FileResult>)>);
 impl FileExecutor for Queue {
     fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<FileResult>) {

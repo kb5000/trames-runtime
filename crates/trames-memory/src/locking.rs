@@ -144,7 +144,7 @@ impl Memory {
             };
             let page = self.page_for_access(base, 1, access)?;
             page.prepare_source(base)?;
-            page.charge.ensure()?;
+            page.access_charge().ensure()?;
             page.read_bytes(0, &mut [0])
                 .map_err(|e| e.at_access(base))?;
         }

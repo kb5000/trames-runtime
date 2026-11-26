@@ -9,9 +9,16 @@ pub struct Lookup {
     deadline: Option<Instant>,
     bytes: file_input::Bytes,
     header: Option<input::Header>,
+    resources: trames_vfs::CgroupResourceContext,
 }
 impl Lookup {
-    pub(super) fn new(aio: Aio, number: u32, args: [u64; 6], deadline: Option<Instant>) -> Self {
+    pub(super) fn new(
+        aio: Aio,
+        number: u32,
+        args: [u64; 6],
+        deadline: Option<Instant>,
+        resources: trames_vfs::CgroupResourceContext,
+    ) -> Self {
         Self {
             aio,
             number,
@@ -19,6 +26,7 @@ impl Lookup {
             deadline,
             bytes: Default::default(),
             header: matches!(number, 4 | 292).then(input::Header::default),
+            resources,
         }
     }
     pub fn resume(
@@ -28,6 +36,7 @@ impl Lookup {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        let _resources = self.resources.enter();
         if self.number == 2 && self.args[1] > i64::MAX as u64 {
             return IoAttempt::Complete(Err(Errno(22)));
         }
@@ -84,6 +93,7 @@ impl Lookup {
                 self.header
                     .take()
                     .map(|header| Arc::new(Mutex::new(header))),
+                self.resources.clone(),
             )
         });
         match call {
@@ -98,8 +108,18 @@ pub(super) struct User {
     active: std::sync::atomic::AtomicBool,
     exiting: std::sync::atomic::AtomicBool,
     destroy: bool,
+    // Old syscall snapshots share logical completion. They must not keep a
+    // deleted controller alive after this one user has actually retired.
+    resources: Mutex<Option<trames_vfs::CgroupResourceContext>>,
 }
 impl User {
+    pub(super) fn resource_scope(&self) -> Option<trames_vfs::CgroupResourceScope> {
+        self.resources
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|resources| resources.enter())
+    }
     pub(super) fn active(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -117,6 +137,7 @@ impl User {
             active: true.into(),
             exiting: false.into(),
             destroy: false,
+            resources: Mutex::new(Some(trames_vfs::CgroupResourceContext::capture())),
         })
     }
     pub(super) fn release(&self) {
@@ -133,6 +154,8 @@ impl User {
                 state.users -= 1;
             }
             drop(state);
+            let resources = self.resources.lock().unwrap().take();
+            drop(resources);
             self.context.notify();
         }
     }
@@ -149,6 +172,7 @@ impl RetainedAio {
         args: [u64; 6],
         deadline: Option<Instant>,
         header: Option<Arc<Mutex<input::Header>>>,
+        resources: trames_vfs::CgroupResourceContext,
     ) -> Result<Self, Errno> {
         let user = {
             let mut state = context.state.lock().unwrap();
@@ -165,6 +189,7 @@ impl RetainedAio {
                 active: true.into(),
                 exiting: false.into(),
                 destroy: number == 1,
+                resources: Mutex::new(Some(resources)),
             }))
         };
         Ok(Self {

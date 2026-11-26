@@ -38,6 +38,21 @@ pub struct HostWait {
     deadline: Option<Instant>,
 }
 impl HostWait {
+    /// Synchronous embeddings retain their original resource while sleeping;
+    /// runtime workers use subscriptions and return their execution slot.
+    pub fn resource(&mut self, resource: &dyn crate::ResourceWait) -> io::Result<()> {
+        while !resource.ready() {
+            self.begin();
+            self.retain(resource.subscribe(self.signal()));
+            if let Some(deadline) = resource.deadline() {
+                self.until(deadline);
+            }
+            if !resource.ready() {
+                self.wait()?;
+            }
+        }
+        Ok(())
+    }
     pub fn new() -> io::Result<Self> {
         let events = HostEvents::new()?;
         let wake = Arc::new_cyclic(|weak: &std::sync::Weak<HostWake>| {

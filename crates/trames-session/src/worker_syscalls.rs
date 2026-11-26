@@ -1479,9 +1479,14 @@ impl Snapshot {
                     control.status_ioctl(fd, cpu.x(1) as u32, cpu.x(2), memory, &owners)
                 })
             }
-            number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280 | 425) => self
-                .direct
-                .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
+            number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280 | 425) => {
+                self.direct.invoke_creation_for(
+                    number,
+                    std::array::from_fn(|i| cpu.x(i)),
+                    memory,
+                    self.io_signals.tid(),
+                )?
+            }
             number if self.direct.supports_path_query(number) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?

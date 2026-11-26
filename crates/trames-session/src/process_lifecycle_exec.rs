@@ -23,7 +23,7 @@ impl<C: Cpu> Lifecycle<C> {
             if p.signals.io.lifecycle().termination().is_some() {
                 continue;
             }
-            if p.exec_pending.is_none() && p.linux.vfs.namespace_host_work() {
+            if p.exec_pending.is_none() {
                 p.linux.vfs.sync_task_namespaces();
                 p.linux.vfs.set_process_context(job.work.pid);
                 p.linux.vfs.set_lock_owner(p.tgid);
@@ -38,12 +38,21 @@ impl<C: Cpu> Lifecycle<C> {
                     Ok(request) => {
                         let result = Arc::new(exec::Pending::new());
                         p.exec_pending = Some(exec::Preparation::Disk(result.clone()));
-                        self.images.submit_image(request, result);
+                        if p.linux.vfs.namespace_host_work() {
+                            self.images.submit_image(request, result);
+                        } else {
+                            // Resident images retain their original inline
+                            // execution; only an actual wait parks the inputs.
+                            result.complete(request.load());
+                        }
                     }
                     // A resident lookup error neither queues work nor wakes an
                     // owner. Keep its accepted errno inline until source commit.
                     Err(error) => p.exec_pending = Some(exec::Preparation::Error(error)),
                 }
+            }
+            if let Some(result) = &p.exec_pending {
+                result.resume(self.images.as_ref());
             }
             let Some(result) = p.exec_pending.as_ref().filter(|result| !result.ready()) else {
                 continue;
@@ -52,7 +61,7 @@ impl<C: Cpu> Lifecycle<C> {
                 signal: trames_shared::IoSignal::new(0, epoch.io_target.clone()),
                 subscriptions: Vec::new(),
             });
-            wait.subscriptions.push(result.subscribe(&wait.signal));
+            wait.subscriptions.extend(result.subscribe(&wait.signal));
             pending |= !result.ready();
         }
         pending.then_some(wait).flatten()

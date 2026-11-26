@@ -5,6 +5,63 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock, Weak,
 };
+use std::time::Instant;
+
+/// One original resource continuation. Subscription precedes the ready check;
+/// no host thread is retained while waiting for IO credits or writeback.
+pub trait ResourceWait: Send + Sync {
+    fn ready(&self) -> bool;
+    fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription>;
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
+}
+impl std::fmt::Debug for dyn ResourceWait + '_ {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("ResourceWait")
+    }
+}
+
+/// A backend can preserve an internal resource wait through std::io without
+/// encoding a guest errno. The accepted operation owns retry and byte progress.
+#[derive(Clone)]
+pub struct ResourcePending {
+    pub wait: Arc<dyn ResourceWait>,
+    pub progress: usize,
+}
+impl ResourcePending {
+    pub fn io_error(wait: Arc<dyn ResourceWait>) -> std::io::Error {
+        std::io::Error::other(Self { wait, progress: 0 })
+    }
+    pub fn from_io(error: &std::io::Error) -> Option<Arc<dyn ResourceWait>> {
+        Self::detail(error).map(|pending| pending.wait.clone())
+    }
+    pub fn detail(error: &std::io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+    pub fn add_progress(error: std::io::Error, bytes: usize) -> std::io::Error {
+        let Some(pending) = Self::detail(&error) else {
+            return error;
+        };
+        let mut pending = pending.clone();
+        pending.progress = pending.progress.saturating_add(bytes);
+        std::io::Error::other(pending)
+    }
+}
+impl std::fmt::Debug for ResourcePending {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ResourcePending")
+            .field("ready", &self.wait.ready())
+            .field("progress", &self.progress)
+            .finish()
+    }
+}
+impl std::fmt::Display for ResourcePending {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("original resource is pending")
+    }
+}
+impl std::error::Error for ResourcePending {}
 
 pub trait IoWake: Send + Sync {
     fn register_protocol(&self, _protocol: Arc<dyn crate::HostProtocol>) -> std::io::Result<()> {
@@ -161,6 +218,10 @@ struct DynamicHost {
     signal: Weak<IoSignal>,
     state: Mutex<DynamicState>,
 }
+enum DynamicSource {
+    Host(DynamicHost),
+    Resource(Arc<dyn ResourceWait>),
+}
 #[derive(Default)]
 struct DynamicState {
     revision: Option<u64>,
@@ -209,7 +270,7 @@ pub struct IoSubscription {
     host: Option<HostBinding>,
     host_error: Option<Arc<std::io::Error>>,
     external: bool,
-    dynamic: Option<Box<DynamicHost>>,
+    dynamic: Option<Box<DynamicSource>>,
     retained_signal: Option<Arc<IoSignal>>,
 }
 impl Readiness {
@@ -297,6 +358,19 @@ impl Readiness {
     }
 }
 impl IoSubscription {
+    /// Cold resource waits keep their current deadline on the existing interest.
+    /// Ordinary readiness subscriptions keep the same inline representation.
+    pub fn with_resource_wait(mut self, wait: Arc<dyn ResourceWait>) -> Self {
+        assert!(self.dynamic.is_none() && self.host.is_none());
+        self.dynamic = Some(Box::new(DynamicSource::Resource(wait)));
+        self
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        match self.dynamic.as_deref() {
+            Some(DynamicSource::Resource(wait)) => wait.deadline(),
+            _ => None,
+        }
+    }
     pub fn retain_signal(mut self, signal: Arc<IoSignal>) -> Self {
         self.retained_signal = Some(signal);
         self
@@ -355,7 +429,7 @@ impl IoSubscription {
     /// Original descriptors for an embedding's existing direct wait loop.
     /// Hub-backed registrations need no duplicate or second native poller.
     pub fn direct_wait_interest(&self) -> std::io::Result<Option<(crate::HostFd, bool)>> {
-        if let Some(dynamic) = &self.dynamic {
+        if let Some(DynamicSource::Host(dynamic)) = self.dynamic.as_deref() {
             return dynamic
                 .state
                 .lock()
@@ -373,14 +447,15 @@ impl IoSubscription {
         source: Weak<dyn HostSource>,
         signal: &Arc<IoSignal>,
     ) -> Self {
-        self.dynamic = Some(Box::new(DynamicHost {
+        let dynamic = DynamicHost {
             source,
             signal: Arc::downgrade(signal),
             state: Mutex::default(),
-        }));
-        if let Err(error) = self.dynamic.as_ref().unwrap().rearm() {
+        };
+        if let Err(error) = dynamic.rearm() {
             self.host_error.get_or_insert_with(|| Arc::new(error));
         }
+        self.dynamic = Some(Box::new(DynamicSource::Host(dynamic)));
         self
     }
     pub fn notification_external(&self) -> bool {
@@ -400,9 +475,10 @@ impl IoSubscription {
         {
             return true;
         }
-        self.dynamic
-            .as_ref()
-            .map_or(self.external, |d| d.state.lock().unwrap().external)
+        match self.dynamic.as_deref() {
+            Some(DynamicSource::Host(dynamic)) => dynamic.state.lock().unwrap().external,
+            _ => self.external,
+        }
     }
     pub fn rearm_host(&self) -> std::io::Result<()> {
         if let Some(error) = &self.host_error {
@@ -411,7 +487,7 @@ impl IoSubscription {
                 std::io::Error::from_raw_os_error,
             ));
         }
-        if let Some(dynamic) = &self.dynamic {
+        if let Some(DynamicSource::Host(dynamic)) = self.dynamic.as_deref() {
             return dynamic.rearm();
         }
         self.host.as_ref().map_or(Ok(()), |host| host.rearm())

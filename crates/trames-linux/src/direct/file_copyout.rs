@@ -400,12 +400,14 @@ impl FileCopyout {
             }
         }
     }
-    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
-        let wait = self.waiting.as_ref()?;
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
+        let Some(wait) = self.waiting.as_ref() else {
+            return Vec::new();
+        };
         let subscription = wait.subscribe(signal);
         if wait.ready() {
             signal.notify();
         }
-        Some(subscription)
+        subscription
     }
 }

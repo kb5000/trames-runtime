@@ -75,6 +75,20 @@ pub(crate) struct AdmissionWait {
     pub signal: Arc<trames_shared::IoSignal>,
     pub subscriptions: Vec<trames_shared::IoSubscription>,
 }
+impl AdmissionWait {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.subscriptions
+            .iter()
+            .filter_map(trames_shared::IoSubscription::deadline)
+            .min()
+    }
+    pub fn ready(&self) -> bool {
+        self.signal.ready()
+            || self
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
+}
 fn obtain<T>(
     mut acquire: impl FnMut() -> Option<T>,
     subscribe: impl FnOnce(&Arc<trames_shared::IoSignal>) -> Vec<trames_shared::IoSubscription>,

@@ -52,6 +52,7 @@ pub(crate) struct Client<D: 'static> {
     last_serial: u32,
     pub(crate) id: InnerClientId,
     pub(crate) killed: bool,
+    pub(crate) dispatch_enabled: bool,
     pub(crate) data: Arc<dyn ClientData>,
 }
 
@@ -77,14 +78,26 @@ impl<D> Client<D> {
             Object {
                 interface: &WL_DISPLAY_INTERFACE,
                 version: 1,
-                data: Data { user_data: Arc::new(DumbObjectData), serial: 0 },
+                data: Data {
+                    user_data: Arc::new(DumbObjectData),
+                    serial: 0,
+                },
             },
         )
         .unwrap();
 
         data.initialized(ClientId { id: id.clone() });
 
-        Self { socket, map, debug, id, killed: false, last_serial: 0, data }
+        Self {
+            socket,
+            map,
+            debug,
+            id,
+            killed: false,
+            dispatch_enabled: true,
+            last_serial: 0,
+            data,
+        }
     }
 
     pub(crate) fn create_object(
@@ -99,7 +112,12 @@ impl<D> Client<D> {
             version,
             data: Data { serial, user_data },
         });
-        InnerObjectId { id, serial, client_id: self.id.clone(), interface }
+        InnerObjectId {
+            id,
+            serial,
+            client_id: self.id.clone(),
+            interface,
+        }
     }
 
     pub(crate) fn destroy_object(
@@ -115,12 +133,20 @@ impl<D> Client<D> {
 
     pub(crate) fn object_info(&self, id: InnerObjectId) -> Result<ObjectInfo, InvalidId> {
         let object = self.get_object(id.clone())?;
-        Ok(ObjectInfo { id: id.id, interface: object.interface, version: object.version })
+        Ok(ObjectInfo {
+            id: id.id,
+            interface: object.interface,
+            version: object.version,
+        })
     }
 
     pub(crate) fn send_event(
         &mut self,
-        Message { sender_id: object_id, opcode, args }: Message<ObjectId, RawFd>,
+        Message {
+            sender_id: object_id,
+            opcode,
+            args,
+        }: Message<ObjectId, RawFd>,
         pending_destructors: Option<&mut Vec<super::handle::PendingDestructor<D>>>,
     ) -> Result<(), InvalidId> {
         if self.killed {
@@ -205,7 +231,11 @@ impl<D> Client<D> {
             });
         }
 
-        let msg = Message { sender_id: object_id.id.id, opcode, args: msg_args };
+        let msg = Message {
+            sender_id: object_id.id.id,
+            opcode,
+            args: msg_args,
+        };
 
         if self.socket.write_message(&msg).is_err() {
             self.kill(DisconnectReason::ConnectionClosed);
@@ -214,7 +244,11 @@ impl<D> Client<D> {
         // Handle destruction if relevant
         if message_desc.is_destructor {
             if let Some(vec) = pending_destructors {
-                vec.push((object.data.user_data.clone(), self.id.clone(), object_id.id.clone()));
+                vec.push((
+                    object.data.user_data.clone(),
+                    self.id.clone(),
+                    object_id.id.clone(),
+                ));
             }
             self.send_delete_id(object_id.id);
         }
@@ -291,7 +325,9 @@ impl<D> Client<D> {
                 },
                 0, // wl_display.error
                 [
-                    Argument::Object(ObjectId { id: object_id.clone() }),
+                    Argument::Object(ObjectId {
+                        id: object_id.clone()
+                    }),
                     Argument::Uint(error_code),
                     Argument::Str(Some(Box::new(message))),
                 ],
@@ -313,18 +349,31 @@ impl<D> Client<D> {
         let creds =
             rustix::net::sockopt::socket_peercred(&self.socket).expect("getsockopt failed!?");
         let pid = rustix::process::Pid::as_raw(Some(creds.pid));
-        Credentials { pid, uid: creds.uid.as_raw(), gid: creds.gid.as_raw() }
+        Credentials {
+            pid,
+            uid: creds.uid.as_raw(),
+            gid: creds.gid.as_raw(),
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // for now this only works on linux
     pub(crate) fn get_credentials(&self) -> Credentials {
-        Credentials { pid: 0, uid: 0, gid: 0 }
+        Credentials {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        }
     }
 
     pub(crate) fn kill(&mut self, reason: DisconnectReason) {
         self.killed = true;
-        self.data.disconnected(ClientId { id: self.id.clone() }, reason);
+        self.data.disconnected(
+            ClientId {
+                id: self.id.clone(),
+            },
+            reason,
+        );
     }
 
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {
@@ -380,7 +429,11 @@ impl<D> Client<D> {
                 debug::print_dispatched_message(
                     obj.interface.name,
                     msg.sender_id,
-                    obj.interface.requests.get(msg.opcode as usize).unwrap().name,
+                    obj.interface
+                        .requests
+                        .get(msg.opcode as usize)
+                        .unwrap()
+                        .name,
                     &msg.args,
                 );
             }
@@ -435,7 +488,10 @@ impl<D> Client<D> {
                     let callback_obj = Object {
                         interface: &WL_CALLBACK_INTERFACE,
                         version: 1,
-                        data: Data { user_data: Arc::new(DumbObjectData), serial },
+                        data: Data {
+                            user_data: Arc::new(DumbObjectData),
+                            serial,
+                        },
                     };
                     if let Err(()) = self.map.insert_at(new_id, callback_obj) {
                         self.post_display_error(
@@ -453,7 +509,8 @@ impl<D> Client<D> {
                         },
                     };
                     // send wl_callback.done(0) this callback does not have any meaningful destructor to run, we can ignore it
-                    self.send_event(message!(cb_id, 0, [Argument::Uint(0)]), None).unwrap();
+                    self.send_event(message!(cb_id, 0, [Argument::Uint(0)]), None)
+                        .unwrap();
                 } else {
                     unreachable!()
                 }
@@ -465,7 +522,10 @@ impl<D> Client<D> {
                     let registry_obj = Object {
                         interface: &WL_REGISTRY_INTERFACE,
                         version: 1,
-                        data: Data { user_data: Arc::new(DumbObjectData), serial },
+                        data: Data {
+                            user_data: Arc::new(DumbObjectData),
+                            serial,
+                        },
                     };
                     let registry_id = InnerObjectId {
                         id: new_id,
@@ -504,7 +564,12 @@ impl<D> Client<D> {
         &mut self,
         message: Message<u32, OwnedFd>,
         registry: &mut Registry<D>,
-    ) -> Option<(InnerClientId, InnerGlobalId, InnerObjectId, Arc<dyn GlobalHandler<D>>)> {
+    ) -> Option<(
+        InnerClientId,
+        InnerGlobalId,
+        InnerObjectId,
+        Arc<dyn GlobalHandler<D>>,
+    )> {
         match message.opcode {
             // wl_registry.bind(uint name, str interface, uint version, new id)
             0 => {
@@ -518,7 +583,10 @@ impl<D> Client<D> {
                         let object = Object {
                             interface,
                             version,
-                            data: Data { serial, user_data: Arc::new(UninitObjectData) },
+                            data: Data {
+                                serial,
+                                user_data: Arc::new(UninitObjectData),
+                            },
                         };
                         if let Err(()) = self.map.insert_at(new_id, object) {
                             self.post_display_error(
@@ -575,7 +643,11 @@ impl<D> Client<D> {
         object: &Object<Data<D>>,
         message: Message<u32, OwnedFd>,
     ) -> Option<(ArgSmallVec<OwnedFd>, bool, Option<InnerObjectId>)> {
-        let message_desc = object.interface.requests.get(message.opcode as usize).unwrap();
+        let message_desc = object
+            .interface
+            .requests
+            .get(message.opcode as usize)
+            .unwrap();
 
         if message_desc.since > object.version {
             self.post_display_error(
@@ -703,7 +775,11 @@ pub(crate) struct ClientStore<D: 'static> {
 
 impl<D> ClientStore<D> {
     pub(crate) fn new(debug: bool) -> Self {
-        Self { clients: Vec::new(), last_serial: 0, debug }
+        Self {
+            clients: Vec::new(),
+            last_serial: 0,
+            debug,
+        }
     }
 
     pub(crate) fn create_client(
@@ -714,7 +790,12 @@ impl<D> ClientStore<D> {
     ) -> InnerClientId {
         let serial = self.next_serial();
         // Find the next free place
-        let (id, place) = match self.clients.iter_mut().enumerate().find(|(_, c)| c.is_none()) {
+        let (id, place) = match self
+            .clients
+            .iter_mut()
+            .enumerate()
+            .find(|(_, c)| c.is_none())
+        {
             Some((id, place)) => (id, place),
             None => {
                 self.clients.push(None);
@@ -722,9 +803,18 @@ impl<D> ClientStore<D> {
             }
         };
 
-        let id = InnerClientId { id: id as u32, serial };
+        let id = InnerClientId {
+            id: id as u32,
+            serial,
+        };
 
-        *place = Some(Client::new(stream, id.clone(), self.debug, data, buffer_size));
+        *place = Some(Client::new(
+            stream,
+            id.clone(),
+            self.debug,
+            data,
+            buffer_size,
+        ));
 
         id
     }
@@ -769,12 +859,17 @@ impl<D> ClientStore<D> {
     }
 
     pub(crate) fn clients_mut(&mut self) -> impl Iterator<Item = &mut Client<D>> {
-        self.clients.iter_mut().flat_map(|o| o.as_mut()).filter(|c| !c.killed)
+        self.clients
+            .iter_mut()
+            .flat_map(|o| o.as_mut())
+            .filter(|c| !c.killed)
     }
 
     pub(crate) fn all_clients_id(&self) -> impl Iterator<Item = ClientId> + '_ {
         self.clients.iter().flat_map(|opt| {
-            opt.as_ref().filter(|c| !c.killed).map(|client| ClientId { id: client.id.clone() })
+            opt.as_ref().filter(|c| !c.killed).map(|client| ClientId {
+                id: client.id.clone(),
+            })
         })
     }
 }

@@ -35,7 +35,7 @@ pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
 pub use task_copy::TaskCopyCall;
 pub use task_name::task_name_call;
 mod host_files;
-pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
+pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask, HostFileWait};
 mod heap;
 mod keyctl;
 mod memory_lock;

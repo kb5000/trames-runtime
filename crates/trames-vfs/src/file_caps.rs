@@ -6,7 +6,7 @@ pub(super) const NAME: &[u8] = b"security.capability";
 const V2: u32 = 0x0200_0000;
 const V3: u32 = 0x0300_0000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileCaps {
     root: u32,
     pub permitted: u64,
@@ -124,6 +124,31 @@ impl storage::FileData {
             _ => Err(Errno(95)),
         }
     }
+    pub(super) fn has_writable_mappings(&self) -> bool {
+        match self {
+            Self::Mapped(data) => data.has_writable_mappings(),
+            Self::Layer(file) => file
+                .read(|data| Ok(data.has_writable_mappings()))
+                .unwrap_or(true),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.has_writable_mappings(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    pub(super) fn edit_capabilities_after_sync(
+        &self,
+        caps: Option<FileCaps>,
+        flags: u32,
+    ) -> Result<()> {
+        match self {
+            Self::Plain(file) => file.edit_capabilities(caps, flags),
+            Self::Mapped(data) => data.edit_capabilities_after_sync(caps, flags),
+            Self::Layer(file) => file.edit_caps_after_sync(caps, flags),
+            _ => Err(Errno(95)),
+        }
+    }
     pub(super) fn revoke_capabilities(&self) -> Result<()> {
         if let Self::Plain(file) = self {
             return file.revoke_capabilities();
@@ -136,6 +161,9 @@ impl storage::FileData {
 }
 impl Node {
     pub(super) fn file_caps(&self) -> Option<FileCaps> {
+        if let Some(caps) = overlay::projection::caps(self.identity) {
+            return caps;
+        }
         match &self.content {
             Content::File(data) => data.capabilities(),
             _ => None,
@@ -144,6 +172,12 @@ impl Node {
     pub(super) fn edit_caps(&self, caps: Option<FileCaps>, flags: u32) -> Result<()> {
         match &self.content {
             Content::File(data) => data.edit_capabilities(caps, flags),
+            _ => Err(Errno(95)),
+        }
+    }
+    pub(super) fn edit_caps_after_sync(&self, caps: Option<FileCaps>, flags: u32) -> Result<()> {
+        match &self.content {
+            Content::File(data) => data.edit_capabilities_after_sync(caps, flags),
             _ => Err(Errno(95)),
         }
     }

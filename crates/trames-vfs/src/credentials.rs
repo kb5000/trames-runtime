@@ -1210,6 +1210,16 @@ impl Vfs {
         gid: u32,
         nofollow: bool,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Chown {
+                fd: dirfd,
+                path: Some(path.to_vec()),
+                uid,
+                gid,
+                nofollow,
+                empty: false,
+            });
+        }
         let uid = if uid == u32::MAX {
             uid
         } else {
@@ -1226,14 +1236,15 @@ impl Vfs {
         {
             return result;
         }
-        let MetadataTarget { path, node, _magic } = target;
-        path.writable()?;
-        let ids = path.ids(self);
+        let retry = self.metadata_retry(Some(target));
+        let target = retry.target();
+        target.path.writable()?;
+        let ids = target.path.ids(self);
         self.chown_node(
-            node,
+            target.node.clone(),
             ids.stored(false, uid)?,
             ids.stored(true, gid)?,
-            Some(&path.filesystem(self)),
+            Some(&target.path.filesystem(self)),
             ids,
         )
     }
@@ -1245,6 +1256,16 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Chown {
+                fd: fd as i32,
+                path: None,
+                uid,
+                gid,
+                nofollow: false,
+                empty: true,
+            });
+        }
         let uid = if uid == u32::MAX {
             uid
         } else {

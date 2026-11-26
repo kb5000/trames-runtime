@@ -1622,11 +1622,6 @@ impl Vfs {
             .as_ref()
             .map_or(Ok(()), |m| m.writable())
     }
-    pub(super) fn fd_available_bytes(&self, fd: u32) -> Result<u64> {
-        let open_descriptor = self.descriptor(fd)?;
-        let open = open_descriptor.open.borrow();
-        Ok(self.description_available_bytes(&open))
-    }
     pub(super) fn description_available_bytes(&self, open: &OpenDescription) -> u64 {
         #[cfg(all(feature = "hostfs", unix))]
         if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {

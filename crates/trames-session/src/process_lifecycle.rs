@@ -94,6 +94,7 @@ pub(crate) fn eligible<'a, C: Cpu>(
             match outcome {
                 SliceOutcome::NativeCall { .. } => {}
                 SliceOutcome::Syscall { .. } => {}
+                SliceOutcome::Yield { instructions: 0 } => {}
                 SliceOutcome::Yield { .. } if job.maintenance_scope => {}
                 _ => return false,
             }
@@ -504,6 +505,15 @@ impl<C: Cpu> Lifecycle<C> {
         // cannot make this executor block while preparing a child's first View.
         let mut child_custody = Vec::new();
         for job in &mut checkpoint.jobs {
+            // A live cgroup policy update only withdraws coarse mm exports.
+            // It has no accepted syscall to execute or clone to publish.
+            if matches!(
+                job.checkpoint,
+                Some(SliceOutcome::Yield { instructions: 0 })
+            ) {
+                job.checkpoint = None;
+                continue;
+            }
             let Some(_outcome) = job.checkpoint.take() else {
                 continue;
             };
@@ -684,6 +694,40 @@ mod tests {
     use crate::workers::{Control, Event};
     use trames_cpu::Cpu;
     use trames_memory::Permissions;
+
+    #[test]
+    fn memory_policy_checkpoint_republishes_without_a_clone_or_mutable_peer_borrow() {
+        let mut kernel = super::super::tests::kernel();
+        let mut root = super::super::tests::admitted_process(&kernel);
+        root.memory.set_cgroup_controlled(true).unwrap();
+        kernel.processes.insert(1, root);
+        kernel.publish_io_tasks(None);
+        let epoch =
+            Epoch::with_events(Arc::new(Control::new(10000)), kernel.workers.events(), true);
+        epoch.bind_lifecycle(Lifecycle::capture(&kernel));
+        // The last controlled task left this mm. Its own directory handle
+        // participates in the peer scan while coarse exports are restored.
+        for (id, _, view) in kernel.prepare_parallel_views(&[(1, 0)]).unwrap() {
+            epoch.add(kernel.capture_worker(
+                id,
+                view,
+                &epoch.control,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+            ));
+        }
+        let mut caller = epoch.take(0).unwrap();
+        caller.work.cpu.set_x(8, 172);
+        let pc = caller.work.cpu.pc;
+        epoch.checkpoint(caller, SliceOutcome::Yield { instructions: 0 });
+        let resumed = epoch.take(0).unwrap();
+        assert_eq!(resumed.work.pid, 1);
+        assert_eq!(resumed.work.cpu.pc, pc);
+        assert_eq!(resumed.work.cpu.x(8), 172);
+        assert!(resumed.checkpoint.is_none());
+        assert_eq!(kernel.processes.len(), 1);
+    }
 
     #[test]
     fn resumed_mapping_releases_custody_before_cold_accounting() {

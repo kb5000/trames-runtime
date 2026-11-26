@@ -11,8 +11,19 @@ use std::{
 };
 
 mod controllers;
+mod io;
+mod memory_control;
+pub(super) use memory_control::MemoryWrite;
+#[cfg(test)]
+mod lifetime_tests;
+#[cfg(test)]
+mod memory_control_tests;
 pub use controllers::CpuShare;
 use controllers::{CONTROLLERS, PIDS};
+pub(crate) use io::{
+    admit as admit_io, complete as complete_io, limited as io_limited, Context as IoContext,
+    Permit as IoPermit, Scope as IoScope,
+};
 
 const ROOT: u64 = 5 << 32;
 const UNLIMITED: u32 = i32::MAX as u32;
@@ -38,10 +49,6 @@ const FILES: &[(&str, u32)] = &[
     ("cpu.stat", 0o444),
     ("cgroup.freeze", 0o644),
     ("cgroup.kill", 0o200),
-    // crun opens io.max even for an empty OCI blockIO object. Expose the
-    // empty/unlimited view, but reject all writes: no IO controller is
-    // advertised and no throttling request can silently succeed.
-    ("io.max", 0o644),
 ];
 const ALLOW_OVERRIDE: u32 = 1;
 const ALLOW_MULTI: u32 = 2;
@@ -101,6 +108,8 @@ struct Group {
     cpus: Option<u64>,
     mems: Option<u64>,
     memory: Option<Arc<trames_memory::MemoryCgroup>>,
+    io: Option<Arc<io::Group>>,
+    retired: Resources,
     max_depth: u32,
     max_descendants: u32,
     descendants: u32,
@@ -116,8 +125,34 @@ struct Group {
     files: BTreeMap<Vec<u8>, Arc<ControlEvents>>,
 }
 struct Dying {
+    id: u64,
     nodes: Vec<std::sync::Weak<Inode>>,
     ancestors: Vec<u64>,
+    resources: Resources,
+}
+#[derive(Default)]
+struct Resources {
+    memory: Vec<Weak<trames_memory::MemoryCgroup>>,
+    io: Vec<io::Reference>,
+}
+impl Resources {
+    fn memory(&mut self, group: &Arc<trames_memory::MemoryCgroup>) {
+        self.memory.retain(|group| group.strong_count() != 0);
+        self.memory.push(Arc::downgrade(group));
+    }
+    fn io(&mut self, group: &io::Group) {
+        self.io.retain(io::Reference::live);
+        self.io.push(group.reference());
+    }
+    fn live(&self) -> bool {
+        self.memory.iter().any(|group| group.strong_count() != 0)
+            || self.io.iter().any(io::Reference::live)
+    }
+}
+impl Dying {
+    fn live(&self) -> bool {
+        self.nodes.iter().any(|node| node.strong_count() != 0) || self.resources.live()
+    }
 }
 pub(super) struct Cgroups {
     pub bpf: bpf::Registry,
@@ -134,11 +169,14 @@ struct Member {
     tgid: AtomicU32,
     group: AtomicU64,
     exited: std::sync::OnceLock<Arc<GroupLocation>>,
+    exit_readiness: std::sync::OnceLock<Arc<Readiness>>,
+    oom: std::sync::OnceLock<Weak<OomTask>>,
     cpu_base: AtomicU64,
     cpus: AtomicU64,
     cpu_limited: AtomicBool,
     bandwidth: SharedCell<Arc<[Arc<controllers::CpuBandwidth>]>>,
     memory: Arc<trames_memory::CgroupMemoryTarget>,
+    io: Arc<io::Target>,
     share: SharedCell<Arc<CpuShare>>,
     weighted: Arc<AtomicBool>,
     frozen: AtomicBool,
@@ -147,17 +185,26 @@ struct Member {
     wake: Mutex<Option<Weak<dyn TaskSignal>>>,
 }
 impl Member {
+    fn oom_protected(&self) -> bool {
+        self.oom
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|oom| oom.protected())
+    }
     fn new(pid: u32, tgid: u32, group: u64, frozen: bool, weighted: Arc<AtomicBool>) -> Self {
         Self {
             pid: AtomicU32::new(pid),
             tgid: AtomicU32::new(tgid),
             group: AtomicU64::new(group),
             exited: Default::default(),
+            exit_readiness: Default::default(),
+            oom: Default::default(),
             cpu_base: AtomicU64::new(0),
             cpus: AtomicU64::new(u64::MAX),
             cpu_limited: AtomicBool::new(false),
             bandwidth: Default::default(),
             memory: Arc::default(),
+            io: Arc::default(),
             share: Default::default(),
             weighted,
             frozen: AtomicBool::new(frozen),
@@ -213,9 +260,65 @@ pub struct CgroupTask {
     groups: Arc<SharedCell<Cgroups>>,
     member: Arc<Member>,
 }
+/// Existing execution slots bind both resources of this actual task. Captured
+/// file work replaces these live bindings with its original accepted owners.
+pub struct CgroupResourceScope {
+    _memory: trames_memory::CgroupMemoryScope,
+    _io: io::Scope,
+}
+/// Owned allocation/IO origins for work accepted outside the CPU worker scope.
+/// Explicit native/root absence is restored just like a concrete guest owner.
+#[derive(Clone, Default)]
+pub struct CgroupResourceContext {
+    memory: trames_memory::CgroupMemoryContext,
+    io: io::Context,
+}
+impl CgroupResourceContext {
+    pub fn capture() -> Self {
+        Self {
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: io::Context::capture(),
+        }
+    }
+    pub fn enter(&self) -> CgroupResourceScope {
+        CgroupResourceScope {
+            _memory: self.memory.enter(),
+            _io: self.io.enter(),
+        }
+    }
+}
 impl CgroupTask {
+    pub fn bind_oom(&self, oom: &Arc<OomTask>) {
+        let _ = self.member.oom.set(Arc::downgrade(oom));
+    }
+    pub(super) fn context_for(
+        groups: &Arc<SharedCell<Cgroups>>,
+        tid: u32,
+    ) -> Option<CgroupResourceContext> {
+        let groups = groups.borrow();
+        let member = groups.tasks.get(&tid)?;
+        let _memory = member.memory.scope();
+        let _io = member.io.scope();
+        Some(CgroupResourceContext::capture())
+    }
+    pub fn memory_controlled(&self) -> bool {
+        self.member.memory.controlled()
+    }
     pub fn memory_scope(&self) -> trames_memory::CgroupMemoryScope {
         self.member.memory.scope()
+    }
+    pub fn resource_scope(&self) -> CgroupResourceScope {
+        CgroupResourceScope {
+            _memory: self.member.memory.scope(),
+            _io: self.member.io.scope(),
+        }
+    }
+    pub fn resource_context(&self) -> CgroupResourceContext {
+        // Acceptance snapshots the same membership update for both resources.
+        // Ordinary live CPU scopes keep their existing per-target access.
+        let _groups = self.groups.borrow();
+        let _scope = self.resource_scope();
+        CgroupResourceContext::capture()
     }
 
     pub fn cpu_share(&self) -> Option<Arc<CpuShare>> {
@@ -249,39 +352,65 @@ impl CgroupTask {
         self.member.cpus.load(Ordering::Relaxed)
     }
     pub fn memory_oom(&self) -> bool {
-        let Some((origin, limit)) = self.member.memory.take_oom() else {
+        let Some((_, limit)) = self.member.memory.take_oom() else {
             return false;
         };
-        let kill_group = origin.oom_group_within(&limit);
-        let victims = {
+        let (kill_group, victims) = {
             let cg = self.groups.borrow();
+            let eligible = |task: &&Arc<Member>| {
+                !task.oom_protected()
+                    && cg
+                        .memory_at(task.group())
+                        .is_some_and(|memory| memory.is_within(&limit))
+                    && task
+                        .wake
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .is_some()
+            };
+            let primary = cg
+                .tasks
+                .values()
+                .filter(eligible)
+                .find(|task| task.tgid() == self.member.tgid())
+                .or_else(|| cg.tasks.values().find(eligible));
+            let Some(primary) = primary else { return false };
+            let memory = cg.memory_at(primary.group()).unwrap();
+            let kill_group = memory.oom_group_within(&limit);
             let mut seen = BTreeSet::new();
-            cg.tasks
+            let victims = cg
+                .tasks
                 .values()
                 .filter_map(|task| {
-                    let memory = cg.memory_at(task.group());
-                    let selected = task.tgid() == self.member.tgid()
-                        || memory
+                    let memory = cg.memory_at(task.group())?;
+                    let selected = task.tgid() == primary.tgid()
+                        || kill_group
                             .as_ref()
-                            .zip(kill_group.as_ref())
-                            .is_some_and(|(current, group)| current.is_within(group));
-                    if !selected || seen.contains(&task.tgid()) {
+                            .is_some_and(|group| memory.is_within(group));
+                    if !selected
+                        || !memory.is_within(&limit)
+                        || task.oom_protected()
+                        || !seen.insert(task.tgid())
+                    {
                         return None;
                     }
                     let victim = task.wake.lock().unwrap().as_ref().and_then(Weak::upgrade)?;
-                    seen.insert(task.tgid());
-                    Some((victim, memory.unwrap_or_else(|| origin.clone())))
+                    Some((victim, memory))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (kill_group, victims)
         };
         if let Some(group) = kill_group {
             group.record_group_kill();
         }
+        let killed = !victims.is_empty();
         for (task, group) in victims {
             group.record_oom_kill();
             task.terminate_process();
         }
-        true
+        killed
     }
     pub fn path_status(&self) -> (Vec<u8>, bool) {
         let cg = self.groups.borrow();
@@ -366,6 +495,9 @@ impl CgroupTask {
             );
             cg.changed_events(before)
         };
+        if let Some(readiness) = self.member.exit_readiness.get() {
+            readiness.notify_atomic();
+        }
         notify_events(events);
     }
     /// Called once the original executor/accepted work has relinquished this
@@ -426,6 +558,16 @@ struct ControlEvents {
     generation: AtomicU64,
     readiness: Arc<Readiness>,
     node: Weak<Inode>,
+    memory_notifications: Option<inotify::LiveNotifications>,
+}
+impl trames_memory::CgroupMemoryEvents for ControlEvents {
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(notifications) = &self.memory_notifications {
+            notifications.send(inotify::MODIFY);
+        }
+        self.readiness.notify_atomic();
+    }
 }
 impl ControlEvents {
     fn changed(&self) {
@@ -517,6 +659,7 @@ impl Default for Cgroups {
             weighted,
         };
         out.add_group(b"/".to_vec(), None, 0o755, (0, 0));
+        out.tasks[&1].io.set(out.io_at(ROOT));
         out.publish_bandwidth(&out.tasks[&1]);
         out
     }
@@ -643,6 +786,7 @@ impl Cgroups {
             .is_some_and(|task| task.kill_pending.load(Ordering::Relaxed));
         let member = Arc::new(Member::new(child, tgid, id, frozen, self.weighted.clone()));
         member.memory.set(self.memory_at(id));
+        member.io.set(self.io_at(id));
         self.publish_bandwidth(&member);
         member
             .cpus
@@ -697,7 +841,7 @@ impl Cgroups {
             if parent.is_none()
                 && matches!(
                     *name,
-                    "cgroup.type" | "cgroup.events" | "cgroup.freeze" | "cgroup.kill" | "io.max"
+                    "cgroup.type" | "cgroup.events" | "cgroup.freeze" | "cgroup.kill"
                 )
             {
                 continue;
@@ -735,6 +879,8 @@ impl Cgroups {
                 cpus: None,
                 mems: None,
                 memory: None,
+                io: parent.is_none().then(|| io::Group::new(None)),
+                retired: Resources::default(),
                 max_depth: UNLIMITED,
                 max_descendants: UNLIMITED,
                 descendants: 0,
@@ -750,6 +896,11 @@ impl Cgroups {
                 pids_local_signal: self.file_events(&path, b"pids.events.local"),
             },
         );
+        if parent.is_none() {
+            // Root has accounting, while per-device limits are owned by the
+            // parent and therefore exist only in non-root controller domains.
+            let _ = self.install_files(id, &[("io.stat", 0o444)], true, owner);
+        }
         if parent.is_some() {
             let available = self.available_controllers(id);
             for (_, bit) in CONTROLLERS {
@@ -795,15 +946,17 @@ impl Cgroups {
         }
     }
     fn file_events(&self, path: &[u8], name: &[u8]) -> Arc<ControlEvents> {
+        let node = self.fs.borrow().paths.get(&child_path(path, name)).cloned();
         Arc::new(ControlEvents {
             generation: AtomicU64::new(1),
             readiness: Arc::default(),
-            node: self
-                .fs
-                .borrow()
-                .paths
-                .get(&child_path(path, name))
-                .map_or_else(Weak::new, Arc::downgrade),
+            node: node.as_ref().map_or_else(Weak::new, Arc::downgrade),
+            memory_notifications: matches!(name, b"memory.events" | b"memory.events.local")
+                .then(|| {
+                    node.as_ref()
+                        .map(|node| inotify::LiveNotifications::capture(&node.borrow()))
+                })
+                .flatten(),
         })
     }
     fn update_peak(&mut self, id: u64) {
@@ -911,9 +1064,18 @@ impl Cgroups {
             *group.devices.effective.borrow_mut() = effective.into();
         }
     }
-    fn prune(&mut self) {
+    fn retained_dying(&self) -> BTreeSet<u64> {
+        // A removed descendant still pins its original parents, even after
+        // those parents lose their own control-file and resource references.
         self.dying
-            .retain(|g| g.nodes.iter().any(|n| n.strong_count() != 0));
+            .iter()
+            .filter(|group| group.live())
+            .flat_map(|group| std::iter::once(group.id).chain(group.ancestors.iter().copied()))
+            .collect()
+    }
+    fn prune(&mut self) {
+        let retained = self.retained_dying();
+        self.dying.retain(|group| retained.contains(&group.id));
         self.fs
             .borrow_mut()
             .inodes
@@ -1166,9 +1328,10 @@ impl Vfs {
     pub(super) fn cgroup_v1_conflicts(&self, data: &[u8]) -> bool {
         let active = self.cgroups.borrow().available_controllers(ROOT);
         data.split(|&item| item == b',').any(|option| {
-            CONTROLLERS
-                .iter()
-                .any(|(name, bit)| option == name.as_bytes() && active & bit != 0)
+            option == b"blkio" && active & controllers::IO != 0
+                || CONTROLLERS
+                    .iter()
+                    .any(|(name, bit)| option == name.as_bytes() && active & bit != 0)
         })
     }
 
@@ -1284,13 +1447,29 @@ impl Vfs {
             nodes.push(Arc::downgrade(&node));
             removed_nodes.push(node);
         }
-        cg.groups.remove(&id);
+        let mut group = cg.groups.remove(&id).expect("original cgroup");
+        if let Some(memory) = group.memory.take() {
+            group.retired.memory(&memory);
+        }
+        let io = group.io.take();
+        if let Some(io) = &io {
+            group.retired.io(io);
+            io.retire_state();
+        }
         for ancestor in &ancestors {
             cg.groups.get_mut(ancestor).unwrap().descendants -= 1;
         }
-        cg.dying.push(Dying { nodes, ancestors });
+        cg.dying.push(Dying {
+            id,
+            nodes,
+            ancestors,
+            resources: group.retired,
+        });
         cg.prune();
         drop(cg);
+        if let Some(io) = io {
+            io.notify();
+        }
         notify_events(events);
         for node in removed_nodes {
             inotify::notify_removed(&node);
@@ -1514,7 +1693,8 @@ impl CgroupFile {
         }
         let group = cg.groups.get(&id).ok_or(Errno(19))?;
         let text = match name.as_slice() {
-            b"io.max" => String::new(),
+            b"io.max" => group.io.as_ref().ok_or(Errno(19))?.format_max(),
+            b"io.stat" => group.io.as_ref().ok_or(Errno(19))?.format_stat(),
             b"cgroup.procs" | b"cgroup.threads" => {
                 let ids: BTreeSet<_> = cg
                     .tasks
@@ -1553,6 +1733,7 @@ impl CgroupFile {
             b"cpuset.mems" => controllers::format_mask(group.mems.unwrap_or(0)),
             b"cpuset.mems.effective" => "0\n".to_owned(),
             b"memory.current" => format!("{}\n", group.memory.as_ref().ok_or(Errno(19))?.current()),
+            b"memory.stat" => group.memory.as_ref().ok_or(Errno(19))?.format_stat(),
             b"memory.max" => {
                 controllers::limit_text(group.memory.as_ref().ok_or(Errno(19))?.limit())
             }
@@ -1608,12 +1789,11 @@ impl CgroupFile {
             ),
             b"cgroup.stat" => {
                 let descendants = group.descendants;
+                let retained = cg.retained_dying();
                 let dying = cg
                     .dying
                     .iter()
-                    .filter(|g| {
-                        g.ancestors.contains(&id) && g.nodes.iter().any(|n| n.strong_count() != 0)
-                    })
+                    .filter(|g| g.ancestors.contains(&id) && retained.contains(&g.id))
                     .count();
                 format!("nr_descendants {descendants}\nnr_dying_descendants {dying}\n")
             }
@@ -1622,6 +1802,33 @@ impl CgroupFile {
         let from = (offset.min(text.len() as u64)) as usize;
         let to = from + count.min(text.len() - from);
         Ok(Some(text.as_bytes()[from..to].to_vec()))
+    }
+    fn check_write(&self, cg: &Cgroups, caller: &CgroupAccess, bytes: &[u8]) -> Result<()> {
+        self.check_live(cg)?;
+        if !caller.admin && self.name != b"cgroup.subtree_control" {
+            return Err(Errno(1));
+        }
+        if self
+            .namespace
+            .root
+            .as_ref()
+            .is_some_and(|node| node.borrow().inode == self.id)
+            && cg.nsdelegate.load(Ordering::Relaxed)
+            && !matches!(
+                self.name.as_slice(),
+                b"cgroup.procs"
+                    | b"cgroup.threads"
+                    | b"cgroup.subtree_control"
+                    | b"memory.oom.group"
+                    | b"memory.reclaim"
+            )
+        {
+            return Err(Errno(1));
+        }
+        if bytes.len() > 4096 {
+            return Err(Errno(7));
+        }
+        Ok(())
     }
     pub(super) fn cgroup_write(
         &self,
@@ -1634,29 +1841,7 @@ impl CgroupFile {
         // as its effect. Disabling/re-enabling a controller must not let an old
         // pids.max FD mutate the replacement control's state.
         let mut cg = self.groups.borrow_mut();
-        self.check_live(&cg)?;
-        if !caller.admin && name != b"cgroup.subtree_control" {
-            return Err(Errno(1));
-        }
-        if self
-            .namespace
-            .root
-            .as_ref()
-            .is_some_and(|node| node.borrow().inode == id)
-            && cg.nsdelegate.load(Ordering::Relaxed)
-            && !matches!(
-                name.as_slice(),
-                b"cgroup.procs"
-                    | b"cgroup.threads"
-                    | b"cgroup.subtree_control"
-                    | b"memory.oom.group"
-            )
-        {
-            return Err(Errno(1));
-        }
-        if bytes.len() > 4096 {
-            return Err(Errno(7));
-        }
+        self.check_write(&cg, caller, bytes)?;
         if bytes.is_empty() {
             return Ok(Some(0));
         }
@@ -1676,7 +1861,13 @@ impl CgroupFile {
                     group.max_descendants = limit;
                 }
             }
-            b"io.max" => return Err(Errno(95)),
+            b"io.max" => {
+                let io = cg.groups[&id].io.as_ref().ok_or(Errno(19))?.clone();
+                // Configuration and resource notifications run outside the
+                // cgroup topology lock, using the original per-device policy.
+                drop(cg);
+                io.set_max(text)?;
+            }
             b"cgroup.freeze" => {
                 let freeze = match sysctl::parse_kernel_i32(text)? {
                     0 => false,
@@ -1741,6 +1932,9 @@ impl CgroupFile {
             b"cgroup.subtree_control" => {
                 let change = cg.change_controllers(id, text, caller.owner)?;
                 drop(cg);
+                for io in change.io_retired {
+                    io.notify();
+                }
                 for task in change.reschedule {
                     task.notify();
                 }
@@ -1798,15 +1992,7 @@ impl CgroupFile {
                     group.mems = mask;
                 }
             }
-            b"memory.max" | b"memory.high" => {
-                let limit = controllers::memory_limit(text)?;
-                let memory = cg.groups[&id].memory.as_ref().ok_or(Errno(19))?;
-                if name == b"memory.max" {
-                    memory.set_limit(limit);
-                } else {
-                    memory.set_high(limit);
-                }
-            }
+            b"memory.max" | b"memory.high" | b"memory.reclaim" => return Err(Errno(95)),
             b"memory.oom.group" => {
                 let enabled = match text {
                     "0" | "+0" => false,
@@ -1918,7 +2104,8 @@ impl CgroupFile {
                     let old_ack = task.acknowledged.load(Ordering::Relaxed);
                     cg.adjust(old_group, -1, -i64::from(old_ack));
                     task.group.store(id, Ordering::Relaxed);
-                    task.memory.set(cg.memory_at(id));
+                    let moved_memory = task.memory.set(cg.memory_at(id));
+                    let moved_io = task.io.set(cg.io_at(id));
                     let cpus = cg.effective_cpus(id, u64::MAX);
                     let moved_cpu = task.cpus.swap(cpus, Ordering::Relaxed) != cpus;
                     let moved = task.frozen.swap(frozen, Ordering::Relaxed) != frozen;
@@ -1930,7 +2117,8 @@ impl CgroupFile {
                     };
                     task.acknowledged.store(ack, Ordering::Relaxed);
                     cg.adjust(id, 1, i64::from(ack));
-                    if cg.publish_bandwidth(&task) || moved || moved_cpu {
+                    if cg.publish_bandwidth(&task) || moved || moved_cpu || moved_memory || moved_io
+                    {
                         changed.push(task);
                     }
                 }

@@ -189,9 +189,15 @@ pub struct EnterInput {
     deadline: Option<Option<Instant>>,
     timeouts: u32,
     control: Option<Arc<EnterControl>>,
+    resources: trames_vfs::CgroupResourceContext,
 }
 impl EnterInput {
-    pub(super) fn new(ring: Arc<Uring>, args: [u64; 6], clock: Instant) -> Self {
+    pub(super) fn new(
+        ring: Arc<Uring>,
+        args: [u64; 6],
+        clock: Instant,
+        resources: trames_vfs::CgroupResourceContext,
+    ) -> Self {
         Self {
             ring,
             args,
@@ -203,6 +209,7 @@ impl EnterInput {
             deadline: None,
             timeouts: 0,
             control: None,
+            resources,
         }
     }
     pub(crate) fn accepted(
@@ -210,8 +217,9 @@ impl EnterInput {
         args: [u64; 6],
         clock: Instant,
         submitted: u32,
+        resources: trames_vfs::CgroupResourceContext,
     ) -> Box<Self> {
-        let mut call = Box::new(Self::new(ring, args, clock));
+        let mut call = Box::new(Self::new(ring, args, clock, resources));
         call.submitted = Some(submitted);
         call
     }
@@ -255,6 +263,7 @@ impl EnterInput {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        let _resources = self.resources.enter();
         self.args = match normalize(self.args) {
             Ok(args) => args,
             Err(error) => return self.complete(source, Err(error)),

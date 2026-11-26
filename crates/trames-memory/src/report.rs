@@ -34,17 +34,18 @@ pub struct ImageRanges {
 pub struct MemoryReport(pub(super) Arc<Report>);
 pub(super) struct Report {
     identity: u64,
-    owner: std::sync::Weak<ReportOwner>,
+    pub(super) owner: std::sync::Weak<ReportOwner>,
     retired: std::sync::atomic::AtomicBool,
     image: RwLock<Option<ImageRanges>>,
     state: RwLock<Arc<Layout>>,
     pub(super) smaps: OnceLock<smaps::Requests>,
     pub(super) transfers: OnceLock<process_transfer::Transfers>,
     pub(super) reads: OnceLock<read_export::Reads>,
+    pub(super) reclaims: OnceLock<cgroup_memory::reclaim::Requests>,
     pub(super) read_waker: RwLock<Option<read_export::ReadWaker>>,
 }
 #[derive(Default)]
-pub(super) struct ReportOwner(OnceLock<std::sync::Weak<Report>>);
+pub(super) struct ReportOwner(pub(super) OnceLock<std::sync::Weak<Report>>);
 impl Drop for ReportOwner {
     fn drop(&mut self) {
         if let Some(report) = self.0.get().and_then(std::sync::Weak::upgrade) {
@@ -214,10 +215,12 @@ impl Memory {
                 smaps: OnceLock::new(),
                 transfers: OnceLock::new(),
                 reads: OnceLock::new(),
+                reclaims: OnceLock::new(),
                 read_waker: RwLock::new(None),
             }))
         };
         owner.0.get_or_init(|| Arc::downgrade(&report.0));
+        self.account.bind_reclaimer(&report.0);
         *cache = Some((self.layout_revision, report.clone(), owner));
         report
     }
@@ -243,11 +246,15 @@ impl Page {
     }
 }
 impl MemoryReport {
+    pub(crate) fn reclaim_generation(&self) -> (u64, u64) {
+        self.0.state.read().unwrap().account.reclaim_generation()
+    }
     pub(super) fn retire(&self) {
         self.0.retired.store(true, Ordering::Relaxed);
         self.retire_reads();
         self.finish_smaps(None);
         self.finish_transfers(None);
+        self.finish_reclaims(None);
     }
     pub fn image_ranges(&self) -> Option<ImageRanges> {
         *self.0.image.read().unwrap()

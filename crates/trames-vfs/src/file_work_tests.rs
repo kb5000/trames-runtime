@@ -43,6 +43,64 @@ fn disk() -> (std::path::PathBuf, Vfs) {
     (path, v)
 }
 #[test]
+fn accepted_disk_read_and_mapping_share_original_physical_owner() {
+    use trames_memory::{CgroupMemoryTarget, MemoryCgroup};
+    let (directory, mut v) = disk();
+    v.import_file(b"/cache", vec![41; PAGE_SIZE as usize])
+        .unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/cache", 2, 0).unwrap();
+    let first = MemoryCgroup::new(None);
+    let second = MemoryCgroup::new(None);
+    let actor = Arc::new(CgroupMemoryTarget::default());
+    actor.set(Some(first.clone()));
+    let _scope = actor.scope();
+    let work = FileWork::new(
+        &v.path_queries(),
+        target(&v, fd),
+        FileCommand::Read {
+            count: 16,
+            offset: Some(0),
+        },
+    );
+    actor.set(Some(second.clone()));
+    assert_eq!(value(work).unwrap().into_bytes().unwrap(), vec![41; 16]);
+    assert_eq!(first.current(), PAGE_SIZE as usize);
+    assert_eq!(second.current(), 0);
+    let mut memory = Memory::default();
+    memory
+        .map_backed(
+            PAGE_SIZE,
+            v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap(),
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+    assert_eq!(memory.read_array::<1>(PAGE_SIZE), Ok([41]));
+    assert_eq!(first.current(), PAGE_SIZE as usize);
+    assert_eq!(second.current(), 0);
+    assert_eq!(
+        first.reclaim(PAGE_SIZE as usize),
+        0,
+        "mapped bytes are pinned"
+    );
+    memory.write(PAGE_SIZE, &[23]).unwrap();
+    assert_eq!(v.pread(fd, 1, 0).unwrap(), [23]);
+    memory.sync_range(PAGE_SIZE, PAGE_SIZE).unwrap();
+    memory.unmap(PAGE_SIZE, PAGE_SIZE).unwrap();
+    drop(memory);
+    assert_eq!(first.reclaim(PAGE_SIZE as usize), PAGE_SIZE as usize);
+    assert_eq!(first.current(), 0);
+    assert_eq!(
+        v.pread(fd, 1, 0).unwrap(),
+        [23],
+        "reclaimed bytes reload from the backing file"
+    );
+    assert_eq!(second.current(), PAGE_SIZE as usize);
+    drop(v);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+#[test]
 fn an_idle_position_subscription_covers_a_new_reader_before_the_ready_check() {
     struct Wake;
     impl IoWake for Wake {
@@ -193,19 +251,30 @@ fn concurrent_append_keeps_every_record_and_metadata_is_visible_without_epoch_co
             let paths = v.path_queries();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
+                let mut control = paths.view.borrow().host_files_context();
+                let mut waiter = host_sync::Wait::default();
                 barrier.wait();
                 for sequence in 0..128u32 {
                     let mut bytes = id.to_le_bytes().to_vec();
                     bytes.extend(sequence.to_le_bytes());
                     assert_eq!(
-                        count(FileWork::new(
-                            &paths,
-                            file.clone(),
-                            FileCommand::Write {
-                                bytes,
-                                offset: None
-                            }
-                        )),
+                        waiter
+                            .file(
+                                &mut control,
+                                FileWork::new(
+                                    &paths,
+                                    file.clone(),
+                                    FileCommand::Write {
+                                        bytes,
+                                        offset: None
+                                    },
+                                )
+                                .run()
+                            )
+                            .map(|value| match value {
+                                FileValue::Count(n) => n,
+                                _ => panic!("write count"),
+                            }),
                         Ok(8)
                     );
                 }
@@ -492,10 +561,21 @@ fn file_copy_resumes_after_a_committed_chunk_and_a_layout_wait() {
     assert_eq!(v.seek(source, 0, 1), Ok(block as u64));
     assert_eq!(v.seek(output, 0, 1), Ok(block as u64));
     v.pwrite(source, b"changed", block as u64).unwrap();
-    v.pwrite(output, b"X", block as u64 - 1).unwrap();
+    let FileOutcome::Waiting(contender) = FileWork::from_vfs(
+        &v,
+        target(&v, output),
+        FileCommand::Write {
+            bytes: b"X".to_vec(),
+            offset: Some(block as u64 - 1),
+        },
+    )
+    .run() else {
+        panic!("same-inode contender waits for original data transaction");
+    };
     memory.commit_parallel().unwrap();
     assert!(
         matches!(value(work.exclusive()), Ok(FileValue::Transfer {count,from,to:Some(to)}) if count==(block+7) as u64 && from==count && to==count)
     );
+    assert_eq!(count(contender), Ok(1));
     assert_eq!(v.pread(output, 8, block as u64 - 1).unwrap(), b"XQQQQQQQ");
 }

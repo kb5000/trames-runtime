@@ -49,7 +49,8 @@ impl MemoryReport {
         }
     }
     pub fn has_requested_reads(&self) -> bool {
-        self.has_transfers()
+        self.has_reclaims()
+            || self.has_transfers()
             || self.requested_smaps()
             || self.read_ranges(0, u64::MAX).iter().any(|read| {
                 matches!(
@@ -229,6 +230,7 @@ impl Memory {
         let Some(report) = report else { return true };
         report.finish_transfers(Some(self));
         report.finish_smaps(Some(self));
+        report.finish_reclaims(Some(self));
         for read in report.read_ranges(0, u64::MAX) {
             let mut state = read.state.write().unwrap();
             if !matches!(*state, ReadState::Pending { requested: true }) {

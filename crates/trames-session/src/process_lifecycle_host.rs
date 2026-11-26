@@ -10,6 +10,12 @@ impl<C: Cpu> Lifecycle<C> {
         self.host_driver
             .get()
             .is_some_and(|driver| driver.signal.ready())
+            || self
+                .host_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
+    pub(crate) fn host_deadline(&self) -> Option<Instant> {
+        self.host_launches.deadline()
     }
     pub(crate) fn host_pending(&self) -> bool {
         self.host_launches.pending()
@@ -88,13 +94,14 @@ impl<C: Cpu> Lifecycle<C> {
                     work.phase = Phase::Image(child, exec::Preparation::Disk(result));
                 }
                 Phase::Image(child, result) => {
+                    result.resume(self.images.as_ref());
                     if !result.ready() {
                         work.signal.reset();
-                        let subscription = result.subscribe(&work.signal);
+                        let subscriptions = result.subscribe(&work.signal);
                         if !result.ready() {
                             work.wait = Some(tasks::AdmissionWait {
                                 signal: work.signal.clone(),
-                                subscriptions: vec![subscription],
+                                subscriptions,
                             });
                             work.phase = Phase::Image(child, result);
                             return Ok(false);

@@ -69,18 +69,22 @@ impl Memory {
         Ok(HardwarePageInfo {
             permissions: page.permissions,
             instruction_revision: (page.instruction_revision, 0),
-            storage_id: page.bytes.shared().map_or(0, |b| b.identity),
+            storage_id: if page.backing.as_ref().is_some_and(|b| !b.private_current()) {
+                0
+            } else {
+                page.bytes.shared().map_or(0, |b| b.identity)
+            },
             backing_version: page
                 .backing
                 .as_ref()
-                .filter(|b| !b.private_copy)
+                .filter(|b| !b.private_current())
                 .map_or(0, |b| b.object.version()),
             exclusive: Arc::strong_count(&page.bytes) == 1,
             writable: page.permissions.write
                 && page.write_fault(base).is_none()
                 && page.charge.write_ready()
                 && Arc::strong_count(&page.bytes) == 1
-                && page.backing.as_ref().is_none_or(|b| b.private_copy),
+                && page.backing.as_ref().is_none_or(|b| b.private_current()),
         })
     }
     /// Bind a hardware-aligned host allocation to the original guest page.
@@ -116,6 +120,7 @@ impl Memory {
         self.materialize_descriptors(base, PAGE_SIZE as usize);
         let frame = self.frame(base).unwrap();
         let page = self.frames[frame].as_mut().unwrap();
+        page.refresh_private_backing();
         if write {
             if !page.permissions.write {
                 return Err(MemoryError::Permission {

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned namespace calls over the original fs_struct, Files and filesystem.
 use super::*;
+#[cfg(test)]
+#[path = "namespace_capability_tests.rs"]
+mod capability_tests;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct PathKey(usize, i32, Vec<u8>, bool, bool, u64, bool);
@@ -514,6 +517,9 @@ pub(super) struct NamespaceWork {
     fuse: Option<Box<fuse::Metadata>>,
     parents: Option<Box<fuse::PendingNamespace>>,
     paths: Option<Arc<SharedCell<AcceptedPaths>>>,
+    capabilities: Option<Box<xattr::CapabilitiesWork>>,
+    resource_wait: Option<Arc<trames_memory::PageWait>>,
+    resource_metadata: Option<Box<MetadataTarget>>,
 }
 pub(super) enum NamespaceRun {
     Complete(Result<FileValue>),
@@ -709,6 +715,9 @@ impl PathQueries {
                 waiting: None,
                 fuse: None,
                 parents: None,
+                capabilities: None,
+                resource_wait: None,
+                resource_metadata: None,
             };
             let reply = if host_work {
                 NamespaceRun::Owner
@@ -751,6 +760,9 @@ impl PathQueries {
                 waiting: None,
                 fuse: None,
                 parents: None,
+                capabilities: None,
+                resource_wait: None,
+                resource_metadata: None,
             },
         )
     }
@@ -773,6 +785,7 @@ impl NamespaceWork {
             self.fuse = None;
             self.parents = None;
             self.waiting = None;
+            self.resource_metadata = None;
             if let Some(paths) = &self.paths {
                 *paths.borrow_mut() = AcceptedPaths::default();
             }
@@ -855,7 +868,10 @@ impl NamespaceWork {
         }
     }
     pub(super) fn waiting(&self) -> bool {
-        self.bind_wait().is_some()
+        self.resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+            || self.bind_wait().is_some()
             || self.waiting.is_some()
             || self.fuse.is_some()
             || self.parents.is_some()
@@ -869,7 +885,8 @@ impl NamespaceWork {
         }
     }
     pub(super) fn ready(&self) -> bool {
-        self.bind_wait().is_none_or(|bind| bind.ready())
+        self.resource_wait.as_ref().is_none_or(|wait| wait.ready())
+            && self.bind_wait().is_none_or(|bind| bind.ready())
             && self.waiting.as_ref().is_none_or(|admin| admin.ready())
             && self.fuse.as_ref().is_none_or(|f| f.ready())
             && self.parents.as_ref().is_none_or(|parents| parents.ready())
@@ -883,10 +900,49 @@ impl NamespaceWork {
             .map(|admin| admin.subscribe(signal))
             .or_else(|| self.fuse_request().and_then(|f| f.subscribe(signal)))
     }
+    pub(super) fn wait_sources(&self, signal: &Arc<IoSignal>) -> TransferWait {
+        if let Some(wait) = self.resource_wait.as_ref().filter(|wait| !wait.ready()) {
+            return TransferWait {
+                subscriptions: wait.subscribe(signal),
+                native: Vec::new(),
+                deadline: wait.deadline(),
+            };
+        }
+        TransferWait {
+            subscriptions: self.subscribe(signal).into_iter().collect(),
+            native: Vec::new(),
+            deadline: None,
+        }
+    }
+    pub(super) fn interruptible_wait(&self) -> bool {
+        self.capabilities.is_none()
+    }
     pub(super) fn run(&mut self, paths: &PathQueries) -> NamespaceRun {
         self.execute(&mut paths.view.borrow_mut())
     }
     fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
+        if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+        {
+            return NamespaceRun::Waiting;
+        }
+        // Preserve cold resource state until its actual body is reached, even
+        // when namespace or original-owner admission first needs a handoff.
+        if let Some(capabilities) = &mut self.capabilities {
+            let scope = resource_io::Scope::enter();
+            let result = capabilities.run();
+            let pending = scope.finish();
+            // Page tickets and observers cannot run while an inode, data or
+            // metadata guard from the original operation is still borrowed.
+            capabilities.notify();
+            if let Some(pending) = pending {
+                self.resource_wait = Some(pending.wait);
+                return NamespaceRun::Waiting;
+            }
+            return NamespaceRun::Complete(result.map(|()| FileValue::Count(0)));
+        }
         if let Some(bind) = self.bind_wait() {
             let Some(lease) = bind.try_enter() else {
                 return NamespaceRun::Waiting;
@@ -997,6 +1053,9 @@ impl NamespaceWork {
         if !self.call.topology() {
             view.query.as_ref().unwrap().namespace_uses.begin();
         }
+        *view.query.as_ref().unwrap().resource_metadata.borrow_mut() =
+            self.resource_metadata.take();
+        let resource_scope = resource_io::Scope::enter();
         let result = {
             struct Restore<'a> {
                 view: &'a mut Vfs,
@@ -1029,12 +1088,24 @@ impl NamespaceWork {
             }
             self.call.execute_locked(scope.view)
         };
+        let resource_pending = resource_scope.finish();
         let query = view.query.as_ref().unwrap();
         let uses = query.namespace_uses.finish();
         let deferred = query.take_deferred();
         drop(uses);
+        let metadata = query.resource_metadata.borrow_mut().take();
+        if let Some(pending) = resource_pending {
+            self.resource_wait = Some(pending.wait);
+            self.resource_metadata = metadata;
+            return NamespaceRun::Waiting;
+        }
         if !deferred {
             return NamespaceRun::Complete(result);
+        }
+        let capabilities = query.prepared.borrow_mut().capabilities.take();
+        if let Some(capabilities) = capabilities {
+            self.capabilities = Some(capabilities);
+            return self.execute(view);
         }
         let parents = query.prepared.borrow_mut().namespace.take();
         if let Some(parents) = parents {

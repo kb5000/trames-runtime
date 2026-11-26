@@ -4,6 +4,136 @@ use super::*;
 use std::sync::{mpsc, Barrier};
 use trames_memory::{Memory, Permissions};
 
+fn truncation_file(kind: u8) -> (Vfs, u32) {
+    let mut v = Vfs::default();
+    let fd = match kind {
+        0 => v
+            .open_at(AT_FDCWD, b"/truncate-private", 0x42, 0o600)
+            .unwrap(),
+        1 => {
+            v.mkdir_at(AT_FDCWD, b"/tmp", 0o777).unwrap();
+            v.mount(None, b"/tmp", Some(b"tmpfs"), 0, None).unwrap();
+            v.open_at(AT_FDCWD, b"/tmp/private", 0x42, 0o600).unwrap()
+        }
+        _ => v.memfd_create(b"truncate-private", 0).unwrap(),
+    };
+    (v, fd)
+}
+
+#[test]
+fn private_cow_survives_writes_and_partial_truncation_but_full_pages_refault_in_both_forks() {
+    use trames_memory::{parallel::Registry, CpuMemory};
+    for kind in 0..3 {
+        let (mut v, fd) = truncation_file(kind);
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        v.pwrite(fd, &[1], 0).unwrap();
+        v.pwrite(fd, &[2], PAGE_SIZE).unwrap();
+        let mut parent = Memory::default();
+        parent
+            .map_backed(
+                0x10000,
+                v.mapping_pages(fd, 0, PAGE_SIZE * 2, false, true).unwrap(),
+                false,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        parent.write_array(0x10000, [8]).unwrap();
+        parent
+            .with_write_chunk(0x11000, 1, |bytes| bytes[0] = 9)
+            .unwrap();
+        let mut child = parent.try_fork().unwrap();
+        let mut registry = Registry::default();
+        drop(parent.parallel_view(&mut registry).unwrap());
+        v.pwrite(fd, &[3], 0).unwrap();
+        v.pwrite(fd, &[4], PAGE_SIZE).unwrap();
+        assert_eq!(parent.read_array::<1>(0x10000).unwrap(), [8]);
+        assert_eq!(child.read_array::<1>(0x11000).unwrap(), [9]);
+        // Linux keeps the COW of the partial EOF page, and unmaps private PTEs
+        // for every complete page removed by truncation, including in a fork.
+        v.truncate_fd(fd, 1).unwrap();
+        assert!(matches!(
+            parent.read_array::<1>(0x11000),
+            Err(MemoryError::Bus(_))
+        ));
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        for memory in [&mut parent, &mut child] {
+            assert_eq!(memory.read_array::<1>(0x10000).unwrap(), [8]);
+            assert_eq!(memory.read_array::<1>(0x11000).unwrap(), [0]);
+            assert_eq!(
+                memory
+                    .with_read_chunk(0x11000, 1, |bytes| bytes[0])
+                    .unwrap()
+                    .0,
+                0
+            );
+            let view = memory.parallel_view(&mut registry).unwrap();
+            assert_eq!(view.read_array::<1>(0x10000).unwrap(), [8]);
+            assert_eq!(view.read_array::<1>(0x11000).unwrap(), [0]);
+            drop(view);
+        }
+        parent.write_array(0x11000, [6]).unwrap();
+        assert_eq!(parent.read_array::<1>(0x11000).unwrap(), [6]);
+        assert_eq!(child.read_array::<1>(0x11000).unwrap(), [0]);
+        assert_eq!(v.pread(fd, 1, PAGE_SIZE).unwrap(), [0]);
+    }
+}
+
+#[test]
+fn truncated_private_preflight_keeps_new_admission_and_retires_only_obsolete_rss() {
+    use trames_memory::{Access, CgroupMemoryTarget, MemoryCgroup};
+    for kind in 1..3 {
+        let source = MemoryCgroup::new(None);
+        let writer = MemoryCgroup::new(None);
+        writer.set_limit(2 * PAGE_SIZE as usize);
+        let target = Arc::new(CgroupMemoryTarget::default());
+        target.set(Some(source.clone()));
+        let _scope = target.scope();
+        let (mut v, fd) = truncation_file(kind);
+        v.pwrite(fd, &[1], 0).unwrap();
+        let mut memory = Memory::default();
+        memory.set_total_limit(PAGE_SIZE as usize).unwrap();
+        memory
+            .map_backed(
+                0x10000,
+                v.mapping_pages(fd, 0, PAGE_SIZE, false, true).unwrap(),
+                false,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        target.set(Some(writer.clone()));
+        memory.write_array(0x10000, [9]).unwrap();
+        target.set(Some(source.clone()));
+        v.truncate_fd(fd, 0).unwrap();
+        v.pwrite(fd, &[3], 0).unwrap();
+        target.set(Some(writer.clone()));
+        writer.set_limit(0);
+        assert_eq!(
+            memory.check(0x10000, 1, Access::Write),
+            Err(MemoryError::Limit)
+        );
+        writer.set_limit(2 * PAGE_SIZE as usize);
+        memory.check(0x10000, 1, Access::Write).unwrap();
+        memory.check(0x10000, 1, Access::Write).unwrap();
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(
+            writer.current(),
+            2 * PAGE_SIZE as usize,
+            "old bytes and accepted new COW both exist"
+        );
+        memory
+            .with_write_chunk(0x10000, 1, |bytes| bytes[0] = 7)
+            .unwrap();
+        assert_eq!(writer.current(), PAGE_SIZE as usize);
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(memory.read_array::<1>(0x10000).unwrap(), [7]);
+        assert_eq!(v.pread(fd, 1, 0).unwrap(), [3]);
+        drop(memory);
+        assert_eq!(writer.current(), 0);
+    }
+}
+
 #[test]
 fn simultaneous_first_mappings_retain_one_physical_page_per_offset() {
     for _ in 0..32 {

@@ -421,6 +421,33 @@ pub(super) fn prepare_views<C: Cpu>(
     reuse_retained: bool,
     backend_error: &mut Option<String>,
 ) -> Option<Vec<(u32, usize, Box<trames_memory::parallel::View>)>> {
+    // Decide a shared mm's policy before publishing its first View. A root
+    // peer must not publish coarse RW extents for a controlled peer selected
+    // later in this same cohort. Normal root-only epochs do no peer-body scan.
+    let controlled: std::collections::BTreeSet<_> = chosen
+        .iter()
+        .filter_map(|(id, _)| {
+            let task = tasks.handle(id)?;
+            let p = task.read();
+            let controlled = p
+                .signals
+                .io
+                .cgroup()
+                .is_some_and(trames_vfs::CgroupTask::memory_controlled)
+                || p.memory.cgroup_controlled()
+                    && tasks
+                        .memory(&p.memory.memory_report())
+                        .into_iter()
+                        .any(|(_, peer)| {
+                            peer.read()
+                                .signals
+                                .io
+                                .cgroup()
+                                .is_some_and(trames_vfs::CgroupTask::memory_controlled)
+                        });
+            controlled.then(|| p.memory.coordinator_ownership().0)
+        })
+        .collect();
     let mut views: Vec<(u32, usize, Box<trames_memory::parallel::View>)> =
         Vec::with_capacity(chosen.len());
     let mut published = BTreeMap::<u64, usize>::new();
@@ -428,6 +455,20 @@ pub(super) fn prepare_views<C: Cpu>(
         let task = tasks.handle(&id).expect("selected process");
         let p = &mut *task.write();
         let (identity, _) = p.memory.coordinator_ownership();
+        if !published.contains_key(&identity) {
+            // Peer bodies were read before taking this task's mutable body;
+            // the directory includes the current task itself.
+            let controlled = controlled.contains(&identity);
+            if p.memory.cgroup_controlled() != controlled {
+                if !p.memory.parallel_views_quiescent() {
+                    return None;
+                }
+                if let Err(error) = p.memory.set_cgroup_controlled(controlled) {
+                    *backend_error = Some(error.to_string());
+                    return None;
+                }
+            }
+        }
         if !p.memory.admit_parallel_layouts() {
             return None;
         }

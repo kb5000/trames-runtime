@@ -180,3 +180,77 @@ fn independent_waiters_and_cancellation_cannot_steal_another_actors_notification
     wait.finish();
     assert_eq!(target.0.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn resource_faults_keep_all_ancestor_notifications_and_a_live_deadline() {
+    use trames_shared::{Readiness, ResourcePending, ResourceWait};
+    struct Resource {
+        changed: [Arc<Readiness>; 2],
+        deadline: Mutex<std::time::Instant>,
+        ready: std::sync::atomic::AtomicBool,
+    }
+    impl ResourceWait for Resource {
+        fn ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+        fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_shared::IoSubscription> {
+            self.changed
+                .iter()
+                .map(|changed| changed.subscribe(signal))
+                .collect()
+        }
+        fn deadline(&self) -> Option<std::time::Instant> {
+            Some(*self.deadline.lock().unwrap())
+        }
+    }
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let target: Arc<dyn IoWake> = Arc::new(Wake);
+    let first = IoSignal::new(1, Arc::downgrade(&target));
+    let second = IoSignal::new(2, Arc::downgrade(&target));
+    let now = std::time::Instant::now();
+    let resource = Arc::new(Resource {
+        changed: std::array::from_fn(|_| Arc::default()),
+        deadline: Mutex::new(now + std::time::Duration::from_secs(600)),
+        ready: Default::default(),
+    });
+    let wait = PageWait::resource(resource.clone());
+    let cancelled = wait.subscribe(&first);
+    let active = wait.subscribe(&second);
+    drop(cancelled);
+    assert_eq!(
+        active
+            .iter()
+            .filter_map(trames_shared::IoSubscription::deadline)
+            .min(),
+        wait.deadline()
+    );
+    let earlier = now + std::time::Duration::from_secs(60);
+    *resource.deadline.lock().unwrap() = earlier;
+    resource.changed[1].notify_atomic();
+    assert!(second.ready() && !first.ready() && !wait.ready());
+    assert_eq!(
+        active
+            .iter()
+            .filter_map(trames_shared::IoSubscription::deadline)
+            .min(),
+        Some(earlier)
+    );
+    assert!(active.iter().all(|subscription| !subscription.external()));
+    for subscription in &active {
+        subscription.rearm_host().unwrap();
+    }
+    second.reset();
+    resource.ready.store(true, Ordering::Relaxed);
+    resource.changed[0].notify_atomic();
+    assert!(second.ready() && wait.ready());
+    let original: Arc<dyn ResourceWait> = wait.clone();
+    let error = ResourcePending::io_error(original.clone());
+    assert!(Arc::ptr_eq(
+        &ResourcePending::from_io(&error).unwrap(),
+        &original
+    ));
+    assert!(ResourcePending::from_io(&std::io::Error::from_raw_os_error(11)).is_none());
+}

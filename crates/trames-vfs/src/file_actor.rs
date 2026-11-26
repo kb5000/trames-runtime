@@ -14,6 +14,8 @@ thread_local! {
 pub struct FileActorScope {
     previous: Option<(Arc<CredentialState>, u32)>,
     previous_sync: Option<Arc<dyn trames_memory::SyncExecutor>>,
+    _memory: Option<trames_memory::CgroupMemoryScope>,
+    _io: Option<crate::cgroup::IoScope>,
     _thread: PhantomData<Rc<()>>,
 }
 #[derive(Clone)]
@@ -21,13 +23,33 @@ pub struct FileActorSnapshot {
     credentials: Arc<CredentialState>,
     tid: u32,
     executor: Option<Arc<dyn trames_memory::SyncExecutor>>,
+    memory: trames_memory::CgroupMemoryContext,
+    io: crate::cgroup::IoContext,
 }
 impl FileActorSnapshot {
     pub fn enter(&self) -> FileActorScope {
-        FileActorScope::enter_with_sync(self.credentials.clone(), self.tid, self.executor.clone())
+        let mut scope = FileActorScope::enter_with_sync(
+            self.credentials.clone(),
+            self.tid,
+            self.executor.clone(),
+        );
+        scope._memory = Some(self.memory.enter());
+        scope._io = Some(self.io.enter());
+        scope
     }
 }
 impl FileActorScope {
+    /// A lifecycle/host acceptance already owns the actual task's credentials
+    /// and has explicitly bound its resource context, without a CPU actor TLS.
+    pub fn frozen_for(credentials: &crate::Credentials, tid: u32) -> FileActorSnapshot {
+        FileActorSnapshot {
+            credentials: Arc::new(CredentialState::new(credentials.clone())),
+            tid,
+            executor: sync_executor(),
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: crate::cgroup::IoContext::capture(),
+        }
+    }
     /// AIO fsync uses prepare_creds semantics, rather than a later live task
     /// credential update. Capture only at this asynchronous acceptance point.
     pub fn frozen() -> Option<FileActorSnapshot> {
@@ -37,6 +59,8 @@ impl FileActorScope {
             credentials,
             tid,
             executor: sync_executor(),
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: crate::cgroup::IoContext::capture(),
         })
     }
     pub fn enter_if_absent(
@@ -65,6 +89,8 @@ impl FileActorScope {
         Self {
             previous,
             previous_sync: SYNC.with(|current| current.replace(executor)),
+            _memory: None,
+            _io: None,
             _thread: PhantomData,
         }
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 use trames_shared::{Mapping, SharedFile};
 use wayland_protocols::xdg::shell::server::{
@@ -113,7 +113,7 @@ pub struct ShmBuffer {
 }
 /// A scene/GPU completion retains this lease. Release only follows its final use.
 pub(crate) struct BufferData {
-    pub pixels: Arc<ShmBuffer>,
+    pub pixels: OnceLock<Arc<ShmBuffer>>,
     pub lease: Mutex<Weak<BufferLease>>,
 }
 impl BufferLease {
@@ -124,7 +124,7 @@ impl BufferLease {
             return Some(lease);
         }
         let lease = Arc::new(Self {
-            pixels: data.pixels.clone(),
+            pixels: data.pixels.get()?.clone(),
             resource: resource.clone(),
         });
         *weak = Arc::downgrade(&lease);

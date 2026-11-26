@@ -2,6 +2,9 @@
 //! Descriptor-backed mount construction. Detached trees only become visible
 //! to namespace observers when the complete tree is attached.
 use super::*;
+#[cfg(test)]
+#[path = "idmap_resource_tests.rs"]
+mod idmap_resource_tests;
 
 pub enum MountFdCall {
     Open {

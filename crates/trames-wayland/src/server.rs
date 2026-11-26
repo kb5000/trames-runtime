@@ -66,6 +66,19 @@ struct Control {
     guest_clock: OnceLock<std::time::Instant>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
+/// Resource notifications reuse the existing command socket and event loop.
+/// The callback owns no guest task, memory view or compositor mutation.
+struct ResourceWake(UnixStream);
+impl trames_shared::IoWake for ResourceWake {
+    fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+        loop {
+            match (&self.0).write(&[1]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+    }
+}
 impl Control {
     fn send(&self, command: Command) -> io::Result<()> {
         self.sender.try_send(command).map_err(|e| match e {
@@ -121,9 +134,21 @@ impl Server {
         let notifications = changes.clone();
         let command_space = Arc::new(trames_shared::Readiness::default());
         let commands = command_space.clone();
+        let resource_wake: Arc<dyn trames_shared::IoWake> =
+            Arc::new(ResourceWake(wake.try_clone()?));
         let worker = thread::Builder::new()
             .name("trames-wayland".into())
-            .spawn(move || run(compositor, read, receiver, output, notifications, commands))?;
+            .spawn(move || {
+                run(
+                    compositor,
+                    read,
+                    receiver,
+                    output,
+                    notifications,
+                    commands,
+                    resource_wake,
+                )
+            })?;
         Ok(Self(Arc::new(Control {
             sender,
             wake,
@@ -308,12 +333,32 @@ fn run(
     output: Arc<Mutex<Snapshot>>,
     changes: Arc<trames_shared::Readiness>,
     command_space: Arc<trames_shared::Readiness>,
+    resource_wake: Arc<dyn trames_shared::IoWake>,
 ) {
+    compositor
+        .state
+        .shm
+        .set_signal(trames_shared::IoSignal::new(
+            0,
+            Arc::downgrade(&resource_wake),
+        ));
     let mut stopped = false;
     let mut published = u64::MAX;
+    let mut fds = Vec::with_capacity(2);
     while !stopped {
         let mut commands_consumed = false;
-        while let Ok(command) = receiver.try_recv() {
+        loop {
+            let command = match receiver.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // A last Server lease can retire on this loop. Resource
+                    // notifications also retain its wake writer, so command
+                    // channel retirement must stop it independently of EOF.
+                    stopped = true;
+                    break;
+                }
+            };
             commands_consumed = true;
             match command {
                 Command::ConnectXwm(socket, key) => {
@@ -411,7 +456,8 @@ fn run(
             }
             changes.notify_locked();
         }
-        let mut fds = [
+        fds.clear();
+        fds.extend([
             libc::pollfd {
                 fd: compositor.display.as_fd().as_raw_fd(),
                 events: libc::POLLIN,
@@ -422,8 +468,8 @@ fn run(
                 events: libc::POLLIN,
                 revents: 0,
             },
-        ];
-        // SAFETY: two live native descriptors and a fixed initialized array.
+        ]);
+        fds.extend(compositor.shm_wait_fds());
         // A producer wakeup can precede fence completion. Sleeping a full 16ms
         // then misses a display refresh even when rendering itself was fast.
         // Keep the idle/backpressure timeout; only retry pending fences at 1ms.
@@ -431,6 +477,16 @@ fn run(
         if let Some(left) = callback_timeout {
             timeout = timeout.min(left.as_millis().saturating_add(1).min(16) as i32);
         }
+        if let Some(deadline) = compositor.state.shm.deadline() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            timeout = timeout.min(
+                left.as_millis()
+                    .saturating_add(u128::from(!left.is_zero()))
+                    .min(16) as i32,
+            );
+        }
+        // SAFETY: the display, wake socket and suspended native peer monitors
+        // all remain owned by this event loop for the complete poll call.
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             break;

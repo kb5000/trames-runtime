@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Exec prepares an image before committing task/resource replacement.
 use super::*;
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_exec_resource_tests.rs"]
+mod resource_tests;
 #[derive(Debug)]
 pub(crate) enum ImageError {
     Rejected(Errno),
     Unmappable,
+    Pending(Box<Retry>),
+}
+pub(crate) struct Retry {
+    request: Request,
+    wait: Arc<trames_memory::PageWait>,
+}
+impl std::fmt::Debug for Retry {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("original executable input waiting")
+    }
 }
 impl From<Errno> for ImageError {
     fn from(errno: Errno) -> Self {
@@ -17,6 +30,7 @@ impl ImageError {
         match self {
             Self::Rejected(errno) => errno,
             Self::Unmappable => Errno(8),
+            Self::Pending(_) => unreachable!("pending image input must retain its request"),
         }
     }
 }
@@ -114,6 +128,14 @@ impl<C: Cpu> Kernel<C> {
                 // Equivalent to a Linux segment mapping failure past begin_new_exec.
                 // An already accepted fatal group status wins over this SIGSEGV.
                 p.signals.io.lifecycle().request_exit(11);
+                Ok(None)
+            }
+            Err(ImageError::Pending(retry)) => {
+                let pending = Arc::new(Pending::new());
+                pending.complete(Err(ImageError::Pending(retry)));
+                p.exec_pending = Some(Preparation::Disk(pending));
+                p.state = State::Blocked(number, a);
+                put_args(&mut p.cpu, a);
                 Ok(None)
             }
         }
@@ -421,7 +443,7 @@ mod tests {
     fn mov(reg: u32, value: u32) -> u32 {
         0xd2800000 | (value & 0xffff) << 5 | reg
     }
-    fn elf(words: &[u32]) -> Vec<u8> {
+    pub(super) fn elf(words: &[u32]) -> Vec<u8> {
         let mut b = vec![0; 256 + words.len() * 4];
         b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
         for (at, v) in [(16, 2u16), (18, 183), (52, 64), (54, 56), (56, 1)] {
@@ -1384,6 +1406,29 @@ pub(crate) struct Request {
     options: crate::RuntimeOptions,
     clock_origin: Instant,
     search: bool,
+    actor: trames_vfs::FileActorSnapshot,
+    input: Option<Box<Inputs>>,
+}
+struct Inputs {
+    filename: Vec<u8>,
+    inaccessible: bool,
+    depth: usize,
+    access: Arc<trames_vfs::ExecutingFile>,
+    read: trames_vfs::ExecutableRead,
+    bytes: Option<Vec<u8>>,
+    loader: Option<InterpreterInput>,
+    credentials: Option<trames_vfs::ExecCredentials>,
+    mapping: Option<trames_elf::Loader>,
+    loaded: Option<trames_elf::LoadedElf>,
+    entry: Option<crate::InitialEntry>,
+    no_new_privs: Option<bool>,
+    stack: Option<u64>,
+}
+struct InterpreterInput {
+    file: Arc<trames_vfs::ExecutableFile>,
+    _access: Arc<trames_vfs::ExecutingFile>,
+    read: trames_vfs::ExecutableRead,
+    bytes: Option<Vec<u8>>,
 }
 impl Request {
     #[allow(clippy::too_many_arguments)]
@@ -1397,10 +1442,22 @@ impl Request {
         budget: usize,
         clock_origin: Instant,
     ) -> Self {
+        let resources = p
+            .signals
+            .io
+            .cgroup()
+            .map(trames_vfs::CgroupTask::resource_context)
+            .unwrap_or_default();
+        let _resources = resources.enter();
         Self {
             vfs: p.linux.vfs.clone(),
             file: None,
             search: false,
+            actor: trames_vfs::FileActorScope::frozen_for(
+                &p.linux.vfs.credentials,
+                p.linux.vfs.process_context(),
+            ),
+            input: None,
             dirfd,
             path,
             argv,
@@ -1444,6 +1501,7 @@ impl Request {
         environment: Vec<Vec<u8>>,
         budget: usize,
         clock_origin: Instant,
+        resources: trames_vfs::CgroupResourceContext,
     ) -> Self {
         let path = argv[0].clone();
         let mut request = Self::new(
@@ -1457,6 +1515,11 @@ impl Request {
             clock_origin,
         );
         request.search = !request.path.contains(&b'/');
+        let _resources = resources.enter();
+        request.actor = trames_vfs::FileActorScope::frozen_for(
+            &request.vfs.credentials,
+            request.vfs.process_context(),
+        );
         request
     }
     pub(super) fn capture<C: Cpu>(
@@ -1483,21 +1546,30 @@ impl Request {
         request.file = file;
         Ok(request)
     }
-    pub(crate) fn load<C: Cpu>(self) -> Result<Image<C>, ImageError> {
-        let Self {
-            vfs,
-            mut file,
-            dirfd,
-            mut path,
-            mut argv,
-            envp,
-            flags,
-            options,
-            clock_origin,
-            search,
-        } = self;
-        if search {
-            let paths = envp
+    pub(crate) fn load<C: Cpu>(mut self) -> Result<Image<C>, ImageError> {
+        let _actor = self.actor.enter();
+        let mapping = self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.mapping.is_some() || input.loaded.is_some());
+        let wait = if !mapping { self.read_inputs()? } else { None };
+        let wait = match wait {
+            Some(wait) => Some(wait),
+            None => self.prepare_mapping::<C>()?,
+        };
+        if let Some(wait) = wait {
+            return Err(ImageError::Pending(Box::new(Retry {
+                request: self,
+                wait,
+            })));
+        }
+        let input = *self.input.take().expect("accepted executable inputs");
+        self.load_image(input)
+    }
+    fn begin_input(&mut self) -> Result<(), ImageError> {
+        if self.search {
+            let paths = self
+                .envp
                 .iter()
                 .find_map(|e| e.strip_prefix(b"PATH="))
                 .unwrap_or(b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -1508,8 +1580,8 @@ impl Request {
                 if !candidate.is_empty() {
                     candidate.push(b'/');
                 }
-                candidate.extend_from_slice(&path);
-                match vfs.executable_file_at(AT_FDCWD, &candidate, 0) {
+                candidate.extend_from_slice(&self.path);
+                match self.vfs.executable_file_at(AT_FDCWD, &candidate, 0) {
                     Ok(open) => {
                         found = Some((candidate, open));
                         break;
@@ -1519,130 +1591,263 @@ impl Request {
                     Err(e) => return Err(e.into()),
                 }
             }
-            let (found, open) = found.ok_or(Errno(if denied { 13 } else { 2 }))?;
-            path = found;
-            file = Some(open);
+            let (path, file) = found.ok_or(Errno(if denied { 13 } else { 2 }))?;
+            self.path = path;
+            self.file = Some(file);
+            self.search = false;
         }
-        let budget = options.memory_limits.per_process;
-        if path.is_empty() && flags & 0x1000 == 0 {
+        if self.path.is_empty() && self.flags & 0x1000 == 0 {
             return Err(Errno(2).into());
         }
-        if flags & !0x1100 != 0 {
+        if self.flags & !0x1100 != 0 {
             return Err(Errno(22).into());
         }
-        let via_fd = path.is_empty() || !path.starts_with(b"/") && dirfd != AT_FDCWD;
+        let via_fd = self.path.is_empty() || !self.path.starts_with(b"/") && self.dirfd != AT_FDCWD;
         let filename = if via_fd {
-            let mut name = format!("/dev/fd/{dirfd}").into_bytes();
-            if !path.is_empty() {
+            let mut name = format!("/dev/fd/{}", self.dirfd).into_bytes();
+            if !self.path.is_empty() {
                 name.push(b'/');
-                name.extend_from_slice(&path);
+                name.extend_from_slice(&self.path);
             }
             name
         } else {
-            path.clone()
+            self.path.clone()
         };
-        let mut file = match file {
-            Some(file) => file,
-            None => vfs.executable_file_at(dirfd, &path, flags)?,
-        };
-        let inaccessible = via_fd && vfs.flags(dirfd as u32)? & trames_vfs::O_CLOEXEC != 0;
-        if argv.is_empty() {
-            argv.push(Vec::new());
-        }
-        for depth in 0..=5 {
-            let executable_access = file.begin_execution()?;
-            let bytes = file.bytes()?;
-            if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
-                if depth == 0 && inaccessible {
-                    return Err(Errno(2).into());
-                }
-                if depth == 5 {
-                    return Err(Errno(40).into());
-                }
-                let mut next = vec![interpreter.clone()];
-                if let Some(argument) = optional {
-                    next.push(argument);
-                }
-                next.push(if depth == 0 {
-                    filename.clone()
-                } else {
-                    path.clone()
-                });
-                next.extend(argv.into_iter().skip(1));
-                argv = next;
-                path = interpreter;
-                file = vfs.executable_file_at(AT_FDCWD, &path, 0)?;
-                continue;
-            }
-            let mut execute_vfs = vfs;
-            let mut credentials = execute_vfs.exec_credentials(&file)?;
-            let exec_error = |e| match e {
-                RuntimeError::Elf(trames_elf::ElfError::SegmentMapping(_)) => {
-                    ImageError::Unmappable
-                }
-                RuntimeError::Arguments(_) => Errno(7).into(),
-                RuntimeError::Memory(_)
-                | RuntimeError::Configuration(_)
-                | RuntimeError::Elf(trames_elf::ElfError::Memory(_)) => Errno(12).into(),
-                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n).into(),
-                _ => Errno(8).into(),
-            };
-            // Resolve PT_INTERP as the caller, before installing set-ID credentials.
-            let elf = Runtime::<C>::load_elf(
-                &bytes,
-                &execute_vfs,
-                options,
-                Some(&file),
-                Some(&mut credentials),
-            )
-            .map_err(exec_error)?;
-            let no_new_privs = credentials.apply(&mut execute_vfs);
-            let mut runtime = Runtime::<C>::start_image(
-                elf,
-                &argv,
-                &envp,
-                &execute_vfs,
-                options,
-                Some(&filename),
-                Some(executable_access),
-            )
-            .map_err(exec_error)?;
-            crate::clock::initialize::<C>(
-                &mut runtime.memory,
-                &runtime.linux.auxiliary,
-                clock_origin,
-            )
-            .map_err(|_| Errno(12))?;
-            if runtime.memory.resident_bytes() > budget {
-                return Err(Errno(12).into());
-            }
-            runtime.linux.command_name.set(
-                &(filename
-                    .rsplit(|b| *b == b'/')
-                    .next()
-                    .unwrap_or_default()
-                    .iter()
-                    .copied()
-                    .take(15)
-                    .collect::<Vec<_>>()),
-            );
-            runtime.linux.vfs.credentials = execute_vfs.credentials.clone();
-            runtime
-                .linux
+        let file = match &self.file {
+            Some(file) => file.clone(),
+            None => self
                 .vfs
-                .install_exec_dumpable(execute_vfs.dumpable_state());
-            return Ok(Image {
-                cpu: runtime.cpu,
-                memory: runtime.memory,
-                linux: runtime.linux,
-                credentials,
-                no_new_privs,
-                externally_shared_fs: false,
-            });
+                .executable_file_at(self.dirfd, &self.path, self.flags)?,
+        };
+        let inaccessible =
+            via_fd && self.vfs.flags(self.dirfd as u32)? & trames_vfs::O_CLOEXEC != 0;
+        if self.argv.is_empty() {
+            self.argv.push(Vec::new());
         }
-        Err(Errno(40).into())
+        let access = file.begin_execution()?;
+        let read = trames_vfs::ExecutableRead::new(file.clone())?;
+        self.file = Some(file);
+        self.input = Some(Box::new(Inputs {
+            filename,
+            inaccessible,
+            depth: 0,
+            access,
+            read,
+            bytes: None,
+            loader: None,
+            credentials: None,
+            mapping: None,
+            loaded: None,
+            entry: None,
+            no_new_privs: None,
+            stack: None,
+        }));
+        Ok(())
+    }
+    fn read_inputs(&mut self) -> Result<Option<Arc<trames_memory::PageWait>>, ImageError> {
+        if self.input.is_none() {
+            self.begin_input()?;
+        }
+        loop {
+            let input = self.input.as_mut().unwrap();
+            if input.bytes.is_none() {
+                let Some(bytes) = input.read.run()? else {
+                    return Ok(Some(
+                        input.read.wait().expect("original executable wait").clone(),
+                    ));
+                };
+                if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
+                    if input.depth == 0 && input.inaccessible {
+                        return Err(Errno(2).into());
+                    }
+                    if input.depth == 5 {
+                        return Err(Errno(40).into());
+                    }
+                    let mut next = vec![interpreter.clone()];
+                    next.extend(optional);
+                    next.push(if input.depth == 0 {
+                        input.filename.clone()
+                    } else {
+                        self.path.clone()
+                    });
+                    next.extend(std::mem::take(&mut self.argv).into_iter().skip(1));
+                    self.argv = next;
+                    self.path = interpreter;
+                    let file = self.vfs.executable_file_at(AT_FDCWD, &self.path, 0)?;
+                    let access = file.begin_execution()?;
+                    let read = trames_vfs::ExecutableRead::new(file.clone())?;
+                    self.file = Some(file);
+                    input.depth += 1;
+                    input.access = access;
+                    input.read = read;
+                    continue;
+                }
+                input.bytes = Some(bytes);
+            }
+            if input.credentials.is_none() {
+                let mut credentials = self.vfs.exec_credentials(self.file.as_ref().unwrap())?;
+                self.options.memory_limits.validate().map_err(image_error)?;
+                let interpreter = trames_elf::interpreter(input.bytes.as_ref().unwrap())
+                    .map_err(|e| image_error(RuntimeError::Elf(e)))?;
+                if let Some(path) = interpreter {
+                    let file = self.vfs.executable_file_at(AT_FDCWD, path, 0)?;
+                    credentials.include_interpreter(&self.vfs, &file);
+                    let access = file.begin_execution()?;
+                    let read = trames_vfs::ExecutableRead::new(file.clone())?;
+                    input.loader = Some(InterpreterInput {
+                        file,
+                        _access: access,
+                        read,
+                        bytes: None,
+                    });
+                }
+                input.credentials = Some(credentials);
+            }
+            if let Some(loader) = &mut input.loader {
+                if loader.bytes.is_none() {
+                    let Some(bytes) = loader.read.run()? else {
+                        return Ok(Some(
+                            loader.read.wait().expect("original PT_INTERP wait").clone(),
+                        ));
+                    };
+                    loader.bytes = Some(bytes);
+                }
+            }
+            return Ok(None);
+        }
+    }
+    fn prepare_mapping<C: Cpu>(
+        &mut self,
+    ) -> Result<Option<Arc<trames_memory::PageWait>>, ImageError> {
+        let input = self.input.as_mut().expect("accepted executable inputs");
+        if input.mapping.is_none() && input.loaded.is_none() {
+            self.options.memory_limits.validate().map_err(image_error)?;
+            self.options
+                .memory_limits
+                .configure_shared_memory(&self.vfs);
+            if self.options.video_accelerator {
+                self.vfs.enable_video_device();
+            }
+            let interpreter = input.loader.as_mut().map(|loader| {
+                (
+                    loader.bytes.take().expect("original PT_INTERP bytes"),
+                    Some(self.vfs.executable_mapping(&loader.file)),
+                )
+            });
+            input.mapping = Some(
+                trames_elf::Loader::new(
+                    input.bytes.take().expect("original main image bytes"),
+                    self.options.memory_limits.per_process,
+                    Some(self.vfs.executable_mapping(self.file.as_ref().unwrap())),
+                    interpreter,
+                )
+                .map_err(|error| image_error(RuntimeError::Elf(error)))?,
+            );
+        }
+        if input.loaded.is_none() {
+            let mapping = input.mapping.as_mut().unwrap();
+            input.loaded = mapping
+                .run()
+                .map_err(|error| image_error(RuntimeError::Elf(error)))?;
+            if input.loaded.is_none() {
+                return Ok(Some(mapping.wait().unwrap().clone()));
+            }
+            input.mapping = None;
+        }
+        if input.no_new_privs.is_none() {
+            input.no_new_privs = Some(input.credentials.as_ref().unwrap().apply(&mut self.vfs));
+        }
+        let loaded = input.loaded.as_mut().unwrap();
+        if input.entry.is_none() {
+            input.entry = Some(crate::InitialEntry::new(&loaded.memory).map_err(image_error)?);
+        }
+        let result = input.entry.as_mut().unwrap().run::<C>(
+            loaded,
+            &self.argv,
+            &self.envp,
+            &self.vfs.credentials,
+            self.options,
+            Some(&input.filename),
+        );
+        match result {
+            Ok(stack) => {
+                input.stack = Some(stack);
+                Ok(None)
+            }
+            Err(RuntimeError::Memory(trames_memory::MemoryError::Pending(fault))) => {
+                Ok(Some(fault.wait))
+            }
+            Err(error) => Err(image_error(error)),
+        }
+    }
+    fn load_image<C: Cpu>(self, mut input: Inputs) -> Result<Image<C>, ImageError> {
+        let Self {
+            vfs: execute_vfs,
+            argv,
+            envp,
+            options,
+            clock_origin,
+            ..
+        } = self;
+        let credentials = input.credentials.take().unwrap();
+        let no_new_privs = input.no_new_privs.unwrap();
+        let mut runtime = Runtime::<C>::start_image_at(
+            input
+                .loaded
+                .take()
+                .expect("completed original image mappings"),
+            &argv,
+            &envp,
+            &execute_vfs,
+            options,
+            Some(&input.filename),
+            Some(input.access),
+            input.stack,
+        )
+        .map_err(image_error)?;
+        crate::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, clock_origin)
+            .map_err(|_| Errno(12))?;
+        if runtime.memory.resident_bytes() > options.memory_limits.per_process {
+            return Err(Errno(12).into());
+        }
+        runtime.linux.command_name.set(
+            &(input
+                .filename
+                .rsplit(|b| *b == b'/')
+                .next()
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .take(15)
+                .collect::<Vec<_>>()),
+        );
+        runtime.linux.vfs.credentials = execute_vfs.credentials.clone();
+        runtime
+            .linux
+            .vfs
+            .install_exec_dumpable(execute_vfs.dumpable_state());
+        Ok(Image {
+            cpu: runtime.cpu,
+            memory: runtime.memory,
+            linux: runtime.linux,
+            credentials,
+            no_new_privs,
+            externally_shared_fs: false,
+        })
     }
 }
+fn image_error(error: RuntimeError) -> ImageError {
+    match error {
+        RuntimeError::Elf(trames_elf::ElfError::SegmentMapping(_)) => ImageError::Unmappable,
+        RuntimeError::Arguments(_) => Errno(7).into(),
+        RuntimeError::Memory(_)
+        | RuntimeError::Configuration(_)
+        | RuntimeError::Elf(trames_elf::ElfError::Memory(_)) => Errno(12).into(),
+        RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n).into(),
+        _ => Errno(8).into(),
+    }
+}
+
 pub(crate) trait Executor<C: Cpu>: Send + Sync {
     fn submit_image(&self, request: Request, result: Arc<Pending<C>>);
 }
@@ -1652,6 +1857,11 @@ pub(super) enum Preparation<C: Cpu> {
     Disk(Arc<Pending<C>>),
 }
 impl<C: Cpu> Preparation<C> {
+    pub(super) fn resume(&self, executor: &dyn Executor<C>) {
+        if let Self::Disk(pending) = self {
+            pending.resume(executor);
+        }
+    }
     pub(super) fn ready(&self) -> bool {
         match self {
             Self::PeerExit(_, hold) => hold.acknowledgement.finished(),
@@ -1669,9 +1879,9 @@ impl<C: Cpu> Preparation<C> {
     pub(super) fn subscribe(
         &self,
         signal: &Arc<trames_shared::IoSignal>,
-    ) -> trames_shared::IoSubscription {
+    ) -> Vec<trames_shared::IoSubscription> {
         match self {
-            Self::PeerExit(_, hold) => hold.acknowledgement.subscribe(signal),
+            Self::PeerExit(_, hold) => vec![hold.acknowledgement.subscribe(signal)],
             Self::Disk(pending) => pending.subscribe(signal),
             Self::Error(_) => unreachable!("inline errors never wait"),
         }
@@ -1679,6 +1889,7 @@ impl<C: Cpu> Preparation<C> {
 }
 pub(crate) struct Pending<C: Cpu> {
     result: std::sync::Mutex<Option<Result<Image<C>, ImageError>>>,
+    waiting: std::sync::Mutex<Option<Box<Retry>>>,
     ready: std::sync::atomic::AtomicBool,
     readiness: Arc<trames_shared::Readiness>,
 }
@@ -1686,14 +1897,35 @@ impl<C: Cpu> Pending<C> {
     pub(super) fn new() -> Self {
         Self {
             result: Default::default(),
+            waiting: Default::default(),
             ready: Default::default(),
             readiness: Arc::default(),
         }
     }
     pub(crate) fn complete(&self, result: Result<Image<C>, ImageError>) {
-        *self.result.lock().unwrap() = Some(result);
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        match result {
+            Err(ImageError::Pending(retry)) => *self.waiting.lock().unwrap() = Some(retry),
+            result => {
+                *self.result.lock().unwrap() = Some(result);
+                self.ready.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         self.readiness.notify_locked();
+    }
+    fn resume(self: &Arc<Self>, executor: &dyn Executor<C>) {
+        let retry = {
+            let mut waiting = self.waiting.lock().unwrap();
+            if waiting.as_ref().is_some_and(|retry| retry.wait.ready()) {
+                waiting.take()
+            } else {
+                None
+            }
+        };
+        if let Some(retry) = retry {
+            let Retry { request, wait } = *retry;
+            drop(wait);
+            executor.submit_image(request, self.clone());
+        }
     }
     pub(super) fn ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Acquire)
@@ -1704,7 +1936,20 @@ impl<C: Cpu> Pending<C> {
     pub(super) fn subscribe(
         &self,
         signal: &Arc<trames_shared::IoSignal>,
-    ) -> trames_shared::IoSubscription {
-        self.readiness.subscribe(signal)
+    ) -> Vec<trames_shared::IoSubscription> {
+        let mut subscriptions = vec![self.readiness.subscribe(signal)];
+        let wait = self
+            .waiting
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|retry| retry.wait.clone());
+        if let Some(wait) = wait {
+            subscriptions.extend(wait.subscribe(signal));
+            if wait.ready() {
+                signal.notify();
+            }
+        }
+        subscriptions
     }
 }

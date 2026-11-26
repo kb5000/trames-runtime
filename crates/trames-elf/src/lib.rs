@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Checked ELF64/AArch64 loading; the guest interpreter performs dynamic relocation.
 use std::fmt;
+mod load;
+pub use load::Loader;
 
 // Keep the low 4 GiB available for runtimes with compressed heap/image pointers
 // (notably ART). This is a guest virtual address, not reserved resident memory.
@@ -49,6 +51,8 @@ pub struct LoadedElf {
     pub data: (u64, u64),
     pub brk_base: u64,
 }
+#[cfg(test)]
+mod load_tests;
 
 #[derive(Debug)]
 struct Segment {
@@ -106,43 +110,42 @@ pub fn load_with_files(
     main_file: Option<&MappingFileInfo>,
     mut resolve: impl FnMut(&[u8]) -> Result<(Vec<u8>, Option<MappingFileInfo>), ElfError>,
 ) -> Result<LoadedElf, ElfError> {
-    let mut memory = Memory::new(memory_limit);
     let header = Header::parse(bytes, 0x4000_0000)?;
     // Linux opens and validates PT_INTERP before begin_new_exec. A missing
     // loader must still return ENOENT even if a later PT_LOAD cannot map.
     let interpreter = header.interpreter.map(&mut resolve).transpose()?;
-    let loader_header = interpreter
-        .as_ref()
-        .map(|(bytes, _)| {
-            let header = Header::parse(bytes, INTERPRETER_BASE).map_err(|err| match err {
-                ElfError::Invalid(_) | ElfError::Unsupported(_) => ElfError::Interpreter(80),
-                other => other,
-            })?;
-            if header.interpreter.is_some() {
-                return Err(ElfError::Invalid("nested PT_INTERP"));
+    let mut load = Loader::new(
+        bytes.to_vec(),
+        memory_limit,
+        main_file.cloned(),
+        interpreter,
+    )?;
+    let mut wait = None;
+    loop {
+        if let Some(loaded) = load.run()? {
+            return Ok(loaded);
+        }
+        let page = load.wait().expect("retained ELF mapping wait");
+        let wait = match &mut wait {
+            Some(wait) => wait,
+            slot @ None => {
+                slot.insert(trames_shared::HostWait::new().map_err(|_| MemoryError::BackingIo(5))?)
             }
-            Ok(header)
-        })
-        .transpose()?;
-    let main = map_image(bytes, &mut memory, header, main_file)?;
-    let (start_entry, interpreter_base) =
-        if let Some(((bytes, file), header)) = interpreter.as_ref().zip(loader_header) {
-            let loader = map_image(bytes, &mut memory, header, file.as_ref())?;
-            (loader.entry, loader.bias)
-        } else {
-            (main.entry, 0)
         };
-    Ok(LoadedElf {
-        memory,
-        entry: main.entry,
-        phdr: main.phdr,
-        phnum: main.phnum,
-        start_entry,
-        interpreter_base,
-        code: main.executable.code,
-        data: main.executable.data,
-        brk_base: main.executable.start_brk,
-    })
+        wait.begin();
+        wait.retain(page.subscribe(wait.signal()));
+        if let Some(deadline) = page.deadline() {
+            wait.until(deadline);
+        }
+        if !page.ready() {
+            wait.wait().map_err(|_| MemoryError::BackingIo(5))?;
+        }
+    }
+}
+/// Validate the original header and identify an input which must be accepted
+/// before segment mappings start. Shared with the synchronous loader's parser.
+pub fn interpreter(bytes: &[u8]) -> Result<Option<&[u8]>, ElfError> {
+    Ok(Header::parse(bytes, 0x4000_0000)?.interpreter)
 }
 struct Image {
     entry: u64,
@@ -232,175 +235,233 @@ impl<'a> Header<'a> {
         })
     }
 }
-fn map_image(
-    bytes: &[u8],
-    memory: &mut Memory,
-    header: Header<'_>,
-    file: Option<&MappingFileInfo>,
-) -> Result<Image, ElfError> {
-    use ElfError::{Invalid, SegmentMapping};
-    let Header {
-        bias,
-        phoff,
-        phend,
-        phnum,
-        interpreter,
-    } = header;
-    let entry = u64_at(bytes, 24)
-        .checked_add(bias)
-        .ok_or(SegmentMapping("entry overflow"))?;
-    let mut segments = Vec::new();
-    let mut code = (u64::MAX, 0u64);
-    let mut data = (0u64, 0u64);
-    for pos in (phoff..phend).step_by(PH_SIZE) {
-        if u32_at(bytes, pos) != 1 {
-            continue;
-        }
-        let flags = u32_at(bytes, pos + 4);
-        if flags & !7 != 0 {
-            return Err(Invalid("PT_LOAD flags"));
-        }
-        let offset =
-            usize::try_from(u64_at(bytes, pos + 8)).map_err(|_| Invalid("segment offset"))?;
-        let address = u64_at(bytes, pos + 16)
+struct ImageWork {
+    image: Option<Image>,
+    segments: Vec<Segment>,
+    index: usize,
+    mapped: bool,
+    recorded: bool,
+    written: usize,
+    protected: u8,
+    phoff: usize,
+    phend: usize,
+}
+impl ImageWork {
+    fn new(bytes: &[u8], memory: &Memory, header: Header<'_>) -> Result<Self, ElfError> {
+        use ElfError::{Invalid, SegmentMapping};
+        let Header {
+            bias,
+            phoff,
+            phend,
+            phnum,
+            interpreter,
+        } = header;
+        let entry = u64_at(bytes, 24)
             .checked_add(bias)
-            .ok_or(SegmentMapping("segment bias overflow"))?;
-        let filesz =
-            usize::try_from(u64_at(bytes, pos + 32)).map_err(|_| Invalid("segment size"))?;
-        let memsz = u64_at(bytes, pos + 40);
-        let align = u64_at(bytes, pos + 48);
-        if filesz as u64 > memsz {
-            return Err(SegmentMapping("p_filesz exceeds p_memsz"));
+            .ok_or(SegmentMapping("entry overflow"))?;
+        let mut segments = Vec::new();
+        let mut code = (u64::MAX, 0u64);
+        let mut data = (0u64, 0u64);
+        for pos in (phoff..phend).step_by(PH_SIZE) {
+            if u32_at(bytes, pos) != 1 {
+                continue;
+            }
+            let flags = u32_at(bytes, pos + 4);
+            if flags & !7 != 0 {
+                return Err(Invalid("PT_LOAD flags"));
+            }
+            let offset =
+                usize::try_from(u64_at(bytes, pos + 8)).map_err(|_| Invalid("segment offset"))?;
+            let address = u64_at(bytes, pos + 16)
+                .checked_add(bias)
+                .ok_or(SegmentMapping("segment bias overflow"))?;
+            let filesz =
+                usize::try_from(u64_at(bytes, pos + 32)).map_err(|_| Invalid("segment size"))?;
+            let memsz = u64_at(bytes, pos + 40);
+            let align = u64_at(bytes, pos + 48);
+            if filesz as u64 > memsz {
+                return Err(SegmentMapping("p_filesz exceeds p_memsz"));
+            }
+            if filesz != 0
+                && offset
+                    .checked_add(filesz)
+                    .is_none_or(|end| end > bytes.len().next_multiple_of(PAGE_SIZE as usize))
+            {
+                return Err(Invalid("segment outside file"));
+            }
+            if filesz != 0 && address % PAGE_SIZE != offset as u64 % PAGE_SIZE {
+                return Err(SegmentMapping("segment page offset"));
+            }
+            if align > 1 && (!align.is_power_of_two() || address % align != offset as u64 % align) {
+                return Err(Invalid("segment alignment"));
+            }
+            let end = address
+                .checked_add(memsz)
+                .filter(|&end| address < ADDRESS_LIMIT && end <= ADDRESS_LIMIT)
+                .ok_or(SegmentMapping("segment address range"))?;
+            // Linux binfmt_elf records file-backed ends, excluding the BSS tail.
+            let file_end = address + filesz as u64;
+            code.0 = code.0.min(address);
+            if flags & 1 != 0 {
+                code.1 = code.1.max(file_end);
+            }
+            data.0 = data.0.max(address);
+            data.1 = data.1.max(file_end);
+            if memsz == 0 {
+                continue;
+            }
+            let base = address & !(PAGE_SIZE - 1);
+            let page_end = end
+                .checked_add(PAGE_SIZE - 1)
+                .ok_or(SegmentMapping("page range"))?
+                & !(PAGE_SIZE - 1);
+            let permissions = Permissions {
+                read: flags & 4 != 0,
+                write: flags & 2 != 0,
+                execute: flags & 1 != 0,
+            };
+            segments.push(Segment {
+                offset,
+                filesz,
+                memsz,
+                permissions,
+                base,
+                size: page_end - base,
+            });
         }
-        if filesz != 0
-            && offset
-                .checked_add(filesz)
-                .is_none_or(|end| end > bytes.len().next_multiple_of(PAGE_SIZE as usize))
+        // PT_INTERP supplies the first instruction. The main entry is AT_ENTRY
+        // data for that loader, including executables with no main entry point.
+        if interpreter.is_none()
+            && (!entry.is_multiple_of(4)
+                || !segments
+                    .iter()
+                    .any(|s| s.permissions.execute && (s.base..s.base + s.size).contains(&entry)))
         {
-            return Err(Invalid("segment outside file"));
+            return Err(Invalid("entry is not aligned inside an executable mapping"));
         }
-        if filesz != 0 && address % PAGE_SIZE != offset as u64 % PAGE_SIZE {
-            return Err(SegmentMapping("segment page offset"));
+        let end = segments
+            .iter()
+            .map(|s| s.base + s.size)
+            .max()
+            .ok_or(Invalid("no load segments"))?;
+        // A fixed segment in a single image may replace an earlier segment.
+        // A separately placed PIE interpreter must not replace the main image.
+        if bias != 0 && segments.iter().any(|s| !memory.is_free(s.base, s.size)) {
+            return Err(SegmentMapping("dynamic image address collision"));
         }
-        if align > 1 && (!align.is_power_of_two() || address % align != offset as u64 % align) {
-            return Err(Invalid("segment alignment"));
-        }
-        let end = address
-            .checked_add(memsz)
-            .filter(|&end| address < ADDRESS_LIMIT && end <= ADDRESS_LIMIT)
-            .ok_or(SegmentMapping("segment address range"))?;
-        // Linux binfmt_elf records file-backed ends, excluding the BSS tail.
-        let file_end = address + filesz as u64;
-        code.0 = code.0.min(address);
-        if flags & 1 != 0 {
-            code.1 = code.1.max(file_end);
-        }
-        data.0 = data.0.max(address);
-        data.1 = data.1.max(file_end);
-        if memsz == 0 {
-            continue;
-        }
-        let base = address & !(PAGE_SIZE - 1);
-        let page_end = end
-            .checked_add(PAGE_SIZE - 1)
-            .ok_or(SegmentMapping("page range"))?
-            & !(PAGE_SIZE - 1);
-        let permissions = Permissions {
-            read: flags & 4 != 0,
-            write: flags & 2 != 0,
-            execute: flags & 1 != 0,
-        };
-        segments.push(Segment {
-            offset,
-            filesz,
-            memsz,
-            permissions,
-            base,
-            size: page_end - base,
-        });
+        Ok(Self {
+            image: Some(Image {
+                entry,
+                phdr: None,
+                phnum,
+                bias,
+                executable: trames_memory::ExecutableRanges {
+                    code,
+                    data,
+                    start_brk: end,
+                },
+            }),
+            segments,
+            index: 0,
+            mapped: false,
+            recorded: false,
+            written: 0,
+            protected: 0,
+            phoff,
+            phend,
+        })
     }
-    // PT_INTERP supplies the first instruction. The main entry is AT_ENTRY
-    // data for that loader, including executables with no main entry point.
-    if interpreter.is_none()
-        && (!entry.is_multiple_of(4)
-            || !segments
-                .iter()
-                .any(|s| s.permissions.execute && (s.base..s.base + s.size).contains(&entry)))
-    {
-        return Err(Invalid("entry is not aligned inside an executable mapping"));
-    }
-    let mut phdr = None;
-    let end = segments
-        .iter()
-        .map(|s| s.base + s.size)
-        .max()
-        .ok_or(Invalid("no load segments"))?;
-    // A fixed segment in a single image may replace an earlier segment.
-    // A separately placed PIE interpreter must not replace the main image.
-    if bias != 0 && segments.iter().any(|s| !memory.is_free(s.base, s.size)) {
-        return Err(SegmentMapping("dynamic image address collision"));
-    }
-    for s in segments {
-        match memory.map(s.base, s.size, Permissions::RW) {
-            Err(MemoryError::Overlap(_)) => memory.map_fixed(s.base, s.size, Permissions::RW)?,
-            other => other?,
-        }
-        if phdr.is_some_and(|p| (s.base..s.base + s.size).contains(&p)) {
-            phdr = None;
-        }
-        let mut file_pages = 0;
-        if s.filesz != 0 {
-            // mmap exposes the prefix of the first file page and the last
-            // page up to EOF. BSS starts exactly at p_filesz when present.
-            let start = s.offset & !(PAGE_SIZE as usize - 1);
-            let file_end = s.offset + s.filesz;
-            let end = if s.memsz == s.filesz as u64 {
-                file_end.next_multiple_of(PAGE_SIZE as usize)
-            } else {
-                file_end
+    fn run(
+        &mut self,
+        bytes: &[u8],
+        memory: &mut Memory,
+        file: Option<&MappingFileInfo>,
+    ) -> Result<Image, ElfError> {
+        while let Some(s) = self.segments.get(self.index) {
+            let image = self.image.as_mut().expect("unpublished ELF image");
+            if !self.mapped {
+                match memory.map(s.base, s.size, Permissions::RW) {
+                    Err(MemoryError::Overlap(_)) => {
+                        memory.map_fixed(s.base, s.size, Permissions::RW)?
+                    }
+                    other => other?,
+                }
+                if image
+                    .phdr
+                    .is_some_and(|p| (s.base..s.base + s.size).contains(&p))
+                {
+                    image.phdr = None;
+                }
+                self.mapped = true;
             }
-            .min(bytes.len());
-            file_pages = (file_end.next_multiple_of(PAGE_SIZE as usize) - start) as u64;
-            if let Some(file) = file {
-                memory.record_image_file(s.base, file_pages, start as u64, file.clone());
-            }
-            if start < end {
-                memory.write(s.base, &bytes[start..end])?;
-                // Keep the first surviving complete header mapping. Later
-                // PT_LOADs can expose the same file-page prefix at another
-                // virtual address; that alias has a different load bias and
-                // must not replace the main image's AT_PHDR.
-                if phdr.is_none() && start <= phoff && phend <= end {
-                    phdr = Some(s.base + (phoff - start) as u64);
+            let mut file_pages = 0;
+            if s.filesz != 0 {
+                // mmap exposes the prefix of the first file page and the last
+                // page up to EOF. BSS starts exactly at p_filesz when present.
+                let start = s.offset & !(PAGE_SIZE as usize - 1);
+                let file_end = s.offset + s.filesz;
+                let end = if s.memsz == s.filesz as u64 {
+                    file_end.next_multiple_of(PAGE_SIZE as usize)
+                } else {
+                    file_end
+                }
+                .min(bytes.len());
+                file_pages = (file_end.next_multiple_of(PAGE_SIZE as usize) - start) as u64;
+                if !self.recorded {
+                    if let Some(file) = file {
+                        memory.record_image_file(s.base, file_pages, start as u64, file.clone());
+                    }
+                    self.recorded = true;
+                }
+                if start < end {
+                    while self.written < end - start {
+                        let count = (end - start - self.written).min(PAGE_SIZE as usize);
+                        memory.write(
+                            s.base + self.written as u64,
+                            &bytes[start + self.written..start + self.written + count],
+                        )?;
+                        self.written += count;
+                    }
+                    // Keep the first surviving complete header mapping. Later
+                    // PT_LOADs can expose the same file-page prefix at another
+                    // virtual address; that alias has a different load bias and
+                    // must not replace the main image's AT_PHDR.
+                    if image.phdr.is_none() && start <= self.phoff && self.phend <= end {
+                        image.phdr = Some(s.base + (self.phoff - start) as u64);
+                    }
                 }
             }
-        }
-        // Linux allocates complete anonymous BSS pages with brk semantics.
-        // The partial BSS tail inside a file page keeps the segment protection.
-        let anonymous = Permissions {
-            execute: s.permissions.execute,
-            ..Permissions::RW
-        };
-        if file_pages == s.size || anonymous == s.permissions {
-            memory.protect(s.base, s.size, s.permissions)?;
-        } else {
-            if file_pages != 0 {
-                memory.protect(s.base, file_pages, s.permissions)?;
+            // Linux allocates complete anonymous BSS pages with brk semantics.
+            // The partial BSS tail inside a file page keeps the segment protection.
+            let anonymous = Permissions {
+                execute: s.permissions.execute,
+                ..Permissions::RW
+            };
+            if file_pages == s.size || anonymous == s.permissions {
+                if self.protected == 0 {
+                    memory.protect(s.base, s.size, s.permissions)?;
+                    self.protected = 2;
+                }
+            } else {
+                if self.protected == 0 && file_pages != 0 {
+                    memory.protect(s.base, file_pages, s.permissions)?;
+                }
+                if self.protected == 0 {
+                    self.protected = 1;
+                }
+                if self.protected == 1 {
+                    memory.protect(s.base + file_pages, s.size - file_pages, anonymous)?;
+                    self.protected = 2;
+                }
             }
-            memory.protect(s.base + file_pages, s.size - file_pages, anonymous)?;
+            self.index += 1;
+            self.mapped = false;
+            self.recorded = false;
+            self.written = 0;
+            self.protected = 0;
         }
+        Ok(self.image.take().expect("completed ELF image"))
     }
-    Ok(Image {
-        entry,
-        phdr,
-        phnum,
-        bias,
-        executable: trames_memory::ExecutableRanges {
-            code,
-            data,
-            start_brk: end,
-        },
-    })
 }
 
 #[cfg(test)]

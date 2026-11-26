@@ -84,6 +84,7 @@ pub(super) struct ConcurrentPage {
     bytes: Option<Arc<page::MutablePage>>,
     loaded: std::sync::OnceLock<Arc<page::MutablePage>>,
     source: Option<Arc<dyn PageSource>>,
+    source_generation: u64,
     private_source: bool,
     dirty: AtomicU64,
     version: AtomicU64,
@@ -98,6 +99,7 @@ impl ConcurrentPage {
             bytes: Some(bytes),
             loaded: Default::default(),
             source: None,
+            source_generation: 0,
             private_source: false,
             constant: None,
             dirty: AtomicU64::new(0),
@@ -112,6 +114,7 @@ impl ConcurrentPage {
         private_source: bool,
         code_epoch: Arc<AtomicU64>,
     ) -> Self {
+        let source_generation = source.generation();
         Self {
             identity,
             hardware_constant: Default::default(),
@@ -119,6 +122,7 @@ impl ConcurrentPage {
             bytes: None,
             loaded: Default::default(),
             source: Some(source),
+            source_generation,
             private_source,
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
@@ -202,6 +206,7 @@ impl ConcurrentPage {
             bytes: mutable,
             loaded: Default::default(),
             source: None,
+            source_generation: 0,
             private_source: false,
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
@@ -329,7 +334,7 @@ fn direct_matches(page: &Page, frame: &Frame) -> bool {
     let backing = page
         .backing
         .as_ref()
-        .filter(|b| b.shared || !b.private_copy);
+        .filter(|b| b.shared || !b.private_current());
     // A deferred shared source may first become resident on a worker. The
     // original root Page still owns that source, rather than a resident byte
     // alias. Joining those writes must not demand a second materialization.
@@ -337,7 +342,10 @@ fn direct_matches(page: &Page, frame: &Frame) -> bool {
         && frame.bytes.source.as_ref().is_some_and(|source| {
             backing
                 .and_then(|b| b.object.page_source())
-                .is_some_and(|original| Arc::ptr_eq(&original, source))
+                .is_some_and(|original| {
+                    Arc::ptr_eq(&original, source)
+                        && original.generation() == frame.bytes.source_generation
+                })
         })
     {
         return true;
@@ -358,6 +366,7 @@ fn prepare_frame(
     previous: Option<&Frame>,
     registry: &mut Registry,
 ) -> Option<Frame> {
+    page.refresh_private_backing();
     let error = page.check_backing(base).err();
     let write_error = page.write_fault(base);
     let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
@@ -432,6 +441,10 @@ fn prepare_frame(
             .as_ref()
             .is_some_and(|b| !b.shared && page.permissions.write);
         let source_key = page.backing.as_ref().and_then(|b| b.object.parallel_key());
+        let generation = source.generation();
+        let same = same.filter(|frame| {
+            frame.bytes.source.is_some() && frame.bytes.source_generation == generation
+        });
         let make = || {
             same.map(|frame| frame.bytes.clone()).unwrap_or_else(|| {
                 Arc::new(ConcurrentPage::deferred(
@@ -447,7 +460,14 @@ fn prepare_frame(
             })
         };
         if let Some(key) = source_key.filter(|_| !private) {
-            registry.shared.intern(key, |_| true, make).0
+            registry
+                .shared
+                .intern(
+                    key,
+                    |bytes| bytes.source.is_some() && bytes.source_generation == generation,
+                    make,
+                )
+                .0
         } else {
             make()
         }
@@ -656,6 +676,12 @@ pub(super) struct SnapshotCache {
     source_backing_revision: u64,
 }
 impl SnapshotCache {
+    pub(super) fn has_uncommitted(&self) -> bool {
+        self.snapshot
+            .dirty_pages
+            .iter()
+            .any(|word| word.load(Ordering::Relaxed) != 0)
+    }
     pub(super) fn code_epoch(&self) -> u64 {
         if self.snapshot.dynamic_code {
             self.snapshot.code_epoch.load(Ordering::Acquire)
@@ -1105,7 +1131,7 @@ impl CpuMemory for View {
             || self.snapshot.anonymous.mapped_at_or_after(address)
     }
     fn async_faults_possible(&self) -> bool {
-        self.snapshot.async_sources
+        self.snapshot.async_sources || crate::CgroupMemoryTarget::active()
     }
     fn numa_mode_at(&self, address: u64) -> u32 {
         self.nodes.at(address)
@@ -1536,7 +1562,12 @@ impl Memory {
         {
             self.adopt_anonymous();
         }
-        if !self.has_parallel_users() && !self.anonymous_retired.is_empty() {
+        if !self.has_parallel_users()
+            && (!self.anonymous_retired.is_empty()
+                || self.has_backings
+                    && self.private_invalidation_revision
+                        != backing::private_invalidation_revision())
+        {
             self.reclaim_unused();
         }
         // A resumed runtime can construct a new coordinator registry. Cached
@@ -2127,7 +2158,10 @@ impl View {
             vm: self.snapshot.identity,
             base: frame.base,
             root: frame.root_frame,
-            storage: frame.bytes.identity,
+            storage: frame
+                .bytes
+                .mutable()
+                .map_or(frame.bytes.identity, |bytes| bytes.identity),
             publication: frame.hardware_track_writes,
             epoch: frame.hardware_write_epoch.clone(),
         })
@@ -2155,7 +2189,11 @@ impl View {
         };
         if token.vm != self.snapshot.identity
             || token.base != frame.base
-            || token.storage != frame.bytes.identity
+            || token.storage
+                != frame
+                    .bytes
+                    .mutable()
+                    .map_or(frame.bytes.identity, |bytes| bytes.identity)
             || !frame.permissions.write
         {
             return Err(MemoryError::InvalidRange);

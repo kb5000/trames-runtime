@@ -44,7 +44,8 @@ impl<D> State<D> {
 
     pub(crate) fn cleanup<'a>(&mut self) -> impl FnOnce(&super::Handle, &mut D) + 'a {
         let dead_clients = self.clients.cleanup(&mut self.pending_destructors);
-        self.registry.cleanup(&dead_clients, &self.pending_destructors);
+        self.registry
+            .cleanup(&dead_clients, &self.pending_destructors);
         // return a closure that will do the cleanup once invoked
         let pending_destructors = std::mem::take(&mut self.pending_destructors);
         move |handle, data| {
@@ -103,7 +104,8 @@ pub struct WeakInnerHandle {
 
 impl std::fmt::Debug for WeakInnerHandle {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt.debug_struct("WeakInnerHandle[rs]").finish_non_exhaustive()
+        fmt.debug_struct("WeakInnerHandle[rs]")
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,8 +116,21 @@ impl WeakInnerHandle {
 }
 
 impl InnerHandle {
+    pub fn set_client_dispatch_enabled(
+        &self,
+        client: InnerClientId,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .set_client_dispatch_enabled(client, enabled)
+    }
+
     pub fn downgrade(&self) -> WeakInnerHandle {
-        WeakInnerHandle { state: Arc::downgrade(&self.state) }
+        WeakInnerHandle {
+            state: Arc::downgrade(&self.state),
+        }
     }
 
     pub fn object_info(&self, id: InnerObjectId) -> Result<ObjectInfo, InvalidId> {
@@ -151,7 +166,10 @@ impl InnerHandle {
         client_id: InnerClientId,
         mut f: impl FnMut(ObjectId),
     ) -> Result<(), InvalidId> {
-        self.state.lock().unwrap().with_all_objects_for(client_id, &mut f)
+        self.state
+            .lock()
+            .unwrap()
+            .with_all_objects_for(client_id, &mut f)
     }
 
     pub fn object_for_protocol_id(
@@ -160,7 +178,10 @@ impl InnerHandle {
         interface: &'static Interface,
         protocol_id: u32,
     ) -> Result<ObjectId, InvalidId> {
-        self.state.lock().unwrap().object_for_protocol_id(client_id, interface, protocol_id)
+        self.state
+            .lock()
+            .unwrap()
+            .object_for_protocol_id(client_id, interface, protocol_id)
     }
 
     pub fn create_object<D: 'static>(
@@ -175,7 +196,9 @@ impl InnerHandle {
             .downcast_mut::<State<D>>()
             .expect("Wrong type parameter passed to Handle::create_object().");
         let client = state.clients.get_client_mut(client_id)?;
-        Ok(ObjectId { id: client.create_object(interface, version, data) })
+        Ok(ObjectId {
+            id: client.create_object(interface, version, data),
+        })
     }
 
     pub fn destroy_object<D: 'static>(&self, id: &ObjectId) -> Result<(), InvalidId> {
@@ -210,7 +233,10 @@ impl InnerHandle {
         let state = (&mut *state as &mut dyn ErasedState)
             .downcast_mut::<State<D>>()
             .expect("Wrong type parameter passed to Handle::get_object_data().");
-        state.clients.get_client(id.client_id.clone())?.get_object_data(id)
+        state
+            .clients
+            .get_client(id.client_id.clone())?
+            .get_object_data(id)
     }
 
     pub fn get_object_data_any(
@@ -229,11 +255,17 @@ impl InnerHandle {
         let state = (&mut *state as &mut dyn ErasedState)
             .downcast_mut::<State<D>>()
             .expect("Wrong type parameter passed to Handle::set_object_data().");
-        state.clients.get_client_mut(id.client_id.clone())?.set_object_data(id, data)
+        state
+            .clients
+            .get_client_mut(id.client_id.clone())?
+            .set_object_data(id, data)
     }
 
     pub fn post_error(&self, object_id: InnerObjectId, error_code: u32, message: CString) {
-        self.state.lock().unwrap().post_error(object_id, error_code, message)
+        self.state
+            .lock()
+            .unwrap()
+            .post_error(object_id, error_code, message)
     }
 
     pub fn kill_client(&self, client_id: InnerClientId, reason: DisconnectReason) {
@@ -250,7 +282,9 @@ impl InnerHandle {
         let state = (&mut *state as &mut dyn ErasedState)
             .downcast_mut::<State<D>>()
             .expect("Wrong type parameter passed to Handle::create_global().");
-        state.registry.create_global(interface, version, handler, &mut state.clients)
+        state
+            .registry
+            .create_global(interface, version, handler, &mut state.clients)
     }
 
     pub fn disable_global<D: 'static>(&self, id: InnerGlobalId) {
@@ -300,12 +334,18 @@ impl InnerHandle {
 
     #[allow(dead_code)]
     pub fn set_default_max_buffer_size(&self, max_buffer_size: usize) {
-        self.state.lock().unwrap().set_default_max_buffer_size(max_buffer_size)
+        self.state
+            .lock()
+            .unwrap()
+            .set_default_max_buffer_size(max_buffer_size)
     }
 
     #[allow(dead_code)]
     pub fn set_client_max_buffer_size(&self, client: InnerClientId, max_buffer_size: usize) {
-        self.state.lock().unwrap().set_client_max_buffer_size(client, max_buffer_size)
+        self.state
+            .lock()
+            .unwrap()
+            .set_client_max_buffer_size(client, max_buffer_size)
     }
 }
 
@@ -343,13 +383,74 @@ pub(crate) trait ErasedState: downcast_rs::Downcast {
     fn flush(&mut self, client: Option<ClientId>) -> std::io::Result<()>;
     fn set_default_max_buffer_size(&mut self, max_buffer_size: usize);
     fn set_client_max_buffer_size(&mut self, client: InnerClientId, max_buffer_size: usize);
+    fn set_client_dispatch_enabled(
+        &mut self,
+        client: InnerClientId,
+        enabled: bool,
+    ) -> std::io::Result<()>;
 }
 
 downcast_rs::impl_downcast!(ErasedState);
 
 impl<D> ErasedState for State<D> {
+    fn set_client_dispatch_enabled(
+        &mut self,
+        id: InnerClientId,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        let client = self.clients.get_client_mut(id.clone()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid client ID")
+        })?;
+        if client.dispatch_enabled == enabled {
+            return Ok(());
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+        {
+            use rustix::event::epoll;
+            if enabled {
+                epoll::add(
+                    &self.poll_fd,
+                    &*client,
+                    epoll::EventData::new_u64(id.as_u64()),
+                    epoll::EventFlags::IN,
+                )?;
+            } else {
+                epoll::delete(&self.poll_fd, &*client)?;
+            }
+        }
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_vendor = "apple"
+        ))]
+        {
+            use rustix::event::kqueue::*;
+            use std::os::unix::io::{AsFd, AsRawFd};
+            let flags = if enabled {
+                EventFlags::ADD
+            } else {
+                EventFlags::DELETE
+            };
+            let event = Event::new(
+                EventFilter::Read(client.as_fd().as_raw_fd()),
+                flags,
+                id.as_u64() as *mut _,
+            );
+            // SAFETY: this client's live socket and the backend's own kqueue.
+            unsafe {
+                kevent(&self.poll_fd, &[event], &mut [] as &mut [Event], None)?;
+            }
+        }
+        client.dispatch_enabled = enabled;
+        Ok(())
+    }
+
     fn object_info(&self, id: InnerObjectId) -> Result<ObjectInfo, InvalidId> {
-        self.clients.get_client(id.client_id.clone())?.object_info(id)
+        self.clients
+            .get_client(id.client_id.clone())?
+            .object_info(id)
     }
 
     fn insert_client(
@@ -357,7 +458,9 @@ impl<D> ErasedState for State<D> {
         stream: UnixStream,
         data: Arc<dyn ClientData>,
     ) -> std::io::Result<InnerClientId> {
-        let id = self.clients.create_client(stream, data, self.default_max_buffer_size);
+        let id = self
+            .clients
+            .create_client(stream, data, self.default_max_buffer_size);
         let client = self.clients.get_client(id.clone()).unwrap();
 
         // register the client to the internal epoll
@@ -489,8 +592,11 @@ impl<D> ErasedState for State<D> {
         let handler = self.registry.get_handler(global_id.clone()).ok()?;
         let name = global_id.id;
 
-        let can_view =
-            handler.can_view(ClientId { id: client_id }, &client.data, GlobalId { id: global_id });
+        let can_view = handler.can_view(
+            ClientId { id: client_id },
+            &client.data,
+            GlobalId { id: global_id },
+        );
 
         if can_view {
             Some(name)

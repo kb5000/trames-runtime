@@ -82,6 +82,16 @@ impl Vfs {
         follow: bool,
         empty_path: bool,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Link {
+                follow,
+                empty_path,
+                oldfd,
+                old: old.to_vec(),
+                newfd,
+                new: new.to_vec(),
+            });
+        }
         let accepted = if empty_path && oldfd != AT_FDCWD && !old.starts_with(b"/") {
             let descriptor = self.descriptor(oldfd as u32)?;
             let open = descriptor.open.borrow();
@@ -240,6 +250,15 @@ impl Vfs {
         new: &[u8],
         flags: u32,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Rename {
+                oldfd,
+                old: old.to_vec(),
+                newfd,
+                new: new.to_vec(),
+                flags,
+            });
+        }
         if !matches!(flags, 0 | RENAME_NOREPLACE | RENAME_EXCHANGE) {
             return Err(Errno(22));
         }
@@ -610,20 +629,30 @@ impl Vfs {
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Chmod {
+                fd: dirfd,
+                path: Some(path.to_vec()),
+                mode,
+                nofollow: false,
+                empty: false,
+            });
+        }
         let target = self.metadata_target(dirfd, path, true)?;
         if let Some(result) = self.fuse_path_attributes(&target, fuse::AttributeChange::Mode(mode))
         {
             return result;
         }
-        let MetadataTarget { path, node, _magic } = target;
-        path.writable()?;
-        let link = self.event_link(&path, &node);
+        let retry = self.metadata_retry(Some(target));
+        let target = retry.target();
+        target.path.writable()?;
+        let link = self.event_link(&target.path, &target.node);
         self.chmod_node(
-            node,
+            target.node.clone(),
             mode,
-            Some(&path.filesystem(self)),
+            Some(&target.path.filesystem(self)),
             link.as_ref(),
-            path.ids(self),
+            target.path.ids(self),
         )
     }
     pub fn chmod_at_flags(
@@ -633,23 +662,33 @@ impl Vfs {
         mode: u32,
         nofollow: bool,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Chmod {
+                fd: dirfd,
+                path: Some(path.to_vec()),
+                mode,
+                nofollow,
+                empty: false,
+            });
+        }
         let target = self.metadata_target(dirfd, path, !nofollow)?;
         if let Some(result) = self.fuse_path_attributes(&target, fuse::AttributeChange::Mode(mode))
         {
             return result;
         }
-        let MetadataTarget { path, node, _magic } = target;
-        path.writable()?;
-        if matches!(node.borrow().content, Content::Symlink(_)) {
+        let retry = self.metadata_retry(Some(target));
+        let target = retry.target();
+        target.path.writable()?;
+        if matches!(target.node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
-        let link = self.event_link(&path, &node);
+        let link = self.event_link(&target.path, &target.node);
         self.chmod_node(
-            node,
+            target.node.clone(),
             mode,
-            Some(&path.filesystem(self)),
+            Some(&target.path.filesystem(self)),
             link.as_ref(),
-            path.ids(self),
+            target.path.ids(self),
         )
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
@@ -660,6 +699,15 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Chmod {
+                fd: fd as i32,
+                path: None,
+                mode,
+                nofollow: false,
+                empty: true,
+            });
+        }
         if let Some(result) = self.fuse_fd_attributes(fd, fuse::AttributeChange::Mode(mode)) {
             return result;
         }
@@ -713,6 +761,14 @@ impl Vfs {
         times: Option<[[i64; 2]; 2]>,
         flags: u32,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Times {
+                fd: dirfd,
+                path: path.map(<[u8]>::to_vec),
+                times,
+                flags,
+            });
+        }
         if times.is_some_and(|t| t.iter().all(|pair| pair[1] == UTIME_OMIT)) {
             return Ok(());
         }
@@ -757,6 +813,7 @@ impl Vfs {
             }
             self.fd_writable(dirfd as u32)?;
         }
+        let mut target_on_wait = None;
         let (node, link, filesystem, mount) = match path {
             Some(p) => {
                 let target = self.metadata_target(dirfd, p, flags & 0x100 == 0)?;
@@ -772,12 +829,14 @@ impl Vfs {
                     .and_then(|m| m.file.as_ref()?.notification.as_ref()?.link.clone())
                     .or_else(|| self.event_link(&target.path, &target.node));
                 let filesystem = target.path.filesystem(self);
-                (
-                    target.node,
+                let accepted = (
+                    target.node.clone(),
                     link,
                     Some(filesystem),
-                    target.path.mount.map(|m| m.identity.clone()),
-                )
+                    target.path.mount.as_ref().map(|m| m.identity.clone()),
+                );
+                target_on_wait = Some(target);
+                accepted
             }
             None => {
                 let descriptor = self.descriptor(dirfd as u32)?;
@@ -796,6 +855,7 @@ impl Vfs {
                 )
             }
         };
+        let _retry = self.metadata_retry(target_on_wait);
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         {

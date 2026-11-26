@@ -57,7 +57,7 @@ pub(super) struct NamespaceWait {
 }
 pub(super) struct PageWait {
     pending: Arc<trames_memory::PageWait>,
-    subscription: Mutex<Option<(Arc<trames_vfs::IoSignal>, trames_vfs::IoSubscription)>>,
+    subscription: Mutex<Option<(Arc<trames_vfs::IoSignal>, Vec<trames_vfs::IoSubscription>)>>,
 }
 impl PageWait {
     pub fn new(pending: Arc<trames_memory::PageWait>) -> Arc<Self> {
@@ -68,6 +68,9 @@ impl PageWait {
     }
     pub fn ready(&self) -> bool {
         self.pending.ready()
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.pending.deadline()
     }
     pub fn bind(&self, signal: &Arc<trames_vfs::IoSignal>) {
         let subscription = self.pending.subscribe(signal);
@@ -179,6 +182,14 @@ pub(super) struct ChildWait {
     wake: Mutex<Option<Arc<trames_vfs::IoSignal>>>,
 }
 impl ChildWait {
+    fn deadline(&self) -> Option<Instant> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(trames_vfs::IoSubscription::deadline)
+            .min()
+    }
     pub fn new(request: trames_kernel::children::Wait) -> Arc<Self> {
         Self::accepted(trames_kernel::children::WaitCall::accepted(request))
     }
@@ -203,7 +214,7 @@ impl ChildWait {
         subscriptions.push(call.subscribe(family, signal));
         drop(call);
         if let Some(fault) = &fault {
-            subscriptions.push(fault.wait.subscribe(signal));
+            subscriptions.extend(fault.wait.subscribe(signal));
         }
         *self.subscriptions.lock().unwrap() = subscriptions;
         *self.wake.lock().unwrap() = Some(signal.clone());
@@ -419,7 +430,7 @@ impl SignalWait {
         let completion = call.completion();
         let mut subscriptions = task.subscribe(signal);
         if let Some(fault) = &fault {
-            subscriptions.push(fault.wait.subscribe(signal));
+            subscriptions.extend(fault.wait.subscribe(signal));
         }
         if let Some(completion) = &completion {
             subscriptions.push(completion.subscribe(signal));
@@ -439,6 +450,15 @@ impl SignalWait {
             .unwrap()
             .as_ref()
             .and_then(SignalCall::deadline)
+            .into_iter()
+            .chain(
+                self.subscriptions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(trames_vfs::IoSubscription::deadline),
+            )
+            .min()
     }
     pub fn ready(&self, task: &trames_kernel::signal::IoTask) -> bool {
         self.call
@@ -512,15 +532,15 @@ impl WaitState {
             Self::Sleep { deadline, .. } | Self::Cgroup(deadline) => Some(*deadline),
             Self::ClockSleep(wait) => wait.deadline(),
             Self::OwnerEvent
-            | Self::Child(_)
             | Self::Completion(_)
             | Self::Namespace(_)
             | Self::Policy(_)
-            | Self::Barrier(_)
-            | Self::Page(_)
-            | Self::Delivery(_)
-            | Self::Custody(_) => None,
+            | Self::Barrier(_) => None,
+            Self::Custody(wait) => wait.deadline(),
             Self::Signal(wait) => wait.deadline(),
+            Self::Page(wait) => wait.deadline(),
+            Self::Child(wait) => wait.deadline(),
+            Self::Delivery(wait) => wait.deadline(),
         }
     }
     fn woken(&self) -> bool {
@@ -1021,7 +1041,7 @@ impl<C: Cpu> Job<C> {
         {
             return true;
         }
-        if matches!(&self.waiting, Some(WaitState::Custody(wait)) if wait.signal.ready()) {
+        if matches!(&self.waiting, Some(WaitState::Custody(wait)) if wait.ready()) {
             return true;
         }
         if let Some(snapshot) = self
@@ -1271,6 +1291,20 @@ struct CustodyWait<C: Cpu> {
     checkpoint: Checkpoint<C>,
     signal: Arc<trames_vfs::IoSignal>,
     _subscriptions: Vec<trames_vfs::IoSubscription>,
+}
+impl<C: Cpu> CustodyWait<C> {
+    fn deadline(&self) -> Option<Instant> {
+        self._subscriptions
+            .iter()
+            .filter_map(trames_vfs::IoSubscription::deadline)
+            .min()
+    }
+    fn ready(&self) -> bool {
+        self.signal.ready()
+            || self
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
 }
 pub(super) struct Epoch<C: Cpu> {
     pub control: Arc<Control>,
@@ -2021,7 +2055,7 @@ impl<C: Cpu> Epoch<C> {
         if let Some(index) = q.custody_waits.iter().position(|wait| {
             #[cfg(all(test, trames_interpreter_conformance))]
             {
-                wait.signal.ready()
+                wait.ready()
                     && (q.domains.source_lifecycle
                         && crate::process::lifecycle::eligible(
                             wait.checkpoint.jobs.iter().map(Box::as_ref),
@@ -2034,7 +2068,7 @@ impl<C: Cpu> Epoch<C> {
             }
             #[cfg(not(all(test, trames_interpreter_conformance)))]
             {
-                wait.signal.ready() && q.domains.source_lifecycle == source
+                wait.ready() && q.domains.source_lifecycle == source
             }
         }) {
             let wait = q.custody_waits.swap_remove(index);
@@ -2058,7 +2092,11 @@ impl<C: Cpu> Epoch<C> {
         subscriptions: Vec<trames_vfs::IoSubscription>,
     ) {
         let mut q = self.queues.lock().unwrap();
-        let ready = signal.ready();
+        let deadline = subscriptions
+            .iter()
+            .filter_map(trames_vfs::IoSubscription::deadline)
+            .min();
+        let ready = signal.ready() || deadline.is_some_and(|deadline| deadline <= Instant::now());
         #[cfg(all(test, trames_interpreter_conformance))]
         let source = q.domains.source_lifecycle
             && crate::process::lifecycle::eligible(
@@ -2075,7 +2113,8 @@ impl<C: Cpu> Epoch<C> {
         });
         // Publication and wake share this mutex. A release before publication
         // is latched in the signal; a later release finds the published wait.
-        if ready {
+        self.publish_deadline(deadline);
+        if ready || deadline.is_some() {
             #[cfg(all(test, trames_interpreter_conformance))]
             if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
                 let _ = events.send(crate::workers::Event::VmReady);
@@ -2139,6 +2178,7 @@ impl<C: Cpu> Epoch<C> {
             && q.completing == 0
             && q.ready.is_empty()
             && q.host_admissions.is_empty()
+            && q.custody_waits.is_empty()
             && !q.host_waiting
             && !q.retirement_notified
             && q.parked.next_deadline().is_none()
@@ -2306,7 +2346,7 @@ impl<C: Cpu> Epoch<C> {
                     && !job.restart_sleep_after_stop()
                 {
                     let waiting = job.waiting.take().unwrap();
-                    if !matches!(waiting, WaitState::Cgroup(_)) {
+                    if !matches!(waiting, WaitState::Cgroup(_) | WaitState::Custody(_)) {
                         job.work.trace.finish(&mut job.work.cpu, waiting.expire());
                     }
                 }
@@ -2397,6 +2437,17 @@ impl<C: Cpu> Epoch<C> {
                 .into_iter()
                 .chain(self.timers.get().and_then(|t| t.next_deadline()))
                 .chain(self.protocols.deadline())
+                .chain(q.custody_waits.iter().filter_map(CustodyWait::deadline))
+                .chain(
+                    self.lifecycle
+                        .get()
+                        .and_then(|lifecycle| lifecycle.host_deadline()),
+                )
+                .chain(
+                    self.lifecycle
+                        .get()
+                        .and_then(|lifecycle| lifecycle.layouts_deadline()),
+                )
                 .min();
             self.next_deadline.store(
                 deadline.map_or(u64::MAX, |d| self.deadline_ticks(d)),
@@ -3076,6 +3127,46 @@ mod tests {
         let signal = trames_vfs::IoSignal::new(1, Arc::downgrade(&target));
         wait.bind(&trames_kernel::signal::IoTask::default(), &signal);
         assert!(wake.called.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn a_resource_deadline_reclaims_its_original_checkpoint_without_a_notification() {
+        struct Budget(Mutex<Instant>);
+        impl trames_shared::ResourceWait for Budget {
+            fn ready(&self) -> bool {
+                *self.0.lock().unwrap() <= Instant::now()
+            }
+            fn subscribe(&self, _: &Arc<trames_vfs::IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+                Vec::new()
+            }
+            fn deadline(&self) -> Option<Instant> {
+                Some(*self.0.lock().unwrap())
+            }
+        }
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1, &epoch));
+        let original = epoch.take(0).unwrap();
+        epoch.checkpoint(original, SliceOutcome::Syscall { instructions: 0 });
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        let budget = Arc::new(Budget(Mutex::new(Instant::now() + Duration::from_secs(60))));
+        let page = trames_memory::PageWait::resource(budget.clone());
+        let signal = trames_vfs::IoSignal::new(1, epoch.io_target.clone());
+        let subscriptions = page.subscribe(&signal);
+        epoch.defer_checkpoint(checkpoint, signal.clone(), subscriptions);
+        assert!(!signal.ready());
+        assert!(epoch.take_checkpoint().is_none());
+        assert!(!epoch.terminal_idle(&epoch.queues.lock().unwrap()));
+        assert_ne!(epoch.next_deadline.load(Ordering::Relaxed), u64::MAX);
+        // Advancing this fixture's resource clock needs no sleeping host
+        // thread. The claim must observe the subscription's current deadline.
+        *budget.0.lock().unwrap() = Instant::now();
+        assert!(!signal.ready());
+        let checkpoint = epoch
+            .take_checkpoint()
+            .expect("due original resource checkpoint");
+        assert_eq!(checkpoint.jobs[0].work.pid, 1);
+        epoch.restore_checkpoint(checkpoint, true);
+        epoch.stop();
+        assert_eq!(epoch.drain().len(), 1);
     }
     #[test]
     fn terminal_idle_probe_rechecks_new_waits_returns_and_admissions() {

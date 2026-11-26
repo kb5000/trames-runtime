@@ -2,6 +2,7 @@
 //! Page-sized virtual backing objects, with no host pointers exposed to guests.
 use super::*;
 static BACKING_REVISION: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_INVALIDATION_REVISION: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_REVISION: AtomicU64 = AtomicU64::new(0);
 pub fn external_memory_changed() {
     EXTERNAL_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -13,6 +14,15 @@ pub(super) fn external_revision() -> u64 {
 pub fn backing_changed() {
     BACKING_REVISION.fetch_add(1, Ordering::Relaxed);
 }
+/// Whole-page truncation invalidates private PTEs. This cold notification lets
+/// joined reclamation skip page-table scans after unrelated file changes.
+pub fn backing_invalidated() {
+    PRIVATE_INVALIDATION_REVISION.fetch_add(1, Ordering::Relaxed);
+    backing_changed();
+}
+pub(super) fn private_invalidation_revision() -> u64 {
+    PRIVATE_INVALIDATION_REVISION.load(Ordering::Relaxed)
+}
 pub(super) fn backing_revision() -> u64 {
     BACKING_REVISION.load(Ordering::Relaxed)
 }
@@ -22,6 +32,11 @@ pub trait PageSource: Send + Sync {
     /// A missing asynchronous page returns MemoryError::Pending with its
     /// original PageWait. Never block a CPU worker or encode a guest errno.
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
+    /// Physical byte replacement, published with the provider's existing layout
+    /// and version notification. Ordinary writes do not change this generation.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 /// A file VMA's cold mremap hook. The caller owns original mm custody and
 /// restores moved pages if the provider rejects the destination VMA.
@@ -47,6 +62,9 @@ pub trait SyncExecutor: Send + Sync {
 /// actor scope. It owns no guest address, VMA lookup or running CPU view.
 pub trait SyncResource: Send + Sync {
     fn layout(&self) -> Option<Arc<crate::layout::Layout>>;
+    /// Pending retains this resource's accepted progress. An executor releases
+    /// layout admission and its worker slot, then calls this same resource
+    /// again; providers must not repeat already completed writeback phases.
     fn sync(&self) -> Result<(), MemoryError>;
     /// The accepted executor ended before this resource could complete. File
     /// providers retain the error on their original mapping/OFD, even for the
@@ -135,6 +153,17 @@ impl SyncRange {
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
 pub trait PageBacking: Send + Sync {
+    /// Cold pressure cleanup only: the provider already discarded canonical
+    /// clean bytes under its original layout admission. Private COW is separate.
+    fn reclaimed(&self, _group: &MemoryCgroup) -> bool {
+        false
+    }
+    /// Whole-page truncation invalidates private PTEs as well as shared cache
+    /// aliases. Ordinary writes and cache storage replacement must keep COW.
+    /// Changes also publish backing_invalidated() under original layout custody.
+    fn invalidation_generation(&self) -> u64 {
+        0
+    }
     /// Physical file or shmem page membership used only at mapping transitions and by smaps.
     fn mapped_residents(&self) -> Option<&MappedResidents> {
         None
@@ -359,11 +388,73 @@ enum Members {
     Several(Vec<std::sync::Weak<Charge>>),
 }
 impl MappedResidents {
+    pub fn with_kind(kind: crate::CgroupMemoryKind) -> Self {
+        Self(
+            Default::default(),
+            Arc::new(crate::cgroup_memory::SharedCharge::new(kind)),
+        )
+    }
     /// A non-mmap cache fill reserves its physical owner on the requesting
     /// worker, before IO. Later aliases acquire only their own RSS tickets;
     /// a daemon delivering the bytes cannot become the physical owner.
     pub fn reserve_cache(&self) -> Result<(), MemoryError> {
         self.1.get().map(|_| ())
+    }
+    pub fn cache_charge(&self) -> Result<crate::CgroupPageCharge, MemoryError> {
+        self.1.get().map(crate::CgroupPageCharge::existing)
+    }
+    /// Adopt an already allocated zero-extent slice before publishing bytes.
+    pub fn adopt_cache(&self, charge: &crate::CgroupPageCharge) {
+        self.1.adopt(charge);
+    }
+    /// Publish a physical lease with its actual bytes, so retained executor or
+    /// provider pins keep accounting after cache/VMA invalidation.
+    pub fn bind_cache(&self, bytes: &Arc<SharedPage>) {
+        self.1.bind(bytes);
+    }
+    pub fn publish_cache(&self, bytes: &Arc<SharedPage>) -> Result<(), MemoryError> {
+        self.1.publish(bytes)
+    }
+    /// A provider which admitted IO earlier can bind its delivered bytes without
+    /// attributing any allocation to the daemon/completion thread.
+    pub fn retain_cache(&self, bytes: &Arc<SharedPage>) {
+        self.1.retain_existing(bytes);
+    }
+    /// The caller holds the original layout mutation admission. Detached COW
+    /// pages keep their private leases; file aliases fault a new cache identity.
+    pub fn invalidate_cache(&self) {
+        let members: Vec<_> = match &*self.0.lock() {
+            Members::Empty => Vec::new(),
+            Members::One(member) => member.upgrade().into_iter().collect(),
+            Members::Several(members) => members
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect(),
+        };
+        for member in members {
+            member.invalidate_cache(&self.1);
+        }
+        self.1.invalidate();
+    }
+    pub fn register_reclaimer(&self, resource: &Arc<dyn crate::CgroupReclaim>) {
+        self.1.register_reclaimer(resource);
+    }
+    pub fn charged_within(&self, group: &crate::MemoryCgroup) -> bool {
+        self.1.is_within(group)
+    }
+    pub fn physical_owner(&self) -> Option<Arc<crate::MemoryCgroup>> {
+        self.1.physical_owner()
+    }
+    /// Count a reconstructible mapped allocation only when its final physical
+    /// lease is released, including byte pins surviving the layout checkpoint.
+    pub fn mark_reclaimed(&self) -> bool {
+        self.1.mark_reclaimed()
+    }
+    /// Undo failed page-in admission only when no mapping owns that lease.
+    pub fn cancel_cache(&self) {
+        if self.resident_count() == 0 {
+            self.1.cancel_unused();
+        }
     }
     fn attach(&self, charge: &Arc<Charge>, private: bool) {
         charge.attach_cache(self.1.clone(), private);
@@ -401,14 +492,56 @@ impl MappedResidents {
         }
     }
 }
-#[derive(Clone)]
 pub(super) struct Backed {
     pub object: Arc<dyn PageBacking>,
     pub shared: bool,
     pub private_copy: bool,
+    private_generation: u64,
+    // An immutable kernel-output preflight may reach a truncated private page
+    // before the next joined snapshot. Retain that admission for the actual
+    // write; never consume input against the old, already resident COW charge.
+    refault: parking_lot::Mutex<Option<(u64, Arc<Charge>)>>,
+}
+impl Clone for Backed {
+    fn clone(&self) -> Self {
+        Self {
+            object: self.object.clone(),
+            shared: self.shared,
+            private_copy: self.private_copy,
+            private_generation: self.private_generation,
+            // A fork has its own RSS account, installed by the caller. An
+            // unmaterialized parent preflight is not a shared physical page.
+            refault: Default::default(),
+        }
+    }
 }
 impl Backed {
-    fn attach(&self, charge: &Arc<Charge>) {
+    pub(super) fn account_rebound(&mut self) {
+        self.refault.get_mut().take();
+    }
+    pub(super) fn private_current(&self) -> bool {
+        self.private_copy && self.private_generation == self.object.invalidation_generation()
+    }
+    fn private_stale(&self) -> bool {
+        self.private_copy && !self.private_current()
+    }
+    fn refault_charge(&self, original: &Arc<Charge>) -> Arc<Charge> {
+        let generation = self.object.invalidation_generation();
+        let mut refault = self.refault.lock();
+        if let Some((previous, charge)) = &*refault {
+            if *previous == generation {
+                return charge.clone();
+            }
+        }
+        original.retire_mapping();
+        let charge = original.fresh();
+        if let Some(owners) = self.object.mapped_residents() {
+            owners.attach(&charge, true);
+        }
+        *refault = Some((generation, charge.clone()));
+        charge
+    }
+    pub(super) fn attach(&self, charge: &Arc<Charge>) {
         if !self.private_copy {
             if let Some(owners) = self.object.mapped_residents() {
                 owners.attach(charge, !self.shared);
@@ -426,9 +559,32 @@ impl Backed {
     pub(super) fn detached_copy(&mut self, charge: &Arc<Charge>) {
         self.detach(charge);
         self.private_copy = true;
+        self.private_generation = self.object.invalidation_generation();
     }
 }
 impl Page {
+    pub(super) fn access_charge(&self) -> std::borrow::Cow<'_, Arc<Charge>> {
+        if let Some(backing) = self.backing.as_ref().filter(|b| b.private_stale()) {
+            std::borrow::Cow::Owned(backing.refault_charge(&self.charge))
+        } else {
+            std::borrow::Cow::Borrowed(&self.charge)
+        }
+    }
+    /// Original mm custody only. Old Views and byte pins keep their original
+    /// physical lease; the root PTE rejoins the live backing with a fresh charge.
+    pub(super) fn refresh_private_backing(&mut self) -> bool {
+        let Some(backing) = self.backing.as_mut().filter(|b| b.private_stale()) else {
+            return false;
+        };
+        let charge = backing.refault_charge(&self.charge);
+        backing.refault.get_mut().take();
+        backing.private_copy = false;
+        self.charge = charge;
+        self.bytes = Arc::new(PageBytes::Zero);
+        self.data_revision = self.data_revision.wrapping_add(1);
+        self.instruction_revision = self.instruction_revision.wrapping_add(1);
+        true
+    }
     pub(super) fn write_fault(&self, address: u64) -> Option<MemoryError> {
         self.backing
             .as_ref()
@@ -477,11 +633,11 @@ impl Page {
         if let Some(b) = self
             .backing
             .as_ref()
-            .filter(|b| b.shared || !b.private_copy)
+            .filter(|b| b.shared || !b.private_current())
         {
             if !b.object.native_resident() {
                 if let Some(source) = b.object.page_source() {
-                    self.charge.check_available()?;
+                    self.access_charge().check_available()?;
                     source.load().map_err(|error| error.at_access(address))?;
                 }
             }
@@ -490,7 +646,7 @@ impl Page {
     }
     pub(crate) fn shared_storage(&self) -> Option<std::sync::Arc<SharedPage>> {
         if let Some(b) = &self.backing {
-            if b.shared || !b.private_copy {
+            if b.shared || !b.private_current() {
                 return b.object.shared_page();
             }
         }
@@ -500,13 +656,14 @@ impl Page {
         if self
             .backing
             .as_ref()
-            .is_some_and(|b| !b.shared && !b.private_copy)
+            .is_some_and(|b| !b.shared && !b.private_current())
         {
             return None;
         }
         self.shared_storage()
     }
     pub(super) fn detach_private(&mut self) -> Result<(), MemoryError> {
+        self.refresh_private_backing();
         if let Some(b) = self
             .backing
             .as_mut()
@@ -524,10 +681,10 @@ impl Page {
     #[inline]
     pub(super) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
-            if b.shared || !b.private_copy {
+            if b.shared || !b.private_current() {
                 self.prepare_source(0)?;
                 if b.object.charge_reads() {
-                    self.charge.ensure()?;
+                    self.access_charge().ensure()?;
                 }
                 return b.object.read(offset, out);
             }
@@ -646,6 +803,8 @@ impl Memory {
                 object,
                 shared: shared_mapping,
                 private_copy: false,
+                private_generation: 0,
+                refault: Default::default(),
             });
             page.register_backing();
         }
@@ -781,8 +940,9 @@ impl Memory {
                 self.parallel_mappings.insert(base);
             }
             page.bytes = Arc::new(PageBytes::Zero);
-            if page.backing.is_none() {
-                page.charge = Charge::new(&self.account);
+            if page.backing.as_ref().is_none_or(|b| b.private_copy) {
+                page.charge.retire_mapping();
+                page.charge = page.charge.fresh();
             }
             if let Some(b) = page.backing.as_mut().filter(|b| b.private_copy) {
                 b.private_copy = false;

@@ -3,6 +3,13 @@
 //! guest pointers, source task execution and descriptor membership stay outside.
 use super::*;
 use std::sync::atomic::AtomicUsize;
+mod open;
+mod read;
+pub(super) use open::Request as ResourceOpen;
+mod memory_control;
+mod resize;
+mod write;
+pub(super) use write::Policy as WritePolicy;
 
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
@@ -34,7 +41,7 @@ impl FileTarget {
         file.page_source(self.0.clone(), offset).map(Some)
     }
 
-    fn daemon_backed(&self) -> bool {
+    pub(crate) fn daemon_backed(&self) -> bool {
         matches!(
             self.0.open.control,
             Some(events::SharedControl::FuseFile(_) | events::SharedControl::Fuse(_))
@@ -456,7 +463,7 @@ pub struct FileReply {
 }
 pub enum FileOutcome {
     Complete(FileReply),
-    /// No bytes committed: the source task parks on the accepted endpoint.
+    /// The source task parks with its original resources and committed progress.
     Waiting(FileWork),
     /// A mapping-layout boundary. A copy retains its committed prefix, current
     /// offsets and accepted input for the chunk awaiting the layout change.
@@ -466,8 +473,11 @@ pub enum FileOutcome {
     Owner(FileWork),
 }
 pub struct FileWork {
+    memory: trames_memory::CgroupMemoryContext,
+    io: cgroup::IoContext,
     paths: Box<PathQueries>,
     target: Option<FileTarget>,
+    _transfer: Option<TransferLease>,
     command: FileCommand,
     exclusive: bool,
     layout_exclusive: Option<trames_memory::layout::LayoutExclusive>,
@@ -475,6 +485,7 @@ pub struct FileWork {
     active: Option<FileActive>,
     input_active: Option<FileActive>,
     open: Option<Box<PreparedOpen>>,
+    resource_open: Option<Box<ResourceOpen>>,
     path_retry: Option<Box<PathRevalidation>>,
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
@@ -482,6 +493,14 @@ pub struct FileWork {
     proc_memory: Option<Box<ProcMemory>>,
     fuse_stat: Option<Box<fuse::Metadata>>,
     linger: Option<Box<trames_net::TcpLinger>>,
+    resource_wait: Option<Arc<trames_memory::PageWait>>,
+    read: Option<Box<read::Cursor>>,
+    write: Option<Box<write::Cursor>>,
+    memory_control: Option<Box<memory_control::Cursor>>,
+    sync: Option<Box<write::Sync>>,
+    mutation: Option<Box<resize::Mutation>>,
+    copy_tail: Option<write::CopyTail>,
+    write_end: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 struct ProcMemory {
     request: Option<Arc<trames_memory::TransferRequest>>,
@@ -533,6 +552,46 @@ impl Drop for ProcPosition {
     }
 }
 struct FileActive(Arc<Inode>);
+enum TransferLease {
+    Copy(Arc<std::sync::Mutex<FileCopy>>),
+    Stream(Arc<std::sync::Mutex<StreamTransfer>>),
+}
+impl TransferLease {
+    fn new(command: &FileCommand) -> Option<Self> {
+        match command {
+            FileCommand::Copy { transfer, .. } => Some(Self::Copy(transfer.clone())),
+            FileCommand::Transfer(transfer) => Some(Self::Stream(transfer.clone())),
+            _ => None,
+        }
+    }
+}
+impl Drop for TransferLease {
+    fn drop(&mut self) {
+        let (request, retired): (_, Box<dyn Send>) = match self {
+            Self::Copy(transfer) => {
+                let mut transfer = transfer.lock().unwrap();
+                (
+                    transfer.io.fuse_signal_request(),
+                    Box::new(transfer.cancel_pending()),
+                )
+            }
+            Self::Stream(transfer) => {
+                let mut transfer = transfer.lock().unwrap();
+                (
+                    transfer.io.fuse_signal_request(),
+                    Box::new(transfer.cancel_pending()),
+                )
+            }
+        };
+        // Original resource callbacks run outside the per-call state mutex.
+        // A daemon keeps this receipt until its cancellation becomes terminal.
+        let retired = match request {
+            Some(request) => request.retain_cancellation(retired),
+            None => Some(retired),
+        };
+        drop(retired);
+    }
+}
 impl Drop for FileActive {
     fn drop(&mut self) {
         self.0.active_file_work.fetch_sub(1, Ordering::Relaxed);
@@ -564,6 +623,15 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
+    pub(super) fn resource_pending(&self) -> bool {
+        // Classification is independent of transient readiness: another
+        // waiter may acquire/release the resource between the caller's checks.
+        self.resource_wait.is_some()
+            || self
+                .command
+                .transfer_io(transfer_io::Io::resource_pending)
+                .unwrap_or(false)
+    }
     /// Cold non-data descriptors use their canonical ABI body rather than the
     /// regular-file write specialization. No byte provider or host job is added.
     pub fn descriptor_reply(
@@ -614,14 +682,40 @@ impl FileWork {
             .or_else(|| self.namespace.as_ref().and_then(|ns| ns.fuse_request()))
     }
     pub fn waits_for_fuse(&self) -> bool {
-        self.fuse_request()
-            .and_then(|p| p.daemon_request())
-            .is_some()
+        self.fuse_signal_request().is_some()
     }
     pub fn interruptible_wait(&self) -> bool {
+        if self
+            .namespace
+            .as_ref()
+            .is_some_and(|work| !work.interruptible_wait())
+        {
+            return false;
+        }
+        if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+            && self.fuse_request().is_none()
+        {
+            return self.sync.is_none()
+                && self.mutation.is_none()
+                && !self
+                    .command
+                    .transfer_io(transfer_io::Io::retained)
+                    .unwrap_or(false)
+                && self
+                    .write
+                    .as_ref()
+                    .is_none_or(|write| write.interruptible());
+        }
         // These are original inode/OFD mutex transactions. Caught handlers
         // cannot cross their retained operation and replay its source inputs.
         self.fuse_request().is_none()
+            && !self
+                .command
+                .transfer_io(transfer_io::Io::retained)
+                .unwrap_or(false)
             && !self
                 .command
                 .transfer_io(transfer_io::Io::blocked)
@@ -634,13 +728,48 @@ impl FileWork {
                 .position_wait()
                 .is_some_and(|file| file.waiting_for(&self.command))
     }
+    /// Finish a caught signal from a parked original operation. Its original
+    /// byte prefix belongs to this call and must never be guest-replayed.
+    pub fn interrupted(mut self) -> FileReply {
+        if let Some(cursor) = self.memory_control.take() {
+            return Self::descriptor_result(Ok(cursor.finish()), &mut self.command)
+                .retain_file(self.target.as_ref().map(|target| target.0.clone()));
+        }
+        if self.read.is_some() {
+            let result = self.finish_read(Err(Errno(4)));
+            return Self::descriptor_result(result, &mut self.command)
+                .retain_file(self.target.as_ref().map(|target| target.0.clone()));
+        }
+        let progress = self.write.as_ref().map_or(0, |write| write.progress());
+        let signal = self
+            .write
+            .as_ref()
+            .is_some_and(|write| write.file_size_signal());
+        let result = if progress == 0 {
+            Err(Errno(4))
+        } else {
+            Ok(FileValue::Count(progress as u64))
+        };
+        let mut reply = Self::descriptor_result(result, &mut self.command);
+        reply.file_size_signal = signal;
+        reply.retain_file(self.target.as_ref().map(|target| target.0.clone()))
+    }
     pub fn fuse_interrupt_needed(&self) -> bool {
         self.fuse_request().is_some_and(|p| p.needs_interrupt())
+            || self
+                .command
+                .transfer_io(transfer_io::Io::fuse_interrupt_needed)
+                .unwrap_or(false)
     }
     pub fn fuse_signal_request(&self) -> Option<Arc<fuse::Request>> {
         self.fuse_request()
             .and_then(|p| p.daemon_request())
             .cloned()
+            .or_else(|| {
+                self.command
+                    .transfer_io(transfer_io::Io::fuse_signal_request)
+                    .flatten()
+            })
     }
     fn position_wait(&self) -> Option<&fuse::File> {
         if matches!(
@@ -658,6 +787,13 @@ impl FileWork {
     }
     pub fn waiting(&self) -> bool {
         if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+        {
+            return true;
+        }
+        if self
             .command
             .transfer_io(transfer_io::Io::blocked)
             .unwrap_or(false)
@@ -665,10 +801,13 @@ impl FileWork {
             return true;
         }
         if self.proc_memory.is_some()
-            || self
-                .target
-                .as_ref()
-                .is_some_and(|t| t.position_busy(&self.command))
+            || self.read.is_none()
+                && self.write.is_none()
+                && self.memory_control.is_none()
+                && self
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| t.position_busy(&self.command))
         {
             return true;
         }
@@ -693,6 +832,13 @@ impl FileWork {
             || matches!(&self.command, FileCommand::Transfer(t) if t.lock().unwrap().waits())
     }
     pub fn ready(&self) -> bool {
+        if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+        {
+            return false;
+        }
         if !self
             .command
             .transfer_io(transfer_io::Io::ready)
@@ -703,10 +849,13 @@ impl FileWork {
         if let Some(io) = &self.proc_memory {
             return io.request.as_ref().is_none_or(|r| r.ready());
         }
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|t| t.position_busy(&self.command))
+        if self.read.is_none()
+            && self.write.is_none()
+            && self.memory_control.is_none()
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.position_busy(&self.command))
         {
             return false;
         }
@@ -739,12 +888,24 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        // Observe changes before checking readiness; another contender can
+        // acquire/release this original transaction during those checks.
+        let resource_changes = self
+            .resource_wait
+            .as_ref()
+            .map(|wait| wait.subscribe_changes(signal));
         let mut wait = self.resource_wait_sources(signal)?;
+        if let Some(changes) = resource_changes {
+            wait.subscriptions.extend(changes);
+        }
         // A position can become busy after subscription but before ready().
         // Subscribe even when currently idle, alongside the actual page/proc
         // dependency; choosing only one loses either kind of completion.
         if let Some(target) = self.target.as_ref().filter(|target| {
-            target.position_command(&self.command)
+            self.read.is_none()
+                && self.write.is_none()
+                && self.memory_control.is_none()
+                && target.position_command(&self.command)
                 && !matches!(
                     target.0.open.control,
                     Some(events::SharedControl::FuseFile(_))
@@ -756,16 +917,22 @@ impl FileWork {
         Ok(wait)
     }
     fn resource_wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some(wait) = self.resource_wait.as_ref().filter(|wait| !wait.ready()) {
+            return Ok(TransferWait {
+                subscriptions: wait.subscribe(signal),
+                native: Vec::new(),
+                deadline: wait.deadline(),
+            });
+        }
         if self
             .command
             .transfer_io(transfer_io::Io::blocked)
             .unwrap_or(false)
         {
-            return Ok(TransferWait {
-                subscriptions: self.command.transfer_io(|io| io.subscribe(signal)).unwrap(),
-                native: Vec::new(),
-                deadline: None,
-            });
+            return self
+                .command
+                .transfer_io(|io| io.wait_sources(signal))
+                .unwrap();
         }
         if let Some(request) = self.proc_memory.as_ref().and_then(|io| io.request.as_ref()) {
             return Ok(TransferWait {
@@ -820,11 +987,7 @@ impl FileWork {
             });
         }
         if let Some(work) = &self.namespace {
-            return Ok(TransferWait {
-                subscriptions: work.subscribe(signal).into_iter().collect(),
-                native: Vec::new(),
-                deadline: None,
-            });
+            return Ok(work.wait_sources(signal));
         }
         match &self.command {
             FileCommand::Transfer(t) => t.lock().unwrap().wait_sources(signal),
@@ -896,6 +1059,7 @@ impl FileWork {
     }
     pub(super) fn namespace(paths: PathQueries, namespace: namespace_work::NamespaceWork) -> Self {
         Self {
+            memory: trames_memory::CgroupMemoryContext::capture(),
             namespace: Some(Box::new(namespace)),
             ..Self::sync_all(paths)
         }
@@ -904,6 +1068,14 @@ impl FileWork {
     /// existing owner checkpoint, then returns to ordinary scheduling. It may
     /// encounter another daemon or native stage and must keep the same work.
     pub fn resume_owner(mut self, vfs: &mut Vfs) -> FileOutcome {
+        if self
+            .command
+            .transfer_io(transfer_io::Io::owner)
+            .unwrap_or(false)
+        {
+            self.command.transfer_io_mut(|io| io.resume_owner(vfs));
+            return FileOutcome::Waiting(self);
+        }
         if self
             .fuse_stat
             .as_ref()
@@ -932,6 +1104,8 @@ impl FileWork {
         }
     }
     pub fn run_owner(self, vfs: &mut Vfs) -> FileReply {
+        let _memory = self.memory.enter();
+        let _io = self.io.enter();
         let scope = crate::output_resources::OutputScope::enter();
         let result = self
             .namespace
@@ -948,8 +1122,11 @@ impl FileWork {
     }
     pub fn sync_all(paths: PathQueries) -> Self {
         Self {
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: cgroup::IoContext::capture(),
             paths: Box::new(paths),
             target: None,
+            _transfer: None,
             command: FileCommand::SyncAll,
             exclusive: false,
             layout_exclusive: None,
@@ -957,6 +1134,7 @@ impl FileWork {
             active: None,
             input_active: None,
             open: None,
+            resource_open: None,
             path_retry: None,
             sync_targets: None,
             namespace: None,
@@ -964,9 +1142,24 @@ impl FileWork {
             proc_memory: None,
             fuse_stat: None,
             linger: None,
+            resource_wait: None,
+            read: None,
+            write: None,
+            memory_control: None,
+            sync: None,
+            mutation: None,
+            copy_tail: None,
+            write_end: None,
         }
     }
     pub fn host_work(&self) -> bool {
+        if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+        {
+            return false;
+        }
         if self
             .command
             .transfer_io(|io| io.blocked() && !io.ready())
@@ -974,11 +1167,13 @@ impl FileWork {
         {
             return false;
         }
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|t| t.proc_memory_command(&self.command) || t.position_busy(&self.command))
-        {
+        if self.target.as_ref().is_some_and(|t| {
+            t.proc_memory_command(&self.command)
+                || self.read.is_none()
+                    && self.write.is_none()
+                    && self.memory_control.is_none()
+                    && t.position_busy(&self.command)
+        }) {
             return false;
         }
 
@@ -991,14 +1186,21 @@ impl FileWork {
         if let Some(namespace) = &self.namespace {
             return namespace.host_work();
         }
-        self.target
-            .as_ref()
-            .is_none_or(|target| target.host_work(&self.command))
+        self.command
+            .transfer_io(transfer_io::Io::host_work)
+            .unwrap_or(false)
+            || self
+                .target
+                .as_ref()
+                .is_none_or(|target| target.host_work(&self.command))
     }
     pub fn new(paths: &PathQueries, target: FileTarget, command: FileCommand) -> Self {
         Self {
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: cgroup::IoContext::capture(),
             paths: Box::new(paths.file_context(&target, &command)),
             target: Some(target),
+            _transfer: TransferLease::new(&command),
             command,
             exclusive: false,
             layout_exclusive: None,
@@ -1006,6 +1208,7 @@ impl FileWork {
             active: None,
             input_active: None,
             open: None,
+            resource_open: None,
             path_retry: None,
             sync_targets: None,
             namespace: None,
@@ -1013,12 +1216,23 @@ impl FileWork {
             proc_memory: None,
             fuse_stat: None,
             linger: None,
+            resource_wait: None,
+            read: None,
+            write: None,
+            memory_control: None,
+            sync: None,
+            mutation: None,
+            copy_tail: None,
+            write_end: None,
         }
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
         Self {
+            memory: trames_memory::CgroupMemoryContext::capture(),
+            io: cgroup::IoContext::capture(),
             paths: Box::new(PathQueries::file_view(vfs, &target, &command)),
             target: Some(target),
+            _transfer: TransferLease::new(&command),
             command,
             exclusive: false,
             layout_exclusive: None,
@@ -1026,6 +1240,7 @@ impl FileWork {
             active: None,
             input_active: None,
             open: None,
+            resource_open: None,
             path_retry: None,
             sync_targets: None,
             namespace: None,
@@ -1033,6 +1248,14 @@ impl FileWork {
             proc_memory: None,
             fuse_stat: None,
             linger: None,
+            resource_wait: None,
+            read: None,
+            write: None,
+            memory_control: None,
+            sync: None,
+            mutation: None,
+            copy_tail: None,
+            write_end: None,
         }
     }
     pub fn queued(mut self) -> Self {
@@ -1117,6 +1340,10 @@ impl FileWork {
     /// Joined caller execution, with the same original VFS ownership contract.
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
     pub fn run_owned(vfs: &mut Vfs, target: FileTarget, command: FileCommand) -> FileOutcome {
+        let memory = trames_memory::CgroupMemoryContext::capture();
+        let _memory = memory.enter();
+        let io = cgroup::IoContext::capture();
+        let _io = io.enter();
         let scope = crate::output_resources::OutputScope::enter();
         let original = target.0.clone();
         Self::run_owned_inner(vfs, target, command)
@@ -1125,6 +1352,33 @@ impl FileWork {
     }
     fn run_owned_inner(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
         command.retain_output_inputs();
+        if target.memory_control(&command) || target.cursor_read(&command) {
+            return Self::from_vfs(vfs, target, command).exclusive().run();
+        }
+        if matches!(command, FileCommand::Copy { .. } | FileCommand::Transfer(_)) {
+            return Self::from_vfs(vfs, target, command).exclusive().run();
+        }
+        if matches!(command, FileCommand::SyncAll | FileCommand::SyncFilesystem) {
+            return Self::from_vfs(vfs, target, command).run();
+        }
+        if target.regular_file()
+            && !target.daemon_backed()
+            && matches!(
+                command,
+                FileCommand::Write { .. }
+                    | FileCommand::WriteSync { .. }
+                    | FileCommand::Sync { .. }
+                    | FileCommand::SyncRange { .. }
+                    | FileCommand::Truncate(_)
+                    | FileCommand::TruncateOpen
+                    | FileCommand::Allocate { .. }
+                    | FileCommand::Seals(Some(_))
+            )
+        {
+            // This entry owns joined VM views, as the original direct call did.
+            // A later resource wait releases that authority before parking.
+            return Self::from_vfs(vfs, target, command).exclusive().run();
+        }
         if target.proc_memory_command(&command)
             || target.position_busy(&command)
             || target.daemon_backed()
@@ -1136,7 +1390,14 @@ impl FileWork {
         if let Some(result) = target.proc_read(&command) {
             return Self::proc_outcome(result, || Self::from_vfs(vfs, target, command));
         }
+        let resource_scope = resource_io::Scope::enter();
         let result = command.execute_target(vfs, &target);
+        if let Some(pending) = resource_scope.finish() {
+            let mut work = Self::from_vfs(vfs, target, command);
+            work.resource_wait = Some(pending.wait);
+            work.exclusive = false;
+            return FileOutcome::Waiting(work);
+        }
         if result.as_ref().is_err_and(|e| e.0 == 11) && target.waits(&command) {
             return FileOutcome::Waiting(Self::from_vfs(vfs, target, command));
         }
@@ -1159,6 +1420,10 @@ impl FileWork {
         target: FileTarget,
         command: FileCommand,
     ) -> FileOutcome {
+        let memory = trames_memory::CgroupMemoryContext::capture();
+        let _memory = memory.enter();
+        let io = cgroup::IoContext::capture();
+        let _io = io.enter();
         let scope = crate::output_resources::OutputScope::enter();
         let original = target.0.clone();
         Self::run_inline_inner(paths, target, command)
@@ -1171,7 +1436,27 @@ impl FileWork {
         mut command: FileCommand,
     ) -> FileOutcome {
         command.retain_output_inputs();
-        if target.proc_memory_command(&command) || target.position_busy(&command) {
+        if target.memory_control(&command) || target.cursor_read(&command) {
+            return Self::new(paths, target, command).run();
+        }
+        if matches!(command, FileCommand::Copy { .. } | FileCommand::Transfer(_)) {
+            return Self::new(paths, target, command).run();
+        }
+        if target.proc_memory_command(&command)
+            || target.position_busy(&command)
+            || target.regular_file()
+                && matches!(
+                    command,
+                    FileCommand::Write { .. }
+                        | FileCommand::WriteSync { .. }
+                        | FileCommand::Sync { .. }
+                        | FileCommand::SyncRange { .. }
+                        | FileCommand::Truncate(_)
+                        | FileCommand::TruncateOpen
+                        | FileCommand::Allocate { .. }
+                        | FileCommand::Seals(Some(_))
+                )
+        {
             return Self::new(paths, target, command).run();
         }
         if target.daemon_backed() || command.daemon_backed() {
@@ -1180,7 +1465,14 @@ impl FileWork {
         if let Some(result) = target.proc_read(&command) {
             return Self::proc_outcome(result, || Self::new(paths, target, command));
         }
-        match paths.file_command(&target, &command, false) {
+        let resource_scope = resource_io::Scope::enter();
+        let reply = paths.file_command(&target, &command, false);
+        if let Some(pending) = resource_scope.finish() {
+            let mut work = Self::new(paths, target, command);
+            work.resource_wait = Some(pending.wait);
+            return FileOutcome::Waiting(work);
+        }
+        match reply {
             Some((result, signal)) => {
                 if result.as_ref().is_err_and(|e| e.0 == 11) && target.waits(&command) {
                     return FileOutcome::Waiting(Self::new(paths, target, command));
@@ -1204,13 +1496,20 @@ impl FileWork {
             {
                 FileOutcome::Waiting(Self::new(paths, target, command))
             }
-            None => FileOutcome::Layout(Self::new(paths, target, command)),
+            None => Self::new(paths, target, command).defer_operation(),
         }
     }
     pub fn layout_domains(&self) -> Vec<u64> {
-        self.target
+        let mut domains = self
+            .target
             .as_ref()
-            .map_or_else(Vec::new, FileTarget::layout_domains)
+            .map_or_else(Vec::new, FileTarget::layout_domains);
+        if let Some(child) = self.command.transfer_io(transfer_io::Io::layout_domains) {
+            domains.extend(child);
+        }
+        domains.sort_unstable();
+        domains.dedup();
+        domains
     }
     pub fn target(&self) -> Option<&FileTarget> {
         self.target.as_ref()
@@ -1223,16 +1522,17 @@ impl FileWork {
         self.admission_layout().map(|layout| layout.write())
     }
     pub fn admission_layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
-        self.fuse_layout
-            .clone()
-            .or_else(|| self.target.as_ref()?.layout())
+        self.command
+            .transfer_io(transfer_io::Io::layout)
+            .flatten()
+            .or_else(|| {
+                self.fuse_layout
+                    .clone()
+                    .or_else(|| self.target.as_ref()?.layout())
+            })
     }
     pub fn enter_layout(mut self, exclusive: trames_memory::layout::LayoutExclusive) -> Self {
-        let original = self
-            .fuse_layout
-            .clone()
-            .or_else(|| self.target.as_ref().and_then(FileTarget::layout))
-            .expect("mapped original inode");
+        let original = self.admission_layout().expect("mapped original inode");
         assert!(
             Arc::ptr_eq(&original, exclusive.layout()),
             "original layout admission"
@@ -1359,11 +1659,20 @@ impl FileWork {
         }
     }
     pub fn run(self) -> FileOutcome {
+        let _memory = self.memory.enter();
+        let _io = self.io.enter();
         let scope = crate::output_resources::OutputScope::enter();
         let original = self.target.as_ref().map(|target| target.0.clone());
         let mut outcome = self.run_inner();
         if let FileOutcome::Waiting(work) = &mut outcome {
-            if work.fuse_layout.take().is_some() {
+            if work.resource_wait.is_some()
+                || work
+                    .command
+                    .transfer_io(transfer_io::Io::retained)
+                    .unwrap_or(false)
+                || work.fuse_layout.take().is_some()
+            {
+                work.fuse_layout = None;
                 work.layout_exclusive = None;
                 work.exclusive = false;
             }
@@ -1371,6 +1680,38 @@ impl FileWork {
         outcome.retain_file(original).retain_output(scope.finish())
     }
     fn run_inner(mut self) -> FileOutcome {
+        if self
+            .resource_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+        {
+            return FileOutcome::Waiting(self);
+        }
+        // A ready receipt can own cold copy-up progress. Keep it through an
+        // intervening layout/owner handoff; a new wait replaces it only after
+        // the actual resource body has resumed. Ready receipts do not override
+        // other readiness or subscription sources above.
+        if self.resource_open.is_some() {
+            return self.run_resource_open();
+        }
+        if self
+            .command
+            .transfer_io(transfer_io::Io::owner)
+            .unwrap_or(false)
+        {
+            return FileOutcome::Owner(self);
+        }
+        if self.sync_targets.is_none()
+            && self.fuse_stat.is_none()
+            && (matches!(self.command, FileCommand::SyncAll)
+                || matches!(self.command, FileCommand::SyncFilesystem)
+                    && self
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.status_flags() & O_PATH == 0))
+        {
+            self = self.queued();
+        }
         self.command.retain_output_inputs();
         if !self.exclusive {
             let layout = if let Some(metadata) = &self.fuse_stat {
@@ -1402,10 +1743,13 @@ impl FileWork {
                 }),
             };
         }
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|t| t.position_busy(&self.command))
+        if self.read.is_none()
+            && self.write.is_none()
+            && self.memory_control.is_none()
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.position_busy(&self.command))
         {
             return FileOutcome::Waiting(self);
         }
@@ -1431,6 +1775,20 @@ impl FileWork {
         }
         if let Some(p) = &mut self.fuse_stat {
             let value = p.take(&mut self.paths.view.borrow_mut());
+            if self.write.is_some() || self.sync.is_some() || self.mutation.is_some() {
+                return match value {
+                    Some(Ok(_)) => {
+                        self.fuse_stat = None;
+                        self.run_inner()
+                    }
+                    Some(Err(error)) if self.write.is_some() => self.fail_write(error),
+                    Some(Err(error)) => FileOutcome::Complete(Self::descriptor_result(
+                        Err(error),
+                        &mut self.command,
+                    )),
+                    None => FileOutcome::Waiting(self),
+                };
+            }
             if self
                 .command
                 .transfer_io(transfer_io::Io::pending)
@@ -1607,10 +1965,36 @@ impl FileWork {
                 namespace_work::NamespaceRun::Waiting => FileOutcome::Waiting(self),
             };
         }
-        let reply = if let Some(targets) = &self.sync_targets {
+        if self.memory_control.is_some()
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.memory_control(&self.command))
+        {
+            return self.run_memory_control();
+        }
+        if self.read.is_some()
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.cursor_read(&self.command))
+        {
+            return self.run_read();
+        }
+        if self.mutation.is_some() || self.cursor_resize() {
+            return self.run_resize();
+        }
+        if self.sync.is_some() || self.cursor_sync() {
+            return self.run_sync();
+        }
+        if self.write.is_some() || self.cursor_write() {
+            return self.run_write();
+        }
+        let resource_scope = resource_io::Scope::enter();
+        let reply = if let Some(targets) = &mut self.sync_targets {
             Some((
                 targets
-                    .iter()
+                    .iter_mut()
                     .try_for_each(storage::FilesystemSync::run)
                     .map(|()| FileValue::Count(0)),
                 false,
@@ -1628,32 +2012,12 @@ impl FileWork {
                 false,
             ))
         };
+        if let Some(pending) = resource_scope.finish() {
+            self.resource_wait = Some(pending.wait);
+            return FileOutcome::Waiting(self);
+        }
         if reply.is_none() {
-            let pending = self
-                .paths
-                .view
-                .borrow()
-                .query
-                .as_ref()
-                .unwrap()
-                .prepared
-                .borrow_mut()
-                .fuse
-                .take();
-            if let Some(pending) = pending {
-                // An original descriptor can require daemon metadata without
-                // having an opened FUSE file handle (notably O_PATH roots).
-                // Keep this request; a layout retry would issue it again.
-                self.fuse_stat = Some(pending);
-                return FileOutcome::Waiting(self);
-            }
-            if self
-                .command
-                .transfer_io(transfer_io::Io::blocked)
-                .unwrap_or(false)
-            {
-                return FileOutcome::Waiting(self);
-            }
+            return self.defer_operation();
         }
         match reply {
             Some((mut result, signal)) => {
@@ -1682,13 +2046,7 @@ impl FileWork {
                 {
                     return FileOutcome::Waiting(self);
                 }
-                if result.is_ok() {
-                    if let Some(open) = self.open.take() {
-                        result = open
-                            .publish(&self.paths)
-                            .map(|fd| FileValue::Count(fd as u64));
-                    }
-                }
+                result = self.publish_open(result);
                 let scratch = match &mut self.command {
                     FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => {
                         Some(std::mem::take(bytes))
@@ -1703,6 +2061,40 @@ impl FileWork {
                 })
             }
             None => FileOutcome::Layout(self),
+        }
+    }
+    fn defer_operation(mut self) -> FileOutcome {
+        if self
+            .command
+            .transfer_io(transfer_io::Io::owner)
+            .unwrap_or(false)
+        {
+            return FileOutcome::Owner(self);
+        }
+        let pending = self
+            .paths
+            .view
+            .borrow()
+            .query
+            .as_ref()
+            .unwrap()
+            .prepared
+            .borrow_mut()
+            .fuse
+            .take();
+        if let Some(pending) = pending {
+            // Keep original daemon metadata even when the accepted descriptor
+            // itself has no FUSE handle; retries must not submit it again.
+            self.fuse_stat = Some(pending);
+            FileOutcome::Waiting(self)
+        } else if self
+            .command
+            .transfer_io(transfer_io::Io::blocked)
+            .unwrap_or(false)
+        {
+            FileOutcome::Waiting(self)
+        } else {
+            FileOutcome::Layout(self)
         }
     }
 }
@@ -1935,12 +2327,19 @@ impl PathQueries {
         command: &FileCommand,
         exclusive: bool,
     ) -> Option<(Result<FileValue>, bool)> {
+        self.file_operation(exclusive, |view| command.execute_target(view, target))
+    }
+    fn file_operation(
+        &self,
+        exclusive: bool,
+        operation: impl FnOnce(&mut Vfs) -> Result<FileValue>,
+    ) -> Option<(Result<FileValue>, bool)> {
         let mut view = self.view.borrow_mut();
         let authority = view.query.as_mut().expect("sealed file authority");
         authority.file_layout_exclusive = exclusive;
         authority.clear_deferred();
         view.file_size_signal.set(false);
-        let result = command.execute_target(&mut view, target);
+        let result = operation(&mut view);
         let signal = view.file_size_signal.replace(false);
         let authority = view.query.as_ref().unwrap();
         (!authority.take_deferred()).then_some((result, signal))
@@ -1998,6 +2397,13 @@ impl FileCommand {
         match self {
             Self::Copy { transfer, .. } => Some(f(&transfer.lock().unwrap().io)),
             Self::Transfer(transfer) => Some(f(&transfer.lock().unwrap().io)),
+            _ => None,
+        }
+    }
+    fn transfer_io_mut<T>(&mut self, f: impl FnOnce(&mut transfer_io::Io) -> T) -> Option<T> {
+        match self {
+            Self::Copy { transfer, .. } => Some(f(&mut transfer.lock().unwrap().io)),
+            Self::Transfer(transfer) => Some(f(&mut transfer.lock().unwrap().io)),
             _ => None,
         }
     }
@@ -2209,6 +2615,9 @@ pub struct FileCopy {
     target_stat: Option<[u8; 128]>,
     start_from: Option<u64>,
     start_to: Option<u64>,
+    source_position: Option<transfer_io::Position>,
+    output_position: Option<transfer_io::Position>,
+    cancelled: bool,
 }
 struct CopyStage {
     from: u64,
@@ -2216,6 +2625,42 @@ struct CopyStage {
     bytes: Option<Vec<u8>>,
     written: Option<(usize, usize)>,
     source_committed: bool,
+    output_committed: bool,
+    offered: usize,
+}
+struct CancelledCopy {
+    _io: transfer_io::Io,
+    position: Option<transfer_io::Position>,
+    output: Option<transfer_io::Position>,
+    _stage: Option<CopyStage>,
+    prefix_end: Option<u64>,
+    output_end: Option<u64>,
+    range: bool,
+}
+impl Drop for CancelledCopy {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self._io));
+        if let (Some(position), Some(end)) = (&self.position, self.prefix_end) {
+            position.record(end);
+        }
+        if let (Some(position), Some(end)) = (&self.output, self.output_end) {
+            position.record(end);
+        }
+        let source = self.position.take();
+        let output = self.output.take();
+        if self.range {
+            drop(source);
+            drop(output);
+        } else {
+            drop(output);
+            drop(source);
+        }
+    }
+}
+impl Drop for FileCopy {
+    fn drop(&mut self) {
+        drop(self.cancel_pending());
+    }
 }
 impl Vfs {
     pub const MAX_RW_COUNT: u64 = i32::MAX as u64 & !(trames_memory::PAGE_SIZE - 1);
@@ -2285,6 +2730,45 @@ pub(super) fn repeat_tail(seed: &[u8], count: usize) -> Vec<u8> {
 }
 
 impl FileCopy {
+    fn cancel_pending(&mut self) -> CancelledCopy {
+        self.cancelled = true;
+        let prefix_end = self
+            .stage
+            .as_ref()
+            .filter(|stage| !stage.source_committed)
+            .and_then(|stage| {
+                let count = stage
+                    .written
+                    .map_or_else(|| self.io.cancelled_write_progress(), |(count, _)| count);
+                (count != 0).then(|| stage.from + count as u64)
+            });
+        CancelledCopy {
+            output_end: self
+                .stage
+                .as_ref()
+                .filter(|stage| !stage.output_committed)
+                .and_then(|stage| {
+                    let count = stage
+                        .written
+                        .map_or_else(|| self.io.cancelled_write_progress(), |(count, _)| count);
+                    (count != 0).then(|| {
+                        self.io.write_end().unwrap_or_else(|| {
+                            self.output_position
+                                .as_ref()
+                                .map_or(0, |position| position.offset)
+                                + self.copied
+                                + count as u64
+                        })
+                    })
+                }),
+            _io: std::mem::take(&mut self.io),
+            position: self.source_position.take(),
+            output: self.output_position.take(),
+            _stage: self.stage.take(),
+            prefix_end,
+            range: self.range,
+        }
+    }
     pub fn new(
         from: Result<Option<u64>>,
         to: Result<Option<u64>>,
@@ -2303,9 +2787,15 @@ impl FileCopy {
             target_stat: None,
             start_from: None,
             start_to: None,
+            source_position: None,
+            output_position: None,
+            cancelled: false,
         }
     }
     fn execute(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
+        if self.cancelled {
+            return Err(Errno(4));
+        }
         if self.stage.is_none() {
             if !self.range {
                 Vfs::check_sendfile_modes(v.flags(input)?, v.flags(output)?)?;
@@ -2325,7 +2815,15 @@ impl FileCopy {
             } else {
                 let from = match self.from? {
                     Some(offset) => offset,
-                    None => self.io.seek(v, &v.descriptor(input)?, 0, 1)?,
+                    None => {
+                        let descriptor = v.descriptor(input)?;
+                        let file = SharedFd::new(descriptor.open.borrow().shared.clone());
+                        if file.open.is_regular_file() {
+                            file.open.file_position.snapshot()
+                        } else {
+                            self.io.seek(v, &descriptor, 0, 1)?
+                        }
+                    }
                 };
                 self.start_from = Some(from);
                 from
@@ -2348,7 +2846,7 @@ impl FileCopy {
                 } else {
                     let to = match self.to? {
                         Some(offset) => offset,
-                        None => self.io.seek(v, &v.descriptor(output)?, 0, 1)?,
+                        None => v.descriptor(output)?.open.borrow().file_position.snapshot(),
                     };
                     self.start_to = Some(to);
                     to
@@ -2364,10 +2862,9 @@ impl FileCopy {
                 if transfer_io::Io::regular(&SharedFd::new(
                     v.descriptor(output)?.open.borrow().shared.clone(),
                 )) {
-                    Vfs::check_io_range(
-                        self.io.seek(v, &v.descriptor(output)?, 0, 1)?,
-                        self.count.min(Vfs::MAX_RW_COUNT),
-                    )?;
+                    let offset = v.descriptor(output)?.open.borrow().file_position.snapshot();
+                    self.start_to = Some(offset);
+                    Vfs::check_io_range(offset, self.count.min(Vfs::MAX_RW_COUNT))?;
                 }
             }
             self.start(from, to);
@@ -2385,15 +2882,6 @@ impl FileCopy {
         to: Option<u64>,
     ) -> Result<u64> {
         self.start(from, to);
-        if v.query.is_some()
-            && [input, output].iter().any(|&fd| {
-                v.descriptor(fd).is_ok_and(|d| {
-                    matches!(
-                        d.open.borrow().control,
-                        Some(events::SharedControl::FuseFile(_))
-                    )
-                })
-            })
         {
             let input = FileTarget(SharedFd::new(
                 v.descriptor(input)?.open.borrow().shared.clone(),
@@ -2405,13 +2893,11 @@ impl FileCopy {
                 input,
                 transfer: Arc::new(std::sync::Mutex::new(self)),
             };
-            return match v.transfer_work(FileWork::from_vfs(v, target, command))? {
+            match v.transfer_work(FileWork::from_vfs(v, target, command))? {
                 FileValue::Transfer { count, .. } => Ok(count),
                 _ => unreachable!("retained copy result"),
-            };
+            }
         }
-        self.drive(v, input, output)?;
-        Ok(self.copied)
     }
 
     fn start(&mut self, from: u64, to: Option<u64>) {
@@ -2422,10 +2908,33 @@ impl FileCopy {
             bytes: None,
             written: None,
             source_committed: false,
+            output_committed: false,
+            offered: 0,
         });
     }
 
     fn drive(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
+        if self.source_position.is_none() && self.from?.is_none() {
+            let descriptor = v.descriptor(input)?;
+            let source = SharedFd::new(descriptor.open.borrow().shared.clone());
+            if source.open.is_regular_file() {
+                self.source_position = Some(transfer_io::Position::capture(
+                    source,
+                    Some(self.stage.as_ref().unwrap().from),
+                ));
+            }
+        }
+        if self.output_position.is_none() && self.to?.is_none() {
+            let target = SharedFd::new(v.descriptor(output)?.open.borrow().shared.clone());
+            if target.open.is_regular_file() {
+                let position = transfer_io::Position::capture(
+                    target,
+                    self.stage.as_ref().unwrap().to.or(self.start_to),
+                );
+                self.start_to = Some(position.offset);
+                self.output_position = Some(position);
+            }
+        }
         loop {
             let chunk = self.chunk_size();
             let stage = self.stage.as_mut().unwrap();
@@ -2447,7 +2956,10 @@ impl FileCopy {
                     Ok(bytes) if self.copied > 0 && bytes.is_empty() => {
                         return Ok(self.result(from, to))
                     }
-                    Ok(bytes) => stage.bytes = Some(bytes),
+                    Ok(bytes) => {
+                        stage.offered = bytes.len();
+                        stage.bytes = Some(bytes);
+                    }
                     Err(e)
                         if self.copied == 0 || v.query.as_ref().is_some_and(|q| q.deferred()) =>
                     {
@@ -2456,60 +2968,52 @@ impl FileCopy {
                     Err(_) => return Ok(self.result(from, to)),
                 }
             }
-            let bytes = stage.bytes.as_ref().unwrap();
-            let mut offered = bytes.len();
+            let out = v.descriptor(output)?;
             let result = if let Some((written, original_offered)) = stage.written {
-                offered = original_offered;
+                stage.offered = original_offered;
                 Ok(written)
-            } else if matches!(
-                &v.descriptor(output)?.open.borrow().control,
-                Some(events::SharedControl::FuseFile(_))
-            ) {
-                self.io
-                    .call(
-                        &v.descriptor(output)?,
-                        v,
-                        FileCommand::Write {
-                            bytes: bytes.clone(),
-                            offset: to,
-                        },
-                        transfer_io::Step::Write,
-                    )
-                    .and_then(transfer_io::Io::count)
-            } else if let Some(to) = to {
-                v.pwrite(output, bytes, to)
-            } else if !bytes.is_empty() && bytes.len() < chunk {
-                let out = v.descriptor(output)?;
-                let source = v.descriptor(input)?.open.borrow().data_node();
-                let same = source
-                    .zip(out.open.borrow().node.clone())
-                    .is_some_and(|(s, d)| s.regular_file && Arc::ptr_eq(&s, &d));
-                if same {
-                    v.file_write_description_inner::<true>(
-                        &out,
-                        bytes,
-                        None,
-                        None,
-                        (from, chunk),
-                        &mut offered,
-                    )
+            } else if transfer_io::Io::regular(&SharedFd::new(out.open.borrow().shared.clone())) {
+                let bytes = stage.bytes.as_mut().unwrap();
+                let tail = if to.is_none()
+                    && !self.io.retained()
+                    && !bytes.is_empty()
+                    && bytes.len() < chunk
+                {
+                    v.descriptor(input)?
+                        .open
+                        .borrow()
+                        .data_node()
+                        .zip(out.open.borrow().node.clone())
+                        .is_some_and(|(source, target)| {
+                            source.regular_file && Arc::ptr_eq(&source, &target)
+                        })
+                        .then_some((from, chunk))
                 } else {
-                    v.write_description(&out, bytes)
-                }
+                    None
+                };
+                // An implicit destination belongs to its original OFD. The
+                // retained child acquires that position before writing bytes.
+                let at = to;
+                let result = self.io.write(&out, v, bytes, at, tail);
+                stage.offered = self.io.offered();
+                result
+            } else if let Some(to) = to {
+                v.pwrite(output, stage.bytes.as_ref().unwrap(), to)
             } else {
-                v.write(output, bytes)
+                v.write(output, stage.bytes.as_ref().unwrap())
             };
             let written = match result {
                 Ok(n) => n,
                 Err(Errno(11))
-                    if v.descriptor(output)?
-                        .open
-                        .borrow()
-                        .file_position
-                        .lock()
-                        .unwrap()
-                        .pending
-                        != 0 =>
+                    if !self.io.retained()
+                        && v.descriptor(output)?
+                            .open
+                            .borrow()
+                            .file_position
+                            .lock()
+                            .unwrap()
+                            .pending
+                            != 0 =>
                 {
                     return self.io.wait_position(
                         v,
@@ -2523,19 +3027,34 @@ impl FileCopy {
                 }
                 Err(_) => return Ok(self.result(from, to)),
             };
-            let short = written < offered;
-            stage.written = Some((written, offered));
+            let short = written < stage.offered;
+            stage.written = Some((written, stage.offered));
             let written = written as u64;
             let from = from + written;
             let to = to.map(|p| p + written);
             if self.from?.is_none() && !stage.source_committed {
-                self.io.seek(v, &v.descriptor(input)?, from as i64, 0)?;
+                if let Some(position) = &self.source_position {
+                    if written != 0 && !position.try_record(from) {
+                        return self.io.wait_position(v, position.position());
+                    }
+                } else {
+                    self.io.seek(v, &v.descriptor(input)?, from as i64, 0)?;
+                }
                 stage.source_committed = true;
             }
-            if let Some(to) = to {
-                if self.to?.is_none() {
+            if self.to?.is_none() && !stage.output_committed {
+                if let Some(position) = &self.output_position {
+                    if written != 0 {
+                        position.record(
+                            self.io
+                                .write_end()
+                                .unwrap_or(position.offset + self.copied + written),
+                        );
+                    }
+                } else if let Some(to) = to {
                     self.io.seek(v, &v.descriptor(output)?, to as i64, 0)?;
                 }
+                stage.output_committed = true;
             }
             self.copied += written;
             if short || written == 0 || self.copied == self.count {
@@ -2547,6 +3066,8 @@ impl FileCopy {
                 bytes: None,
                 written: None,
                 source_committed: false,
+                output_committed: false,
+                offered: 0,
             });
         }
     }
@@ -2564,7 +3085,10 @@ impl FileCopy {
     }
 }
 impl Vfs {
-    pub(super) fn transfer_work(&self, work: FileWork) -> Result<FileValue> {
+    pub(super) fn transfer_work(&mut self, work: FileWork) -> Result<FileValue> {
+        if self.query.is_none() {
+            return host_sync::Wait::default().file(self, work.run());
+        }
         match work.run() {
             FileOutcome::Complete(reply) => reply.result,
             FileOutcome::Waiting(work) | FileOutcome::Layout(work) | FileOutcome::Owner(work) => {

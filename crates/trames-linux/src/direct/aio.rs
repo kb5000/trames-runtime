@@ -25,6 +25,9 @@ mod mapping;
 mod mask_tests;
 #[path = "aio/owned.rs"]
 mod owned;
+#[cfg(test)]
+#[path = "aio/resource_tests.rs"]
+mod resource_tests;
 #[path = "aio/retire.rs"]
 mod retire;
 #[cfg(test)]
@@ -186,12 +189,15 @@ impl Active {
         true
     }
 }
+#[allow(clippy::large_enum_variant)] // Transient dispatch is consumed immediately; boxing adds an allocation to every AIO file request.
 enum Work {
     Disk(trames_vfs::FileWork),
     Pipe(trames_vfs::DirectFd, trames_vfs::FileCommand),
 }
 struct Request {
     _file: trames_vfs::SharedFd,
+    resources: trames_vfs::CgroupResourceContext,
+    actor: Option<Arc<trames_vfs::FileActorSnapshot>>,
     asynchronous: bool,
     waiting: Option<trames_vfs::FileWork>,
     layout: Option<Box<LayoutWait>>,
@@ -207,6 +213,8 @@ struct Iocb {
     address: u64,
     bytes: [u8; 64],
     file: trames_vfs::SharedFd,
+    resources: trames_vfs::CgroupResourceContext,
+    actor: Option<Arc<trames_vfs::FileActorSnapshot>>,
     event: Option<trames_vfs::NativeEvent>,
 }
 struct LayoutWait {
@@ -469,7 +477,7 @@ impl DirectSyscalls {
         }
         Ok(b)
     }
-    fn bind_iocb(&self, address: u64, b: [u8; 64]) -> Result<Iocb, Errno> {
+    fn bind_iocb(&self, address: u64, b: [u8; 64], pid: u32) -> Result<Iocb, Errno> {
         let u32_at = |n| u32::from_le_bytes(b[n..n + 4].try_into().unwrap());
         let file = self
             .membership
@@ -484,10 +492,26 @@ impl DirectSyscalls {
         } else {
             None
         };
+        let resources = self.resource_context(pid);
+        let op = u16::from_le_bytes(b[16..18].try_into().unwrap());
+        let actor = if matches!(op, 2 | 3) {
+            let _resources = resources.enter();
+            trames_vfs::FileActorScope::frozen()
+                .or_else(|| {
+                    self.resources.as_ref().map(|factory| {
+                        trames_vfs::FileActorScope::frozen_for(factory.local_credentials(), pid)
+                    })
+                })
+                .map(Arc::new)
+        } else {
+            None
+        };
         Ok(Iocb {
             address,
             bytes: b,
             file,
+            resources,
+            actor,
             event,
         })
     }
@@ -571,6 +595,8 @@ impl DirectSyscalls {
         Ok((
             Request {
                 _file: accepted.file.clone(),
+                resources: accepted.resources.clone(),
+                actor: accepted.actor.clone(),
                 asynchronous: matches!(op, 2 | 3),
                 pipe: None,
                 waiting: None,
@@ -598,14 +624,22 @@ impl DirectSyscalls {
             return None;
         }
         let (aio, _) = self.aio.as_ref()?;
+        let resources = self.resource_context(pid);
         if number == 0 {
             return Some(
-                Box::new(SetupInput::new(aio.clone(), a)).resume(self, memory, pid, target),
+                Box::new(SetupInput::new(aio.clone(), a, resources))
+                    .resume(self, memory, pid, target),
             );
         }
         Some(
-            Box::new(lookup::Lookup::new(aio.clone(), number, a, deadline))
-                .resume(self, memory, pid, target),
+            Box::new(lookup::Lookup::new(
+                aio.clone(),
+                number,
+                a,
+                deadline,
+                resources,
+            ))
+            .resume(self, memory, pid, target),
         )
     }
     pub fn start_retained_aio(
@@ -663,6 +697,9 @@ impl DirectSyscalls {
         let (aio, _) = self.aio.as_ref().expect("accepted AIO domain");
         let reaped = retained.as_ref().map_or(0, |call| call.reaped);
         let user = retained.as_ref().and_then(|call| call.user.clone());
+        // A context user represents one accepted syscall across all snapshots.
+        // IOCBs override this control/input scope with their own accepted origin.
+        let _resources = user.as_ref().and_then(|user| user.resource_scope());
         let mask_header = retained.as_ref().and_then(|call| call.header.clone());
         let result = (|| {
             let mut call = retained.expect("context lookup precedes AIO execution");
@@ -743,7 +780,7 @@ impl DirectSyscalls {
                     }
                     Ok(Err(error)) => return Err(error),
                     Err(fault) => {
-                        subscriptions.push(fault.wait.subscribe(&signal));
+                        subscriptions.extend(fault.wait.subscribe(&signal));
                         return Ok(self.park_aio(
                             RetainedAio {
                                 context,
@@ -807,14 +844,14 @@ impl DirectSyscalls {
                     let mut batch = batch_root.lock().unwrap();
                     if batch.requests.is_empty() {
                         if batch.pending.is_none() {
-                            let next = import.lock().unwrap().next(self, a, memory, exiting);
+                            let next = import.lock().unwrap().next(self, a, memory, pid, exiting);
                             match next {
                                 input::Next::Done(result) => {
                                     drop(batch);
                                     return Ok(IoAttempt::Complete(result));
                                 }
                                 input::Next::Wait(wait) => {
-                                    subscriptions.push(wait.subscribe(&signal));
+                                    subscriptions.extend(wait.subscribe(&signal));
                                     drop(batch);
                                     return Ok(self.park_aio(
                                         RetainedAio {
@@ -887,6 +924,7 @@ impl DirectSyscalls {
                     while remaining != 0 {
                         remaining -= 1;
                         let mut request = batch.requests.pop_front().unwrap();
+                        let _resources = request.resources.enter();
                         let completed = if request.copyout.is_some() {
                             None
                         } else if request.layout.is_some() && exiting {
@@ -1053,7 +1091,7 @@ impl DirectSyscalls {
                                     if exiting {
                                         request.copyout.as_mut().unwrap().faulted()
                                     } else {
-                                        subscriptions.push(fault.wait.subscribe(&signal));
+                                        subscriptions.extend(fault.wait.subscribe(&signal));
                                         if fault.wait.ready() {
                                             remaining += 1;
                                         }
@@ -1253,7 +1291,7 @@ impl DirectSyscalls {
                 }
             }
             Err(fault) => {
-                subscriptions.push(fault.wait.subscribe(&signal));
+                subscriptions.extend(fault.wait.subscribe(&signal));
                 self.park_aio(call, signal, subscriptions, target)
             }
         }

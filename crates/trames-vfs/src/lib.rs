@@ -11,7 +11,10 @@ pub use console::NativeConsole;
 pub use console::{CapturedBytes, CapturedConsole, ConsoleCallbacks, ConsoleIo, ConsoleStream};
 pub mod capabilities;
 mod cgroup;
-pub use cgroup::{CgroupBirth, CgroupDestination, CgroupTask, CpuShare};
+pub use cgroup::{
+    CgroupBirth, CgroupDestination, CgroupResourceContext, CgroupResourceScope, CgroupTask,
+    CpuShare,
+};
 mod fs_context;
 mod path_position;
 mod path_queries;
@@ -79,9 +82,11 @@ mod direct_io;
 mod native_images;
 pub use direct_io::{NativeEvent, NativeEvents};
 mod file_accounting;
+mod file_cache;
 mod file_data;
 mod file_work;
 mod output_resources;
+mod shared_account;
 pub use output_resources::FileResources;
 mod namespace_work;
 pub use file_work::{
@@ -112,13 +117,13 @@ pub mod sync_file;
 mod uring;
 pub use uring::{
     RetainedFd, Uring, UringBufferGroup, UringBufferSource, UringExecutionLease, UringFile,
-    UringFileView, UringObject, UringProvidedBuffer, UringRequest, UringResource, UringRetirement,
-    UringRunning, UringSelection, UringSource, UringSqe, UringState, URING_CQES, URING_MAX_ENTRIES,
-    URING_OPS, URING_SQ_ARRAY,
+    UringFileView, UringObject, UringPreparation, UringProvidedBuffer, UringRequest, UringResource,
+    UringRetirement, UringRunning, UringSelection, UringSource, UringSqe, UringState, URING_CQES,
+    URING_MAX_ENTRIES, URING_OPS, URING_SQ_ARRAY,
 };
 mod executable;
 pub use executable::{script_interpreter, ScriptInterpreter};
-pub use executable::{ExecutableFile, ExecutingFile};
+pub use executable::{ExecutableFile, ExecutableRead, ExecutingFile};
 mod inotify;
 pub use inotify::{FileClose, InotifyInstance};
 mod ipc;
@@ -145,9 +150,11 @@ pub use locks::{
     OFD_LOCK_OWNER,
 };
 mod host_files;
+mod import_work;
+pub use import_work::{HostImport, ImportedFile};
 mod linux_namespace;
 mod task_namespace;
-pub use host_files::{HostEdit, HostExport};
+pub use host_files::{HostEdit, HostEditWork, HostExport, HostExportWork};
 pub use task_namespace::{
     TaskNamespaceAttempt, TaskNamespaceOwnerAttempt, TaskNamespaceResources, TaskNamespaceWork,
     TaskNamespaces,
@@ -192,6 +199,8 @@ mod storage;
 mod storage_tests;
 pub use credentials::{CredentialState, Credentials, Dumpable, ExecCredentials};
 mod file_actor;
+mod host_sync;
+mod resource_io;
 pub use file_actor::{FileActorScope, FileActorSnapshot};
 pub use linux_namespace::{NamespaceProjection, PidfdNamespaces, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
@@ -714,6 +723,26 @@ struct MetadataTarget {
     path: ResolvedPath,
     node: NodeRef,
     _magic: Option<ResolvedInode>,
+}
+/// Keep the already accepted target only if this metadata attempt suspends on
+/// an actual resource. Ordinary calls neither clone a path nor allocate a map.
+struct MetadataRetry<'a> {
+    target: Option<MetadataTarget>,
+    slot: Option<&'a RefCell<Option<Box<MetadataTarget>>>>,
+}
+impl MetadataRetry<'_> {
+    fn target(&self) -> &MetadataTarget {
+        self.target.as_ref().expect("accepted metadata target")
+    }
+}
+impl Drop for MetadataRetry<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.filter(|_| self.target.is_some()) {
+            if resource_io::waiting() {
+                *slot.borrow_mut() = self.target.take().map(Box::new);
+            }
+        }
+    }
 }
 /// Mount information belonging to the same resolved path or open description as stat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1674,9 +1703,21 @@ impl Vfs {
         &mut self,
         path: ResolvedPath,
         content: Content,
-        mut mode: u32,
+        mode: u32,
         exclusive: bool,
     ) -> Result<()> {
+        self.insert_node(path, content, mode, exclusive, true, exclusive)
+            .map(|_| ())
+    }
+    fn insert_node(
+        &mut self,
+        path: ResolvedPath,
+        content: Content,
+        mut mode: u32,
+        exclusive: bool,
+        sync_data: bool,
+        must_be_absent: bool,
+    ) -> Result<NodeRef> {
         let filesystem = path.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
         let path = self.rebase_indexed(path)?;
@@ -1699,7 +1740,7 @@ impl Vfs {
                 0,
                 matches!(content, Content::Directory),
             );
-            return Ok(());
+            return Ok(node);
         }
         let parent = if path == b"/" {
             None
@@ -1745,7 +1786,7 @@ impl Vfs {
         };
         let parent_times = directory::EntryTimes::lock(parent.as_deref(), None);
         let mut fs = filesystem.borrow_mut();
-        if exclusive && fs.paths.contains_key(&path.key) {
+        if must_be_absent && fs.paths.contains_key(&path.key) {
             return Err(Errno(17));
         }
         let (uid, gid) = path.ids(self).creator(&self.credentials)?;
@@ -1770,8 +1811,10 @@ impl Vfs {
         if inode == fs.next_inode {
             fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
         }
-        if let Content::File(data) = &content {
-            data.sync(false)?;
+        if sync_data {
+            if let Content::File(data) = &content {
+                data.sync(false)?;
+            }
         }
         let now = storage::Timestamp::now();
         let node = Arc::new(Inode::new(Node {
@@ -1815,7 +1858,7 @@ impl Vfs {
             0,
             matches!(node.borrow().content, Content::Directory),
         );
-        Ok(())
+        Ok(node)
     }
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<NodeRef> {
         let key = path.key();
@@ -2030,6 +2073,14 @@ impl Vfs {
             .map(|entry| entry.0)
     }
     fn metadata_target(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<MetadataTarget> {
+        if let Some(target) = self
+            .query
+            .as_ref()
+            .filter(|query| query.metadata_call)
+            .and_then(|query| query.resource_metadata.borrow_mut().take())
+        {
+            return Ok(*target);
+        }
         // Metadata calls have one pathname operand. Retain it only after an
         // actual suspension, rather than allocating an operand map on every
         // ordinary chmod/chown/utimens call.
@@ -2051,6 +2102,16 @@ impl Vfs {
             self.resolve_entry_operation(dirfd, path, follow, true, 0, false, operation, None)?
         };
         self.metadata_target_resolved(entry)
+    }
+    fn metadata_retry(&self, target: Option<MetadataTarget>) -> MetadataRetry<'_> {
+        MetadataRetry {
+            target,
+            slot: self
+                .query
+                .as_ref()
+                .filter(|query| query.metadata_call)
+                .map(|query| &query.resource_metadata),
+        }
     }
     fn metadata_target_resolved(&self, (path, magic): ResolvedEntry) -> Result<MetadataTarget> {
         let magic = match magic {
@@ -3035,6 +3096,13 @@ impl Vfs {
         Ok((current, None))
     }
     pub fn symlink_at(&mut self, target: &[u8], dirfd: i32, path: &[u8]) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Symlink {
+                target: target.to_vec(),
+                fd: dirfd,
+                path: path.to_vec(),
+            });
+        }
         if target.is_empty() {
             return Err(Errno(2));
         }
@@ -3172,21 +3240,37 @@ impl Vfs {
         self.import_reader(path, &mut bytes.as_slice(), false)
             .map(|_| ())
     }
-    fn import_data(
+    fn import_data_node(
         &mut self,
         path: &[u8],
         data: storage::FileData,
         executable: bool,
-    ) -> Result<()> {
+        sync_data: bool,
+    ) -> Result<NodeRef> {
         let (current, parents) = self.import_plan(path)?;
         // Staged bytes already own their original quota reservation.
         for parent in parents {
-            self.insert(parent, Content::Directory, 0o40755)?;
+            match self.insert_node(
+                parent.clone().into(),
+                Content::Directory,
+                0o40755,
+                false,
+                true,
+                true,
+            ) {
+                Ok(_) => {}
+                Err(Errno(17)) if self.is_directory(&parent) => {}
+                Err(Errno(17)) => return Err(Errno(20)),
+                Err(error) => return Err(error),
+            }
         }
-        self.insert(
-            current,
+        self.insert_node(
+            current.into(),
             Content::File(data),
             if executable { 0o100755 } else { 0o100644 },
+            false,
+            sync_data,
+            true,
         )
     }
     fn import_plan(&self, path: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
@@ -3363,6 +3447,13 @@ impl Vfs {
         self.executable_file_at(AT_FDCWD, path, 0)?.bytes()
     }
     pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Mkdir {
+                fd: dirfd,
+                path: path.to_vec(),
+                mode,
+            });
+        }
         if path.len() >= MAX_PATH {
             return Err(Errno(36));
         }
@@ -3395,6 +3486,14 @@ impl Vfs {
         self.insert_entry(p, Content::Directory, 0o40000 | (mode & 0o7777), true)
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Mknod {
+                fd: dirfd,
+                path: path.to_vec(),
+                mode,
+                device,
+            });
+        }
         let type_ = mode & 0o170000;
         if type_ == 0o040000 {
             return Err(Errno(1));
@@ -3455,6 +3554,13 @@ impl Vfs {
         self.insert_entry(p, content, type_ | (mode & 0o7777), true)
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Unlink {
+                fd: dirfd,
+                path: path.to_vec(),
+                directory,
+            });
+        }
         let (p, fuse) = self.capture_fuse_path(dirfd, path, false)?;
         if directory {
             match path.rsplit(|&b| b == b'/').find(|part| !part.is_empty()) {
@@ -3622,6 +3728,18 @@ impl Vfs {
         mode: u32,
         policy: u64,
     ) -> Result<u32> {
+        if self.host_resources() {
+            let paths = self.path_queries();
+            let files = FileEpoch::default().capture(self, true);
+            if let Some(result) = paths.open_at_resolve(dirfd, path, flags, mode, policy, &files) {
+                return result;
+            }
+            let work = paths.take_open_work().ok_or(Errno(95))?;
+            return match host_sync::Wait::default().file(self, work.run())? {
+                FileValue::Count(fd) => Ok(fd as u32),
+                _ => Err(Errno(5)),
+            };
+        }
         self.open_at_resolve_published::<false>(dirfd, path, flags, mode, policy, None)
     }
     fn open_at_resolve_published<const PATH_TRUNCATE: bool>(
@@ -3748,6 +3866,27 @@ impl Vfs {
         mode: u32,
         publication: Option<&DirectFiles>,
         reservation: &mut Option<fd_table::ReservedFd>,
+    ) -> Result<u32> {
+        self.open_reserved_phase::<PATH_TRUNCATE, false>(
+            entry,
+            flags,
+            mode,
+            publication,
+            reservation,
+            0,
+        )
+    }
+    /// Only the sealed resource-open receipt resumes after successful inode,
+    /// access and Landlock checks. It still uses this original open body and
+    /// exact FD reservation, without revoking an accepted grant after a wait.
+    fn open_reserved_phase<const PATH_TRUNCATE: bool, const ACCEPTED: bool>(
+        &mut self,
+        entry: ResolvedEntry,
+        flags: u32,
+        mode: u32,
+        publication: Option<&DirectFiles>,
+        reservation: &mut Option<fd_table::ReservedFd>,
+        accepted_denied: u64,
     ) -> Result<u32> {
         let (mut p, target) = entry;
         let magic = match target {
@@ -3935,7 +4074,9 @@ impl Vfs {
                 {
                     return Err(Errno(21));
                 }
-                check_write(Some(&node))?;
+                if !ACCEPTED {
+                    check_write(Some(&node))?;
+                }
                 let proc_regular = {
                     let n = node.borrow();
                     n.volatile && matches!(n.content, Content::File(_))
@@ -4046,7 +4187,9 @@ impl Vfs {
             }
         }
         let node = forced_node.map_or_else(|| self.node(&p), Ok)?;
-        let landlock_denied = if self.credentials.landlock.fs_mask() == 0 {
+        let landlock_denied = if ACCEPTED {
+            accepted_denied
+        } else if self.credentials.landlock.fs_mask() == 0 {
             0
         } else {
             let retained = magic
@@ -4064,10 +4207,10 @@ impl Vfs {
                 node.borrow().mode & 0o170000,
                 0o100000 | 0o040000 | 0o120000
             );
-        if existed && flags & O_CREAT != 0 && !fuse_special {
+        if !ACCEPTED && existed && flags & O_CREAT != 0 && !fuse_special {
             self.check_sticky_create(&p, &node)?;
         }
-        {
+        if !ACCEPTED {
             let n = node.borrow();
             self.check_device_open(&n, flags)?;
             if flags & O_NOATIME != 0 {
@@ -4133,7 +4276,44 @@ impl Vfs {
             None
         };
         if fd_can_write(flags) || flags & O_TRUNC != 0 {
-            self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
+            let scope = resource_io::Scope::enter();
+            let result = self.overlay_prepare(&p, &node, flags & 0x200 != 0);
+            let pending = scope.finish();
+            if let Some(pending) = pending {
+                if let Some(query) = &self.query {
+                    let original = magic.clone().unwrap_or_else(|| ResolvedInode {
+                        node: node.clone(),
+                        label: p.key.clone(),
+                        mount: p.mount.clone(),
+                        file: None,
+                        #[cfg(all(feature = "hostfs", unix))]
+                        host_file: None,
+                        _image: None,
+                        _directory: p
+                            .mount
+                            .as_ref()
+                            .map(|mount| Arc::new(mounts::MountUse::new(mount.identity.clone()))),
+                    });
+                    let work = FileWork::resource_open(
+                        self,
+                        file_work::ResourceOpen {
+                            entry: (p.clone(), Some(ResolvedTarget::Inode(original))),
+                            flags,
+                            mode,
+                            path_truncate: PATH_TRUNCATE,
+                            denied: landlock_denied,
+                            publication: publication.cloned(),
+                            reservation: reservation.take(),
+                            _access: write_access.take(),
+                        },
+                        pending.wait,
+                    );
+                    query.prepared.borrow_mut().work = Some(std::sync::Mutex::new(work));
+                    return query.defer();
+                }
+                return Err(resource_io::memory_error(pending.wait.fault(0)));
+            }
+            result?;
             if let Some(access) = &mut write_access {
                 access.retain_layer()?;
                 if let Some(o) = p.filesystem_ref(self).overlay_handle() {
@@ -4627,9 +4807,12 @@ impl Vfs {
         let files = self.shared_files();
         if let (Some(Ok(source)), Some(Ok(dest))) = (files.lookup(input), files.lookup(output)) {
             if StreamTransfer::admitted(&source, &dest) {
-                let mut transfer =
+                let transfer =
                     StreamTransfer::new(source, dest, Ok(from), Ok(to), count as u64, true, 0);
-                if self.query.is_some() && transfer.daemon_backed() {
+                // A private-disk child can park on resource admission just as
+                // a daemon operation can. The original query must retain the
+                // enclosing pipe reservation, offsets and read/write cursor.
+                {
                     let target = transfer.output.filesystem_target();
                     let command = FileCommand::Transfer(Arc::new(std::sync::Mutex::new(transfer)));
                     return match self.transfer_work(FileWork::from_vfs(self, target, command))? {
@@ -4637,10 +4820,6 @@ impl Vfs {
                         _ => unreachable!("retained splice result"),
                     };
                 }
-                return match transfer.execute(self)? {
-                    FileValue::Transfer { count, .. } => Ok(count as usize),
-                    _ => unreachable!(),
-                };
             }
         }
         let source = self.descriptor(input)?.open.clone();
@@ -4701,6 +4880,22 @@ impl Vfs {
         self.read_description(&descriptor, count)
     }
     fn read_description(&mut self, descriptor: &Descriptor, count: usize) -> Result<Vec<u8>> {
+        if self.host_resources() {
+            let target = FileTarget(SharedFd::new(descriptor.open.borrow().shared.clone()));
+            if target.regular_file() {
+                return self
+                    .host_file_work(FileWork::from_vfs(
+                        self,
+                        target,
+                        FileCommand::Read {
+                            count,
+                            offset: None,
+                        },
+                    ))?
+                    .into_bytes()
+                    .ok_or(Errno(5));
+            }
+        }
         let mut o = descriptor.open.borrow_mut();
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_read(kind, count);
@@ -4943,7 +5138,30 @@ impl Vfs {
         bytes: &[u8],
         offset: Option<u64>,
     ) -> Result<usize> {
-        self.file_write_description_inner::<false>(descriptor, bytes, offset, None, (0, 0), &mut 0)
+        let target = FileTarget(SharedFd::new(descriptor.open.borrow().shared.clone()));
+        let command = FileCommand::Write {
+            bytes: Vec::new(),
+            offset,
+        };
+        if target.memory_control(&command) || self.host_resources() && target.regular_file() {
+            let command = FileCommand::Write {
+                bytes: bytes.to_vec(),
+                offset,
+            };
+            return match self.transfer_work(FileWork::from_vfs(self, target, command))? {
+                FileValue::Count(count) => Ok(count as usize),
+                _ => unreachable!("memory controller write count"),
+            };
+        }
+        self.file_write_description_inner::<false>(
+            descriptor,
+            bytes,
+            offset,
+            None,
+            (0, 0),
+            &mut 0,
+            None,
+        )
     }
     fn file_write_sync_description(
         &mut self,
@@ -4966,6 +5184,7 @@ impl Vfs {
                 Some(data_only),
                 (0, 0),
                 &mut 0,
+                None,
             )
         } else {
             let count = self.file_write_description(descriptor, bytes, offset)?;
@@ -4974,6 +5193,7 @@ impl Vfs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Original write ABI plus the retained copy/write policy share one byte body.
     fn file_write_description_inner<const COPY_TAIL: bool>(
         &mut self,
         descriptor: &Descriptor,
@@ -4982,10 +5202,17 @@ impl Vfs {
         sync: Option<bool>,
         tail: (u64, usize),
         offered: &mut usize,
+        policy: Option<file_work::WritePolicy>,
     ) -> Result<usize> {
-        let file_size_limit = self.file_size_limit.get();
+        let file_size_limit =
+            policy.map_or_else(|| self.file_size_limit.get(), |policy| policy.limit);
         let o = descriptor.open.borrow();
-        let synchronous = fd_status::write_sync(o.flags.get(), sync);
+        let synchronous = if policy.is_some_and(|policy| policy.defer_sync) {
+            None
+        } else {
+            fd_status::write_sync(o.flags.get(), sync)
+        };
+        let append = policy.map_or_else(|| o.flags.get() & 0x400 != 0, |policy| policy.append);
         if offset.is_some() && o.pipe.is_some() {
             return Err(Errno(29));
         }
@@ -5073,13 +5300,18 @@ impl Vfs {
                         return Err(Errno(11));
                     }
                     let at = offset.unwrap_or(position.value);
-                    Self::check_io_range(at, bytes.len() as u64)?;
-                    let append = o.flags.get() & 0x400 != 0;
+                    Self::check_io_range(
+                        policy.map_or(at, |policy| policy.range_offset),
+                        policy.map_or(bytes.len(), |policy| policy.range_count) as u64,
+                    )?;
                     let result = data.write_limited(at, bytes, append, file_size_limit, || {
                         self.file_size_signal.set(true)
                     });
                     let mut deferred_position = None;
                     if let Ok((_, end)) = result {
+                        if let Some(policy) = policy {
+                            policy.end.set(Some(end));
+                        }
                         if offset.is_none() {
                             if synchronous.is_some() {
                                 deferred_position =
@@ -5133,8 +5365,13 @@ impl Vfs {
                 if offset.is_none() && file_position.pending != 0 {
                     return Err(Errno(11));
                 }
-                Self::check_io_range(offset.unwrap_or(file_position.value), bytes.len() as u64)?;
-                let position = if o.flags.get() & 0x400 != 0 {
+                Self::check_io_range(
+                    policy.map_or(offset.unwrap_or(file_position.value), |policy| {
+                        policy.range_offset
+                    }),
+                    policy.map_or(bytes.len(), |policy| policy.range_count) as u64,
+                )?;
+                let position = if append {
                     b.len()
                 } else {
                     offset.unwrap_or(file_position.value)
@@ -5188,13 +5425,13 @@ impl Vfs {
                     }
                     bytes
                 };
-                let (written, end) = b.write_transfer(
-                    position,
-                    bytes,
-                    o.flags.get() & 0x400 != 0,
-                    file_size_limit,
-                    || self.file_size_signal.set(true),
-                )?;
+                let (written, end) =
+                    b.write_transfer(position, bytes, append, file_size_limit, || {
+                        self.file_size_signal.set(true)
+                    })?;
+                if let Some(policy) = policy {
+                    policy.end.set(Some(end));
+                }
                 if offset.is_none() {
                     if synchronous.is_some() {
                         deferred_position =
@@ -5263,6 +5500,22 @@ impl Vfs {
         count: usize,
         offset: u64,
     ) -> Result<Vec<u8>> {
+        if self.host_resources() {
+            let target = FileTarget(SharedFd::new(descriptor.open.borrow().shared.clone()));
+            if target.regular_file() {
+                return self
+                    .host_file_work(FileWork::from_vfs(
+                        self,
+                        target,
+                        FileCommand::Read {
+                            count,
+                            offset: Some(offset),
+                        },
+                    ))?
+                    .into_bytes()
+                    .ok_or(Errno(5));
+            }
+        }
         let o = descriptor.open.borrow();
         if o.bridge.is_some() || o.kernel_log.is_some() || o.pipe.is_some() {
             return Err(Errno(29));

@@ -4,6 +4,11 @@
 //! the namespace commit point, including whiteouts and copied parent directories.
 use super::*;
 use std::collections::BTreeSet;
+mod copy_up;
+#[cfg(test)]
+#[path = "overlay/copy_up_tests.rs"]
+mod copy_up_tests;
+pub(super) mod projection;
 
 type Tree = BTreeMap<Vec<u8>, NodeRef>;
 static NEXT_DEVICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x6f00_0000);
@@ -173,6 +178,19 @@ impl LayerFile {
             .transpose()?;
         self.node.borrow().edit_caps(caps, flags)
     }
+    pub(super) fn edit_caps_after_sync(
+        &self,
+        caps: Option<file_caps::FileCaps>,
+        flags: u32,
+    ) -> Result<()> {
+        if !self.upper {
+            return Err(Errno(30));
+        }
+        let caps = caps
+            .map(|caps| caps.translate(|id| self.ids().stored(false, id)))
+            .transpose()?;
+        self.node.borrow().edit_caps_after_sync(caps, flags)
+    }
 }
 pub(super) fn writable_layer(node: &NodeRef) -> Option<(NodeRef, Arc<mounts::MountIdentity>)> {
     match &node.borrow().content {
@@ -197,12 +215,7 @@ pub(super) fn mapping_node(mut node: NodeRef) -> NodeRef {
 struct ProjectionEdit {
     view: NodeRef,
     raw: NodeRef,
-    old: Option<(
-        Metadata,
-        [storage::Timestamp; 3],
-        Option<file_caps::FileCaps>,
-    )>,
-    caps: Option<file_caps::FileCaps>,
+    old: Option<(Metadata, [storage::Timestamp; 3])>,
     moved: bool,
 }
 #[derive(Default)]
@@ -216,14 +229,13 @@ impl Drop for ProjectionEdits {
             return;
         }
         for e in self.entries.iter().rev() {
-            if let Some((old, times, caps)) = &e.old {
+            if let Some((old, times)) = &e.old {
                 let mut raw = e.raw.borrow_mut();
                 raw.mode = old.mode;
                 raw.uid = old.uid;
                 raw.gid = old.gid;
                 raw.times = *times;
                 raw.xattrs = old.attrs.clone();
-                let _ = raw.edit_caps(*caps, 0);
             } else if e.moved {
                 let mut view = e.view.borrow_mut();
                 let mut raw = e.raw.borrow_mut();
@@ -232,7 +244,6 @@ impl Drop for ProjectionEdits {
                     Content::File(storage::FileData::memory(Vec::new())),
                 );
                 view.content = content;
-                let _ = view.edit_caps(e.caps, 0);
             }
         }
     }
@@ -314,6 +325,7 @@ pub(super) struct Overlay {
     lower_numbers: SharedCell<BTreeMap<usize, u64>>,
     baseline: SharedCell<BTreeMap<Vec<u8>, Entry>>,
     uncopied: SharedCell<BTreeSet<usize>>,
+    copying: Arc<SharedCell<copy_up::Copies>>,
     dirty: SharedCell<BTreeSet<usize>>,
     userxattr: bool,
     options: Vec<u8>,
@@ -564,86 +576,7 @@ impl Overlay {
         self.uncopied.borrow().contains(&pointer(node))
     }
     pub(super) fn copy_up(&self, node: &NodeRef, truncate: bool) -> Result<()> {
-        let id = pointer(node);
-        if !self.uncopied.borrow().contains(&id) {
-            return Ok(());
-        }
-        let upper = self.upper.as_ref().ok_or(Errno(30))?;
-        let copied_inode = self.allocate_inode()?;
-        let fs = upper.fs.borrow();
-        let available = Vfs::filesystem_bytes(&fs).2;
-        let mut n = node.borrow_mut();
-        let ids = mounts::idmap::Ids::from_mount(&upper.at.identity);
-        if n.uid == u32::MAX || n.gid == u32::MAX {
-            return Err(Errno(75));
-        }
-        ids.stored(false, n.uid)?;
-        ids.stored(true, n.gid)?;
-        ids.creator(&self.creator)?;
-        projected_attrs(&n.xattrs, ids, true)?;
-        if let Some(caps) = n.file_caps() {
-            caps.translate(|id| ids.stored(false, id))?;
-        }
-        if let Content::File(data) = &n.content {
-            let caps = data.capabilities();
-            let length = if truncate { 0 } else { data.len() };
-            if length != 0 {
-                if let (Some(source), Some(mount)) = (data.source_node(), data.layer_mount()) {
-                    if !self.creator.allows_mapped(
-                        &source.borrow(),
-                        4,
-                        mounts::idmap::Ids::from_mount(&mount),
-                    ) {
-                        return Err(Errno(13));
-                    }
-                }
-            }
-            let sparse = fs.quota.tmpfs.then(|| data.tmpfs_file()).flatten();
-            if sparse.is_none() && length > available {
-                return Err(Errno(28));
-            }
-            let copy = if let Some(file) = sparse.filter(|_| !truncate) {
-                let quota = fs.quota.clone();
-                drop(fs);
-                data.sync(false)?;
-                file.copy_up_tmpfs(&quota)?
-            } else {
-                let mut copy = if let Some(disk) = &fs.disk {
-                    disk.create(copied_inode)?
-                } else {
-                    Vfs::ram_file(fs.quota)?
-                };
-                drop(fs);
-                let mut offset = 0;
-                while offset < length {
-                    let bytes = data.read_at(offset, (length - offset).min(65536) as usize)?;
-                    if bytes.is_empty() {
-                        return Err(Errno(5));
-                    }
-                    let mut written = 0;
-                    while written < bytes.len() {
-                        let count = copy.write_at(offset + written as u64, &bytes[written..])?;
-                        if count == 0 {
-                            return Err(Errno(5));
-                        }
-                        written += count;
-                    }
-                    offset += bytes.len() as u64;
-                }
-                copy
-            };
-            if caps.is_some() {
-                copy.edit_capabilities(caps, 0)?;
-            } else {
-                copy.revoke_capabilities()?;
-            }
-            copy.sync(false)?;
-            n.inode = copied_inode;
-            n.content = Content::File(copy);
-        }
-        self.uncopied.borrow_mut().remove(&id);
-        self.dirty.borrow_mut().insert(id);
-        Ok(())
+        copy_up::run(self, node, truncate)
     }
     pub(super) fn prepare(&self, fs: &Filesystem, node: &NodeRef, truncate: bool) -> Result<()> {
         self.upper.as_ref().ok_or(Errno(30))?.at.writable()?;
@@ -706,12 +639,11 @@ impl Overlay {
             .and_then(|(_, raw)| raw.upgrade());
         if let Some(raw) = original {
             let mut n = raw.borrow_mut();
-            let old = (Metadata::of(&n), n.file_metadata().times, n.file_caps());
+            let old = (Metadata::of(&n), n.file_metadata().times);
             edits.entries.push(ProjectionEdit {
                 view: view.clone(),
                 raw: raw.clone(),
                 old: Some(old),
-                caps,
                 moved: false,
             });
             n.mode = metadata.mode;
@@ -719,10 +651,17 @@ impl Overlay {
             n.gid = gid;
             n.times = metadata.times;
             n.xattrs = attrs;
-            if n.file_caps() != stored_caps {
-                n.edit_caps(stored_caps, 0)?;
-            }
+            let source_caps = n.file_caps();
+            let project_caps = source_caps != stored_caps;
             drop(n);
+            if project_caps {
+                // Rebuild if a real provider mutation revoked the grant read
+                // from the view before this metadata projection started.
+                if source_caps.and_then(|caps| caps.mapped(ids)) != caps {
+                    return Err(projection::retry());
+                }
+                projection::set(&raw, source_caps, stored_caps)?;
+            }
             return Ok(raw);
         }
         let mut n = view.borrow_mut();
@@ -771,15 +710,21 @@ impl Overlay {
             view: view.clone(),
             raw: raw.clone(),
             old: None,
-            caps,
             moved,
         });
         if stored_caps != caps {
-            raw.borrow().edit_caps(stored_caps, 0)?;
+            projection::set(&raw, caps, stored_caps)?;
         }
         Ok(raw)
     }
     pub(super) fn checkpoint(&self, fs: &Filesystem) -> Result<()> {
+        if self.projected {
+            projection::run(|| self.checkpoint_projected(fs))
+        } else {
+            self.checkpoint_projected(fs)
+        }
+    }
+    fn checkpoint_projected(&self, fs: &Filesystem) -> Result<()> {
         let Some(upper) = &self.upper else {
             return Ok(());
         };
@@ -953,11 +898,14 @@ impl Overlay {
             .filter_map(std::sync::Weak::upgrade)
             .map(|n| pointer(&n))
             .collect();
-        for (id, (n, _)) in &all {
-            if n.borrow().links != 0 && known.insert(*id) {
-                backing.track_inode(n)?;
+        let tracked = (|| {
+            for (id, (n, _)) in &all {
+                if n.borrow().links != 0 && known.insert(*id) {
+                    backing.track_inode(n)?;
+                }
             }
-        }
+            Ok(())
+        })();
         backing.inodes.retain(|n| n.strong_count() != 0);
         let capacity = Vfs::filesystem_capacity(&backing);
         let mut attr_bytes = 0usize;
@@ -971,14 +919,24 @@ impl Overlay {
                 attr_bytes = attr_bytes.saturating_add(bytes);
                 n.xattrs.len() > 128 || bytes > 65536 || attr_bytes > xattr::XATTR_BUDGET
             });
-        let result = if capacity.used_bytes > capacity.budget_bytes
-            || capacity.nodes_used > capacity.node_limit
-            || invalid_attrs
-        {
-            Err(Errno(28))
-        } else {
-            backing.checkpoint()
-        };
+        let result = tracked
+            .and_then(|()| {
+                if capacity.used_bytes > capacity.budget_bytes
+                    || capacity.nodes_used > capacity.node_limit
+                    || invalid_attrs
+                {
+                    Err(Errno(28))
+                } else {
+                    backing.checkpoint()
+                }
+            })
+            .and_then(|()| {
+                // An unchanged or detached nested upper may have no manifest to
+                // write, but the composed provider capability still needs its
+                // publication point before this projection can be committed.
+                projection::prepare()?;
+                projection::publish(|| Ok(()))
+            });
         if let Err(error) = result {
             backing.paths = old_paths;
             backing.inodes = old_inodes;
@@ -1017,14 +975,22 @@ impl Overlay {
         Ok(())
     }
     pub(super) fn prepare_tmpfile(&self, node: &NodeRef) -> Result<()> {
+        self.upper.as_ref().ok_or(Errno(30))?.at.writable()?;
+        if !self.projected {
+            return Ok(());
+        }
+        projection::run(|| self.prepare_tmpfile_projected(node))
+    }
+    fn prepare_tmpfile_projected(&self, node: &NodeRef) -> Result<()> {
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
-        upper.at.writable()?;
         if self.projected {
             let mut edits = ProjectionEdits::default();
             let raw = self.projected_upper(node, &mut edits)?;
             let mut fs = upper.fs.borrow_mut();
             fs.admit_inode()?;
             fs.track_inode(&raw)?;
+            projection::prepare()?;
+            projection::publish(|| Ok(()))?;
             self.upper_nodes
                 .borrow_mut()
                 .insert(pointer(node), (Arc::downgrade(node), Arc::downgrade(&raw)));
@@ -1045,8 +1011,13 @@ impl Overlay {
         if !self.projected || writable_layer(node).is_none() {
             return Ok(());
         }
+        projection::run(|| self.unlinked_metadata_projected(node))
+    }
+    fn unlinked_metadata_projected(&self, node: &NodeRef) -> Result<()> {
         let mut edits = ProjectionEdits::default();
         self.projected_upper(node, &mut edits)?;
+        projection::prepare()?;
+        projection::publish(|| Ok(()))?;
         edits.committed = true;
         Ok(())
     }
@@ -1421,6 +1392,7 @@ impl Vfs {
             lower_numbers: SharedCell::default(),
             baseline: SharedCell::default(),
             uncopied: SharedCell::default(),
+            copying: Arc::default(),
             dirty: SharedCell::default(),
             userxattr,
             options: data.to_vec(),

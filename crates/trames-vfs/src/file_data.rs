@@ -8,6 +8,11 @@ use std::sync::{
     Mutex, RwLock,
 };
 use storage::{DiskObject, Timestamp};
+mod projection_caps;
+pub(super) use projection_caps::{PreparedCaps, PublishedCaps};
+#[cfg(test)]
+#[path = "file_data_transaction_tests.rs"]
+mod transaction_tests;
 
 pub(super) enum Bytes {
     Memory(Vec<u8>),
@@ -23,6 +28,9 @@ pub(super) struct PlainFile {
     charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
     logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
     backing: Option<Arc<storage::DiskBacking>>,
+    cache: Option<Arc<file_cache::Cache>>,
+    transaction: std::sync::OnceLock<Arc<trames_shared::FileTransaction>>,
+    projection_caps: std::sync::OnceLock<projection_caps::Cache>,
     pending: AtomicUsize,
     mapped: AtomicBool,
     meta: Mutex<Option<FileMeta>>,
@@ -244,6 +252,12 @@ impl PlainFile {
             Bytes::Disk(d) => Some(d.backing.clone()),
             _ => None,
         };
+        // Private storage has no external writer. HostFS retains its original
+        // descriptor coherence contract instead of caching stale host bytes.
+        let cache = backing
+            .as_ref()
+            .filter(|b| b._store.is_some())
+            .map(|_| Arc::new(file_cache::Cache::default()));
         Arc::new(Self {
             #[cfg(all(feature = "hostfs", unix))]
             host: backing.as_ref().and_then(|b| b.host.clone()),
@@ -253,6 +267,9 @@ impl PlainFile {
             charge: std::sync::OnceLock::new(),
             logical_size: std::sync::OnceLock::new(),
             backing,
+            cache,
+            transaction: Default::default(),
+            projection_caps: Default::default(),
             pending: AtomicUsize::new(0),
             mapped: AtomicBool::new(false),
             meta: Mutex::new(None),
@@ -265,6 +282,21 @@ impl PlainFile {
         if meta.is_none() {
             *meta = Some(FileMeta { mode, times });
         }
+    }
+    pub(super) fn begin_transaction(
+        &self,
+    ) -> std::result::Result<
+        Option<trames_shared::FileTransactionLease>,
+        Arc<dyn trames_shared::ResourceWait>,
+    > {
+        let _data = self.bytes.write().unwrap();
+        self.transaction.get_or_init(Arc::default).try_acquire()
+    }
+    fn check_transaction(&self) -> Result<()> {
+        if let Some(transaction) = self.transaction.get() {
+            transaction.check().map_err(storage::host_errno)?;
+        }
+        Ok(())
     }
     pub fn metadata(&self) -> Option<FileMeta> {
         *self.meta.lock().unwrap()
@@ -357,6 +389,11 @@ impl PlainFile {
     pub fn disk_backed(&self) -> bool {
         self.backing.is_some()
     }
+    pub(super) fn private_disk(&self) -> bool {
+        self.backing
+            .as_ref()
+            .is_some_and(|backing| backing._store.is_some())
+    }
     pub fn disk_source(&self) -> Option<(Arc<storage::DiskBacking>, u64)> {
         self.backing
             .as_ref()
@@ -391,7 +428,104 @@ impl PlainFile {
         count: usize,
         cache: Option<&mut DiskReadCache>,
     ) -> Result<Vec<u8>> {
-        self.bytes.read().unwrap().read_at(offset, count, cache)
+        self.read_bytes(&self.bytes.read().unwrap(), offset, count, cache)
+    }
+    fn read_bytes(
+        &self,
+        data: &Bytes,
+        offset: u64,
+        count: usize,
+        descriptors: Option<&mut DiskReadCache>,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_bytes_into(data, offset, count, descriptors, &mut out)?;
+        Ok(out)
+    }
+    pub(super) fn read_into(&self, offset: u64, count: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.read_bytes_into(&self.bytes.read().unwrap(), offset, count, None, out)
+    }
+    fn read_bytes_into(
+        &self,
+        data: &Bytes,
+        offset: u64,
+        count: usize,
+        mut descriptors: Option<&mut DiskReadCache>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let Some(cache) = &self.cache else {
+            let bytes = data.read_at(offset, count, descriptors)?;
+            if out.is_empty() {
+                *out = bytes;
+            } else {
+                out.extend(bytes);
+            }
+            return Ok(());
+        };
+        let count = count.min(data.len().saturating_sub(offset) as usize);
+        let before = out.len();
+        out.try_reserve_exact(count).map_err(|_| Errno(12))?;
+        while out.len() - before < count {
+            let at = offset + (out.len() - before) as u64;
+            let base = at & !(trames_memory::PAGE_SIZE - 1);
+            let page = cache.load(base, || {
+                data.read_at(
+                    base,
+                    trames_memory::PAGE_SIZE as usize,
+                    descriptors.as_deref_mut(),
+                )
+            })?;
+            let within = (at - base) as usize;
+            let chunk = (count - (out.len() - before)).min(page.valid.saturating_sub(within));
+            if chunk == 0 {
+                break;
+            }
+            let start = out.len();
+            out.resize(start + chunk, 0);
+            page.bytes.copy_read(within, &mut out[start..]);
+        }
+        Ok(())
+    }
+    pub(super) fn cache_page(&self, offset: u64) -> Option<Arc<file_cache::Page>> {
+        if let Some(cache) = &self.cache {
+            return Some(cache.page(offset));
+        }
+        if self.tmpfs {
+            if let Bytes::Tmpfs(file) = &mut *self.bytes.write().unwrap() {
+                return Some(file.page(offset / trames_memory::PAGE_SIZE));
+            }
+        }
+        None
+    }
+    pub(super) fn discard_mapped_cache(
+        &self,
+        offset: u64,
+        owners: &Arc<trames_memory::MappedResidents>,
+        bytes: &Arc<trames_memory::SharedPage>,
+    ) -> bool {
+        self.cache
+            .as_ref()
+            .is_some_and(|cache| cache.discard_mapped(offset, owners, bytes))
+    }
+    pub(super) fn cached_fault(
+        &self,
+        offset: u64,
+    ) -> Option<Result<Arc<trames_memory::SharedPage>>> {
+        if self.tmpfs {
+            let mut data = self.bytes.write().unwrap();
+            let Bytes::Tmpfs(file) = &mut *data else {
+                unreachable!()
+            };
+            return Some(file.fault_page(offset));
+        }
+        let cache = self.cache.as_ref()?;
+        let data = self.bytes.read().unwrap();
+        Some(
+            cache
+                .load(offset, || {
+                    data.read_at(offset, trames_memory::PAGE_SIZE as usize, None)
+                })
+                .map(|page| page.bytes),
+        )
     }
     pub(super) fn restore_disk_caps(&self, caps: file_caps::FileCaps) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
@@ -410,8 +544,16 @@ impl PlainFile {
     }
     pub(super) fn revoke_capabilities(&self) -> Result<()> {
         match &mut *self.bytes.write().unwrap() {
-            Bytes::Disk(d) => d.revoke_caps(),
+            Bytes::Disk(d) => {
+                if d.capabilities.is_some() {
+                    self.check_transaction()?;
+                }
+                d.revoke_caps()
+            }
             Bytes::Tmpfs(file) => {
+                if file.capabilities.is_some() {
+                    self.check_transaction()?;
+                }
                 file.capabilities = None;
                 Ok(())
             }
@@ -435,6 +577,7 @@ impl PlainFile {
         if old.is_none() && (caps.is_none() || flags & 2 != 0) {
             return Err(Errno(61));
         }
+        self.check_transaction()?;
         match &mut *data {
             Bytes::Tmpfs(file) => {
                 file.capabilities = caps;
@@ -466,7 +609,13 @@ impl PlainFile {
         if self.mapped.load(Ordering::Relaxed) {
             return None;
         }
-        Some(data.read_at(offset, count, Some(cache)))
+        if let Some(resident) = &self.cache {
+            let count = count.min(data.len().saturating_sub(offset) as usize);
+            if count > (trames_memory::PAGE_SIZE - offset % trames_memory::PAGE_SIZE) as usize {
+                return resident.read_resident(offset, count);
+            }
+        }
+        Some(self.read_bytes(&data, offset, count, Some(cache)))
     }
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         self.write_transfer(offset, bytes, false, None)
@@ -504,7 +653,9 @@ impl PlainFile {
         limit: u64,
         signal: impl FnOnce(),
     ) -> Result<(usize, u64)> {
-        let position = if append { data.len() } else { offset };
+        self.check_transaction()?;
+        let old_length = data.len();
+        let position = if append { old_length } else { offset };
         if position >= limit {
             signal();
             return Err(Errno(27));
@@ -533,6 +684,12 @@ impl PlainFile {
         let result = data
             .write_at(position, bytes, cache)
             .map(|n| (n, position + n as u64));
+        if let (Some(cache), Ok((count, end))) = (&self.cache, &result) {
+            cache.written(*end - *count as u64, &bytes[..*count]);
+            if data.len() > old_length {
+                cache.extended(old_length, data.len());
+            }
+        }
         if let Some(growth) = growth {
             growth.commit(data.len());
         }
@@ -554,6 +711,13 @@ impl PlainFile {
             Err(std::sync::TryLockError::WouldBlock) => return None,
             Err(error) => panic!("{error}"),
         };
+        if self
+            .transaction
+            .get()
+            .is_some_and(|transaction| !transaction.available())
+        {
+            return None;
+        }
         if self.mapped.load(Ordering::Relaxed)
             || matches!(&*data, Bytes::Disk(d) if d.capabilities.is_some() || bytes.len() >= 16 * 1024)
         {
@@ -590,13 +754,15 @@ impl PlainFile {
     }
     pub fn reserve_tmpfs(&self, offset: u64, end: u64) -> Result<()> {
         let mut bytes = self.bytes.write().unwrap();
+        self.check_transaction()?;
         let Bytes::Tmpfs(file) = &mut *bytes else {
             return Err(Errno(95));
         };
-        file.reserve(offset, end)
+        file.allocate(offset, end)
     }
     pub fn reserve_keep_size(&self, offset: u64, end: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
+        self.check_transaction()?;
         let charge = self.charge.get();
         let growth = charge.map(|c| c.grow(end)).transpose()?.flatten();
         match &mut *data {
@@ -610,7 +776,7 @@ impl PlainFile {
                 let backing = disk.open(true)?;
                 storage::reserve_backing_range(&backing, offset, end)?;
             }
-            Bytes::Tmpfs(file) => return file.reserve(offset, end),
+            Bytes::Tmpfs(file) => return file.allocate(offset, end),
         }
         if let Some(charge) = charge {
             charge.set_preallocated(charge.preallocated().max(end));
@@ -633,11 +799,15 @@ impl PlainFile {
             return Ok(Vec::new());
         }
         let end = (offset + page).min(file.length);
-        file.reserve(offset, end)?;
+        file.fault_page(offset)?;
         file.read(offset, (end - offset) as usize)
+    }
+    pub(super) fn has_allocated_after(&self, length: u64) -> bool {
+        matches!(&*self.bytes.read().unwrap(), Bytes::Tmpfs(file) if file.has_allocated_after(length))
     }
     pub fn truncate(&self, length: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
+        self.check_transaction()?;
         let shrinks = length <= data.len();
         let growth = self
             .charge
@@ -669,6 +839,9 @@ impl PlainFile {
             growth.commit(length);
         }
         self.publish_length(length);
+        if let Some(cache) = &self.cache {
+            cache.truncated(length);
+        }
         Ok(())
     }
     pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
@@ -733,22 +906,28 @@ impl Bytes {
             }
             Self::Disk(d) => {
                 let mut bytes = trames_shared::read_buffer(count).map_err(storage::host_errno)?;
-                #[cfg(unix)]
-                let n = if let Some(cache) = cache {
-                    cache.file(&d.backing, false)?.read_at(&mut bytes, offset)
+                let opened;
+                let file = if let Some(cache) = cache {
+                    cache.file(&d.backing, false)?
                 } else {
-                    d.open(false)?.read_at(&mut bytes, offset)
-                }
-                .map_err(storage::host_errno)?;
-                #[cfg(not(unix))]
-                let n = {
-                    use std::io::{Read, Seek};
-                    let _ = cache;
-                    let mut file = d.open(false)?;
-                    file.seek(std::io::SeekFrom::Start(offset))
-                        .map_err(storage::host_errno)?;
-                    file.read(&mut bytes).map_err(storage::host_errno)?
+                    opened = d.open(false)?;
+                    opened.as_ref()
                 };
+                let permit = if d.backing._store.is_some() {
+                    cgroup::admit_io(count as u64, false).map_err(storage::host_errno)?
+                } else {
+                    None
+                };
+                #[cfg(unix)]
+                let result = file.read_at(&mut bytes, offset);
+                #[cfg(not(unix))]
+                let result = (|| {
+                    use std::io::{Read, Seek};
+                    let mut file = file;
+                    file.seek(std::io::SeekFrom::Start(offset))?;
+                    file.read(&mut bytes)
+                })();
+                let n = cgroup::complete_io(permit, result).map_err(storage::host_errno)?;
                 bytes.truncate(n);
                 Ok(bytes)
             }
@@ -778,22 +957,28 @@ impl Bytes {
                 if !bytes.is_empty() {
                     d.revoke_caps()?;
                 }
-                #[cfg(unix)]
-                let n = if let Some(cache) = cache {
-                    cache.file(&d.backing, true)?.write_at(bytes, offset)
+                let opened;
+                let file = if let Some(cache) = cache {
+                    cache.file(&d.backing, true)?
                 } else {
-                    d.open(true)?.write_at(bytes, offset)
-                }
-                .map_err(storage::host_errno)?;
-                #[cfg(not(unix))]
-                let n = {
-                    use std::io::{Seek, Write};
-                    let _ = cache;
-                    let mut file = d.open(true)?;
-                    file.seek(std::io::SeekFrom::Start(offset))
-                        .map_err(storage::host_errno)?;
-                    file.write(bytes).map_err(storage::host_errno)?
+                    opened = d.open(true)?;
+                    opened.as_ref()
                 };
+                let permit = if d.backing._store.is_some() {
+                    cgroup::admit_io(bytes.len() as u64, true).map_err(storage::host_errno)?
+                } else {
+                    None
+                };
+                #[cfg(unix)]
+                let result = file.write_at(bytes, offset);
+                #[cfg(not(unix))]
+                let result = (|| {
+                    use std::io::{Seek, Write};
+                    let mut file = file;
+                    file.seek(std::io::SeekFrom::Start(offset))?;
+                    file.write(bytes)
+                })();
+                let n = cgroup::complete_io(permit, result).map_err(storage::host_errno)?;
                 d.length = d.length.max(offset + n as u64);
                 Ok(n)
             }

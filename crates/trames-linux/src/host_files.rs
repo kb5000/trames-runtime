@@ -3,6 +3,7 @@
 //! resources and owned host operands; no guest CPU or pointer crosses this API.
 use std::sync::Arc;
 pub use trames_memory::layout::{Layout as HostFileLayout, LayoutExclusive as HostFileAdmission};
+pub use trames_memory::PageWait as HostFileWait;
 
 pub trait HostFileTask: Send {
     /// Only an operation consuming mapped bytes requests backing admission.

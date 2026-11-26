@@ -4,11 +4,13 @@
 use crate::{FileExecutor, FileResult, HostFileTask};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 use trames_memory::layout::{Layout, LayoutWrite};
 use trames_shared::{IoSignal, IoSubscription, IoWake};
 use trames_vfs::FileWork;
 
 pub struct FileLayouts {
+    this: Weak<Self>,
     state: Mutex<State>,
     executor: Arc<dyn FileExecutor>,
     driver: Mutex<Option<Weak<IoSignal>>>,
@@ -69,6 +71,7 @@ impl HostFileTask for BackgroundSync {
         self.resource.layout()
     }
     fn run(mut self: Box<Self>, admission: Option<crate::HostFileAdmission>) {
+        let _writeback = trames_shared::FileTransactionScope::writeback();
         let layouts = self.layouts.upgrade();
         self.registration = layouts
             .as_ref()
@@ -95,6 +98,13 @@ impl HostFileTask for BackgroundSync {
 impl trames_memory::SyncCompletion for BackgroundSync {
     fn complete(mut self: Box<Self>, result: Result<(), trames_memory::MemoryError>) {
         drop(self.registration.take());
+        if let Err(trames_memory::MemoryError::Pending(fault)) = &result {
+            if let Some(layouts) = self.layouts.upgrade() {
+                let wait = fault.wait.clone();
+                layouts.wait_host(self, wait);
+            }
+            return;
+        }
         if let Some(completion) = self.completion.take() {
             completion.complete(result);
         }
@@ -113,16 +123,29 @@ struct State {
     ready: BTreeSet<u64>,
     pending: BTreeMap<u64, FileLayoutRequest>,
     syncs: BTreeMap<u64, Weak<dyn trames_memory::SyncResource>>,
+    waiting: BTreeMap<u64, WaitingHost>,
+}
+struct WaitingHost {
+    id: u64,
+    work: Box<dyn HostFileTask>,
+    wait: Arc<trames_memory::PageWait>,
+    signal: Arc<IoSignal>,
+    _wake: Arc<Wake>,
+    _subscriptions: Vec<IoSubscription>,
 }
 impl Drop for FileLayouts {
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap();
         let pending = std::mem::take(&mut state.pending);
         let syncs = std::mem::take(&mut state.syncs);
+        let waiting = std::mem::take(&mut state.waiting);
         // Queued jobs still own their completion directly. Parked providers
         // retain it themselves and must be failed through the weak index.
         for request in pending.into_values() {
             request.work.fail(5);
+        }
+        for request in waiting.into_values() {
+            request.work.fail();
         }
         for resource in syncs
             .into_values()
@@ -197,6 +220,16 @@ pub struct FileLayoutDriver {
     pub signal: Arc<IoSignal>,
 }
 impl FileLayoutDriver {
+    pub fn ready(&self) -> bool {
+        self.signal.ready()
+            || self
+                .layouts
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.layouts.deadline()
+    }
     pub fn take_ready(&self) -> Vec<FileLayoutRequest> {
         let current = self.layouts.driver.lock().unwrap();
         if !current
@@ -207,7 +240,9 @@ impl FileLayoutDriver {
         }
         self.signal.reset();
         let requests = self.layouts.take_ready();
+        let waiting = self.layouts.take_waiting();
         drop(current);
+        self.layouts.resume_waiting(waiting);
         requests
     }
 }
@@ -247,7 +282,8 @@ impl FileLayouts {
         self.executor.clone()
     }
     pub fn new(executor: Arc<dyn FileExecutor>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             state: Mutex::default(),
             executor,
             driver: Mutex::default(),
@@ -280,7 +316,20 @@ impl FileLayouts {
         }
     }
     fn has_ready(&self) -> bool {
-        !self.state.lock().unwrap().ready.is_empty()
+        let ready = !self.state.lock().unwrap().ready.is_empty();
+        ready
+            || self
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap()
+            .waiting
+            .values()
+            .filter_map(|request| request.wait.deadline())
+            .min()
     }
     pub fn pending(&self) -> bool {
         !self.state.lock().unwrap().live.is_empty()
@@ -315,6 +364,87 @@ impl FileLayouts {
             }
         } else {
             self.executor.submit_host(work, None);
+        }
+    }
+    /// Retain an accepted host job after releasing its layout and byte guards.
+    /// Resource notifications and deadlines reuse the original layout driver.
+    pub fn wait_host(
+        self: &Arc<Self>,
+        work: Box<dyn HostFileTask>,
+        wait: Arc<trames_memory::PageWait>,
+    ) {
+        let id = {
+            let mut state = self.state.lock().unwrap();
+            let id = state.next;
+            state.next = state.next.wrapping_add(1);
+            assert!(state.live.insert(id));
+            id
+        };
+        let wake = Arc::new(Wake {
+            owner: self.this.clone(),
+            id,
+        });
+        let target: Arc<dyn IoWake> = wake.clone();
+        let signal = IoSignal::new(0, Arc::downgrade(&target));
+        let subscriptions = wait.subscribe(&signal);
+        let request = WaitingHost {
+            id,
+            work,
+            wait,
+            signal,
+            _wake: wake,
+            _subscriptions: subscriptions,
+        };
+        let mut state = self.state.lock().unwrap();
+        assert!(state.waiting.insert(id, request).is_none());
+        // One initial wake publishes a newly accepted deadline to the existing
+        // driver. Subsequent retries require actual readiness or expiry.
+        state.ready.insert(id);
+        drop(state);
+        self.notify();
+    }
+    fn take_waiting(&self) -> Vec<WaitingHost> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let ids: Vec<_> = state
+            .waiting
+            .iter()
+            .filter_map(|(&id, request)| {
+                (state.ready.contains(&id)
+                    || request
+                        .wait
+                        .deadline()
+                        .is_some_and(|deadline| deadline <= now))
+                .then_some(id)
+            })
+            .collect();
+        ids.into_iter()
+            .map(|id| {
+                state.ready.remove(&id);
+                let request = state.waiting.remove(&id).unwrap();
+                request.signal.reset();
+                request
+            })
+            .collect()
+    }
+    fn resume_waiting(&self, waiting: Vec<WaitingHost>) {
+        for request in waiting {
+            if request.wait.ready() {
+                self.finish(request.id);
+                if let Some(layouts) = self.this.upgrade() {
+                    layouts.submit_host(request.work);
+                } else {
+                    request.work.fail();
+                }
+            } else {
+                let mut state = self.state.lock().unwrap();
+                let ready = request.signal.ready() || state.ready.contains(&request.id);
+                assert!(state.waiting.insert(request.id, request).is_none());
+                drop(state);
+                if ready {
+                    self.notify();
+                }
+            }
         }
     }
     fn enqueue(self: &Arc<Self>, ticket: LayoutWrite, work: LayoutWork) {
@@ -361,7 +491,9 @@ impl FileLayouts {
             signal.reset();
         }
         let requests = self.take_ready();
+        let waiting = self.take_waiting();
         drop(driver);
+        self.resume_waiting(waiting);
         requests
     }
     fn take_ready(&self) -> Vec<FileLayoutRequest> {
@@ -371,6 +503,8 @@ impl FileLayouts {
             if let Some(request) = state.pending.remove(&id) {
                 request.signal.reset();
                 requests.push(request);
+            } else if state.waiting.contains_key(&id) {
+                state.ready.insert(id);
             }
         }
         drop(state);

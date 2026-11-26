@@ -225,6 +225,7 @@ impl Linux {
                 args,
                 self.uring_clock,
                 saved.unwrap(),
+                source.resource_context(task),
             )
             .resume(&source, memory, task, &target),
             None => source
@@ -715,6 +716,7 @@ pub(crate) fn import_request(
     let mut request = UringRequest {
         owner: memory.instruction_identity().0,
         task,
+        resources: trames_vfs::CgroupResourceContext::capture(),
         sequence,
         sqe,
         resource: None,

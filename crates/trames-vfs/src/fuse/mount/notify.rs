@@ -446,9 +446,8 @@ pub(crate) fn prepare(
     };
     let node = fs.attribute_target(id).ok_or(Errno(2))?;
     if let Change::Store(offset, bytes) = &change {
-        inode::attr(&node)
-            .cache
-            .reserve_store(*offset, bytes.len())?;
+        let attr = inode::attr(&node);
+        attr.cache.reserve_store(attr, *offset, bytes.len())?;
     }
     let is_entry = matches!(change, Change::Entry { .. });
     let resource = Arc::new(Notification {

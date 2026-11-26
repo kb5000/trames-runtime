@@ -258,10 +258,27 @@ impl WeakHandle {
 }
 
 impl Handle {
+    /// Suspend parsing requests for one client while its original native
+    /// resource operation is pending. Buffered bytes and received FDs remain
+    /// owned by that client. Other clients continue to dispatch normally.
+    ///
+    /// After enabling dispatch, call `Backend::dispatch_single_client` once:
+    /// already buffered requests need not make the socket readable again.
+    /// This extension requires the Rust server backend.
+    pub fn set_client_dispatch_enabled(
+        &self,
+        client: ClientId,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        self.handle.set_client_dispatch_enabled(client.id, enabled)
+    }
+
     /// Get a [`WeakHandle`] from this handle
     #[inline]
     pub fn downgrade(&self) -> WeakHandle {
-        WeakHandle { handle: self.handle.downgrade() }
+        WeakHandle {
+            handle: self.handle.downgrade(),
+        }
     }
 
     /// Get the detailed protocol information about a wayland object
@@ -281,7 +298,9 @@ impl Handle {
         stream: UnixStream,
         data: Arc<dyn ClientData>,
     ) -> std::io::Result<ClientId> {
-        Ok(ClientId { id: self.handle.insert_client(stream, data)? })
+        Ok(ClientId {
+            id: self.handle.insert_client(stream, data)?,
+        })
     }
 
     /// Returns the id of the client which owns the object.
@@ -336,7 +355,8 @@ impl Handle {
         interface: &'static Interface,
         protocol_id: u32,
     ) -> Result<ObjectId, InvalidId> {
-        self.handle.object_for_protocol_id(client_id.id, interface, protocol_id)
+        self.handle
+            .object_for_protocol_id(client_id.id, interface, protocol_id)
     }
 
     /// Create a new object for given client
@@ -356,7 +376,8 @@ impl Handle {
         version: u32,
         data: Arc<dyn ObjectData<D>>,
     ) -> Result<ObjectId, InvalidId> {
-        self.handle.create_object(client_id.id, interface, version, data)
+        self.handle
+            .create_object(client_id.id, interface, version, data)
     }
 
     /// Destroy an object
@@ -451,7 +472,9 @@ impl Handle {
         version: u32,
         handler: Arc<dyn GlobalHandler<D>>,
     ) -> GlobalId {
-        GlobalId { id: self.handle.create_global(interface, version, handler) }
+        GlobalId {
+            id: self.handle.create_global(interface, version, handler),
+        }
     }
 
     /// Disables a global object that is currently active.
@@ -533,7 +556,8 @@ impl Handle {
     /// Set maximum buffer size for client.
     #[cfg(feature = "libwayland_server_1_23")]
     pub fn set_client_max_buffer_size(&self, client: ClientId, max_buffer_size: usize) {
-        self.handle.set_client_max_buffer_size(client.id, max_buffer_size);
+        self.handle
+            .set_client_max_buffer_size(client.id, max_buffer_size);
     }
 }
 
@@ -550,7 +574,9 @@ impl<D> Backend<D> {
     /// Initialize a new Wayland backend
     #[inline]
     pub fn new() -> Result<Self, InitError> {
-        Ok(Self { backend: server_impl::InnerBackend::new()? })
+        Ok(Self {
+            backend: server_impl::InnerBackend::new()?,
+        })
     }
 
     /// Flushes pending events destined for a client.

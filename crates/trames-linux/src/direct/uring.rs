@@ -76,7 +76,8 @@ impl RequestOps for Request {
         if self.import_pending {
             return crate::uring::input::RESERVED_METADATA;
         }
-        512 + self.parts.as_ref().map_or(0, |p| p.len() * 16)
+        512 + std::mem::size_of::<trames_vfs::CgroupResourceContext>()
+            + self.parts.as_ref().map_or(0, |p| p.len() * 16)
             + self.path.as_ref().map_or(0, Vec::len)
     }
     fn events(&self) -> u16 {
@@ -620,27 +621,30 @@ impl RingOps for Ring {
             // Only imported metadata/control runs under the object lock. Byte
             // transport and guest memory borrows remain on this worker outside it.
             let was_importing = r.import_pending;
-            let result = if let Some(e) = selected_error {
-                Some(Err(e))
-            } else {
-                let requested = selected.map_or(r.requested, |b| {
-                    if r.sqe.opcode() == 27 && r.sqe.length() == 0 {
-                        b.length as u64
-                    } else {
-                        b.length.min(r.sqe.length()) as u64
-                    }
-                });
-                r.run(memory, &mut scratch, &mut cache, selected)
-                    .map(|result| {
-                        result.map(|n| {
-                            (
-                                n,
-                                !matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23 | 26 | 27)
-                                    || n as u64 == requested,
-                            )
+            let result = {
+                let _resources = r.resources.enter();
+                if let Some(e) = selected_error {
+                    Some(Err(e))
+                } else {
+                    let requested = selected.map_or(r.requested, |b| {
+                        if r.sqe.opcode() == 27 && r.sqe.length() == 0 {
+                            b.length as u64
+                        } else {
+                            b.length.min(r.sqe.length()) as u64
+                        }
+                    });
+                    r.run(memory, &mut scratch, &mut cache, selected)
+                        .map(|result| {
+                            result.map(|n| {
+                                (
+                                    n,
+                                    !matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23 | 26 | 27)
+                                        || n as u64 == requested,
+                                )
+                            })
                         })
-                    })
-                    .or_else(|| execute(&mut r, memory, selected))
+                        .or_else(|| execute(&mut r, memory, selected))
+                }
             };
             if let (Some(selection), Some(buffer)) = (&mut r.selection, selected) {
                 selection.buffer = buffer;
@@ -756,6 +760,18 @@ struct Original {
     factory: trames_vfs::DescriptorFactory,
 }
 impl UringSnapshot {
+    fn resource_context(&self) -> trames_vfs::CgroupResourceContext {
+        if let Some(context) = self.context.get() {
+            context.resource_context(self.task)
+        } else if let Some(original) = &self.original {
+            original
+                .factory
+                .task_resource_context(self.task)
+                .unwrap_or_default()
+        } else {
+            trames_vfs::CgroupResourceContext::capture()
+        }
+    }
     /// Only future acceptance changes. Existing request leases retain their
     /// original complete execution context independently of this cache.
     pub(super) fn refresh_context(&mut self) {
@@ -935,12 +951,21 @@ impl UringSnapshot {
             self.record_completed();
             return Some(IoAttempt::Complete(Err(Errno(9))));
         };
-        if memory.async_faults_possible() {
+        let resources = if source.resources.is_some() {
+            source.resource_context(pid)
+        } else {
+            self.resource_context()
+        };
+        let _resources = resources.enter();
+        // Anonymous-only pin/output can also need memory admission. Do not
+        // make retaining the registration depend on file-backed input alone.
+        if memory.async_faults_possible() || trames_memory::CgroupMemoryTarget::active() {
             let Some(files) = self.membership.clone() else {
                 return Some(IoAttempt::Checkpoint);
             };
             return Some(
-                Box::new(Registration::new(ring, args, files)).resume(source, memory, pid, target),
+                Box::new(Registration::new(ring, args, files, resources))
+                    .resume(source, memory, pid, target),
             );
         }
         let result = crate::uring::register(&ring, args, memory, |fd| {
@@ -1017,6 +1042,7 @@ impl UringSnapshot {
                 ring,
                 args,
                 self.clock.unwrap_or_else(Instant::now),
+                self.resource_context(),
             ))
             .resume(source, memory, pid, target),
         )
@@ -1042,6 +1068,15 @@ impl UringSnapshot {
         let mut prepared = Vec::new();
         let mut retired_graph = Vec::new();
         let mut rejected_requests = Vec::new();
+        // The enter accepts this SQE batch before any body runs. Snapshot the
+        // actual submitter before taking the ring lock; each request retains
+        // its own origin through later imports and other observers' pumps.
+        let accepted_resources = if args[1] != 0 {
+            self.resource_context()
+        } else {
+            Default::default()
+        };
+        let _resources = (args[1] != 0).then(|| accepted_resources.enter());
         let mut state = ring.state.lock().unwrap();
         let minimum = (args[2] as u32).min(ring.cq_entries);
         let head = match ring.cq_head(&state) {
@@ -1128,6 +1163,7 @@ impl UringSnapshot {
                 if r.error.is_none() && matches!(r.sqe.opcode(), 26 | 27) && r.sqe.offset() != 0 {
                     r.error = Some(Errno(22));
                 }
+                r.resources = accepted_resources.clone();
                 metadata += r.metadata();
                 if metadata > 1024 * 1024 {
                     rejected_requests.push(r);
@@ -1136,6 +1172,10 @@ impl UringSnapshot {
                 let context = r.import_pending
                     || matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
                         && (self.staged_files.get()
+                            || self.context.get().is_some()
+                                && r.file
+                                    .as_ref()
+                                    .is_some_and(|file| file.file_target().is_some())
                             || r.resource.is_none()
                             || memory.async_faults_possible() && r.buffer.is_none())
                         && r.file.is_some()
@@ -1701,6 +1741,9 @@ mod owned_tests;
 #[cfg(test)]
 #[path = "uring/maintenance_tests.rs"]
 mod maintenance_tests;
+#[cfg(test)]
+#[path = "uring/resource_tests.rs"]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {

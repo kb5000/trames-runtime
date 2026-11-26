@@ -94,7 +94,7 @@ impl RetainedBinder {
             subscriptions.push(request.subscribe(signal));
         }
         if let Some(fault) = &state.fault {
-            subscriptions.push(fault.wait.subscribe(signal));
+            subscriptions.extend(fault.wait.subscribe(signal));
             if fault.wait.ready() {
                 signal.notify();
             }

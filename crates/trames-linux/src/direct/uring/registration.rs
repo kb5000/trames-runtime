@@ -9,9 +9,15 @@ pub struct Registration {
     accepted: Vec<(u32, Result<UringFile>)>,
     output: crate::copy_replay::Replay,
     result: Option<Result<u64>>,
+    resources: trames_vfs::CgroupResourceContext,
 }
 impl Registration {
-    pub(super) fn new(ring: Arc<Uring>, args: [u64; 6], files: trames_vfs::SharedFiles) -> Self {
+    pub(super) fn new(
+        ring: Arc<Uring>,
+        args: [u64; 6],
+        files: trames_vfs::SharedFiles,
+        resources: trames_vfs::CgroupResourceContext,
+    ) -> Self {
         Self {
             ring,
             args,
@@ -20,6 +26,7 @@ impl Registration {
             accepted: Vec::new(),
             output: Default::default(),
             result: None,
+            resources,
         }
     }
     pub fn resume(
@@ -29,6 +36,7 @@ impl Registration {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        let _resources = self.resources.enter();
         if self.result.is_none() {
             let mut imported = file_input::RegistrationMemory {
                 memory,

@@ -71,6 +71,7 @@ impl Birth {
     pub(super) fn bind_task_cgroup<C: Cpu>(&self, id: u32, p: &Process<C>) {
         if !matches!(p.state, State::Zombie(_)) && p.signals.io.cgroup().is_none() {
             if let Some(task) = p.linux.vfs.cgroup_task(id) {
+                task.bind_oom(&p.oom);
                 p.signals.io.bind_cgroup(task);
             }
         }
@@ -851,6 +852,11 @@ impl Birth {
             request.environment,
             self.memory_limits.per_process,
             self.started,
+            root.signals
+                .io
+                .cgroup()
+                .map(trames_vfs::CgroupTask::resource_context)
+                .unwrap_or_default(),
         );
         Ok((
             HostChild {

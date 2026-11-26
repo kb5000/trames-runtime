@@ -13,7 +13,7 @@ use trames_vfs::{Errno, IoSignal, IoSubscription};
 pub(crate) struct Delivery {
     state: Mutex<Option<State>>,
     pending: Mutex<Option<PageFault>>,
-    wake: Mutex<Option<(Arc<IoSignal>, IoSubscription)>>,
+    wake: Mutex<Option<(Arc<IoSignal>, Vec<IoSubscription>)>>,
 }
 struct State {
     sig: u32,
@@ -46,6 +46,18 @@ pub(crate) struct Delivered {
     pub completion: Option<Completion>,
 }
 impl Delivery {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.wake
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(_, subscriptions)| {
+                subscriptions
+                    .iter()
+                    .filter_map(IoSubscription::deadline)
+                    .min()
+            })
+    }
     pub fn new(
         sig: u32,
         info: RetainedInfo,
@@ -161,6 +173,7 @@ impl Delivery {
                             .as_ref()
                             .map(trames_linux::UringEnter::interrupted)
                             .or_else(|| io.aio.as_ref().map(trames_linux::RetainedAio::interrupted))
+                            .or_else(|| io.file.as_ref()?.interrupted(memory))
                             .or_else(|| io.retained_byte.as_ref()?.interrupted(memory))
                             .or_else(|| io.retained_socket.as_ref()?.interrupted(memory))
                             .unwrap_or(Err(Errno(4)))

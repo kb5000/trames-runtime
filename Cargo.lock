@@ -866,6 +866,7 @@ name = "trames-elf"
 version = "1.3.0"
 dependencies = [
  "trames-memory",
+ "trames-shared",
 ]
 
 [[package]]

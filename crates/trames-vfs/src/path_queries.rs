@@ -7,6 +7,7 @@ use super::*;
 #[derive(Default)]
 pub(super) struct PreparedPath {
     pub work: Option<std::sync::Mutex<FileWork>>,
+    pub capabilities: Option<Box<xattr::CapabilitiesWork>>,
     pub open: Option<file_work::PreparedOpen>,
     pub fuse: Option<Box<fuse::Metadata>>,
     pub namespace: Option<Box<fuse::PendingNamespace>>,
@@ -20,6 +21,7 @@ pub(super) struct Authority {
     pub(super) namespace_io: bool,
     pub(super) metadata_call: bool,
     pub(super) metadata_entry: RefCell<Option<Box<ResolvedEntry>>>,
+    pub(super) resource_metadata: RefCell<Option<Box<MetadataTarget>>>,
     pub(super) retained: Option<(u32, RetainedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
     pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
@@ -85,6 +87,7 @@ impl Authority {
             namespace_uses: ActiveMounts::default(),
             metadata_call: false,
             metadata_entry: Default::default(),
+            resource_metadata: Default::default(),
             topology_paths: None,
         }
     }
@@ -104,6 +107,7 @@ impl Authority {
             namespace_uses: ActiveMounts::default(),
             metadata_call: false,
             metadata_entry: Default::default(),
+            resource_metadata: Default::default(),
             topology_paths: None,
         }
     }
@@ -262,6 +266,7 @@ impl Vfs {
             namespace_uses: ActiveMounts::default(),
             metadata_call: false,
             metadata_entry: Default::default(),
+            resource_metadata: Default::default(),
             topology_paths: None,
         });
         PathQueries {
@@ -554,6 +559,9 @@ impl PathQueries {
             .borrow_mut()
             .uring_create_with_output(entries, cq_entries, output)
             .map(|(fd, _)| fd)
+    }
+    pub fn begin_uring(&self, entries: u32, cq_entries: u32) -> Result<UringPreparation> {
+        self.view.borrow_mut().begin_uring(entries, cq_entries)
     }
     pub fn prepare_uring(&self, entries: u32, cq_entries: u32) -> Result<PreparedDescriptor> {
         self.view

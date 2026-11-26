@@ -8,25 +8,43 @@ use std::{
 };
 #[cfg(test)]
 mod concurrency;
+mod pressure;
+#[cfg(test)]
+mod pressure_tests;
+mod sync;
 mod writers;
 use storage::FileData;
+pub(super) use sync::{DataSync, Operation as SyncOperation};
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
 pub(crate) use writers::Admission as WriterAdmission;
 pub(crate) use writers::MountWrite;
 use writers::WriteLease;
 pub(super) use writers::Writers;
 pub(super) struct FilePage {
-    owners: trames_memory::MappedResidents,
+    owners: Arc<trames_memory::MappedResidents>,
     identity: u64,
     bytes: RwLock<PageStorage>,
-    writeback: std::sync::Mutex<()>,
-    dirty: AtomicBool,
+    writeback: std::sync::Mutex<std::sync::Weak<sync::Ticket>>,
+    dirty_resources: std::sync::Mutex<Option<CgroupResourceContext>>,
+    reclaimed_owner: std::sync::Mutex<std::sync::Weak<trames_memory::MemoryCgroup>>,
+    dirty: Arc<AtomicBool>,
     version: AtomicU64,
+    source_generation: AtomicU64,
+    invalidation_generation: AtomicU64,
+    shared_reload: Option<PageStorage>,
+    external_generation: Option<Arc<AtomicU64>>,
+    loaded_generation: AtomicU64,
 }
 #[derive(Clone)]
 enum PageStorage {
     Deferred {
         source: Arc<file_data::PlainFile>,
+        offset: u64,
+        state: std::sync::Weak<MappingState>,
+    },
+    DeferredShared {
+        file: trames_shared::SharedFile,
+        cell: Arc<shared_account::Page>,
         offset: u64,
         state: std::sync::Weak<MappingState>,
     },
@@ -64,14 +82,16 @@ impl PageStorage {
     }
     fn version(&self) -> u64 {
         match self {
-            Self::Deferred { .. } => 0,
+            Self::Deferred { .. } | Self::DeferredShared { .. } => 0,
             Self::Published { bytes, .. } => bytes.revision(),
         }
     }
     fn copy_read(&self, offset: usize, out: &mut [u8]) {
         match self {
             Self::Published { bytes, .. } => bytes.copy_read(offset, out),
-            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
+            Self::Deferred { .. } | Self::DeferredShared { .. } => {
+                unreachable!("page-in precedes byte access")
+            }
         }
     }
     fn copy_write(&self, offset: usize, input: &[u8]) {
@@ -79,31 +99,66 @@ impl PageStorage {
             Self::Published { bytes, .. } => bytes.copy_write(offset, input),
             // Only MappedData::write_at reaches an unloaded page here, after
             // writing the retained PlainFile. A later page-in reads that update.
-            Self::Deferred { .. } => {}
+            Self::Deferred { .. } | Self::DeferredShared { .. } => {}
         }
     }
     fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
         match self {
             Self::Published { bytes, .. } => bytes.with_read(offset, len, f),
-            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
+            Self::Deferred { .. } | Self::DeferredShared { .. } => {
+                unreachable!("page-in precedes byte access")
+            }
         }
     }
     fn with_write<T>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
         match self {
             Self::Published { bytes, .. } => bytes.with_write(offset, len, f),
-            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
+            Self::Deferred { .. } | Self::DeferredShared { .. } => {
+                unreachable!("page-in precedes byte access")
+            }
         }
     }
 }
 impl FilePage {
     fn new(bytes: PageStorage) -> Arc<Self> {
+        let (owners, dirty) = match &bytes {
+            PageStorage::Deferred { source, offset, .. } => source
+                .cache_page(*offset)
+                .map(|page| (page.owners.clone(), page.dirty.clone()))
+                .unwrap_or_default(),
+            PageStorage::DeferredShared { cell, .. } => (cell.owners.clone(), cell.dirty.clone()),
+            _ => Default::default(),
+        };
+        if let PageStorage::Published { bytes, .. } = &bytes {
+            owners.bind_cache(bytes);
+        }
+        let (shared_reload, external_generation) = match &bytes {
+            PageStorage::DeferredShared { cell, state, .. } => {
+                if let Some(state) = state.upgrade() {
+                    cell.observe(&state);
+                }
+                (Some(bytes.clone()), Some(cell.generation.clone()))
+            }
+            PageStorage::Deferred { .. } => (Some(bytes.clone()), None),
+            _ => (None, None),
+        };
+        let loaded_generation = external_generation
+            .as_ref()
+            .map_or(0, |generation| generation.load(Ordering::Relaxed));
         Arc::new(Self {
-            owners: Default::default(),
+            owners,
             identity: trames_memory::new_backing_identity(),
             bytes: RwLock::new(bytes),
-            writeback: std::sync::Mutex::new(()),
-            dirty: AtomicBool::new(false),
+            writeback: std::sync::Mutex::default(),
+            dirty_resources: std::sync::Mutex::default(),
+            reclaimed_owner: std::sync::Mutex::default(),
+            dirty,
             version: AtomicU64::new(0),
+            source_generation: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
+            shared_reload,
+            external_generation,
+            loaded_generation: AtomicU64::new(loaded_generation),
         })
     }
     fn changed(&self) {
@@ -111,36 +166,113 @@ impl FilePage {
     }
     fn replace(&self, bytes: PageStorage) {
         *self.bytes.write().unwrap() = bytes;
+        self.source_generation.fetch_add(1, Ordering::Relaxed);
     }
     fn deferred(&self) -> bool {
-        matches!(*self.bytes.read().unwrap(), PageStorage::Deferred { .. })
+        self.external_version() != self.loaded_generation.load(Ordering::Relaxed)
+            || matches!(
+                *self.bytes.read().unwrap(),
+                PageStorage::Deferred { .. } | PageStorage::DeferredShared { .. }
+            )
+    }
+    fn external_version(&self) -> u64 {
+        self.external_generation
+            .as_ref()
+            .map_or(0, |generation| generation.load(Ordering::Relaxed))
     }
     fn materialize(&self) -> std::result::Result<(), MemoryError> {
+        let scope = resource_io::Scope::enter();
+        let result = self.materialize_inner();
+        if let Some(pending) = scope.finish() {
+            Err(pending.wait.fault(0))
+        } else {
+            result
+        }
+    }
+    fn materialize_inner(&self) -> std::result::Result<(), MemoryError> {
         let mut storage = self.bytes.write().unwrap();
+        let generation = self.external_version();
+        if generation != self.loaded_generation.load(Ordering::Relaxed) {
+            if let Some(reload) = &self.shared_reload {
+                *storage = reload.clone();
+            }
+        }
+        if let PageStorage::DeferredShared {
+            file,
+            cell,
+            offset,
+            state,
+        } = &*storage
+        {
+            if *offset / PAGE_SIZE >= (file.len() as u64).div_ceil(PAGE_SIZE) {
+                return Err(MemoryError::Bus(*offset));
+            }
+            let bytes = cell.load(file, *offset).map_err(|error| {
+                if error == Errno(12) {
+                    MemoryError::Limit
+                } else {
+                    MemoryError::BackingIo(error.0)
+                }
+            })?;
+            let range = *offset..offset.saturating_add(PAGE_SIZE);
+            let state = state.upgrade();
+            *storage = PageStorage::Published {
+                bytes,
+                shared: true,
+            };
+            self.loaded_generation
+                .store(self.external_version(), Ordering::Relaxed);
+            // Admission publishes the existing source bytes, not a content write.
+            drop(storage);
+            if let Some(state) = state {
+                state.changed(Some(range));
+            }
+            return Ok(());
+        }
         let PageStorage::Deferred {
             source,
             offset,
             state,
         } = &*storage
         else {
+            if let PageStorage::Published { bytes, .. } = &*storage {
+                self.owners.publish_cache(bytes)?;
+            }
             return Ok(());
         };
-        let data = source.fault_read(*offset).map_err(|error| {
+        self.owners.reserve_cache()?;
+        let page_error = |error: Errno| {
             if error == Errno(28) {
                 MemoryError::Bus(*offset)
+            } else if error == Errno(12) {
+                MemoryError::Limit
             } else {
                 MemoryError::BackingIo(error.0)
             }
-        })?;
+        };
+        let cached = source.cached_fault(*offset);
+        let published = if let Some(cached) = cached {
+            PageStorage::Published {
+                bytes: cached.map_err(page_error)?,
+                shared: source.tmpfs,
+            }
+        } else {
+            let data = source.fault_read(*offset).map_err(page_error)?;
+            if data.is_empty() {
+                PageStorage::zero()
+            } else {
+                let mut bytes = Box::new([0; PAGE_SIZE as usize]);
+                bytes[..data.len()].copy_from_slice(&data);
+                PageStorage::heap(bytes)
+            }
+        };
+        if let PageStorage::Published { bytes, .. } = &published {
+            self.owners.bind_cache(bytes);
+            self.owners.publish_cache(bytes)?;
+        }
         let state = state.upgrade();
         let range = *offset..offset.saturating_add(PAGE_SIZE);
-        *storage = if data.is_empty() {
-            PageStorage::zero()
-        } else {
-            let mut bytes = Box::new([0; PAGE_SIZE as usize]);
-            bytes[..data.len()].copy_from_slice(&data);
-            PageStorage::heap(bytes)
-        };
+        *storage = published;
         self.changed();
         drop(storage);
         if let Some(state) = state {
@@ -151,7 +283,9 @@ impl FilePage {
     fn shared_page(&self) -> Arc<SharedPage> {
         match &*self.bytes.read().unwrap() {
             PageStorage::Published { bytes, .. } => bytes.clone(),
-            PageStorage::Deferred { .. } => unreachable!("page-in precedes publication"),
+            PageStorage::Deferred { .. } | PageStorage::DeferredShared { .. } => {
+                unreachable!("page-in precedes publication")
+            }
         }
     }
     fn with_bytes<T>(
@@ -159,7 +293,15 @@ impl FilePage {
         f: impl FnOnce(&PageStorage) -> T,
     ) -> std::result::Result<T, MemoryError> {
         let storage = self.bytes.read().unwrap();
-        if !matches!(*storage, PageStorage::Deferred { .. }) {
+        if self.external_version() == self.loaded_generation.load(Ordering::Relaxed)
+            && !matches!(
+                *storage,
+                PageStorage::Deferred { .. } | PageStorage::DeferredShared { .. }
+            )
+        {
+            if let PageStorage::Published { bytes, .. } = &*storage {
+                self.owners.publish_cache(bytes)?;
+            }
             return Ok(f(&storage));
         }
         drop(storage);
@@ -168,6 +310,12 @@ impl FilePage {
     }
 }
 impl trames_memory::PageSource for FilePage {
+    fn generation(&self) -> u64 {
+        self.source_generation
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.invalidation_generation.load(Ordering::Relaxed))
+            .wrapping_add(self.external_version())
+    }
     fn load(&self) -> std::result::Result<Arc<SharedPage>, MemoryError> {
         self.materialize()?;
         Ok(self.shared_page())
@@ -189,7 +337,7 @@ struct RangeChange {
     after: u64,
     bytes: Range<u64>,
 }
-struct MappingState {
+pub(super) struct MappingState {
     identity: u64,
     generation: AtomicU64,
     metadata_identity: u64,
@@ -235,11 +383,11 @@ impl MappingState {
                 .load(Ordering::Relaxed)
                 .wrapping_add(match &self.length {
                     LiveLength::Inode(size) => size.revision(),
-                    _ => 0,
+                    _ => self.metadata_length.revision(),
                 }),
         )
     }
-    fn changed(&self, bytes: Option<Range<u64>>) {
+    pub(super) fn changed(&self, bytes: Option<Range<u64>>) {
         // Generation and interval history form one metadata transaction. A
         // second publisher must not attach its range to another writer's token.
         let mut changes = self.changes.borrow_mut();
@@ -298,8 +446,9 @@ impl MappingState {
 }
 pub(super) struct MappedData {
     state: Arc<MappingState>,
-    data: SharedCell<Box<FileData>>,
-    pages: SharedCell<BTreeMap<u64, std::sync::Weak<FilePage>>>,
+    data: Arc<SharedCell<Box<FileData>>>,
+    pages: Arc<SharedCell<BTreeMap<u64, std::sync::Weak<FilePage>>>>,
+    pressure: std::sync::OnceLock<Arc<pressure::Provider>>,
     writers: Arc<Writers>,
 }
 impl MappedData {
@@ -313,8 +462,9 @@ impl MappedData {
         }
         Self {
             state: MappingState::new(&data, stable, inode),
-            data: SharedCell::new(Box::new(data)),
-            pages: SharedCell::new(BTreeMap::new()),
+            data: Arc::new(SharedCell::new(Box::new(data))),
+            pages: Arc::new(SharedCell::new(BTreeMap::new())),
+            pressure: std::sync::OnceLock::new(),
             writers: Arc::default(),
         }
     }
@@ -330,6 +480,12 @@ impl MappedData {
     pub(super) fn capabilities(&self) -> Option<file_caps::FileCaps> {
         self.data.borrow().capabilities()
     }
+    pub(super) fn projection_caps(
+        &self,
+        caps: Option<file_caps::FileCaps>,
+    ) -> Result<(Arc<file_data::PlainFile>, Option<file_caps::FileCaps>)> {
+        self.data.borrow().projection_caps(caps)
+    }
     pub(super) fn edit_capabilities(
         &self,
         caps: Option<file_caps::FileCaps>,
@@ -341,7 +497,20 @@ impl MappedData {
             }
             self.sync(false)?;
         }
-        self.data.borrow().edit_capabilities(caps, flags)
+        self.edit_capabilities_after_sync(caps, flags)
+    }
+    pub(super) fn has_writable_mappings(&self) -> bool {
+        self.has_writers() || self.data.borrow().has_writable_mappings()
+    }
+    pub(super) fn edit_capabilities_after_sync(
+        &self,
+        caps: Option<file_caps::FileCaps>,
+        flags: u32,
+    ) -> Result<()> {
+        if caps.is_some() && self.has_writers() {
+            return Err(Errno(16));
+        }
+        self.data.borrow().edit_capabilities_after_sync(caps, flags)
     }
     pub(super) fn metadata(&self) -> Option<file_data::FileMeta> {
         self.data.borrow().metadata()
@@ -369,6 +538,26 @@ impl MappedData {
     }
     fn changed(&self) {
         self.state.changed(None);
+    }
+    pub(super) fn begin_validation(
+        &self,
+    ) -> Result<std::result::Result<storage::Validation, Arc<dyn trames_shared::ResourceWait>>>
+    {
+        let data = self.data.borrow();
+        let mut validation = match data.begin_validation()? {
+            Ok(validation) => validation,
+            Err(wait) => return Ok(Err(wait)),
+        };
+        validation.version =
+            storage::DataVersion::Mapped(self.state.domain(), Box::new(validation.version));
+        Ok(Ok(validation))
+    }
+    pub(super) fn matches_validation(
+        &self,
+        token: (u64, u64),
+        source: &storage::DataVersion,
+    ) -> Result<bool> {
+        Ok(token == self.state.domain() && source.matches(&self.data.borrow())?)
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
@@ -413,12 +602,26 @@ impl MappedData {
         let Some(file) = self.shared_file() else {
             return false;
         };
+        if file.accounting::<shared_account::Account>().is_some() {
+            // Resource-backed pages fault lazily and observe the original
+            // shared inode's generation; writes must not map untouched holes.
+            return false;
+        }
         let mut replaced = false;
         for (&offset, page) in self.pages.borrow().iter() {
             let Some(page) = page.upgrade() else { continue };
-            if !page.bytes.read().unwrap().is_shared() {
-                if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
+            if !page.dirty.load(Ordering::Relaxed) && !page.bytes.read().unwrap().is_shared() {
+                // This optional upgrade must not displace a newer dirty prefix
+                // or leak a failed mapping's wait into the enclosing mutation.
+                let scope = resource_io::Scope::enter();
+                let mapped = file.map(offset as usize, PAGE_SIZE as usize);
+                let _pending = scope.finish();
+                if let Ok(map) = mapped {
+                    page.owners.invalidate_cache();
                     page.replace(PageStorage::mapped(map));
+                    if let PageStorage::Published { bytes, .. } = &*page.bytes.read().unwrap() {
+                        page.owners.bind_cache(bytes);
+                    }
                     replaced = true;
                     // Snapshot versions cover physical identity, including
                     // untouched pages upgraded when an inode gains SHM storage.
@@ -447,11 +650,15 @@ impl MappedData {
                 offset,
                 state: Arc::downgrade(&self.state),
             }
-        } else if let Some(map) = self
-            .shared_file()
-            .and_then(|file| file.map(offset as usize, PAGE_SIZE as usize).ok())
-        {
-            PageStorage::mapped(map)
+        } else if let Some(file) = self.shared_file() {
+            shared_account::install(&file, true)?;
+            let cell = shared_account::cell(&file, offset).expect("original shared accounting");
+            PageStorage::DeferredShared {
+                file,
+                cell,
+                offset,
+                state: Arc::downgrade(&self.state),
+            }
         } else {
             let data = self.data.borrow().read_at(offset, PAGE_SIZE as usize)?;
             if data.is_empty() {
@@ -519,19 +726,25 @@ impl MappedData {
         Ok(result)
     }
     pub(super) fn read_at(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
-        let mut out = self.data.borrow().read_at(offset, count)?;
-        let end = offset + out.len() as u64;
+        let mut out = Vec::new();
+        self.read_into(offset, count, &mut out)?;
+        Ok(out)
+    }
+    pub(super) fn read_into(&self, offset: u64, count: usize, out: &mut Vec<u8>) -> Result<()> {
+        let before = out.len();
+        let result = self.data.borrow().read_into(offset, count, out);
+        let end = offset + (out.len() - before) as u64;
         for (&base, p) in self.pages.borrow().range((offset & !(PAGE_SIZE - 1))..end) {
             if let Some(p) = p.upgrade().filter(|page| !page.deferred()) {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
                 p.bytes.read().unwrap().copy_read(
                     (start - base) as usize,
-                    &mut out[(start - offset) as usize..(to - offset) as usize],
+                    &mut out[before + (start - offset) as usize..before + (to - offset) as usize],
                 );
             }
         }
-        Ok(out)
+        result
     }
     pub(super) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let old_len = self.len();
@@ -555,7 +768,7 @@ impl MappedData {
             .changed((!replaced && old_len == self.len() && count != 0).then_some(offset..end));
         Ok(count)
     }
-    fn flush(&self, offset: u64, page: &FilePage) -> Result<()> {
+    pub(super) fn flush(&self, offset: u64, page: &FilePage) -> Result<()> {
         if !page.dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -563,6 +776,11 @@ impl MappedData {
         // two snapshots could reach disk in reverse order and lose the latest
         // write. Clear before copying so later publications keep the page dirty.
         let _writeback = page.writeback.lock().unwrap();
+        if let Some(ticket) = _writeback.upgrade().filter(|ticket| !ticket.ready()) {
+            return Err(resource_io::memory_error(
+                trames_memory::PageWait::resource(ticket).fault(0),
+            ));
+        }
         if !page.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
@@ -602,6 +820,41 @@ impl MappedData {
         self.flush_range(0, u64::MAX)?;
         self.data.borrow().sync(data_only)
     }
+    fn prepare_sync_operation(&self, operation: SyncOperation) -> VecDeque<(u64, Arc<FilePage>)> {
+        let (start, end, write) = match operation {
+            SyncOperation::File(_) => (0, u64::MAX, true),
+            SyncOperation::Range {
+                offset,
+                length,
+                flags,
+            } => (
+                offset & !(PAGE_SIZE - 1),
+                if length == 0 {
+                    u64::MAX
+                } else {
+                    offset + length - 1
+                },
+                flags & 2 != 0,
+            ),
+        };
+        self.pages
+            .borrow()
+            .range(start..=end)
+            .filter_map(|(&offset, page)| {
+                let page = page.upgrade()?;
+                if write && self.has_writers() && !page.deferred() {
+                    page.dirty.store(true, Ordering::Relaxed);
+                }
+                let writing = page
+                    .writeback
+                    .lock()
+                    .unwrap()
+                    .upgrade()
+                    .is_some_and(|ticket| !ticket.ready());
+                (write && page.dirty.load(Ordering::Relaxed) || writing).then_some((offset, page))
+            })
+            .collect()
+    }
     pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
         self.flush_requested_range(offset, length, flags)?;
         self.data.borrow().sync_range(offset, length, flags)
@@ -629,19 +882,34 @@ impl MappedData {
         Ok(())
     }
     pub(super) fn truncate(&self, length: u64) -> Result<()> {
-        if length == self.len() {
+        if length == self.len() && !self.has_allocated_after(length) {
             return Ok(());
         }
         self.sync(false)?;
-        self.data.borrow_mut().truncate(length)?;
-        // The length has changed even if a later page reload fails. Publish
-        // that fact before fallible I/O; no VM/provider re-entry occurs here.
+        self.truncate_after_sync(length)
+    }
+    pub(super) fn truncate_after_sync(&self, length: u64) -> Result<()> {
+        if length == self.len() && !self.has_allocated_after(length) {
+            return Ok(());
+        }
+        let previous_length = self.len();
+        self.data.borrow_mut().truncate_after_sync(length)?;
+        if length < previous_length {
+            trames_memory::backing_invalidated();
+        }
+        // No fallible page-in follows the EOF change. Writeback preserved the
+        // existing prefix; resize only clears bytes which no longer exist.
         self.changed();
         self.refresh_shared_pages();
-        let sparse = self.tmpfs_file();
+        let source = self.plain_file();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                if let Some(source) = sparse.as_ref().filter(|_| base >= length) {
+                if length < previous_length && base / PAGE_SIZE >= length.div_ceil(PAGE_SIZE) {
+                    page.owners.invalidate_cache();
+                    page.invalidation_generation.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(source) = source.as_ref().filter(|_| base >= length) {
+                    page.owners.invalidate_cache();
                     page.replace(PageStorage::Deferred {
                         source: source.clone(),
                         offset: base,
@@ -649,24 +917,38 @@ impl MappedData {
                     });
                     page.dirty.store(false, Ordering::Relaxed);
                 } else if !page.deferred() && !page.bytes.read().unwrap().is_shared() {
-                    let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
                     let mut content = page.bytes.write().unwrap();
-                    if bytes.is_empty() {
+                    if base >= length {
                         *content = PageStorage::zero();
-                    } else {
-                        content.with_write(0, PAGE_SIZE as usize, |out| {
-                            out.fill(0);
-                            out[..bytes.len()].copy_from_slice(&bytes);
-                        });
+                        page.source_generation.fetch_add(1, Ordering::Relaxed);
+                    } else if length - base < PAGE_SIZE {
+                        let keep = (length - base) as usize;
+                        content.with_write(keep, PAGE_SIZE as usize - keep, |out| out.fill(0));
                     }
-                    // Reset while holding the layout guard. A subsequent
-                    // mapping write marks dirty only after releasing that guard.
-                    page.dirty.store(false, Ordering::Relaxed);
+                    // A store while the accepted writeback was parked still
+                    // owns its dirty prefix. Only pages wholly beyond EOF may
+                    // discard that publication after layout is reacquired.
+                    if base >= length {
+                        page.dirty.store(false, Ordering::Relaxed);
+                    }
                 }
                 page.changed();
             }
         }
         Ok(())
+    }
+    pub(super) fn has_allocated_after(&self, length: u64) -> bool {
+        self.data.borrow().has_allocated_after(length)
+    }
+    pub(super) fn begin_transaction(
+        &self,
+    ) -> Result<
+        std::result::Result<
+            Option<trames_shared::FileTransactionLease>,
+            Arc<dyn trames_shared::ResourceWait>,
+        >,
+    > {
+        self.data.borrow_mut().begin_transaction()
     }
 }
 #[derive(Clone)]
@@ -742,8 +1024,19 @@ impl FileMapping {
         // and backing generations still change on EVERY write, for executable
         // aliases, exclusive monitors and incremental worker snapshots.
         if !self.page.dirty.load(Ordering::Relaxed) {
-            self.page.dirty.store(true, Ordering::Relaxed);
-            self.node.borrow_mut().times[1] = storage::Timestamp::now();
+            let resources = CgroupResourceContext::capture();
+            let mut origin = self.page.dirty_resources.lock().unwrap();
+            let first = !self.page.dirty.swap(true, Ordering::Relaxed);
+            let retired = if first {
+                origin.replace(resources)
+            } else {
+                None
+            };
+            drop(origin);
+            drop(retired);
+            if first {
+                self.node.borrow_mut().times[1] = storage::Timestamp::now();
+            }
         }
         self.page.changed();
         self.state
@@ -758,12 +1051,23 @@ impl FileMapping {
         executable: bool,
     ) -> Result<Arc<Self>> {
         let open = open.borrow().shared.clone();
-        let (page, state, writers) =
+        let (page, state, writers, pressure) =
             if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
-                (data.page(offset)?, data.state.clone(), data.writers.clone())
+                let pressure = data
+                    .pressure
+                    .get_or_init(|| pressure::Provider::new(data, &node));
+                pressure.observe(&open);
+                (
+                    data.page(offset)?,
+                    data.state.clone(),
+                    data.writers.clone(),
+                    pressure.clone(),
+                )
             } else {
                 return Err(Errno(19));
             };
+        let resource: Arc<dyn trames_memory::CgroupReclaim> = pressure;
+        page.owners.register_reclaimer(&resource);
         let writer = writable
             .then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()))
             .transpose()?;
@@ -781,6 +1085,20 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn reclaimed(&self, group: &trames_memory::MemoryCgroup) -> bool {
+        self.page
+            .reclaimed_owner
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_some_and(|owner| owner.is_within(group))
+    }
+    fn invalidation_generation(&self) -> u64 {
+        self.page
+            .invalidation_generation
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.page.external_version())
+    }
     fn mapped_residents(&self) -> Option<&trames_memory::MappedResidents> {
         Some(&self.page.owners)
     }
@@ -826,7 +1144,7 @@ impl PageBacking for FileMapping {
         Some(self.state.domain())
     }
     fn parallel_metadata_domain(&self) -> Option<(u64, u64)> {
-        if self.state.stable && !self.page.deferred() {
+        if self.state.stable && (!self.page.deferred() || self.page.external_generation.is_some()) {
             // Resident data already shares its canonical physical bytes. Only
             // EOF/source/layout changes require another mapping preparation.
             // A distinct identity keeps executable aliases on byte versions.
@@ -842,7 +1160,7 @@ impl PageBacking for FileMapping {
         }
     }
     fn parallel_metadata_changes_since(&self, generation: u64) -> Option<Vec<Range<u64>>> {
-        if self.state.stable && !self.page.deferred() {
+        if self.state.stable && (!self.page.deferred() || self.page.external_generation.is_some()) {
             None // rare EOF/layout changes revisit every alias, including COW
         } else {
             self.parallel_changes_since(generation)
@@ -937,11 +1255,23 @@ impl PageBacking for FileMapping {
         Ok(true)
     }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
+        let scope = resource_io::Scope::enter();
         let node = self.node.borrow();
-        if let Content::File(FileData::Mapped(data)) = &node.content {
-            data.sync(false).map_err(|e| MemoryError::BackingIo(e.0))?;
-        }
-        Ok(())
+        let result = if let Content::File(FileData::Mapped(data)) = &node.content {
+            data.sync(false)
+        } else {
+            Ok(())
+        };
+        resource_io::memory_result(scope.finish(), result)
+    }
+    fn sync_resource(
+        &self,
+    ) -> Option<std::result::Result<Arc<dyn trames_memory::SyncResource>, MemoryError>> {
+        Some(
+            sync::Resource::capture(self)
+                .map(|resource| Arc::new(resource) as Arc<dyn trames_memory::SyncResource>)
+                .map_err(|error| MemoryError::BackingIo(error.0)),
+        )
     }
     fn sync_key(&self) -> Option<u64> {
         Some(self.node.identity)
@@ -951,6 +1281,7 @@ impl PageBacking for FileMapping {
             .version
             .load(Ordering::Relaxed)
             .wrapping_add(self.page.bytes.read().unwrap().version())
+            .wrapping_add(self.page.external_version())
     }
     fn executable(&self) -> bool {
         self.executable
@@ -993,7 +1324,31 @@ impl Drop for FileMapping {
         drop(self.writer.take());
     }
 }
-type UringPages = (Vec<Arc<FilePage>>, Vec<Arc<SharedPage>>);
+pub(crate) struct UringPages {
+    pub pages: Vec<Arc<FilePage>>,
+    pub bytes: Vec<Arc<SharedPage>>,
+    pub wait: Option<Arc<trames_memory::PageWait>>,
+}
+impl UringPages {
+    pub fn progress(&mut self) -> Result<bool> {
+        if self.wait.as_ref().is_some_and(|wait| !wait.ready()) {
+            return Ok(false);
+        }
+        let _resumed = self.wait.take();
+        while self.bytes.len() < self.pages.len() {
+            let page = &self.pages[self.bytes.len()];
+            match page.materialize() {
+                Ok(()) => self.bytes.push(page.shared_page()),
+                Err(MemoryError::Pending(fault)) => {
+                    self.wait = Some(fault.wait);
+                    return Ok(false);
+                }
+                Err(error) => return Err(resource_io::memory_error(error)),
+            }
+        }
+        Ok(true)
+    }
+}
 
 /// Pin the original mapped page objects before publishing an io_uring OFD.
 /// Kernel queue access and guest mappings therefore use the same byte domain.
@@ -1015,8 +1370,11 @@ pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> 
         unreachable!()
     };
     let pages = data.batch(0, length)?;
-    let bytes = pages.iter().map(|p| p.shared_page()).collect();
-    Ok((pages, bytes))
+    Ok(UringPages {
+        pages,
+        bytes: Vec::new(),
+        wait: None,
+    })
 }
 /// Original mmap open description. Retain before yielding for file layout
 /// admission; descriptor close/reuse cannot redirect the accepted mapping.
@@ -1205,11 +1563,14 @@ impl MappingFile {
             )));
         }
         offset.checked_add(len).ok_or(Errno(22))?;
-        let (buffers, state, writers) = if let FileData::Mapped(data) = data {
+        let (buffers, state, writers, pressure) = if let FileData::Mapped(data) = data {
             (
                 data.batch(offset, len)?,
                 data.state.clone(),
                 data.writers.clone(),
+                data.pressure
+                    .get_or_init(|| pressure::Provider::new(data, &node))
+                    .clone(),
             )
         } else {
             unreachable!("mapped data")
@@ -1222,11 +1583,14 @@ impl MappingFile {
                 .is_none_or(|m| m.identity().flags.get() & mounts::MS_NOEXEC == 0);
         let open = o.shared.clone();
         drop(o);
+        pressure.observe(&open);
+        let resource: Arc<dyn trames_memory::CgroupReclaim> = pressure;
         let writer = may_write
             .then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()))
             .transpose()?;
         let mut pages: Vec<Arc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
+            page.owners.register_reclaimer(&resource);
             pages.push(Arc::new(FileMapping {
                 open: open.clone(),
                 mount: mount.clone(),
@@ -1943,7 +2307,10 @@ mod tests {
                 view.read_array::<1>(0x3000000),
                 Err(MemoryError::Bus(0x3000000))
             );
-            assert_eq!(registry.metrics.backing_page_checks - before, pages + 2);
+            assert!(
+                registry.metrics.backing_page_checks - before <= pages + 2,
+                "EOF refresh must visit at most all mapped aliases"
+            );
         }
     }
     #[test]
@@ -2045,7 +2412,7 @@ mod tests {
         v.truncate_fd(cold, PAGE_SIZE * 256).unwrap();
         let view = m.parallel_view(&mut registry).unwrap();
         assert_eq!(view.fetch_u32(0x100000).unwrap(), 0);
-        assert_eq!(view.read_array::<1>(0x400000).unwrap(), [88]);
+        assert_eq!(view.read_array::<1>(0x400000).unwrap(), [0]);
     }
     #[test]
     fn file_change_domains_survive_mapping_replacement_and_retained_views() {

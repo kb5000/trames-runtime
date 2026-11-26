@@ -43,7 +43,11 @@ mod cgroup_memory;
 mod report;
 mod reservations;
 mod residency;
-pub use cgroup_memory::{CgroupMemoryScope, CgroupMemoryTarget, MemoryCgroup};
+pub use cgroup_memory::{
+    CgroupMemoryContext, CgroupMemoryEvents, CgroupMemoryKind, CgroupMemoryScope,
+    CgroupMemoryTarget, CgroupPageCharge, CgroupReclaim, CgroupReservation, CgroupWriteback,
+    MemoryCgroup,
+};
 pub use report::{ExecutableRanges, ImageRanges, MemoryReport, VmSizes};
 #[cfg(test)]
 mod ownership_tests;
@@ -53,8 +57,8 @@ mod user_copy;
 mod vma_policy;
 use backing::Backed;
 pub use backing::{
-    backing_changed, external_memory_changed, MappingRemap, PageBacking, PageSource,
-    SyncCompletion, SyncExecutor, SyncRange, SyncResource,
+    backing_changed, backing_invalidated, external_memory_changed, MappingRemap, PageBacking,
+    PageSource, SyncCompletion, SyncExecutor, SyncRange, SyncResource,
 };
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
@@ -307,6 +311,7 @@ pub struct Memory {
     original_identity: u64,
     shared: Option<Arc<Root<Memory>>>,
     has_backings: bool,
+    private_invalidation_revision: u64,
     has_external_code: bool,
     has_async_sources: bool,
     closed_resources: BTreeMap<u64, Arc<dyn SyncResource>>,
@@ -452,6 +457,7 @@ impl Memory {
             original_identity: identity,
             shared: None,
             has_backings: self.has_backings,
+            private_invalidation_revision: self.private_invalidation_revision,
             has_external_code: self.has_external_code,
             has_async_sources: self.has_async_sources,
             closed_resources: BTreeMap::new(),
@@ -671,6 +677,7 @@ impl Memory {
             original_identity: identity,
             shared: None,
             has_backings: false,
+            private_invalidation_revision: backing::private_invalidation_revision(),
             has_external_code: false,
             has_async_sources: false,
             closed_resources: BTreeMap::new(),
@@ -971,7 +978,7 @@ impl Memory {
             page.instruction_revision,
             page.backing
                 .as_ref()
-                .filter(|b| b.shared || !b.private_copy)
+                .filter(|b| b.shared || !b.private_current())
                 .map_or(0, |b| b.object.version())
                 .wrapping_add(page.bytes.shared().map_or(0, |bytes| bytes.revision())),
         ))
@@ -1363,7 +1370,7 @@ impl Memory {
             // read consumes a queue or advances an open-file description.
             if access == Access::Write {
                 page.prepare_source(fault_address)?;
-                page.charge.ensure_write()?;
+                page.access_charge().ensure_write()?;
             }
             allowed &= eligible(page);
         }

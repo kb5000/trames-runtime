@@ -865,7 +865,7 @@ mod tests {
                 &handle,
                 1,
                 BufferData {
-                    pixels,
+                    pixels: std::sync::OnceLock::from(pixels),
                     lease: Mutex::new(Weak::new()),
                 },
             )

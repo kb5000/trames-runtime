@@ -29,6 +29,180 @@ fn contents(page: &Page) -> [u8; PAGE_SIZE as usize] {
 }
 
 #[test]
+fn whole_page_truncation_replaces_fuse_bytes_without_migrating_retained_pins() {
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let (original, file) = opened(&v, c);
+    let first = MemoryCgroup::new(None);
+    let second = MemoryCgroup::new(None);
+    let target = Arc::new(CgroupMemoryTarget::default());
+    target.set(Some(first.clone()));
+    let _scope = target.scope();
+    let _actor =
+        crate::FileActorScope::enter(Arc::new(CredentialState::new(v.credentials.clone())), v.pid);
+    let page = file.attr.cache.mapped_page(0);
+    let source = file.cached_source(original.clone(), 0, page.clone());
+    let read = file.read_page(&original, 0).unwrap();
+    answer(c, &receive(c, 15, 10), b"old");
+    let old = source.load().unwrap();
+    let generation = source.generation();
+    drop(read);
+    file.attr.cache.resize(8192, 0);
+    file.attr.cache.resize(0, 8192);
+    assert_ne!(source.generation(), generation);
+    assert_eq!(first.current(), PAGE_SIZE as usize);
+    target.set(Some(second.clone()));
+    assert!(matches!(source.load(), Err(MemoryError::Pending(_))));
+    answer(c, &receive(c, 15, 10), b"new");
+    let new = source.load().unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    let mut bytes = [0; 3];
+    old.copy_read(0, &mut bytes);
+    assert_eq!(&bytes, b"old");
+    new.copy_read(0, &mut bytes);
+    assert_eq!(&bytes, b"new");
+    assert_eq!(second.current(), PAGE_SIZE as usize);
+    drop(old);
+    assert_eq!(first.current(), 0);
+    file.attr.cache.release_mapping(&page);
+}
+
+#[test]
+fn accepted_fuse_outputs_keep_their_bytes_across_truncation_and_late_replies() {
+    for ready in [false, true] {
+        let (v, dev) = mounted();
+        let c = dev.connection().unwrap();
+        let (original, file) = opened(&v, c);
+        let group = MemoryCgroup::new(None);
+        let target = Arc::new(CgroupMemoryTarget::default());
+        target.set(Some(group.clone()));
+        let _scope = target.scope();
+        let _actor = crate::FileActorScope::enter(
+            Arc::new(CredentialState::new(v.credentials.clone())),
+            v.pid,
+        );
+        let pending = file.read_page(&original, 0).unwrap();
+        answer(c, &receive(c, 15, 10), b"accepted");
+        let accepted = if ready {
+            let cached = file.read_page(&original, 0).unwrap();
+            drop(pending);
+            cached
+        } else {
+            pending
+        };
+        file.attr.cache.resize(8192, 0);
+        assert_eq!(group.current(), PAGE_SIZE as usize);
+        let mut bytes = [0; 8];
+        accepted.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"accepted");
+        drop(accepted);
+        assert_eq!(group.current(), 0);
+    }
+
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let (original, file) = opened(&v, c);
+    let first = MemoryCgroup::new(None);
+    let second = MemoryCgroup::new(None);
+    let target = Arc::new(CgroupMemoryTarget::default());
+    target.set(Some(first.clone()));
+    let _scope = target.scope();
+    let _actor =
+        crate::FileActorScope::enter(Arc::new(CredentialState::new(v.credentials.clone())), v.pid);
+    let old = file.read_page(&original, 0).unwrap();
+    let old_request = receive(c, 15, 10);
+    file.attr.cache.resize(8192, 0);
+    file.attr.cache.resize(0, 8192);
+    target.set(Some(second.clone()));
+    let current = file.read_page(&original, 0).unwrap();
+    let current_request = receive(c, 15, 10);
+    answer(c, &old_request, b"original");
+    assert!(!file.attr.cache.page(0).valid());
+    let mut bytes = [0; 8];
+    old.copy_to(0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"original");
+    assert_eq!(first.current(), PAGE_SIZE as usize);
+    assert_eq!(second.current(), PAGE_SIZE as usize);
+    answer(c, &current_request, b"current!");
+    current.copy_to(0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"current!");
+    drop(old);
+    assert_eq!(first.current(), 0);
+}
+
+#[test]
+fn failed_fuse_read_refunds_unmaterialized_admission_before_waiters_drop() {
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let (original, file) = opened(&v, c);
+    let group = MemoryCgroup::new(None);
+    group.set_limit(PAGE_SIZE as usize);
+    let target = Arc::new(CgroupMemoryTarget::default());
+    target.set(Some(group.clone()));
+    let _scope = target.scope();
+    let _actor =
+        crate::FileActorScope::enter(Arc::new(CredentialState::new(v.credentials.clone())), v.pid);
+    let failed = file.read_page(&original, 0).unwrap();
+    let request = receive(c, 15, 10);
+    c.write(&reply(id(&request), -5, &[])).unwrap();
+    assert!(matches!(failed.result(), Some(Err(Errno(5)))));
+    assert_eq!(group.current(), 0);
+    let retry = file.read_page(&original, 0).unwrap();
+    answer(c, &receive(c, 15, 10), b"retry");
+    assert_eq!(group.current(), PAGE_SIZE as usize);
+    assert!(matches!(failed.result(), Some(Err(Errno(5)))));
+    assert_eq!(&contents(&completed(&retry))[..5], b"retry");
+}
+
+#[test]
+fn memory_reclaim_preserves_pending_dirty_and_pinned_fuse_pages() {
+    let (v, dev) = mounted();
+    let c = dev.connection().unwrap();
+    let (original, file) = opened(&v, c);
+    let group = MemoryCgroup::new(None);
+    let memory = Arc::new(CgroupMemoryTarget::default());
+    memory.set(Some(group.clone()));
+    let _memory = memory.scope();
+    let _actor =
+        crate::FileActorScope::enter(Arc::new(CredentialState::new(v.credentials.clone())), v.pid);
+    let read = file.read_page(&original, 0).unwrap();
+    assert_eq!(group.current(), PAGE_SIZE as usize);
+    assert_eq!(
+        group.reclaim(PAGE_SIZE as usize),
+        0,
+        "accepted request pins its page"
+    );
+    answer(c, &receive(c, 15, 10), b"persistent");
+    let page = completed(&read);
+    let bytes = Arc::downgrade(&page.bytes());
+    drop(read);
+    assert_eq!(
+        group.reclaim(PAGE_SIZE as usize),
+        0,
+        "returned page is still pinned"
+    );
+    page.mark_dirty();
+    drop(page);
+    assert_eq!(
+        group.reclaim(PAGE_SIZE as usize),
+        0,
+        "dirty data needs writeback"
+    );
+    let page = file.attr.cache.page(0);
+    page.wrote_back(page.dirty.load(Ordering::Relaxed));
+    drop(page);
+    assert_eq!(group.reclaim(PAGE_SIZE as usize), PAGE_SIZE as usize);
+    assert!(
+        bytes.upgrade().is_none(),
+        "last physical byte reference was dropped"
+    );
+    assert_eq!(group.current(), 0);
+    let reload = file.read_page(&original, 0).unwrap();
+    answer(c, &receive(c, 15, 10), b"persistent");
+    assert_eq!(&contents(&completed(&reload))[..10], b"persistent");
+}
+
+#[test]
 fn accepted_page_source_keeps_the_original_ofd_across_close_and_numeric_reuse() {
     let (mut v, dev) = mounted();
     let c = dev.connection().unwrap();
@@ -93,7 +267,7 @@ fn accepted_page_source_keeps_invalidated_output_without_refilling_a_mapped_gene
     assert_eq!(&bytes[..8], b"accepted");
     assert!(bytes[8..].iter().all(|byte| *byte == 0));
     assert!(!physical.valid());
-    assert!(!Arc::ptr_eq(&snapshot, physical.bytes()));
+    assert!(!Arc::ptr_eq(&snapshot, &physical.bytes()));
     assert!(Arc::ptr_eq(&snapshot, &source.load().unwrap()));
     let retry = file.read_page(&original, 0).unwrap();
     answer(c, &receive(c, 15, 10), b"current");
@@ -145,7 +319,7 @@ fn page_reads_share_the_original_request_and_publish_short_read_zeroes() {
         "page IO never commits read(2)'s f_pos"
     );
     let cached = file.read_page(&original, 0).unwrap();
-    assert!(matches!(cached, Read::Ready(_)));
+    assert!(matches!(cached, Read::Ready(..)));
     assert!(Arc::ptr_eq(&page, &completed(&cached)));
     assert_eq!(c.read(8192), Err(Errno(11)));
 }
@@ -324,7 +498,7 @@ fn inode_notification_invalidates_data_and_guards_against_older_short_reads() {
     assert_eq!(invalidate(c, 10, -1, 0), Ok(40));
     assert!(matches!(
         file.read_page(&original, 0).unwrap(),
-        Read::Ready(_)
+        Read::Ready(..)
     ));
     // A negative length invalidates every cached page from the offset onward.
     assert_eq!(invalidate(c, 10, 0, -1), Ok(40));

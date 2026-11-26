@@ -167,7 +167,7 @@ impl Pending {
         self.0.wait.ready()
     }
     pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
-        self.0.wait.subscribe(signal)
+        self.0.wait.subscribe_completion(signal)
     }
     pub(crate) fn result(&self) -> Option<Result<()>> {
         *self.0.result.lock().unwrap()
@@ -182,6 +182,8 @@ struct Accepted {
     fsync: bool,
     data_only: bool,
     range: Option<(u64, u64)>,
+    group: Option<Arc<trames_memory::MemoryCgroup>>,
+    actor: Option<crate::FileActorSnapshot>,
     write: bool,
     times: std::sync::atomic::AtomicBool,
     _writer: Option<Arc<OpenWriter>>,
@@ -210,6 +212,26 @@ impl SyncCompletion for Discard {
     fn complete(self: Box<Self>, _: std::result::Result<(), MemoryError>) {}
 }
 impl Sync {
+    pub(super) fn pressure(
+        file: Arc<File>,
+        original: SharedFd,
+        group: Arc<trames_memory::MemoryCgroup>,
+        executor: Arc<dyn SyncExecutor>,
+    ) -> Self {
+        let mut resource = Self::with_options(
+            file,
+            original,
+            Caller::default(),
+            false,
+            false,
+            None,
+            Some(executor),
+        );
+        let accepted = Arc::get_mut(&mut resource.0).unwrap();
+        accepted.group = Some(group);
+        accepted.times.store(false, Ordering::Relaxed);
+        resource
+    }
     pub(super) fn new(
         file: Arc<File>,
         original: SharedFd,
@@ -242,6 +264,8 @@ impl Sync {
             fsync,
             data_only,
             range: None,
+            group: None,
+            actor: crate::FileActorScope::frozen(),
             write: true,
             times: std::sync::atomic::AtomicBool::new(true),
             _writer: writer,
@@ -295,6 +319,7 @@ impl SyncResource for Sync {
         }
     }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
+        let _actor = self.0.actor.as_ref().map(crate::FileActorSnapshot::enter);
         let outcome = self.0.outcome.get_or_init(|| {
             let outcome = Arc::new(Outcome::default());
             if let Some(executor) = &self.0.executor {
@@ -317,6 +342,7 @@ impl SyncResource for Sync {
         &self,
         completion: Box<dyn SyncCompletion>,
     ) -> std::result::Result<(), Box<dyn SyncCompletion>> {
+        let _actor = self.0.actor.as_ref().map(crate::FileActorSnapshot::enter);
         let (wave, new) = {
             let mut slot = self.0.wave.lock().unwrap();
             if let Some(wave) = &*slot {
@@ -329,6 +355,7 @@ impl SyncResource for Sync {
                     fsync: self.0.fsync,
                     data_only: self.0.data_only,
                     range: self.0.range,
+                    group: self.0.group.clone(),
                     write: self.0.write,
                     accepted: Arc::downgrade(&self.0),
                     state: Mutex::default(),
@@ -427,6 +454,7 @@ struct Wave {
     fsync: bool,
     data_only: bool,
     range: Option<(u64, u64)>,
+    group: Option<Arc<trames_memory::MemoryCgroup>>,
     write: bool,
     accepted: Weak<Accepted>,
     state: Mutex<State>,
@@ -596,10 +624,13 @@ impl Wave {
                     .cache
                     .dirty_pages()
                     .into_iter()
-                    .filter(|(index, _)| {
-                        self.range.is_none_or(|(start, end)| {
-                            index * PAGE_SIZE < end && (index + 1) * PAGE_SIZE > start
-                        })
+                    .filter(|(index, page)| {
+                        self.group
+                            .as_ref()
+                            .is_none_or(|group| page.owners.charged_within(group))
+                            && self.range.is_none_or(|(start, end)| {
+                                index * PAGE_SIZE < end && (index + 1) * PAGE_SIZE > start
+                            })
                     })
                     .collect()
             } else {
@@ -708,6 +739,17 @@ impl Wave {
             state.synced = true;
             (20, self.caller, body, Kind::Sync)
         } else {
+            if let Some(group) = &self.group {
+                if !capture {
+                    return Action::Retry(
+                        state
+                            .completion
+                            .take()
+                            .expect("accepted pressure writeback"),
+                    );
+                }
+                self.file.attr.cache.discard_clean_mapped(group);
+            }
             return Action::Finish(Ok(()));
         };
         state.serial = state.serial.wrapping_add(1);

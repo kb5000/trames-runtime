@@ -23,7 +23,7 @@ pub(super) struct Launch<C: Cpu> {
 }
 impl<C: Cpu> Launch<C> {
     fn ready(&self) -> bool {
-        self.process.cancelled() || self.wait.as_ref().is_none_or(|wait| wait.signal.ready())
+        self.process.cancelled() || self.wait.as_ref().is_none_or(tasks::AdmissionWait::ready)
     }
 }
 struct State<C: Cpu> {
@@ -91,6 +91,20 @@ impl<C: Cpu> Launches<C> {
     }
     pub fn pending(&self) -> bool {
         self.count.load(Ordering::Relaxed) != 0
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter_map(|launch| {
+                launch
+                    .wait
+                    .as_ref()
+                    .and_then(tasks::AdmissionWait::deadline)
+            })
+            .min()
     }
     pub fn bind(self: &Arc<Self>, signal: Arc<IoSignal>) -> Driver<C> {
         let mut state = self.state.lock().unwrap();

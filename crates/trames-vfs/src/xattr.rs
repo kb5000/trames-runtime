@@ -14,6 +14,136 @@ pub(super) fn trusted_attribute(name: &[u8]) -> bool {
 pub(super) fn xattr_size(attrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
     attrs.iter().map(|(k, v)| k.len() + 1 + v.len()).sum()
 }
+
+/// One accepted capability update owns its original inode and implicit mapped
+/// writeback. A resource wait must not rerun already completed provider pages.
+pub(super) struct CapabilitiesWork {
+    node: NodeRef,
+    filesystem: FsHandle,
+    _mount: Option<mounts::MountUse>,
+    caps: Option<file_caps::FileCaps>,
+    flags: u32,
+    prepared: bool,
+    admitted: bool,
+    synced: bool,
+    sync: Option<mapped::DataSync>,
+    lease: Option<trames_shared::FileTransactionLease>,
+    publication: Option<CapabilityPublication>,
+    rollback: Option<Errno>,
+    notify: bool,
+}
+struct CapabilityPublication {
+    old: Option<file_caps::FileCaps>,
+    old_time: storage::Timestamp,
+    time: storage::Timestamp,
+}
+impl CapabilitiesWork {
+    pub(super) fn run(&mut self) -> Result<()> {
+        let _namespace = self.filesystem.namespace.lock().unwrap();
+        let _metadata = self.node.metadata.lock().unwrap();
+        if !self.prepared {
+            self.filesystem.prepare_metadata(&self.node)?;
+            self.prepared = true;
+        }
+        if !self.admitted {
+            let mut node = self.node.borrow_mut();
+            let Content::File(data) = &mut node.content else {
+                return Err(Errno(95));
+            };
+            self.lease = match data.begin_transaction()? {
+                Ok(lease) => lease,
+                Err(wait) => {
+                    return Err(resource_io::memory_error(
+                        trames_memory::PageWait::resource(wait).fault(0),
+                    ))
+                }
+            };
+            let old = node.file_caps();
+            if old.is_some() && self.flags & 1 != 0 {
+                return Err(Errno(17));
+            }
+            if old.is_none() && (self.caps.is_none() || self.flags & 2 != 0) {
+                return Err(Errno(61));
+            }
+            self.admitted = true;
+        }
+        let _transaction = self.lease.as_ref().map(|lease| lease.enter());
+        if let Some(error) = self.rollback {
+            return self.restore(error);
+        }
+        if self.publication.is_none() {
+            let node = self.node.borrow();
+            let Content::File(data) = &node.content else {
+                return Err(Errno(95));
+            };
+            if self.caps.is_some() && data.has_writable_mappings() {
+                return Err(Errno(16));
+            }
+            if !self.synced {
+                if self.caps.is_some() {
+                    if self.sync.is_none() {
+                        self.sync = mapped::DataSync::before_capabilities(data)?;
+                    }
+                    if let Some(sync) = &mut self.sync {
+                        let _writeback = trames_shared::FileTransactionScope::writeback();
+                        sync.run()?;
+                    }
+                }
+                self.synced = true;
+            }
+            let old = node.file_caps();
+            let old_time = node.times[2];
+            node.edit_caps_after_sync(self.caps, self.flags)?;
+            drop(node);
+            let time = storage::Timestamp::now();
+            self.node.borrow_mut().times[2] = time;
+            self.publication = Some(CapabilityPublication {
+                old,
+                old_time,
+                time,
+            });
+        }
+        if let Err(error) = self.filesystem.checkpoint_metadata(&self.node) {
+            if resource_io::waiting() {
+                // The sidecar is already published. Keep that stage and its
+                // original ctime; XATTR_CREATE/REPLACE must not execute again.
+                return Err(error);
+            }
+            self.rollback = Some(error);
+            return self.restore(error);
+        }
+        self.notify = true;
+        Ok(())
+    }
+    fn restore(&self, error: Errno) -> Result<()> {
+        let original = self
+            .publication
+            .as_ref()
+            .expect("published capability rollback");
+        let mut node = self.node.borrow_mut();
+        // A real checkpoint failure keeps the old best-effort rollback, but
+        // its sidecar write can itself wait. Preserve the original terminal
+        // error while resuming that write under the same object transaction.
+        let scope = resource_io::Scope::enter();
+        let _ = node.edit_caps_after_sync(original.old, 0);
+        let pending = scope.finish();
+        if let Some(pending) = pending {
+            return Err(resource_io::memory_error(pending.wait.fault(0)));
+        }
+        if node.times[2] == original.time {
+            node.times[2] = original.old_time;
+        }
+        Err(error)
+    }
+    pub(super) fn notify(&mut self) {
+        if let Some(sync) = &mut self.sync {
+            sync.notify();
+        }
+        if std::mem::take(&mut self.notify) {
+            inotify::notify(&self.node, inotify::ATTRIB, None);
+        }
+    }
+}
 impl Vfs {
     fn xattr_node(
         &self,
@@ -246,6 +376,17 @@ impl Vfs {
         name: Option<&[u8]>,
         capacity: u64,
     ) -> Result<FileValue> {
+        if self.host_resources() {
+            return self.host_file_work(self.path_queries().namespace_work(
+                NamespaceCall::GetXattr {
+                    fd,
+                    path: path.map(<[u8]>::to_vec),
+                    follow,
+                    name: name.map(<[u8]>::to_vec),
+                    capacity,
+                },
+            ));
+        }
         if let Some(name) = name {
             Self::xattr_name(name)?;
         }
@@ -318,6 +459,16 @@ impl Vfs {
         value: Option<&[u8]>,
         flags: u32,
     ) -> Result<()> {
+        if self.host_resources() {
+            return self.host_namespace_work(NamespaceCall::Xattr {
+                fd,
+                path: path.map(<[u8]>::to_vec),
+                follow,
+                name: name.to_vec(),
+                value: value.map(<[u8]>::to_vec),
+                flags,
+            });
+        }
         if flags & !3 != 0 {
             return Err(Errno(22));
         }
@@ -379,6 +530,26 @@ impl Vfs {
                 return Err(Errno(61));
             }
             drop(n);
+            if let Some(query) = self.query.as_ref().filter(|query| query.metadata_call) {
+                query.prepared.borrow_mut().capabilities = Some(Box::new(CapabilitiesWork {
+                    node: node.clone(),
+                    filesystem: fs.clone(),
+                    _mount: mount
+                        .as_ref()
+                        .map(|mount| mounts::MountUse::new(mount.clone())),
+                    caps,
+                    flags,
+                    prepared: false,
+                    admitted: false,
+                    synced: false,
+                    lease: None,
+                    sync: None,
+                    publication: None,
+                    rollback: None,
+                    notify: false,
+                }));
+                return query.defer();
+            }
             fs.prepare_metadata(&node)?;
             let mut n = node.borrow_mut();
             n.edit_caps(caps, flags)?;

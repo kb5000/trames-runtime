@@ -145,6 +145,14 @@ impl WaitSources {
     }
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.deadline
+            .into_iter()
+            .chain(self.local.values().flat_map(|entry| {
+                entry
+                    .value
+                    .iter()
+                    .filter_map(trames_vfs::IoSubscription::deadline)
+            }))
+            .min()
     }
     /// Keep the normal subscribe-before-retry path. A failed stale interest
     /// gets one original-resource progress pass before capability escalation;

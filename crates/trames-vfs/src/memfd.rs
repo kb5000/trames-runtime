@@ -34,6 +34,44 @@ pub(super) enum FileResize {
         end: u64,
     },
 }
+#[derive(Default)]
+pub(super) struct ResizeState {
+    accepted: Option<AcceptedResize>,
+    lease: Option<trames_shared::FileTransactionLease>,
+    sync: Option<mapped::DataSync>,
+    reserved: bool,
+    synced: bool,
+    data_done: bool,
+    metadata_done: bool,
+    checkpointed: bool,
+    notified: bool,
+}
+#[derive(Clone, Copy)]
+struct AcceptedResize {
+    old: u64,
+    length: u64,
+}
+impl ResizeState {
+    pub(super) fn notify(&mut self) {
+        if let Some(sync) = &mut self.sync {
+            sync.notify();
+        }
+    }
+}
+#[derive(Default)]
+pub(super) struct SealState {
+    lease: Option<trames_shared::FileTransactionLease>,
+    sync: Option<mapped::DataSync>,
+    accepted: Option<u32>,
+    done: bool,
+}
+impl SealState {
+    pub(super) fn notify(&mut self) {
+        if let Some(sync) = &mut self.sync {
+            sync.notify();
+        }
+    }
+}
 impl Vfs {
     /// Canonical fallocate range prelude, before descriptor/type admission.
     pub fn allocation_end(offset: u64, length: u64) -> Result<u64> {
@@ -58,8 +96,18 @@ impl Vfs {
     /// KEEP_SIZE preserves the guest's logical EOF and current file position.
     pub fn allocate_fd(&mut self, fd: u32, mode: u64, offset: u64, length: u64) -> Result<()> {
         let end = Self::allocation_end(offset, length)?;
+        let descriptor = self.descriptor(fd)?;
+        let request = Self::allocation_request(&descriptor, mode, offset, length, end)?;
+        self.resize_description(&descriptor, request, false)
+    }
+    pub(super) fn allocation_request(
+        descriptor: &Descriptor,
+        mode: u64,
+        offset: u64,
+        length: u64,
+        end: u64,
+    ) -> Result<FileResize> {
         {
-            let descriptor = self.descriptor(fd)?;
             let open = descriptor.open.borrow();
             if !fd_can_write(open.flags.get()) {
                 return Err(Errno(9));
@@ -75,139 +123,235 @@ impl Vfs {
         if mode > 1 {
             return Err(Errno(95));
         }
-        self.resize_fd(
-            fd,
-            FileResize::Allocate {
-                mode,
-                offset,
-                length,
-                end,
-            },
-        )
+        Ok(FileResize::Allocate {
+            mode,
+            offset,
+            length,
+            end,
+        })
     }
     pub(super) fn resize_fd(&mut self, fd: u32, request: FileResize) -> Result<()> {
-        self.resize_fd_inner(fd, request, false)
+        let descriptor = self.descriptor(fd)?;
+        self.resize_description(&descriptor, request, false)
     }
     pub(super) fn truncate_open(&mut self, fd: u32) -> Result<()> {
-        self.resize_fd_inner(fd, FileResize::Truncate(0), true)
-    }
-    fn resize_fd_inner(&mut self, fd: u32, request: FileResize, opening: bool) -> Result<()> {
-        if matches!(request, FileResize::Truncate(_)) && self.flags(fd)? & O_PATH != 0 {
-            return Err(Errno(9));
-        }
-        self.fd_writable(fd)?;
         let descriptor = self.descriptor(fd)?;
+        self.resize_description(&descriptor, FileResize::Truncate(0), true)
+    }
+    fn resize_description(
+        &mut self,
+        descriptor: &Descriptor,
+        request: FileResize,
+        opening: bool,
+    ) -> Result<()> {
+        if self.host_resources() {
+            let target = FileTarget(SharedFd::new(descriptor.open.borrow().shared.clone()));
+            let command = match request {
+                FileResize::Truncate(length) if opening && length == 0 => FileCommand::TruncateOpen,
+                FileResize::Truncate(length) => FileCommand::Truncate(length),
+                FileResize::Allocate {
+                    mode,
+                    offset,
+                    length,
+                    ..
+                } => FileCommand::Allocate {
+                    mode,
+                    offset,
+                    length,
+                },
+            };
+            self.host_file_work(FileWork::from_vfs(self, target, command))?;
+            return Ok(());
+        }
+        let mut state = ResizeState::default();
+        let result = self.resize_description_inner(descriptor, request, opening, &mut state);
+        state.notify();
+        result
+    }
+    pub(super) fn resize_description_inner(
+        &mut self,
+        descriptor: &Descriptor,
+        request: FileResize,
+        opening: bool,
+        state: &mut ResizeState,
+    ) -> Result<()> {
         let open = descriptor.open.borrow();
-        if matches!(request, FileResize::Truncate(_))
-            && open.landlock_denied & landlock::TRUNCATE != 0
-        {
-            return Err(Errno(13));
+        if state.accepted.is_none() {
+            if matches!(request, FileResize::Truncate(_)) && open.flags.get() & O_PATH != 0 {
+                return Err(Errno(9));
+            }
+            open.mount
+                .as_ref()
+                .map_or(Ok(()), |mount| mount.writable())?;
+            if matches!(request, FileResize::Truncate(_))
+                && open.landlock_denied & landlock::TRUNCATE != 0
+            {
+                return Err(Errno(13));
+            }
         }
         let node = open.node.clone().ok_or(Errno(22))?;
         let anonymous = node.borrow().seals.is_some();
         let available = if anonymous {
             self.memfd_available()
         } else {
-            self.fd_available_bytes(fd)?
+            self.description_available_bytes(&open)
         };
-        if !opening && !fd_can_write(open.flags.get()) {
-            return Err(Errno(22));
-        }
-        self.pseudo_immutable(&node)?;
-        if matches!(request, FileResize::Truncate(_)) {
-            let n = node.borrow();
-            self.open_ids(open.mount.as_ref())
-                .valid_owner(n.uid, n.gid)?;
+        if state.accepted.is_none() {
+            if !opening && !fd_can_write(open.flags.get()) {
+                return Err(Errno(22));
+            }
+            self.pseudo_immutable(&node)?;
+            if matches!(request, FileResize::Truncate(_)) {
+                let n = node.borrow();
+                self.open_ids(open.mount.as_ref())
+                    .valid_owner(n.uid, n.gid)?;
+            }
         }
         let mut n = node.borrow_mut();
         let seals = n.seals;
         let Content::File(data) = &mut n.content else {
             return Err(Errno(22));
         };
-        let old = data.len();
-        let length = match request {
-            FileResize::Truncate(length) => length,
-            FileResize::Allocate { mode, end, .. } => {
-                if data.shared_file().is_some() || data.tmpfs_file().is_some() {
-                    if seals.is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old) {
-                        return Err(Errno(1));
+        if state.accepted.is_none() && state.lease.is_none() {
+            state.lease = match data.begin_transaction()? {
+                Ok(lease) => lease,
+                Err(wait) => {
+                    return Err(resource_io::memory_error(
+                        trames_memory::PageWait::resource(wait).fault(0),
+                    ))
+                }
+            };
+        }
+        let _transaction = state
+            .lease
+            .as_ref()
+            .map(trames_shared::FileTransactionLease::enter);
+        let accepted = if let Some(accepted) = state.accepted {
+            accepted
+        } else {
+            let old = data.len();
+            let length = match request {
+                FileResize::Truncate(length) => length,
+                FileResize::Allocate { mode, end, .. } => {
+                    if data.shared_file().is_some() || data.tmpfs_file().is_some() {
+                        if seals.is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old)
+                        {
+                            return Err(Errno(1));
+                        }
+                        if mode == 0 && end > self.file_size_limit.get() {
+                            return Err(Errno(27));
+                        }
                     }
-                    if mode == 0 && end > self.file_size_limit.get() {
-                        return Err(Errno(27));
+                    if mode == 0 {
+                        old.max(end)
+                    } else {
+                        old
                     }
                 }
-                if mode == 0 {
-                    old.max(end)
-                } else {
-                    old
+            };
+            if length > i64::MAX as u64 {
+                return Err(Errno(22));
+            }
+            if seals.is_some_and(|s| s & 2 != 0 && length < old || s & 4 != 0 && length > old) {
+                return Err(Errno(1));
+            }
+            if length > old && length > self.file_size_limit.get() {
+                self.file_size_signal.set(true);
+                return Err(Errno(27));
+            }
+            if let Some(query) = &self.query {
+                if !query.file_layout_exclusive && data.layout_change(length) {
+                    return query.defer();
                 }
             }
+            let accepted = AcceptedResize { old, length };
+            state.accepted = Some(accepted);
+            accepted
         };
-        if length > i64::MAX as u64 {
-            return Err(Errno(22));
-        }
-        if seals.is_some_and(|s| s & 2 != 0 && length < old || s & 4 != 0 && length > old) {
-            return Err(Errno(1));
-        }
-        if length > old && length > self.file_size_limit.get() {
-            self.file_size_signal.set(true);
-            return Err(Errno(27));
-        }
-        if let Some(query) = &self.query {
-            if !query.file_layout_exclusive && data.layout_change(length) {
-                return query.defer();
+        let length = if matches!(request, FileResize::Allocate { mode: 0, .. }) {
+            accepted.length.max(data.len())
+        } else {
+            accepted.length
+        };
+        if !state.data_done {
+            if let Some(query) = &self.query {
+                if !query.file_layout_exclusive && data.layout_change(length) {
+                    return query.defer();
+                }
             }
         }
         // This is the original inode's resize ownership. No mapped publisher
         // can appear between layout admission, reserve_range and final EOF.
-        if let FileResize::Allocate {
-            offset,
-            length,
-            end,
-            ..
-        } = request
-        {
-            if let Some(file) = data.tmpfs_file() {
-                file.reserve_tmpfs(offset, end)?;
-            } else if let Some(file) = data.shared_file() {
-                file.reserve_range(
-                    usize::try_from(offset).map_err(|_| Errno(27))?,
-                    usize::try_from(length).map_err(|_| Errno(27))?,
-                )
-                .map_err(storage::host_errno)?;
-            } else if matches!(request, FileResize::Allocate { mode: 1, .. }) {
-                data.reserve_keep_size(offset, end)?;
+        if !state.reserved {
+            if let FileResize::Allocate {
+                offset,
+                length,
+                end,
+                ..
+            } = request
+            {
+                if let Some(file) = data.tmpfs_file() {
+                    file.reserve_tmpfs(offset, end)?;
+                } else if let Some(file) = data.shared_file() {
+                    file.reserve_range(
+                        usize::try_from(offset).map_err(|_| Errno(27))?,
+                        usize::try_from(length).map_err(|_| Errno(27))?,
+                    )
+                    .map_err(storage::host_errno)?;
+                } else if matches!(request, FileResize::Allocate { mode: 1, .. }) {
+                    data.reserve_keep_size(offset, end)?;
+                }
             }
+            state.reserved = true;
         }
-        if data.growth_charge(length) > available {
-            return Err(Errno(28));
-        }
-        if !matches!(request, FileResize::Allocate { mode: 1, .. }) {
-            data.truncate(length)?;
-        }
-        let meta = n.file_metadata();
-        if !self.credentials.has_cap(capabilities::FSETID) {
-            n.mode = meta.mode & !0o4000;
-            if n.mode & 0o10 != 0 {
-                n.mode &= !0o2000;
+        if !state.data_done {
+            if data.growth_charge(length) > available {
+                return Err(Errno(28));
             }
+            if matches!(request, FileResize::Truncate(_)) || length > accepted.old {
+                if !state.synced {
+                    if state.sync.is_none() {
+                        state.sync = mapped::DataSync::before_truncate(data, length)?;
+                    }
+                    if let Some(sync) = &mut state.sync {
+                        sync.run()?;
+                    }
+                    state.synced = true;
+                }
+                data.truncate_after_sync(length)?;
+            }
+            state.data_done = true;
         }
-        n.times[1] = storage::Timestamp::now();
-        n.times[2] = n.times[1];
+        if !state.metadata_done {
+            let meta = n.file_metadata();
+            if !self.credentials.has_cap(capabilities::FSETID) {
+                n.mode = meta.mode & !0o4000;
+                if n.mode & 0o10 != 0 {
+                    n.mode &= !0o2000;
+                }
+            }
+            n.times[1] = storage::Timestamp::now();
+            n.times[2] = n.times[1];
+            state.metadata_done = true;
+        }
         let linked = n.links != 0;
         drop(n);
-        if linked {
+        if linked && !state.checkpointed {
             open.mount
                 .as_ref()
                 .map_or(&self.fs, |m| &m.fs)
                 .borrow()
                 .checkpoint()?;
         }
-        inotify::notify(
-            &node,
-            inotify::MODIFY,
-            open.notification.as_ref().and_then(|c| c.link.as_ref()),
-        );
+        state.checkpointed = true;
+        if !state.notified {
+            state.notified = true;
+            inotify::notify(
+                &node,
+                inotify::MODIFY,
+                open.notification.as_ref().and_then(|c| c.link.as_ref()),
+            );
+        }
         Ok(())
     }
     pub fn memfd_create(&mut self, name: &[u8], flags: u32) -> Result<u32> {
@@ -271,6 +415,7 @@ impl Vfs {
         let budget = fs.shared_budget.clone();
         drop(fs);
         let backing = backing(budget).map_err(storage::host_errno)?;
+        shared_account::install(&backing, false)?;
         node.borrow_mut().content = Content::File(storage::FileData::Shared(backing));
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);
@@ -337,9 +482,33 @@ impl Vfs {
         data.shared_file().ok_or(Errno(95))
     }
     pub fn seals(&self, fd: u32, add: Option<u32>) -> Result<u32> {
+        if self.host_resources() && add.is_some() {
+            let file = self.shared_files().lookup(fd).ok_or(Errno(9))??;
+            return match self.host_file_work(FileWork::from_vfs(
+                self,
+                file.filesystem_target(),
+                FileCommand::Seals(add),
+            ))? {
+                FileValue::Count(value) => Ok(value as u32),
+                _ => Err(Errno(5)),
+            };
+        }
         Self::seals_description(&self.descriptor(fd)?, add)
     }
     pub(super) fn seals_description(descriptor: &Descriptor, add: Option<u32>) -> Result<u32> {
+        let mut state = SealState::default();
+        let result = Self::seals_description_inner(descriptor, add, &mut state);
+        state.notify();
+        result
+    }
+    pub(super) fn seals_description_inner(
+        descriptor: &Descriptor,
+        add: Option<u32>,
+        state: &mut SealState,
+    ) -> Result<u32> {
+        if state.done {
+            return Ok(0);
+        }
         let o = descriptor.open.borrow();
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
@@ -366,15 +535,39 @@ impl Vfs {
         if o.flags.get() & 3 != 2 || current & 1 != 0 {
             return Err(Errno(1));
         }
-        if add & 8 != 0 {
-            if let Content::File(storage::FileData::Mapped(data)) = &n.content {
-                if data.has_writers() {
-                    return Err(Errno(16));
-                }
-                data.sync(false)?;
+        if state.lease.is_none() {
+            if let Content::File(data) = &mut n.content {
+                state.lease = match data.begin_transaction()? {
+                    Ok(lease) => lease,
+                    Err(wait) => {
+                        return Err(resource_io::memory_error(
+                            trames_memory::PageWait::resource(wait).fault(0),
+                        ))
+                    }
+                };
             }
         }
-        n.seals = Some(current | add);
+        let _transaction = state
+            .lease
+            .as_ref()
+            .map(trames_shared::FileTransactionLease::enter);
+        let accepted = *state.accepted.get_or_insert(current | add);
+        if add & 8 != 0 {
+            if let Content::File(storage::FileData::Mapped(mapped)) = &n.content {
+                if mapped.has_writers() {
+                    return Err(Errno(16));
+                }
+                if state.sync.is_none() {
+                    let Content::File(data) = &n.content else {
+                        unreachable!()
+                    };
+                    state.sync = Some(mapped::DataSync::capture(data, false)?);
+                }
+                state.sync.as_mut().unwrap().run()?;
+            }
+        }
+        n.seals = Some(accepted);
+        state.done = true;
         Ok(0)
     }
 }
@@ -408,8 +601,9 @@ mod allocation_tests {
             assert_eq!(v.allocate_fd(fd, 3, 0, 1), Err(Errno(95)));
             v.truncate_fd(fd, 8192).unwrap();
             let pages = v.mapping_pages(fd, 0, 8192, true, true).unwrap();
-            assert!(v.memfd_available() < before);
+            assert_eq!(v.memfd_available(), before);
             v.pwrite(fd, b"pixels", 4096).unwrap();
+            assert!(v.memfd_available() < before);
             assert_eq!(v.pread(fd, 6, 4096).unwrap(), b"pixels");
             v.close(fd).unwrap();
             drop(pages);

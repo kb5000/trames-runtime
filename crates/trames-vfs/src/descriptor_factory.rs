@@ -78,6 +78,12 @@ impl Vfs {
     }
 }
 impl DescriptorFactory {
+    /// Freeze the actual submitter's resources in one membership transaction.
+    /// tid is the runtime task identity, never a namespace-rendered peer PID.
+    /// A retained request stores this value instead of consulting an observer.
+    pub fn task_resource_context(&self, tid: u32) -> Option<CgroupResourceContext> {
+        CgroupTask::context_for(&self.cgroups, tid)
+    }
     pub fn network_protocol(&self) -> Arc<dyn trames_shared::HostProtocol> {
         self.network.protocol()
     }

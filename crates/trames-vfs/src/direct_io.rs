@@ -1603,6 +1603,9 @@ impl DirectFd {
             if !fd_can_write(self.flags) {
                 return Err(Errno(9));
             }
+            if file.memory_write() {
+                return file.memory_write_sync(caller, bytes, self.flags);
+            }
             return file.cgroup_write(caller, bytes)?.ok_or(Errno(19));
         }
         let ByteResource::SimpleDevice(kind) = self.resource else {
@@ -1875,6 +1878,15 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Console(console) => console.write(bytes),
             ByteResource::Cgroup(file, Some(caller)) => {
+                if file.memory_write() {
+                    use crate::read_reply::CommitRead;
+                    let position = crate::read_reply::FileRead::begin(
+                        self._file.as_ref().ok_or(Errno(9))?.clone(),
+                    )?;
+                    let count = file.memory_write_sync(caller, bytes, self.flags)?;
+                    position.commit(count);
+                    return Ok(count);
+                }
                 let mut position = self
                     ._file
                     .as_ref()

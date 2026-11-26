@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Guest OOM preferences. Allocation limits still return ENOMEM; there is no
-//! guest OOM victim selector. Never changes the host process's OOM policy.
+//! Guest OOM preferences used by procfs and guest cgroup victim selection.
 use crate::*;
 use std::sync::atomic::AtomicU32;
 
@@ -19,6 +18,9 @@ fn unpack(pair: u32) -> (i32, i32) {
     (pair as u16 as i16 as i32, (pair >> 16) as u16 as i16 as i32)
 }
 impl OomTask {
+    pub(super) fn protected(&self) -> bool {
+        unpack(self.score.load(Ordering::Relaxed)).0 == -1000
+    }
     pub fn fork(&self) -> Self {
         Self {
             score: Arc::new(AtomicU32::new(self.score.load(Ordering::Relaxed))),

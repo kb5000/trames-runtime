@@ -899,7 +899,7 @@ mod tests {
                         .mapping_pages(fd, 0, PAGE_SIZE, relation == 4, relation == 4)
                         .unwrap();
                     if relation == 4 {
-                        paused = pages[0].shared_page().unwrap();
+                        paused = pages[0].page_source().unwrap().load().unwrap();
                     }
                     memory
                         .map_backed(

@@ -91,6 +91,8 @@ struct Stage {
     read: Option<ReadLease>,
     from: u64,
     written: Option<usize>,
+    source_committed: bool,
+    output_committed: bool,
 }
 /// Fully accepted original OFDs. Only one executing source/disk job owns this
 /// state; FileWork moves it across readiness/layout boundaries without FD lookup.
@@ -107,6 +109,41 @@ pub struct StreamTransfer {
     blocked: Option<bool>, // true: output; false: input
     deadline: Option<Instant>,
     read_from: Option<u64>,
+    source_position: Option<transfer_io::Position>,
+    output_position: Option<transfer_io::Position>,
+    validated: bool,
+    cancelled: bool,
+}
+pub(super) struct CancelledTransfer {
+    _io: transfer_io::Io,
+    position: Option<transfer_io::Position>,
+    output: Option<transfer_io::Position>,
+    stage: Option<Stage>,
+    prefix: usize,
+    output_end: Option<u64>,
+}
+impl Drop for CancelledTransfer {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self._io));
+        if let Some(stage) = &mut self.stage {
+            if let Some(lease) = stage.read.take() {
+                lease.commit(self.prefix);
+            }
+            if self.prefix != 0 && !stage.source_committed {
+                if let Some(position) = &self.position {
+                    position.record(stage.from + self.prefix as u64);
+                }
+            }
+        }
+        if let (Some(position), Some(end)) = (&self.output, self.output_end) {
+            position.record(end);
+        }
+    }
+}
+impl Drop for StreamTransfer {
+    fn drop(&mut self) {
+        drop(self.cancel_pending());
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransferMode {
@@ -120,6 +157,36 @@ pub struct TransferWait {
     pub deadline: Option<Instant>,
 }
 impl StreamTransfer {
+    pub(super) fn cancel_pending(&mut self) -> CancelledTransfer {
+        self.cancelled = true;
+        let prefix = if self.mode == TransferMode::Tee {
+            0
+        } else {
+            self.stage.as_ref().map_or(0, |stage| {
+                stage
+                    .written
+                    .unwrap_or_else(|| self.io.cancelled_write_progress())
+            })
+        };
+        CancelledTransfer {
+            output_end: self
+                .stage
+                .as_ref()
+                .filter(|stage| !stage.output_committed && prefix != 0)
+                .and_then(|_| {
+                    self.output_position.as_ref().map(|position| {
+                        self.io
+                            .write_end()
+                            .unwrap_or(position.offset + prefix as u64)
+                    })
+                }),
+            _io: std::mem::take(&mut self.io),
+            position: self.source_position.take(),
+            output: self.output_position.take(),
+            stage: self.stage.take(),
+            prefix,
+        }
+    }
     pub(super) fn daemon_backed(&self) -> bool {
         [&self.input, &self.output].iter().any(|f| {
             matches!(
@@ -183,6 +250,10 @@ impl StreamTransfer {
             blocked: None,
             deadline: None,
             read_from: None,
+            source_position: None,
+            output_position: None,
+            validated: false,
+            cancelled: false,
         }
     }
     pub fn tee(input: SharedFd, output: SharedFd, count: u64, flags: u32) -> Result<Self> {
@@ -314,6 +385,9 @@ impl StreamTransfer {
             })
     }
     pub(crate) fn wait_sources(&self, signal: &Arc<IoSignal>) -> io::Result<TransferWait> {
+        if self.io.blocked() {
+            return self.io.wait_sources(signal);
+        }
         let write = self.blocked.expect("accepted transfer wait");
         let file = if write { &self.output } else { &self.input };
         let mut wait = TransferWait {
@@ -342,56 +416,93 @@ impl StreamTransfer {
         Ok(wait)
     }
     pub(crate) fn execute(&mut self, v: &mut Vfs) -> Result<FileValue> {
+        if self.cancelled {
+            return Err(Errno(4));
+        }
         let source = &self.input.open;
         let dest = &self.output.open;
-        if self.mode != TransferMode::Sendfile && self.flags & !15 != 0 {
-            return Err(Errno(22));
-        }
-        if !fd_can_read(source.flags.get()) || !fd_can_write(dest.flags.get()) {
-            return Err(Errno(9));
-        }
-        if self.mode != TransferMode::Tee && dest.flags.get() & 0x400 != 0 {
-            return Err(Errno(22));
+        if !self.validated {
+            if self.mode != TransferMode::Sendfile && self.flags & !15 != 0 {
+                return Err(Errno(22));
+            }
+            if !fd_can_read(source.flags.get()) || !fd_can_write(dest.flags.get()) {
+                return Err(Errno(9));
+            }
+            if self.mode != TransferMode::Tee && dest.flags.get() & 0x400 != 0 {
+                return Err(Errno(22));
+            }
         }
         let source_pipe = source.pipe.as_ref().map(|p| p.data.clone());
         let dest_pipe = dest.pipe.as_ref().map(|p| p.data.clone());
         let from_seekable = transfer_io::Io::regular(&self.input);
         let to_seekable = transfer_io::Io::regular(&self.output);
-        if Arc::ptr_eq(source, dest)
-            || source_pipe
-                .as_ref()
-                .zip(dest_pipe.as_ref())
-                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        if !self.validated
+            && (Arc::ptr_eq(source, dest)
+                || source_pipe
+                    .as_ref()
+                    .zip(dest_pipe.as_ref())
+                    .is_some_and(|(a, b)| Arc::ptr_eq(a, b)))
         {
             return Err(Errno(22));
         }
-        if !matches!(self.from, Ok(None)) && !from_seekable
-            || !matches!(self.to, Ok(None)) && !to_seekable
+        if !self.validated
+            && (!matches!(self.from, Ok(None)) && !from_seekable
+                || !matches!(self.to, Ok(None)) && !to_seekable)
         {
             return Err(Errno(29));
         }
-        if self.mode != TransferMode::Sendfile && source_pipe.is_none() && dest_pipe.is_none()
-            || self.mode == TransferMode::Sendfile && !from_seekable && dest_pipe.is_none()
+        if !self.validated
+            && (self.mode != TransferMode::Sendfile && source_pipe.is_none() && dest_pipe.is_none()
+                || self.mode == TransferMode::Sendfile && !from_seekable && dest_pipe.is_none())
         {
             return Err(Errno(22));
         }
         let from = self.from?;
         let to = self.to?;
         let start = if from_seekable && self.stage.is_none() {
+            if from.is_none() && self.input.open.file_position.lock().unwrap().pending != 0 {
+                return self
+                    .io
+                    .wait_position(v, self.input.open.file_position.clone());
+            }
             let pos = if let Some(pos) = self.read_from.or(from) {
                 pos
             } else {
-                self.io.seek(v, &Self::descriptor(&self.input), 0, 1)?
+                if self.input.open.is_regular_file() {
+                    if self.source_position.is_none() {
+                        self.source_position =
+                            Some(transfer_io::Position::capture(self.input.clone(), None));
+                    }
+                    self.source_position.as_ref().unwrap().offset
+                } else {
+                    self.io.seek(v, &Self::descriptor(&self.input), 0, 1)?
+                }
             };
-            Vfs::check_io_range(pos, self.requested)?;
+            if !self.validated {
+                Vfs::check_io_range(pos, self.requested)?;
+            }
             pos
         } else {
             0
         };
-        if to_seekable {
-            let pos = to.unwrap_or_else(|| dest.file_position.snapshot());
+        if to_seekable
+            && to.is_none()
+            && self.output.open.is_regular_file()
+            && self.output_position.is_none()
+        {
+            self.output_position = Some(transfer_io::Position::capture(self.output.clone(), None));
+        }
+        if to_seekable && !self.validated {
+            let pos = if let Some(to) = to {
+                to
+            } else if let Some(position) = &self.output_position {
+                position.offset
+            } else {
+                self.io.seek(v, &Self::descriptor(&self.output), 0, 1)?
+            };
             Vfs::check_io_range(pos, self.requested.min(Vfs::MAX_RW_COUNT))?;
         }
+        self.validated = true;
         let count = self.count();
         if count == 0 {
             return Ok(FileValue::Transfer {
@@ -447,6 +558,8 @@ impl StreamTransfer {
                     read: Some(lease),
                     from,
                     written: None,
+                    source_committed: false,
+                    output_committed: false,
                 })
             } else if matches!(source.control, Some(events::SharedControl::FuseFile(_))) {
                 self.io
@@ -465,20 +578,37 @@ impl StreamTransfer {
                         read: None,
                         from,
                         written: None,
+                        source_committed: false,
+                        output_committed: false,
                     })
             } else if from_seekable {
-                v.pread_description(&input, count, from).map(|bytes| Stage {
-                    bytes,
-                    read: None,
-                    from,
-                    written: None,
-                })
+                self.io
+                    .call(
+                        &input,
+                        v,
+                        FileCommand::Read {
+                            count,
+                            offset: Some(from),
+                        },
+                        transfer_io::Step::Read,
+                    )
+                    .and_then(transfer_io::Io::bytes)
+                    .map(|bytes| Stage {
+                        bytes,
+                        read: None,
+                        from,
+                        written: None,
+                        source_committed: false,
+                        output_committed: false,
+                    })
             } else {
                 v.read_description(&input, count).map(|bytes| Stage {
                     bytes,
                     read: None,
                     from,
                     written: None,
+                    source_committed: false,
+                    output_committed: false,
                 })
             };
             match result {
@@ -494,14 +624,16 @@ impl StreamTransfer {
             }
         }
         let stage = self.stage.as_mut().unwrap();
-        let bytes = &stage.bytes[..stage.bytes.len().min(count)];
+        let length = stage.bytes.len().min(count);
         let output = Self::descriptor(&self.output);
         let written = if let Some(written) = stage.written {
             Ok(written)
-        } else if bytes.is_empty() {
+        } else if to_seekable && (self.io.retained() || length != 0) {
+            self.io.write(&output, v, &mut stage.bytes, to, None)
+        } else if length == 0 {
             Ok(0)
         } else if let Some(lease) = &mut destination {
-            lease.commit(bytes)
+            lease.commit(&stage.bytes[..length])
         } else if matches!(
             dest.control,
             Some(events::SharedControl::FuseFile(_) | events::SharedControl::Fuse(_))
@@ -511,19 +643,18 @@ impl StreamTransfer {
                     &output,
                     v,
                     FileCommand::Write {
-                        bytes: bytes.to_vec(),
+                        bytes: stage.bytes[..length].to_vec(),
                         offset: to,
                     },
                     transfer_io::Step::Write,
                 )
                 .and_then(transfer_io::Io::count)
-        } else if to_seekable {
-            v.file_write_description(&output, bytes, to)
         } else {
-            v.write_description(&output, bytes)
+            v.write_description(&output, &stage.bytes[..length])
         };
         let n = match written {
             Ok(n) => n,
+            Err(error) if self.io.retained() || self.io.pending() => return Err(error),
             Err(Errno(11)) if to_seekable && dest.file_position.lock().unwrap().pending != 0 => {
                 let position = dest.file_position.clone();
                 self.blocked(true);
@@ -555,8 +686,21 @@ impl StreamTransfer {
         }
         let position = stage.from + n as u64;
         if from_seekable && from.is_none() {
-            self.io
-                .seek(v, &Self::descriptor(&self.input), position as i64, 0)?;
+            if let Some(receipt) = &self.source_position {
+                if n != 0 && !receipt.try_record(position) {
+                    return self.io.wait_position(v, receipt.position());
+                }
+            } else {
+                self.io
+                    .seek(v, &Self::descriptor(&self.input), position as i64, 0)?;
+            }
+            stage.source_committed = true;
+        }
+        if let Some(receipt) = &self.output_position {
+            if n != 0 {
+                receipt.record(self.io.write_end().unwrap_or(receipt.offset + n as u64));
+            }
+            stage.output_committed = true;
         }
         self.stage = None;
         Ok(FileValue::Transfer {

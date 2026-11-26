@@ -490,9 +490,10 @@ mod tests {
                 Some(self.file.layout())
             }
             fn run(self: Box<Self>, admission: Option<trames_linux::HostFileAdmission>) {
-                assert!(admission.is_some());
-                let mut bytes = Vec::new();
-                self.file.write_to(&mut bytes).unwrap();
+                let admission = admission.expect("original export admission");
+                let mut work = self.file.into_work(Vec::new());
+                assert!(work.run(&admission, || false).unwrap().is_some());
+                let bytes = work.into_writer();
                 assert_eq!(&bytes[..8], &17u64.to_le_bytes());
                 self.done.store(true, Ordering::Release);
             }

@@ -67,6 +67,9 @@ impl Drop for Lease {
     }
 }
 impl Execution {
+    pub(super) fn resource_context(&self, task: u32) -> trames_vfs::CgroupResourceContext {
+        self.factory.task_resource_context(task).unwrap_or_default()
+    }
     pub(crate) fn new(
         paths: &trames_vfs::PathQueries,
         factory: &trames_vfs::DescriptorFactory,
@@ -175,6 +178,7 @@ impl Execution {
             call.import = Some(import);
             return Some(Err(Errno(11)));
         };
+        parsed.resources = request.resources.clone();
         if let Some(original) = &request.file {
             parsed.file = Some(original.clone());
             parsed.resource = request.resource.take();
@@ -636,7 +640,7 @@ impl UringActor {
             let accepted = self.accepted.lock().unwrap();
             let call = accepted.get(&(ring as *const Uring as usize, sequence))?;
             if let Some(page) = &call.page {
-                return Some(vec![page.subscribe(signal)]);
+                return Some(page.subscribe(signal));
             }
             if let Some(open) = &call.fifo_open {
                 return Some(vec![open.subscribe(signal)]);

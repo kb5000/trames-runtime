@@ -114,7 +114,12 @@ impl<C: Cpu> Lifecycle<C> {
     pub(crate) fn layouts_ready(&self) -> bool {
         self.layout_driver
             .get()
-            .is_some_and(|driver| driver.signal.ready())
+            .is_some_and(|driver| driver.ready())
+    }
+    pub(crate) fn layouts_deadline(&self) -> Option<std::time::Instant> {
+        self.layout_driver
+            .get()
+            .and_then(|driver| driver.deadline())
     }
     pub(crate) fn layouts_pending(&self) -> bool {
         self.layouts.pending()

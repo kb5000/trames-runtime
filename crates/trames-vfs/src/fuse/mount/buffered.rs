@@ -51,7 +51,9 @@ impl Io {
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
         self.reads.iter().find_map(|read| match read {
-            cache::Read::Pending(read) if !read.wait.ready() => Some(read.wait.subscribe(signal)),
+            cache::Read::Pending(read) if !read.wait.ready() => {
+                Some(read.wait.subscribe_completion(signal))
+            }
             _ => None,
         })
     }

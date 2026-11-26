@@ -317,7 +317,78 @@ fn initial_stack_bytes<C: Cpu>(
     options: RuntimeOptions,
     exec_filename: Option<&[u8]>,
 ) -> Result<u64, RuntimeError> {
-    let mut extra = vec![
+    let mut entry = InitialEntry::new(&elf.memory)?;
+    let mut wait = None;
+    loop {
+        match entry.run::<C>(elf, argv, envp, credentials, options, exec_filename) {
+            Err(RuntimeError::Memory(trames_memory::MemoryError::Pending(fault))) => {
+                let wait = match &mut wait {
+                    Some(wait) => wait,
+                    slot @ None => slot.insert(
+                        trames_shared::HostWait::new()
+                            .map_err(|_| trames_memory::MemoryError::BackingIo(5))?,
+                    ),
+                };
+                wait.resource(fault.wait.as_ref())
+                    .map_err(|_| trames_memory::MemoryError::BackingIo(5))?;
+            }
+            result => return result,
+        }
+    }
+}
+struct InitialEntry {
+    vdso: trames_linux::vdso::Install,
+    stack: Option<trames_linux::image::InitialStack>,
+}
+impl InitialEntry {
+    fn new(memory: &trames_memory::Memory) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            vdso: trames_linux::vdso::Install::new(memory)?,
+            stack: None,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run<C: Cpu>(
+        &mut self,
+        elf: &mut LoadedElf,
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+        credentials: &trames_vfs::Credentials,
+        options: RuntimeOptions,
+        exec_filename: Option<&[u8]>,
+    ) -> Result<u64, RuntimeError> {
+        let base = self.vdso.run(&mut elf.memory)?;
+        if self.stack.is_none() {
+            let mut extra = stack_auxv(options);
+            extra.push((trames_linux::vdso::AUXV, base));
+            self.stack = Some(
+                trames_linux::image::InitialStack::new(
+                    elf,
+                    argv,
+                    envp,
+                    credentials,
+                    C::features(),
+                    &extra,
+                    exec_filename,
+                )
+                .map_err(stack_error)?,
+            );
+        }
+        self.stack
+            .as_mut()
+            .unwrap()
+            .run(&mut elf.memory)
+            .map_err(stack_error)
+    }
+}
+fn stack_error(error: trames_linux::image::ImageError) -> RuntimeError {
+    match error {
+        trames_linux::image::ImageError::Arguments(reason) => RuntimeError::Arguments(reason),
+        trames_linux::image::ImageError::Memory(error) => RuntimeError::Memory(error),
+    }
+}
+fn stack_auxv(options: RuntimeOptions) -> Vec<(u64, u64)> {
+    vec![
         (
             trames_audio::AUXV_KEY,
             if options.audio_output || options.audio_input {
@@ -398,22 +469,7 @@ fn initial_stack_bytes<C: Cpu>(
                 0
             },
         ),
-    ];
-    let base = trames_linux::vdso::install(&mut elf.memory)?;
-    extra.push((trames_linux::vdso::AUXV, base));
-    trames_linux::image::build_initial_stack(
-        elf,
-        argv,
-        envp,
-        credentials,
-        C::features(),
-        &extra,
-        exec_filename,
-    )
-    .map_err(|error| match error {
-        trames_linux::image::ImageError::Arguments(reason) => RuntimeError::Arguments(reason),
-        trames_linux::image::ImageError::Memory(error) => RuntimeError::Memory(error),
-    })
+    ]
 }
 
 impl<C: Cpu> Runtime<C> {
@@ -465,6 +521,30 @@ impl<C: Cpu> Runtime<C> {
         executable: Option<&trames_vfs::ExecutableFile>,
         mut credentials: Option<&mut trames_vfs::ExecCredentials>,
     ) -> Result<LoadedElf, RuntimeError> {
+        Self::load_elf_resolved(bytes, vfs, options, executable, |path| {
+            let file = vfs
+                .executable_file_at(trames_vfs::AT_FDCWD, path, 0)
+                .map_err(|e| ElfError::Interpreter(e.0))?;
+            if let Some(creds) = credentials.as_mut() {
+                creds.include_interpreter(vfs, &file);
+            }
+            let _access = file
+                .begin_execution()
+                .map_err(|e| ElfError::Interpreter(e.0))?;
+            let bytes = file.bytes().map_err(|e| ElfError::Interpreter(e.0))?;
+            Ok((bytes, Some(vfs.executable_mapping(&file))))
+        })
+    }
+    fn load_elf_resolved(
+        bytes: &[u8],
+        vfs: &trames_vfs::Vfs,
+        options: RuntimeOptions,
+        executable: Option<&trames_vfs::ExecutableFile>,
+        resolve: impl FnMut(
+            &[u8],
+        )
+            -> Result<(Vec<u8>, Option<trames_memory::MappingFileInfo>), ElfError>,
+    ) -> Result<LoadedElf, RuntimeError> {
         options.memory_limits.validate()?;
         options.memory_limits.configure_shared_memory(vfs);
         if options.video_accelerator {
@@ -475,22 +555,31 @@ impl<C: Cpu> Runtime<C> {
             bytes,
             options.memory_limits.per_process,
             main_file.as_ref(),
-            |path| {
-                let file = vfs
-                    .executable_file_at(trames_vfs::AT_FDCWD, path, 0)
-                    .map_err(|e| ElfError::Interpreter(e.0))?;
-                if let Some(creds) = credentials.as_mut() {
-                    creds.include_interpreter(vfs, &file);
-                }
-                let _access = file
-                    .begin_execution()
-                    .map_err(|e| ElfError::Interpreter(e.0))?;
-                let bytes = file.bytes().map_err(|e| ElfError::Interpreter(e.0))?;
-                Ok((bytes, Some(vfs.executable_mapping(&file))))
-            },
+            resolve,
         )?)
     }
     fn start_image(
+        elf: LoadedElf,
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+        vfs: &trames_vfs::Vfs,
+        options: RuntimeOptions,
+        exec_filename: Option<&[u8]>,
+        executable: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_image_at(
+            elf,
+            argv,
+            envp,
+            vfs,
+            options,
+            exec_filename,
+            executable,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_image_at(
         mut elf: LoadedElf,
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
@@ -498,6 +587,7 @@ impl<C: Cpu> Runtime<C> {
         options: RuntimeOptions,
         exec_filename: Option<&[u8]>,
         executable: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
+        stack: Option<u64>,
     ) -> Result<Self, RuntimeError> {
         let mut linux = Linux::new(elf.brk_base);
         linux.arguments = argv.to_vec();
@@ -521,14 +611,17 @@ impl<C: Cpu> Runtime<C> {
         } else if let Ok(path) = vfs.resolve(trames_vfs::AT_FDCWD, &linux.executable_path) {
             linux.executable_path = path.into_bytes();
         }
-        let sp = initial_stack_bytes::<C>(
-            &mut elf,
-            argv,
-            envp,
-            &vfs.credentials,
-            options,
-            exec_filename,
-        )?;
+        let sp = match stack {
+            Some(sp) => sp,
+            None => initial_stack_bytes::<C>(
+                &mut elf,
+                argv,
+                envp,
+                &vfs.credentials,
+                options,
+                exec_filename,
+            )?,
+        };
         for i in 0..argv.len() {
             linux
                 .argument_pointers

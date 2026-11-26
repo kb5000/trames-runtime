@@ -281,6 +281,21 @@ impl FilePending {
                 .is_some_and(trames_vfs::FileWork::interruptible_wait)
         })
     }
+    /// Consume only a parked original operation. Submitted host work remains
+    /// uninterruptible; its eventual result cannot race a guest-side replay.
+    pub fn interrupted(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
+        let work = {
+            let mut waiting = self.waiting.as_ref()?.lock().unwrap();
+            if !waiting.as_ref()?.interruptible_wait() {
+                return None;
+            }
+            waiting.take()?
+        };
+        let reply = work.interrupted();
+        debug_assert!(!reply.file_size_signal);
+        self.result.abandon(None, false);
+        Some(self.output.apply(reply.result, memory))
+    }
     pub(super) fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
         self.waiting.as_ref().map_or_else(Vec::new, |w| {
             w.lock()
@@ -833,7 +848,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         signal.reset();
-        let subscriptions = vec![fault.wait.subscribe(&signal)];
+        let subscriptions = fault.wait.subscribe(&signal);
         if fault.wait.ready() {
             signal.notify();
         }

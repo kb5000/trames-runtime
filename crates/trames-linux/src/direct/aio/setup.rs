@@ -12,6 +12,7 @@ pub struct SetupInput {
     imported: bool,
     allocation: Option<Allocation>,
     result: Option<Result<u64, Errno>>,
+    resources: trames_vfs::CgroupResourceContext,
 }
 pub(super) struct Allocation {
     aio: Aio,
@@ -110,7 +111,11 @@ impl Drop for Allocation {
     }
 }
 impl SetupInput {
-    pub(super) fn new(aio: Aio, args: [u64; 6]) -> Self {
+    pub(super) fn new(
+        aio: Aio,
+        args: [u64; 6],
+        resources: trames_vfs::CgroupResourceContext,
+    ) -> Self {
         Self {
             aio,
             args,
@@ -118,6 +123,7 @@ impl SetupInput {
             imported: false,
             allocation: None,
             result: None,
+            resources,
         }
     }
     pub fn resume(
@@ -127,6 +133,7 @@ impl SetupInput {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        let _resources = self.resources.enter();
         if !self.imported {
             let reader = file_input::Reader::new(memory, &self.bytes);
             let imported = reader.read_u64(self.args[1]).map_err(|_| Errno(14));

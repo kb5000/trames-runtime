@@ -481,9 +481,18 @@ impl DirectFile {
         if count == 0 {
             return Some(Ok(Vec::new()));
         }
+        if trames_memory::CgroupMemoryTarget::active()
+            || self.data.disk_backed() && cgroup::io_limited()
+        {
+            return None;
+        }
         if count >= 16 * 1024 && self.data.disk_backed() {
             return None;
         }
+        // A policy can become limited after the fast admission check. Keep
+        // that typed before-effects wait inside this attempt and hand back the
+        // original file, rather than publishing an incidental guest EAGAIN.
+        let resource_scope = self.data.disk_backed().then(resource_io::Scope::enter);
         let result = if let Some(offset) = offset {
             if let Err(e) = Vfs::check_io_range(offset, count as u64) {
                 return Some(Err(e));
@@ -503,6 +512,9 @@ impl DirectFile {
             }
             result
         };
+        if resource_scope.is_some_and(|scope| scope.finish().is_some()) {
+            return None;
+        }
         if result.is_ok() && count != 0 && self.prepared.0.status.get() & O_NOATIME == 0 {
             let flags = self.prepared.0.mount_flags.as_ref().map_or(0, |m| m.get());
             if flags & (mounts::MS_RDONLY | mounts::MS_NOATIME) == 0 {
@@ -526,6 +538,11 @@ impl DirectFile {
             return self
                 .read(count, offset, cache)
                 .map(|result| result.map(FileValue::Bytes));
+        }
+        if trames_memory::CgroupMemoryTarget::active()
+            || self.data.disk_backed() && cgroup::io_limited()
+        {
+            return None;
         }
         let position = {
             let mut state = self.try_position()?;
@@ -565,6 +582,11 @@ impl DirectFile {
         if bytes.is_empty() {
             return Some(Ok(0));
         }
+        if trames_memory::CgroupMemoryTarget::active()
+            || self.data.disk_backed() && cgroup::io_limited()
+        {
+            return None;
+        }
         if !self.unlimited
             || self.prepared.1.get() != u64::MAX
             || self.prepared.0.flags & 0x1000 != 0
@@ -572,6 +594,7 @@ impl DirectFile {
             return None;
         }
         let append = self.prepared.0.status.get() & 0x400 != 0;
+        let resource_scope = self.data.disk_backed().then(resource_io::Scope::enter);
         let result = if let Some(offset) = offset {
             if let Err(e) = Vfs::check_io_range(offset, bytes.len() as u64) {
                 return Some(Err(e));
@@ -595,6 +618,9 @@ impl DirectFile {
             }
             result.map(|(n, _)| n)
         };
+        if resource_scope.is_some_and(|scope| scope.finish().is_some()) {
+            return None;
+        }
         if result.is_ok_and(|n| n != 0) {
             self.data.modified(self.clear_setid);
             self.notify_io(inotify::MODIFY);

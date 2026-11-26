@@ -359,6 +359,11 @@ impl PendingIo {
         [self.deadline, self.resource_deadline]
             .into_iter()
             .flatten()
+            .chain(
+                self._subscriptions
+                    .iter()
+                    .filter_map(IoSubscription::deadline),
+            )
             .min()
     }
 }
@@ -630,6 +635,15 @@ impl DirectSyscalls {
     pub fn descriptor_factory(&self) -> Option<&trames_vfs::DescriptorFactory> {
         self.resources.as_ref()
     }
+    /// Freeze an actual runtime TID, including explicit native/root absence.
+    /// Callers without a factory retain their explicitly installed scope.
+    pub(crate) fn resource_context(&self, pid: u32) -> trames_vfs::CgroupResourceContext {
+        self.resources
+            .as_ref()
+            .map_or_else(trames_vfs::CgroupResourceContext::capture, |factory| {
+                factory.task_resource_context(pid).unwrap_or_default()
+            })
+    }
     pub fn supports_creation(&self, number: u32) -> bool {
         if number == 425 {
             self.paths.is_some()
@@ -637,6 +651,18 @@ impl DirectSyscalls {
             matches!(number, 19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280)
                 && self.resources.is_some()
         }
+    }
+    /// Production creation accepts the actual task before touching io_uring's
+    /// parameter/output pages. Other descriptor creation keeps its old path.
+    pub fn invoke_creation_for(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+    ) -> Option<Result<u64, Errno>> {
+        let _resources = (number == 425).then(|| self.resource_context(pid).enter());
+        self.invoke_creation(number, a, memory)
     }
     pub fn invoke_creation(
         &self,
@@ -653,7 +679,7 @@ impl DirectSyscalls {
             return result;
         }
         if number == 425 {
-            if memory.async_faults_possible() {
+            if memory.async_faults_possible() || trames_memory::CgroupMemoryTarget::active() {
                 return self.invoke_uring_setup(a, memory);
             }
             let paths = self.paths.as_ref()?;

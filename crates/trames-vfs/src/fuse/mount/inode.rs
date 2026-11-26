@@ -21,6 +21,18 @@ pub(super) struct Attr {
     writers: std::sync::Mutex<usize>,
     changed: Arc<Readiness>,
 }
+impl trames_memory::CgroupReclaim for Attr {
+    fn reclaim(&self, group: &trames_memory::MemoryCgroup, bytes: usize) -> usize {
+        self.cache.reclaim(group, bytes)
+    }
+    fn writeback(
+        &self,
+        group: &Arc<trames_memory::MemoryCgroup>,
+        bytes: usize,
+    ) -> Option<Arc<trames_memory::PageWait>> {
+        self.cache.pressure_writeback(group, bytes)
+    }
+}
 /// Linux's original per-inode write/setattr transaction across daemon waits.
 /// Failure to enter parks the guest on readiness, never the host execution slot.
 pub(super) struct Write(Arc<Attr>);

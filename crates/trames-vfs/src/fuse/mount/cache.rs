@@ -2,7 +2,7 @@
 //! Inode-owned clean pages and retained, independently completed read requests.
 //! Mapping/writeback admission is deliberately separate from byte reception.
 use super::*;
-use std::sync::{Mutex, Weak};
+use std::sync::{Mutex, RwLock, Weak};
 use trames_memory::{MappedResidents, MemoryError, PageSource, PageWait, SharedPage, PAGE_SIZE};
 #[path = "read_batch.rs"]
 mod batch;
@@ -20,11 +20,13 @@ pub(super) struct Cache {
     pub(super) writeback: Mutex<super::writeback::Queue>,
     pub(super) writers: Mutex<Vec<Weak<super::writeback::OpenWriter>>>,
     buffered_writers: Mutex<Vec<Weak<SharedOpenDescription>>>,
+    pressure_originals: Mutex<Vec<Weak<SharedOpenDescription>>>,
     // Conservative dirty-page pressure, not a completion or ownership count.
     // Repeated writes may overcount; close/sync inspect the original pages.
     pub(super) buffered_pressure: AtomicU64,
     error: Mutex<(u64, Option<Errno>)>,
     executor: Mutex<Option<Weak<dyn trames_memory::SyncExecutor>>>,
+    pressure_writeback: trames_memory::CgroupWriteback,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -38,31 +40,87 @@ impl Default for Cache {
             writeback: Mutex::default(),
             writers: Mutex::default(),
             buffered_writers: Mutex::default(),
+            pressure_originals: Mutex::default(),
             buffered_pressure: Default::default(),
             error: Mutex::default(),
             executor: Mutex::default(),
+            pressure_writeback: Default::default(),
         }
     }
 }
 pub(super) struct Page {
     pub(super) identity: u64,
-    bytes: OnceLock<Arc<SharedPage>>,
+    allocation: RwLock<Arc<Allocation>>,
+    source_generation: AtomicU64,
+    pub(super) invalidation_generation: AtomicU64,
+    owner: OnceLock<Weak<inode::Attr>>,
     // The physical cache charge lives with this page, including accepted
     // sources which survive removal from the inode's current cache map.
     pub(super) owners: MappedResidents,
     pub(super) dirty: AtomicU64,
     mappings: std::sync::atomic::AtomicUsize,
     state: Mutex<PageState>,
+    reclaimed_owner: Mutex<Weak<trames_memory::MemoryCgroup>>,
+}
+#[derive(Default)]
+struct Allocation {
+    bytes: OnceLock<Arc<SharedPage>>,
+    charge: Mutex<Option<trames_memory::CgroupPageCharge>>,
+}
+impl Allocation {
+    fn bytes(&self) -> Arc<SharedPage> {
+        let bytes = self.bytes.get_or_init(|| Arc::new(SharedPage::zero()));
+        if let Some(charge) = &*self.charge.lock().unwrap() {
+            charge.bind(bytes);
+        }
+        bytes.clone()
+    }
+    fn fill(&self, content: &[u8; PAGE_SIZE as usize]) -> Arc<SharedPage> {
+        let mut installed = false;
+        let bytes = self.bytes.get_or_init(|| {
+            installed = true;
+            Arc::new(SharedPage::new(*content))
+        });
+        if !installed {
+            bytes.copy_write(0, content);
+        }
+        if let Some(charge) = &*self.charge.lock().unwrap() {
+            charge.bind(bytes);
+        }
+        bytes.clone()
+    }
 }
 impl Page {
-    pub(super) fn bytes(&self) -> &Arc<SharedPage> {
-        self.bytes.get_or_init(|| Arc::new(SharedPage::zero()))
+    pub(super) fn reclaimed_within(&self, group: &trames_memory::MemoryCgroup) -> bool {
+        self.reclaimed_owner
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_some_and(|owner| owner.is_within(group))
+    }
+    pub(super) fn bytes(&self) -> Arc<SharedPage> {
+        let bytes = self.allocation.read().unwrap().bytes();
+        self.owners.retain_cache(&bytes);
+        bytes
+    }
+    // The caller holds PageState and original layout admission. Old accepted
+    // READs and physical pins retain the retired allocation, not the new cache.
+    fn discard_bytes(&self) {
+        self.owners.invalidate_cache();
+        *self.allocation.write().unwrap() = Arc::default();
+        self.source_generation.fetch_add(1, Ordering::Relaxed);
     }
     pub(super) fn valid(&self) -> bool {
         self.state.lock().unwrap().valid
     }
     pub(super) fn revision(&self) -> u64 {
-        self.bytes.get().map_or(0, |bytes| bytes.revision())
+        self.allocation
+            .read()
+            .unwrap()
+            .bytes
+            .get()
+            .map_or(0, |bytes| bytes.revision())
+            .wrapping_add(self.source_generation.load(Ordering::Relaxed))
     }
     pub(super) fn dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed) != 0
@@ -81,6 +139,10 @@ impl Page {
                 state.valid = false;
                 state.invalidate_after_write = false;
                 state.generation = state.generation.wrapping_add(1);
+                self.discard_bytes();
+                if let Some(owner) = self.owner.get().and_then(Weak::upgrade) {
+                    owner.cache.changed(true);
+                }
             }
         }
     }
@@ -93,7 +155,7 @@ struct PageState {
     invalidate_after_write: bool,
 }
 pub(super) enum Read {
-    Ready(Arc<Page>),
+    Ready(Arc<Page>, Option<Arc<SharedPage>>),
     Pending(Arc<ReadWave>),
 }
 impl Read {
@@ -122,7 +184,7 @@ impl Read {
     }
     pub(super) fn result(&self) -> Option<Result<Arc<Page>>> {
         match self {
-            Self::Ready(page) => Some(Ok(page.clone())),
+            Self::Ready(page, _) => Some(Ok(page.clone())),
             Self::Pending(read) => read.state.lock().unwrap().result.clone(),
         }
     }
@@ -134,19 +196,13 @@ impl Read {
     }
     fn output(&self) -> Option<Result<Arc<SharedPage>>> {
         match self {
-            Self::Ready(page) => Some(Ok(page.bytes().clone())),
+            Self::Ready(page, bytes) => Some(Ok(bytes.clone().unwrap_or_else(|| page.bytes()))),
             Self::Pending(read) => {
                 let state = read.state.lock().unwrap();
                 state.result.as_ref().map(|result| {
                     result
                         .as_ref()
-                        .map(|page| {
-                            state
-                                .uncached
-                                .as_ref()
-                                .unwrap_or_else(|| page.bytes())
-                                .clone()
-                        })
+                        .map(|page| state.uncached.clone().unwrap_or_else(|| page.bytes()))
                         .map_err(|error| *error)
                 })
             }
@@ -165,6 +221,8 @@ pub(super) struct ReadWave {
     count: usize,
     attr_version: u64,
     page_generation: u64,
+    allocation: Arc<Allocation>,
+    context: trames_memory::CgroupMemoryContext,
     pub(super) wait: Arc<PageWait>,
     state: Mutex<ReadState>,
 }
@@ -176,6 +234,124 @@ struct ReadState {
     uncached: Option<Arc<SharedPage>>,
 }
 impl Cache {
+    pub(super) fn pressure_writeback(
+        &self,
+        group: &Arc<trames_memory::MemoryCgroup>,
+        bytes: usize,
+    ) -> Option<Arc<PageWait>> {
+        let generation: Vec<_> = {
+            let pages = self.pages.try_lock().ok()?;
+            pages
+                .values()
+                .filter_map(|page| {
+                    let stamp = page.dirty.load(Ordering::Relaxed);
+                    if !page.owners.charged_within(group) {
+                        return None;
+                    }
+                    let allocation = page.allocation.try_read().ok()?;
+                    let revision = allocation
+                        .bytes
+                        .get()
+                        .map_or(0, |bytes| bytes.revision())
+                        .wrapping_add(page.source_generation.load(Ordering::Relaxed));
+                    Some((
+                        page.identity,
+                        revision
+                            .wrapping_add(stamp)
+                            .wrapping_mul(2)
+                            .wrapping_add(u64::from(stamp != 0)),
+                    ))
+                })
+                .collect()
+        };
+        if generation.is_empty() {
+            return None;
+        }
+        let original = {
+            let originals = self.buffered_writers.try_lock().ok()?;
+            let open = originals.iter().find_map(Weak::upgrade);
+            drop(originals);
+            SharedFd {
+                open: open.or_else(|| {
+                    self.pressure_originals
+                        .try_lock()
+                        .ok()?
+                        .iter()
+                        .find_map(Weak::upgrade)
+                })?,
+            }
+        };
+        let Some(events::SharedControl::FuseFile(file)) = &original.open.control else {
+            return None;
+        };
+        let file = file.clone();
+        let executor = crate::file_actor::sync_executor()
+            .or_else(|| self.executor.try_lock().ok()?.as_ref()?.upgrade())?;
+        let resource =
+            super::writeback::Sync::pressure(file, original, group.clone(), executor.clone());
+        self.pressure_writeback.submit(
+            generation,
+            group.clone(),
+            bytes,
+            Arc::new(resource),
+            executor,
+        )
+    }
+    fn reserve(
+        &self,
+        page: &Page,
+        owner: &Arc<inode::Attr>,
+    ) -> std::result::Result<Arc<Allocation>, MemoryError> {
+        page.owner.get_or_init(|| Arc::downgrade(owner));
+        let charge = page.owners.cache_charge()?;
+        let allocation = page.allocation.read().unwrap().clone();
+        allocation.charge.lock().unwrap().get_or_insert(charge);
+        let resource: Arc<dyn trames_memory::CgroupReclaim> = owner.clone();
+        page.owners.register_reclaimer(&resource);
+        Ok(allocation)
+    }
+    pub(super) fn reclaim(&self, group: &trames_memory::MemoryCgroup, bytes: usize) -> usize {
+        let Ok(mut pages) = self.pages.try_lock() else {
+            return 0;
+        };
+        let mut freed = 0usize;
+        pages.retain(|_, page| {
+            if freed >= bytes
+                || Arc::strong_count(page) != 1
+                || page.dirty()
+                || page.mappings.load(Ordering::Relaxed) != 0
+                || !page.owners.charged_within(group)
+            {
+                return true;
+            }
+            let Ok(state) = page.state.try_lock() else {
+                return true;
+            };
+            let Ok(allocation) = page.allocation.try_read() else {
+                return true;
+            };
+            if allocation
+                .bytes
+                .get()
+                .is_some_and(|bytes| Arc::strong_count(bytes) != 1)
+            {
+                return true;
+            }
+            if state.reading.strong_count() != 0 {
+                return true;
+            }
+            if !page.owners.mark_reclaimed() {
+                return true;
+            }
+            freed = freed.saturating_add(PAGE_SIZE as usize);
+            false
+        });
+        drop(pages);
+        if freed != 0 {
+            self.changed(false);
+        }
+        freed
+    }
     pub(super) fn bind_executor(&self, executor: &Arc<dyn trames_memory::SyncExecutor>) {
         let mut current = self.executor.lock().unwrap();
         if current.as_ref().and_then(Weak::upgrade).is_none() {
@@ -239,6 +415,53 @@ impl Cache {
             originals.push(weak);
         }
     }
+    pub(super) fn remember_pressure(&self, original: &SharedFd) {
+        let mut originals = self.pressure_originals.lock().unwrap();
+        originals.retain(|open| open.strong_count() != 0);
+        let weak = Arc::downgrade(&original.open);
+        if !originals.iter().any(|open| open.ptr_eq(&weak)) {
+            originals.push(weak);
+        }
+    }
+    /// Original layout and write transaction admission are required. A daemon
+    /// reply alone cannot retire canonical mapped bytes.
+    pub(super) fn discard_clean_mapped(&self, group: &trames_memory::MemoryCgroup) {
+        let Ok(pages) = self.pages.try_lock() else {
+            return;
+        };
+        let mut changed = false;
+        for page in pages.values() {
+            if page.dirty() || !page.owners.charged_within(group) {
+                continue;
+            }
+            let Ok(mut state) = page.state.try_lock() else {
+                continue;
+            };
+            if !state.valid || state.reading.strong_count() != 0 {
+                continue;
+            }
+            let Ok(mut allocation) = page.allocation.try_write() else {
+                continue;
+            };
+            let Some(owner) = page.owners.physical_owner() else {
+                continue;
+            };
+            if !page.owners.mark_reclaimed() {
+                continue;
+            }
+            *page.reclaimed_owner.lock().unwrap() = Arc::downgrade(&owner);
+            page.owners.invalidate_cache();
+            *allocation = Arc::default();
+            state.valid = false;
+            state.generation = state.generation.wrapping_add(1);
+            page.source_generation.fetch_add(1, Ordering::Relaxed);
+            changed = true;
+        }
+        drop(pages);
+        if changed {
+            self.changed(false);
+        }
+    }
     pub(super) fn dirty(&self) -> bool {
         self.pages.lock().unwrap().values().any(|page| page.dirty())
     }
@@ -291,14 +514,17 @@ impl Cache {
         }
         bytes
     }
-    pub(super) fn reserve_store(&self, offset: u64, count: usize) -> Result<()> {
+    pub(super) fn reserve_store(
+        &self,
+        owner: &Arc<inode::Attr>,
+        offset: u64,
+        count: usize,
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
         for index in offset / PAGE_SIZE..=(offset + count as u64 - 1) / PAGE_SIZE {
-            self.page(index)
-                .owners
-                .reserve_cache()
+            self.reserve(&self.page(index), owner)
                 .map_err(|error| match error {
                     MemoryError::BackingIo(code) => Errno(code),
                     _ => Errno(12),
@@ -371,10 +597,10 @@ impl Cache {
             if !state.valid
                 && (offset >= size || start <= offset && end >= size.min(offset + PAGE_SIZE))
             {
-                page.owners.reserve_cache()?;
+                self.reserve(&page, &file.attr)?;
                 // Reservation is not publication. A different edge page can
                 // still fail or be cancelled before this write is accepted.
-                return Ok(Read::Ready(page.clone()));
+                return Ok(Read::Ready(page.clone(), None));
             }
         }
         self.read_from_as(file, original, index, page, caller)
@@ -389,23 +615,12 @@ impl Cache {
             let mut state = page.state.lock().unwrap();
             state.generation = state.generation.wrapping_add(1);
             state.reading = Weak::new();
-            let mut installed = false;
-            let storage = page.bytes.get_or_init(|| {
-                installed = true;
+            if state.valid {
+                page.bytes().copy_write(at, &bytes[done..done + count]);
+            } else {
                 let mut content = [0; PAGE_SIZE as usize];
                 content[at..at + count].copy_from_slice(&bytes[done..done + count]);
-                Arc::new(SharedPage::new(content))
-            });
-            if !installed {
-                if state.valid {
-                    storage.copy_write(at, &bytes[done..done + count]);
-                } else {
-                    storage.with_write(0, PAGE_SIZE as usize, |page| {
-                        page[..at].fill(0);
-                        page[at..at + count].copy_from_slice(&bytes[done..done + count]);
-                        page[at + count..].fill(0);
-                    });
-                }
+                page.allocation.read().unwrap().fill(&content);
             }
             state.valid = true;
             page.mark_dirty();
@@ -428,14 +643,16 @@ impl Cache {
                 if page.dirty() {
                     page.mark_dirty();
                 }
+            } else if page.allocation.read().unwrap().bytes.get().is_none() {
+                page.discard_bytes();
             }
         }
         drop(pages);
         self.changed(true);
     }
     /// Truncation discards dirty bytes past EOF, retaining dirty prefix bytes.
-    /// A mapping keeps its physical identity so existing CPU views see the tail
-    /// zeroing and SIGBUS checks use the new inode size.
+    /// The partial EOF page keeps its physical bytes. Complete removed pages
+    /// get a new source generation; old READs and byte pins retain the old one.
     pub(super) fn resize(&self, old: u64, size: u64) {
         let pages = self.pages.lock().unwrap();
         for (&index, page) in pages.iter() {
@@ -447,6 +664,12 @@ impl Cache {
                 page.dirty.store(0, Ordering::Relaxed);
                 state.valid = false;
                 state.invalidate_after_write = false;
+                page.discard_bytes();
+                if size < old {
+                    page.invalidation_generation.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if !state.valid {
+                page.discard_bytes();
             } else if state.valid && size < start + PAGE_SIZE {
                 let tail = (size - start) as usize;
                 page.bytes()
@@ -461,6 +684,9 @@ impl Cache {
             }
         }
         drop(pages);
+        if size < old {
+            trames_memory::backing_invalidated();
+        }
         self.changed(true);
     }
     fn page_locked(pages: &mut BTreeMap<u64, Arc<Page>>, index: u64) -> Arc<Page> {
@@ -469,11 +695,15 @@ impl Cache {
             .or_insert_with(|| {
                 Arc::new(Page {
                     identity: trames_memory::new_backing_identity(),
-                    bytes: OnceLock::new(),
+                    allocation: Default::default(),
+                    source_generation: Default::default(),
+                    invalidation_generation: Default::default(),
+                    owner: Default::default(),
                     owners: Default::default(),
                     dirty: Default::default(),
                     mappings: Default::default(),
                     state: Mutex::default(),
+                    reclaimed_owner: Mutex::default(),
                 })
             })
             .clone()
@@ -549,12 +779,12 @@ impl Cache {
         let read = {
             let mut state = page.state.lock().unwrap();
             if state.valid {
-                return Ok(Read::Ready(page.clone()));
+                return Ok(Read::Ready(page.clone(), Some(page.bytes())));
             }
             if let Some(read) = state.reading.upgrade().filter(|read| !read.wait.ready()) {
                 return Ok(Read::Pending(read));
             }
-            page.owners.reserve_cache()?;
+            let allocation = self.reserve(&page, &file.attr)?;
             // A failed request remains immutable for its original waiters. A
             // later caller may retry the same physical cache page with a new
             // request; old waiters continue to observe the original error.
@@ -568,6 +798,8 @@ impl Cache {
                 count,
                 attr_version: fs.connection.current_attr_version(),
                 page_generation: state.generation,
+                allocation: allocation.clone(),
+                context: trames_memory::CgroupMemoryContext::capture(),
                 wait: Arc::default(),
                 state: Mutex::default(),
             });
@@ -616,6 +848,7 @@ impl Cache {
                         state.invalidate_after_write = true;
                     } else {
                         state.valid = false;
+                        page.discard_bytes();
                     }
                 } else {
                     retired.push(pages.remove(&index).unwrap());
@@ -709,13 +942,35 @@ impl ReadWave {
                 self.file.attr.check()?;
                 let mut page = self.page.state.lock().unwrap();
                 if page.generation != self.page_generation || self.page.dirty() {
-                    // Mapped identities retain their physical page. A stale
-                    // reply cannot replace a newer write or refill a page that
-                    // was invalidated after this accepted read began.
+                    // The original accepted output survives invalidation, but
+                    // cannot replace a newer write or refill the current cache.
                     if !page.valid && !self.page.dirty() {
                         let mut content = [0; PAGE_SIZE as usize];
                         content[..bytes.len()].copy_from_slice(bytes);
-                        state.uncached = Some(Arc::new(SharedPage::new(content)));
+                        let allocation = self.page.allocation.read().unwrap();
+                        let retired = !Arc::ptr_eq(&self.allocation, &allocation);
+                        let unpinned = self
+                            .allocation
+                            .bytes
+                            .get()
+                            .is_none_or(|bytes| Arc::strong_count(bytes) == 1);
+                        state.uncached = Some(if retired && unpinned {
+                            self.allocation.fill(&content)
+                        } else {
+                            // A retained old byte pin is a different physical
+                            // allocation from this accepted reply's copy.
+                            let _scope = self.context.enter();
+                            let charge = trames_memory::CgroupPageCharge::new(
+                                trames_memory::CgroupMemoryKind::File,
+                            )
+                            .map_err(|error| match error {
+                                MemoryError::BackingIo(code) => Errno(code),
+                                _ => Errno(12),
+                            })?;
+                            let bytes = Arc::new(SharedPage::new(content));
+                            charge.bind(&bytes);
+                            bytes
+                        });
                         compatible = true;
                     }
                     return Ok(self.page.clone());
@@ -735,14 +990,7 @@ impl ReadWave {
                     compatible = bytes.len() <= count;
                     content[count..].fill(0);
                 }
-                let mut installed = false;
-                let storage = self.page.bytes.get_or_init(|| {
-                    installed = true;
-                    Arc::new(SharedPage::new(content))
-                });
-                if !installed {
-                    storage.copy_write(0, &content);
-                }
+                state.uncached = Some(self.allocation.fill(&content));
                 page.valid = true;
                 drop(page);
                 if bytes.len() < self.count && !self.file.reference.fs.connection.option(1 << 16) {
@@ -755,6 +1003,21 @@ impl ReadWave {
                 self.file.attr.cache.changed(true);
                 Ok(self.page.clone())
             });
+            if state.uncached.is_none() {
+                if let Ok(page) = &result {
+                    state.uncached = Some(page.bytes());
+                }
+            }
+            if result.is_err() && self.allocation.bytes.get().is_none() {
+                let mut page = self.page.state.lock().unwrap();
+                if page.generation == self.page_generation {
+                    self.allocation.charge.lock().unwrap().take();
+                    page.generation = page.generation.wrapping_add(1);
+                    page.reading = Weak::new();
+                    self.page.discard_bytes();
+                    self.file.attr.cache.changed(true);
+                }
+            }
             let compatible = compatible && result.is_ok();
             state.result = Some(result);
             (state.request.take(), compatible)
@@ -769,6 +1032,19 @@ impl Drop for ReadWave {
         let request = self.state.get_mut().unwrap().request.take();
         drop(request);
         self.wait.finish();
+        // Cancellation can drop the last request while another caller holds
+        // PageState. Never wait for that lock from a resource destructor.
+        if self.allocation.bytes.get().is_none() {
+            if let Ok(mut page) = self.page.state.try_lock() {
+                if page.generation == self.page_generation {
+                    self.allocation.charge.lock().unwrap().take();
+                    page.generation = page.generation.wrapping_add(1);
+                    page.reading = Weak::new();
+                    self.page.discard_bytes();
+                    self.file.attr.cache.changed(true);
+                }
+            }
+        }
     }
 }
 impl File {
@@ -837,6 +1113,11 @@ struct Source {
     read: Mutex<BTreeMap<u32, Read>>,
 }
 impl PageSource for Source {
+    fn generation(&self) -> u64 {
+        self.page
+            .as_ref()
+            .map_or(0, |page| page.source_generation.load(Ordering::Relaxed))
+    }
     fn load(&self) -> std::result::Result<Arc<SharedPage>, MemoryError> {
         let actor = if self.page.is_some() {
             crate::file_actor::current().map_or(0, |(_, tid)| tid)

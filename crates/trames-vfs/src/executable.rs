@@ -99,6 +99,82 @@ pub struct ExecutableFile {
     pub(super) mount: Option<Arc<mounts::MountData>>,
 }
 
+/// One original executable input. The caller retains its ExecutingFile lease;
+/// completed input survives cache reclaim, namespace edits and worker changes.
+pub struct ExecutableRead {
+    file: Arc<ExecutableFile>,
+    length: usize,
+    bytes: Vec<u8>,
+    wait: Option<Arc<trames_memory::PageWait>>,
+    resources: CgroupResourceContext,
+    done: bool,
+}
+impl ExecutableRead {
+    pub fn new(file: Arc<ExecutableFile>) -> Result<Self> {
+        let length = match &file.node.borrow().content {
+            Content::File(data) => data.len(),
+            _ => return Err(Errno(13)),
+        };
+        if length > storage::MAX_EXECUTABLE {
+            return Err(Errno(27));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length as usize)
+            .map_err(|_| Errno(12))?;
+        Ok(Self {
+            file,
+            length: length as usize,
+            bytes,
+            wait: None,
+            resources: CgroupResourceContext::capture(),
+            done: false,
+        })
+    }
+    pub fn wait(&self) -> Option<&Arc<trames_memory::PageWait>> {
+        self.wait.as_ref()
+    }
+    /// None is an owned continuation, never a guest errno or a short exec read.
+    /// Each data step covers at most one cache page, so a pending later page
+    /// cannot discard a prefix hidden inside a legacy Vec-returning helper.
+    pub fn run(&mut self) -> Result<Option<Vec<u8>>> {
+        assert!(!self.done, "completed executable input");
+        if self.wait.as_ref().is_some_and(|wait| !wait.ready()) {
+            return Ok(None);
+        }
+        let _resumed = self.wait.take();
+        let _resources = self.resources.enter();
+        while self.bytes.len() < self.length {
+            let offset = self.bytes.len();
+            let count = (self.length - offset).min(
+                trames_memory::PAGE_SIZE as usize - offset % trames_memory::PAGE_SIZE as usize,
+            );
+            let scope = resource_io::Scope::enter();
+            let result = match &self.file.node.borrow().content {
+                Content::File(data) => data.read_at(offset as u64, count),
+                _ => Err(Errno(13)),
+            };
+            if let Some(pending) = scope.finish() {
+                if let Ok(bytes) = result {
+                    self.bytes.extend(bytes);
+                }
+                self.wait = Some(pending.wait);
+                return Ok(None);
+            }
+            let bytes = result?;
+            if bytes.is_empty() {
+                return Err(Errno(5));
+            }
+            self.bytes.extend(bytes);
+        }
+        self.done = true;
+        if !self.bytes.is_empty() {
+            self.file.notification.path_event(inotify::ACCESS);
+        }
+        Ok(Some(std::mem::take(&mut self.bytes)))
+    }
+}
+
 impl Vfs {
     pub fn executable_file_at(
         &self,
@@ -343,18 +419,21 @@ impl ExecutableFile {
         }
         Ok(Arc::new(ExecutingFile(self.clone(), sources)))
     }
-    pub fn bytes(&self) -> Result<Vec<u8>> {
-        let bytes = match &self.node.borrow().content {
-            Content::File(data) => Vfs::executable_data(data)?,
-            _ => return Err(Errno(13)),
-        };
-        if !bytes.is_empty() {
-            self.notification.path_event(inotify::ACCESS);
+    pub fn bytes(self: &Arc<Self>) -> Result<Vec<u8>> {
+        let mut work = ExecutableRead::new(self.clone())?;
+        let mut wait = host_sync::Wait::default();
+        loop {
+            if let Some(bytes) = work.run()? {
+                return Ok(bytes);
+            }
+            wait.page(work.wait().expect("retained executable wait"))?;
         }
-        Ok(bytes)
     }
 }
 
+#[cfg(test)]
+#[path = "executable_resource_tests.rs"]
+mod resource_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

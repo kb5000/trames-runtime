@@ -148,7 +148,7 @@ impl NativeMemory for Memory {
         if page
             .backing
             .as_ref()
-            .is_some_and(|b| b.shared || !b.private_copy || !b.object.native_resident())
+            .is_some_and(|b| b.shared || !b.private_current() || !b.object.native_resident())
         {
             return Ok(None);
         }
@@ -249,11 +249,11 @@ impl Page {
             && self
                 .backing
                 .as_ref()
-                .is_none_or(|b| !b.shared && b.private_copy)
+                .is_none_or(|b| !b.shared && b.private_current())
     }
     pub(super) fn native_one_shot(&self) -> bool {
         self.backing.as_ref().is_none_or(|b| {
-            (!b.shared && b.private_copy)
+            (!b.shared && b.private_current())
                 || (b.object.native_resident() && (!b.shared || b.object.writable()))
         })
     }
@@ -305,7 +305,7 @@ impl Memory {
         if page
             .backing
             .as_ref()
-            .is_none_or(|b| !b.shared && b.private_copy)
+            .is_none_or(|b| !b.shared && b.private_current())
         {
             return Ok((page.bytes.with_read(offset, len, operation), true));
         }
@@ -315,7 +315,7 @@ impl Memory {
             .is_some_and(|backing| backing.object.charge_reads())
         {
             page.prepare_source(address)?;
-            page.charge.ensure()?;
+            page.access_charge().ensure()?;
         }
         let mut operation = Some(operation);
         let mut result = None;
@@ -378,7 +378,7 @@ impl Memory {
         // enforces live EOF/SIGBUS even after a private copy has been made.
         let page = self.frames[frame].as_mut().expect("checked page");
         if let Some(b) = &mut page.backing {
-            if !b.shared && !b.private_copy {
+            if !b.shared && !b.private_current() {
                 let mut bytes = [0; PAGE_SIZE as usize];
                 b.object
                     .read(0, &mut bytes)
@@ -512,7 +512,7 @@ impl Memory {
         let direct = |page: &Page| {
             page.backing
                 .as_ref()
-                .is_none_or(|b| !b.shared && b.private_copy)
+                .is_none_or(|b| !b.shared && b.private_current())
         };
         let source_direct = self.checked_pages(source, len, Access::Read, direct)?;
         let destination_direct = self.checked_pages(destination, len, Access::Write, direct)?;

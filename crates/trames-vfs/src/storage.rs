@@ -9,6 +9,10 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+mod io_write;
+pub(super) mod projection_caps;
+#[cfg(test)]
+mod resource_tests;
 
 pub const DEFAULT_DISK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_DISK_NODES: usize = 131_072;
@@ -17,7 +21,7 @@ pub const MAX_TRANSFER: usize = 1024 * 1024;
 const MAX_MANIFEST: u64 = 128 * 1024 * 1024;
 // Large Go executables (including the unmodified Docker daemon) exceed 64 MiB.
 // This is an input-buffer bound; mapped guest memory retains its own quota.
-const MAX_EXECUTABLE: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_EXECUTABLE: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageLimits {
@@ -73,6 +77,9 @@ pub struct DiskOptions {
 }
 
 pub(super) fn host_errno(e: io::Error) -> Errno {
+    if let Some(error) = crate::resource_io::host_error(&e) {
+        return error;
+    }
     // These Unix descriptor exhaustion codes are shared by Linux and Darwin.
     // ErrorKind does not classify them, so otherwise they become a misleading EIO.
     #[cfg(unix)]
@@ -117,6 +124,8 @@ pub(super) enum FileData {
     Shared(trames_shared::SharedFile),
     Mapped(Box<mapped::MappedData>),
 }
+mod version;
+pub(super) use version::{DataVersion, Validation};
 pub(super) struct DiskObject {
     pub(super) capabilities: Option<file_caps::FileCaps>,
     pub(super) length: u64,
@@ -197,6 +206,9 @@ impl DiskObject {
     }
     pub(super) fn set_caps(&mut self, caps: file_caps::FileCaps) -> Result<()> {
         let bytes = caps.encode(&UserNamespace::default())?;
+        // Admission precedes the temporary file and the durability barrier.
+        // A suspended metadata request can retry without repeating either.
+        let permit = cgroup::admit_io(bytes.len() as u64, true).map_err(host_errno)?;
         let path = self.backing.path.with_extension("cap");
         let temp = path.with_extension("new");
         let mut options = OpenOptions::new();
@@ -209,7 +221,7 @@ impl DiskObject {
                 .file(false)
                 .map_err(|e| io::Error::from_raw_os_error(e.0 as i32))?
                 .sync_all()?;
-            file.write_all(&bytes)?;
+            io_write::write_all(&mut file, &bytes, permit)?;
             file.sync_all()?;
             fs::rename(&temp, &path)
         })();
@@ -551,6 +563,32 @@ impl FileData {
             }
         }
     }
+    /// An owned request keeps every appended prefix even if a later page waits.
+    /// Legacy errno-only readers still use read_at and do not silently acquire
+    /// a continuation they cannot retain.
+    pub(super) fn read_into(&self, offset: u64, count: usize, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::Plain(data) => data.read_into(offset, count, out),
+            Self::Mapped(data) => data.read_into(offset, count, out),
+            Self::Layer(file) => file.read(|data| data.read_into(offset, count, out)),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.read_into(offset, count, out),
+                _ => Err(Errno(5)),
+            },
+            Self::Shared(file) => {
+                let count = count.min(self.len().saturating_sub(offset) as usize);
+                if count != 0 {
+                    let bytes = file.read_at(offset, count).map_err(host_errno)?;
+                    if out.is_empty() {
+                        *out = bytes;
+                    } else {
+                        out.extend(bytes);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
     pub(super) fn write_transfer(
         &mut self,
         offset: u64,
@@ -581,7 +619,23 @@ impl FileData {
             Self::Mapped(data) => data.write_at(offset, bytes),
             Self::Layer(file) => file.write(|data| data.write_at(offset, bytes)),
             Self::Lower(_) => Err(Errno(30)),
-            Self::Shared(file) => file.write_at(offset, bytes).map_err(host_errno),
+            Self::Shared(file) => crate::resource_io::write_result(file.write_at(offset, bytes)),
+        }
+    }
+    pub(super) fn begin_transaction(
+        &mut self,
+    ) -> Result<
+        std::result::Result<
+            Option<trames_shared::FileTransactionLease>,
+            Arc<dyn trames_shared::ResourceWait>,
+        >,
+    > {
+        match self {
+            Self::Plain(data) => Ok(data.begin_transaction()),
+            Self::Shared(file) => Ok(file.begin_transaction()),
+            Self::Mapped(data) => data.begin_transaction(),
+            Self::Layer(file) => file.write(|data| data.begin_transaction()),
+            Self::Lower(_) => Ok(Ok(None)),
         }
     }
     pub fn truncate(&mut self, length: u64) -> Result<()> {
@@ -593,6 +647,26 @@ impl FileData {
             Self::Shared(file) => file
                 .set_len(usize::try_from(length).map_err(|_| Errno(27))?)
                 .map_err(host_errno),
+        }
+    }
+    /// The accepted resize already completed its original mapped writeback.
+    /// Re-entering a nested provider must not start a second sync wave.
+    pub(super) fn truncate_after_sync(&mut self, length: u64) -> Result<()> {
+        match self {
+            Self::Mapped(data) => data.truncate_after_sync(length),
+            Self::Layer(file) => file.write(|data| data.truncate_after_sync(length)),
+            _ => self.truncate(length),
+        }
+    }
+    pub(super) fn has_allocated_after(&self, length: u64) -> bool {
+        match self {
+            Self::Shared(file) => shared_account::has_allocated_after(file, length),
+            Self::Plain(data) => data.has_allocated_after(length),
+            Self::Mapped(data) => data.has_allocated_after(length),
+            Self::Layer(file) => file
+                .read(|data| Ok(data.has_allocated_after(length)))
+                .unwrap_or(true),
+            _ => false,
         }
     }
     pub fn sync(&self, data_only: bool) -> Result<()> {
@@ -807,6 +881,13 @@ impl DiskStore {
         }))
     }
     fn commit(&self, bytes: &[u8]) -> Result<()> {
+        overlay::projection::prepare()?;
+        // Namespace callers retain/roll back their original metadata on an
+        // admission wait. No temporary manifest exists until credit is ours.
+        let permit = cgroup::admit_io(bytes.len() as u64, true).map_err(host_errno)?;
+        overlay::projection::publish(|| self.commit_admitted(bytes, permit))
+    }
+    fn commit_admitted(&self, bytes: &[u8], permit: Option<cgroup::IoPermit>) -> Result<()> {
         let tmp = self.root.join("manifest.new");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -814,7 +895,7 @@ impl DiskStore {
         options.mode(0o600);
         let mut file = options.open(&tmp).map_err(host_errno)?;
         let before_rename = (|| {
-            file.write_all(bytes).map_err(host_errno)?;
+            io_write::write_all(&mut file, bytes, permit).map_err(host_errno)?;
             file.sync_all().map_err(host_errno)?;
             let generation = self.objects_generation.load(Ordering::Relaxed);
             if self.objects_synced.load(Ordering::Relaxed) < generation {
@@ -873,6 +954,14 @@ impl DiskStore {
         for entry in fs::read_dir(self.root.join("objects")).map_err(host_errno)? {
             let e = entry.map_err(host_errno)?;
             let name = e.file_name().into_string().map_err(|_| Errno(22))?;
+            if projection_caps::temporary_name(&name) {
+                regular(&e.path())?;
+                garbage.push(e.path());
+                if garbage.len() > MAX_DISK_NODES {
+                    return Err(Errno(28));
+                }
+                continue;
+            }
             if name.len() != 20
                 || !matches!(name.as_bytes().get(16..), Some(b".dat" | b".cap" | b".new"))
                 || !name[..16]
@@ -999,7 +1088,8 @@ impl Filesystem {
             return overlay.checkpoint(self);
         }
         let Some(disk) = &self.disk else {
-            return Ok(());
+            overlay::projection::prepare()?;
+            return overlay::projection::publish(|| Ok(()));
         };
         if disk.initializing.load(Ordering::Relaxed) {
             return Ok(());
@@ -1398,11 +1488,8 @@ impl Vfs {
         if !matches!(old.borrow().content, Content::File(_)) {
             return Err(Errno(21));
         }
-        let identical = if let Content::File(data) = &old.borrow().content {
-            data.len() == bytes.len() as u64 && Self::executable_data(data)? == bytes
-        } else {
-            false
-        };
+        let identical = old.logical_size().load(Ordering::Relaxed) == bytes.len() as u64
+            && crate::host_files::read_sync(old.clone())? == bytes;
         if identical {
             if old.borrow().file_metadata().mode != 0o100755 {
                 self.chmod_at(AT_FDCWD, &canonical, 0o755)?;
@@ -1410,66 +1497,80 @@ impl Vfs {
             return Ok(());
         }
         self.check_growth(0, bytes.len() as u64)?;
-        let mut data = self.empty_data()?;
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let end = bytes.len().min(offset + MAX_TRANSFER);
-            let written = data.write_at(offset as u64, &bytes[offset..end])?;
-            if written == 0 {
-                return Err(Errno(5));
+        let (FileData::Plain(data), _) = self.stage_import(&mut bytes)? else {
+            return Err(Errno(5));
+        };
+        let mut wait = host_sync::Wait::default();
+        loop {
+            let mut fs = self.fs.borrow_mut();
+            if fs
+                .paths
+                .get(&canonical.key)
+                .is_none_or(|node| !Arc::ptr_eq(node, &old))
+            {
+                return Err(Errno(116));
             }
-            offset += written;
-        }
-        data.sync(false)?;
-        let mut fs = self.fs.borrow_mut();
-        fs.admit_inode()?;
-        let inode = data.inode().unwrap_or(fs.next_inode);
-        if inode == fs.next_inode {
-            fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
-        }
-        let links = old.borrow().links;
-        let new = Arc::new(Inode::new(Node {
-            identity: 0,
-            record_locks: std::sync::OnceLock::new(),
-            whole_locks: std::sync::OnceLock::new(),
-            notifications: inotify::Marks::default(),
-            path_hint: SharedCell::default(),
-            device: 0xfd01,
-            content: Content::File(data),
-            mode: 0o100755,
-            uid: old.borrow().uid,
-            gid: old.borrow().gid,
-            volatile: false,
-            inode,
-            links,
-            times: [Timestamp::now(); 3],
-            xattrs: BTreeMap::new(),
-            seals: None,
-        }));
-        for n in fs.paths.values_mut() {
-            if Arc::ptr_eq(n, &old) {
-                *n = new.clone();
+            let previous_next = fs.next_inode;
+            let previous_inodes = fs.inodes.len();
+            fs.admit_inode()?;
+            let inode = FileData::Plain(data.clone())
+                .inode()
+                .unwrap_or(fs.next_inode);
+            if inode == fs.next_inode {
+                fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
             }
-        }
-        fs.track_inode(&new)?;
-        old.borrow_mut().links = 0;
-        if let Err(e) = fs.checkpoint() {
+            let links = old.borrow().links;
+            let new = Arc::new(Inode::new(Node {
+                identity: 0,
+                record_locks: std::sync::OnceLock::new(),
+                whole_locks: std::sync::OnceLock::new(),
+                notifications: inotify::Marks::default(),
+                path_hint: SharedCell::default(),
+                device: 0xfd01,
+                content: Content::File(FileData::Plain(data.clone())),
+                mode: 0o100755,
+                uid: old.borrow().uid,
+                gid: old.borrow().gid,
+                volatile: false,
+                inode,
+                links,
+                times: [Timestamp::now(); 3],
+                xattrs: BTreeMap::new(),
+                seals: None,
+            }));
             for n in fs.paths.values_mut() {
-                if Arc::ptr_eq(n, &new) {
-                    *n = old.clone();
+                if Arc::ptr_eq(n, &old) {
+                    *n = new.clone();
                 }
             }
-            fs.inodes.pop();
-            old.borrow_mut().links = links;
-            return Err(e);
+            old.borrow_mut().links = 0;
+            let scope = resource_io::Scope::enter();
+            let result = fs.track_inode(&new).and_then(|_| fs.checkpoint());
+            let pending = scope.finish();
+            if let Err(e) = result {
+                for n in fs.paths.values_mut() {
+                    if Arc::ptr_eq(n, &new) {
+                        *n = old.clone();
+                    }
+                }
+                fs.next_inode = previous_next;
+                fs.inodes.truncate(previous_inodes);
+                old.borrow_mut().links = links;
+                drop(fs);
+                if let Some(pending) = pending {
+                    wait.page(&pending.wait)?;
+                    continue;
+                }
+                return Err(e);
+            }
+            if let Content::File(data) = &mut new.borrow_mut().content {
+                data.orphan(false);
+            }
+            if let Content::File(data) = &mut old.borrow_mut().content {
+                data.orphan(true);
+            }
+            return Ok(());
         }
-        if let Content::File(data) = &mut new.borrow_mut().content {
-            data.orphan(false);
-        }
-        if let Content::File(data) = &mut old.borrow_mut().content {
-            data.orphan(true);
-        }
-        Ok(())
     }
     /// Populate a private, unpublished staging store before creating a runtime.
     /// The caller must discard the whole store on error. This is not a live
@@ -1685,6 +1786,31 @@ impl Vfs {
         Ok(data)
     }
     pub fn checkpoint(&self) -> Result<()> {
+        if self.query.is_none() {
+            let mut filesystems = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for mount in self
+                .mount_resources
+                .borrow()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+            {
+                if seen.insert(mount.fs.identity()) && mount.fs.borrow().overlay.is_some() {
+                    filesystems.push(mount.fs.clone());
+                }
+            }
+            if !filesystems
+                .iter()
+                .any(|filesystem| filesystem.same_data(&self.fs))
+            {
+                filesystems.push(self.fs.clone());
+            }
+            let mut wait = host_sync::Wait::default();
+            for filesystem in filesystems {
+                wait.operation(|| filesystem.borrow().checkpoint())?;
+            }
+            return Ok(());
+        }
         let mut seen = std::collections::BTreeSet::new();
         for mount in self
             .mount_resources
@@ -1700,6 +1826,10 @@ impl Vfs {
     }
     /// Flush every live file, then the namespace and its directory entry.
     pub fn sync(&self) -> Result<()> {
+        if self.query.is_none() {
+            self.host_file_work(FileWork::sync_all(self.path_queries()))?;
+            return Ok(());
+        }
         let mut filesystems = BTreeMap::new();
         filesystems.insert(self.fs.identity(), self.fs.clone());
         for mount in self
@@ -1738,6 +1868,19 @@ impl Vfs {
         filesystems.into_values().map(FilesystemSync::new).collect()
     }
     pub fn sync_file_range(&self, fd: u32, offset: u64, length: u64, flags: u32) -> Result<()> {
+        if self.query.is_none() {
+            let file = self.shared_files().lookup(fd).ok_or(Errno(9))??;
+            self.host_file_work(FileWork::from_vfs(
+                self,
+                file.filesystem_target(),
+                FileCommand::SyncRange {
+                    offset,
+                    length,
+                    flags,
+                },
+            ))?;
+            return Ok(());
+        }
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
         if open.flags.get() & O_PATH != 0 {
@@ -1772,6 +1915,15 @@ impl Vfs {
         Ok(())
     }
     pub fn sync_filesystem_fd(&self, fd: u32) -> Result<()> {
+        if self.query.is_none() {
+            let file = self.shared_files().lookup(fd).ok_or(Errno(9))??;
+            self.host_file_work(FileWork::from_vfs(
+                self,
+                file.filesystem_target(),
+                FileCommand::SyncFilesystem,
+            ))?;
+            return Ok(());
+        }
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
         if open.flags.get() & O_PATH != 0 {
@@ -1782,7 +1934,20 @@ impl Vfs {
         Self::sync_filesystem(&filesystem)
     }
     pub fn sync_fd(&self, fd: u32, data_only: bool) -> Result<()> {
+        if self.query.is_none() {
+            let file = self.shared_files().lookup(fd).ok_or(Errno(9))??;
+            self.host_file_work(FileWork::from_vfs(
+                self,
+                file.filesystem_target(),
+                FileCommand::Sync { data_only },
+            ))?;
+            return Ok(());
+        }
         self.sync_description(&self.descriptor(fd)?, data_only)
+    }
+    pub(super) fn host_file_work(&self, work: FileWork) -> Result<FileValue> {
+        let mut control = self.host_files_context();
+        host_sync::Wait::default().file(&mut control, work.run())
     }
     pub(super) fn sync_description(&self, descriptor: &Descriptor, data_only: bool) -> Result<()> {
         let o = descriptor.open.borrow();
@@ -1858,67 +2023,52 @@ impl Vfs {
         reader: &mut impl Read,
         executable: bool,
     ) -> Result<u64> {
-        self.import_plan(path)?;
-        let (data, total) = self.stage_import(reader)?;
-        self.import_data(path, data, executable)?;
-        Ok(total)
+        self.import_reader_sync(path, reader, false, executable)
+    }
+    fn import_reader_sync(
+        &self,
+        path: &[u8],
+        reader: &mut impl Read,
+        replace: bool,
+        executable: bool,
+    ) -> Result<u64> {
+        let mut work = self.host_import(path, reader, replace, executable);
+        let mut wait = host_sync::Wait::default();
+        loop {
+            if let Some(result) = work.run()? {
+                return Ok(result.bytes);
+            }
+            wait.page(work.wait().expect("retained import wait"))?;
+        }
     }
     /// An unpublished object owns its quota and cleanup through cancellation.
     pub(super) fn stage_import(&self, reader: &mut impl Read) -> Result<(FileData, u64)> {
-        let mut data = self.empty_data()?;
-        let mut total = 0u64;
-        let mut buffer = [0; 65536];
-        loop {
-            let n = reader.read(&mut buffer).map_err(host_errno)?;
-            if n == 0 {
-                break;
-            }
-            let end = total.checked_add(n as u64).ok_or(Errno(27))?;
-            let mut at = 0;
-            while at < n {
-                let written = data.write_at(total + at as u64, &buffer[at..n])?;
-                if written == 0 {
-                    return Err(Errno(5));
-                }
-                at += written;
-            }
-            total = end;
+        let mut stage = crate::import_work::StagedImport::new(reader);
+        let mut wait = host_sync::Wait::default();
+        while !stage.run(self, &|| false)? {
+            wait.page(stage.wait().expect("original import staging wait"))?;
         }
-        data.sync(false)?;
-        Ok((data, total))
+        Ok((stage.file(), stage.bytes()))
     }
+
     /// Explicit host import replacement. Stage a complete inode before one
     /// namespace rename; cancellation/short reads never truncate the old file.
     pub fn import_reader_replace(&mut self, path: &[u8], reader: &mut impl Read) -> Result<u64> {
-        match self.import_plan(path) {
-            Ok(_) => return self.import_reader(path, reader, false),
-            Err(Errno(17)) => {}
-            Err(error) => return Err(error),
-        }
-        self.host_edit(path)?.replace_unchecked(self, reader)
+        self.import_reader_sync(path, reader, true, false)
     }
     /// Export through an authorized platform writer; no guest-to-host path mapping.
     pub fn export_writer(&self, path: &[u8], writer: &mut impl Write) -> Result<u64> {
-        let canonical = self.resolve(AT_FDCWD, path)?;
-        let node = self.node(&canonical)?;
-        let n = node.borrow();
-        if !self.allowed_on(&n, 4, &canonical) {
-            return Err(Errno(13));
-        }
-        let Content::File(data) = &n.content else {
-            return Err(Errno(21));
-        };
-        let mut offset = 0;
-        while offset < data.len() {
-            let bytes = data.read_at(offset, 65536)?;
-            if bytes.is_empty() {
-                return Err(Errno(5));
+        let mut work = self.host_export(path)?.into_work(writer);
+        let mut wait = host_sync::Wait::default();
+        loop {
+            let admission = wait.layout(&work.layout())?;
+            let result = work.run(&admission, || false);
+            drop(admission);
+            if let Some(bytes) = result? {
+                return Ok(bytes);
             }
-            writer.write_all(&bytes).map_err(host_errno)?;
-            offset += bytes.len() as u64;
+            wait.page(work.wait().expect("retained export wait"))?;
         }
-        writer.flush().map_err(host_errno)?;
-        Ok(offset)
     }
     pub fn storage_stat(&self) -> [u8; 120] {
         let c = self.capacity();
@@ -1938,23 +2088,6 @@ impl Vfs {
         }
         out
     }
-    pub(super) fn executable_data(data: &FileData) -> Result<Vec<u8>> {
-        if data.len() > MAX_EXECUTABLE {
-            return Err(Errno(27));
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve(data.len() as usize)
-            .map_err(|_| Errno(12))?;
-        while (bytes.len() as u64) < data.len() {
-            let part = data.read_at(bytes.len() as u64, MAX_TRANSFER)?;
-            if part.is_empty() {
-                return Err(Errno(5));
-            }
-            bytes.extend(part);
-        }
-        Ok(bytes)
-    }
 }
 
 /// The files accepted by one filesystem sync. Native work keeps this snapshot,
@@ -1963,6 +2096,10 @@ pub(super) struct FilesystemSync {
     filesystem: FsHandle,
     nodes: Vec<NodeRef>,
     active: bool,
+    index: usize,
+    current: Option<mapped::DataSync>,
+    checkpointed: bool,
+    done: bool,
 }
 impl FilesystemSync {
     pub(super) fn new(filesystem: FsHandle) -> Self {
@@ -1977,6 +2114,10 @@ impl FilesystemSync {
             filesystem,
             nodes,
             active: false,
+            index: 0,
+            current: None,
+            checkpointed: false,
+            done: false,
         }
     }
     pub(super) fn queued(mut self) -> Self {
@@ -1986,17 +2127,37 @@ impl FilesystemSync {
         self.active = true;
         self
     }
-    pub(super) fn run(&self) -> Result<()> {
-        for node in &self.nodes {
-            if let Content::File(data) = &node.borrow().content {
-                data.sync(false)?;
+    pub(super) fn run(&mut self) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        let _writeback = trames_shared::FileTransactionScope::writeback();
+        while let Some(node) = self.nodes.get(self.index) {
+            if self.current.is_none() {
+                if let Content::File(data) = &node.borrow().content {
+                    self.current = Some(mapped::DataSync::capture(data, false)?);
+                }
             }
+            if let Some(current) = &mut self.current {
+                let result = {
+                    let _node = node.borrow();
+                    current.run()
+                };
+                current.notify();
+                result?;
+            }
+            self.current = None;
+            self.index += 1;
         }
         let fs = self.filesystem.borrow();
-        fs.checkpoint()?;
+        if !self.checkpointed {
+            fs.checkpoint()?;
+            self.checkpointed = true;
+        }
         if let Some(disk) = &fs.disk {
             disk.sync_directory()?;
         }
+        self.done = true;
         Ok(())
     }
 }

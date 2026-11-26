@@ -619,7 +619,11 @@ pub(crate) fn execute<C: Cpu>(
                     syscalls += 1;
                     break 'entry None;
                 }
-                if let Some(value) = snapshot.direct.invoke_creation(number, args, &mut *memory) {
+                if let Some(value) =
+                    snapshot
+                        .direct
+                        .invoke_creation_for(number, args, &mut *memory, work.pid)
+                {
                     if let Some(began) = began {
                         syscall_time += began.elapsed();
                     }

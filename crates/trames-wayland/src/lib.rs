@@ -13,6 +13,7 @@ mod wsi;
 pub use selection::HostClipboard;
 pub use wsi::WsiConnection;
 mod scene;
+mod shm;
 pub use gpu::{GpuBudget, GpuImage, GpuPermit};
 pub use trames_graphics::NativeHandle;
 mod text;
@@ -47,6 +48,7 @@ pub struct Compositor {
     display: Display<State>,
     state: State,
     clients: std::collections::BTreeMap<u64, wayland_server::Client>,
+    client_sockets: std::collections::BTreeMap<u64, trames_shared::PeerClose>,
     exports: Vec<(u64, trames_shared::ExportLease)>,
     callback_timeout: Option<std::time::Duration>,
 }
@@ -63,6 +65,7 @@ struct State {
     xwayland: xwayland::Xwayland,
     wsi: wsi::Grants,
     surfaces: std::collections::BTreeMap<u64, scene::Surface>,
+    shm: shm::Imports,
 }
 impl Default for State {
     fn default() -> Self {
@@ -79,6 +82,7 @@ impl Default for State {
             xwayland: Default::default(),
             wsi: Default::default(),
             surfaces: Default::default(),
+            shm: Default::default(),
         }
     }
 }
@@ -92,6 +96,7 @@ impl Compositor {
             display,
             state,
             clients: Default::default(),
+            client_sockets: Default::default(),
             exports: Vec::new(),
             callback_timeout: None,
         })
@@ -209,11 +214,14 @@ impl Compositor {
             .min()
     }
     pub fn connect(&mut self, stream: UnixStream, identity: ClientIdentity) -> io::Result<()> {
+        let monitor = stream.try_clone()?;
         let client = self
             .display
             .handle()
             .insert_client(stream, Arc::new(identity))?;
         self.clients.insert(identity.connection, client);
+        self.client_sockets
+            .insert(identity.connection, monitor.into());
         Ok(())
     }
     pub(crate) fn retain_exports(
@@ -228,13 +236,37 @@ impl Compositor {
     }
     /// Nonblocking protocol progress. Native event-loop integration owns polling.
     pub fn dispatch(&mut self) -> io::Result<usize> {
+        let mut count = 0;
+        if !self.state.shm.is_empty() {
+            self.state.shm.reset_signal();
+            self.cancel_closed_shm();
+            let handle = self.display.handle().backend_handle();
+            for client in self.state.shm.progress(&handle) {
+                // This client's transport may already own bytes and SCM_RIGHTS
+                // beyond the suspended request, with no further socket event.
+                count += self
+                    .display
+                    .backend()
+                    .dispatch_single_client(&mut self.state, client)
+                    .unwrap_or(0);
+            }
+        }
         self.state.pump_xwm();
-        let count = self.display.dispatch_clients(&mut self.state)?;
+        count += self.display.dispatch_clients(&mut self.state)?;
+        // A request can first suspend during this dispatch. Arm/drain its
+        // close-only monitor before sleeping; registration failure retires only
+        // that original client through the same existing cleanup path.
+        if !self.state.shm.is_empty() {
+            self.cancel_closed_shm();
+        }
         self.callback_timeout = self.flush_callbacks();
         self.display.flush_clients()?;
         let handle = self.display.handle().backend_handle();
         self.clients
             .retain(|_, client| handle.get_client_data(client.id()).is_ok());
+        self.client_sockets
+            .retain(|connection, _| self.clients.contains_key(connection));
+        self.state.shm.retain_clients(&handle);
         self.exports.retain(|(connection, lease)| {
             self.clients.contains_key(connection) && !lease.claimed()
         });

@@ -46,14 +46,14 @@ impl Cache {
         for (index, page) in pages {
             let mut state = page.state.lock().unwrap();
             if state.valid {
-                reads.push(Read::Ready(page.clone()));
+                reads.push(Read::Ready(page.clone(), Some(page.bytes())));
                 continue;
             }
             if let Some(read) = state.reading.upgrade().filter(|read| !read.wait.ready()) {
                 reads.push(Read::Pending(read));
                 continue;
             }
-            page.owners.reserve_cache()?;
+            let allocation = self.reserve(&page, &file.attr)?;
             let read = Arc::new_cyclic(|this| ReadWave {
                 this: this.clone(),
                 executor: crate::file_actor::sync_executor().or_else(|| self.executor()),
@@ -64,6 +64,8 @@ impl Cache {
                 count: (PAGE_SIZE.min(i64::MAX as u64 - index * PAGE_SIZE)) as usize,
                 attr_version: file.reference.fs.connection.current_attr_version(),
                 page_generation: state.generation,
+                allocation: allocation.clone(),
+                context: trames_memory::CgroupMemoryContext::capture(),
                 wait: Arc::default(),
                 state: Mutex::default(),
             });

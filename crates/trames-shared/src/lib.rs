@@ -23,10 +23,17 @@ mod logical_size;
 mod syscall_dispatch;
 pub use custody::{Admission, Custody, CustodyRead, CustodyWrite, OwnedRead, OwnedWrite};
 pub use logical_size::{LogicalSize, SizeCycle};
+mod file_transaction;
 mod readiness;
-pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness, ReadinessDriver};
+pub use file_transaction::{FileTransaction, FileTransactionLease, FileTransactionScope};
+pub use readiness::{
+    HostSource, IoSignal, IoSubscription, IoWake, Readiness, ReadinessDriver, ResourcePending,
+    ResourceWait,
+};
 mod host_wait;
 pub use host_wait::{HostWait, HostWake};
+mod peer_close;
+pub use peer_close::PeerClose;
 mod host_events;
 pub use host_events::{HostEvents, HostFd, HostSubscription};
 mod pipe;
@@ -45,6 +52,7 @@ struct Transfer {
     _file: SharedFile,
     claimed: AtomicBool,
     readiness: Arc<Readiness>,
+    context: Option<Arc<dyn SharedFileContext>>,
 }
 /// Keeps the original inode, logical EOF and budget through an in-flight FD.
 /// The receiving service retains this until import acknowledgement or disconnect.
@@ -152,6 +160,44 @@ struct Inner {
     resize: Mutex<()>,
     mappings: Mutex<BTreeMap<(usize, usize), Weak<Region>>>,
     attachment: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+    accounting: OnceLock<Arc<dyn SharedFileAccounting>>,
+    default_context: OnceLock<Arc<dyn SharedFileContext>>,
+    transaction: OnceLock<Arc<FileTransaction>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SharedFileAccess {
+    Allocate,
+    Write,
+    Map,
+}
+/// Resource accounting follows the original shared inode across native FD
+/// transfer. Implementations contain no guest pointers or borrowed task views.
+pub trait SharedFileAccounting: std::any::Any + Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn reserve(
+        &self,
+        offset: usize,
+        length: usize,
+        access: SharedFileAccess,
+    ) -> io::Result<Box<dyn SharedFileCharge>>;
+    fn truncate(&self, length: usize);
+    fn context(&self) -> Option<Arc<dyn SharedFileContext>> {
+        None
+    }
+    fn write_chunk(&self, _offset: usize, length: usize) -> usize {
+        length
+    }
+}
+pub trait SharedFileContext: Send + Sync {
+    /// Enter only when the native consumer has no explicit task/resource actor.
+    /// The returned thread-local guard is never sent to another executor.
+    fn enter(&self) -> Box<dyn std::any::Any>;
+}
+pub trait SharedFileCharge: Send {
+    /// New resource state uses the file's existing allocation transaction.
+    /// Existing byte operations retain their original concurrent execution.
+    fn changed(&self) -> bool;
+    fn commit(self: Box<Self>, used: usize) -> Arc<dyn Send + Sync>;
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -160,7 +206,7 @@ impl Drop for Inner {
 }
 /// Cloneable inode capability, not a guest descriptor or a borrowed byte slice.
 #[derive(Clone)]
-pub struct SharedFile(Arc<Inner>);
+pub struct SharedFile(Arc<Inner>, Option<Arc<dyn SharedFileContext>>);
 impl std::fmt::Debug for SharedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedFile")
@@ -196,6 +242,24 @@ fn anonymous_file() -> io::Result<File> {
 }
 
 impl SharedFile {
+    /// Called under the original VFS inode admission; native consumers retain
+    /// their existing byte/protocol synchronization responsibility.
+    pub fn begin_transaction(&self) -> Result<Option<FileTransactionLease>, Arc<dyn ResourceWait>> {
+        let _charges = self.0.charged.lock().unwrap();
+        self.0.transaction.get_or_init(Arc::default).try_acquire()
+    }
+    pub fn transaction_available(&self) -> bool {
+        self.0
+            .transaction
+            .get()
+            .is_none_or(|transaction| transaction.available())
+    }
+    fn check_transaction(&self) -> io::Result<()> {
+        if let Some(transaction) = self.0.transaction.get() {
+            transaction.check()?;
+        }
+        Ok(())
+    }
     pub fn anonymous() -> io::Result<Self> {
         Self::anonymous_in(SharedBudget::default())
     }
@@ -223,10 +287,14 @@ impl SharedFile {
                     }
                 }
                 drop(registry);
-                if let Some(lease) = acknowledged {
+                if let Some(lease) = &acknowledged {
                     lease.readiness.notify_locked();
                 }
-                return Ok(Self(owner));
+                let context = acknowledged
+                    .as_ref()
+                    .and_then(|lease| lease.context.clone())
+                    .or_else(|| owner.default_context.get().cloned());
+                return Ok(Self(owner, context));
             }
         }
         registry.retain(|_, entry| entry.owner.strong_count() != 0);
@@ -246,6 +314,9 @@ impl SharedFile {
             resize: Mutex::default(),
             mappings: Mutex::default(),
             attachment: OnceLock::new(),
+            accounting: OnceLock::new(),
+            default_context: OnceLock::new(),
+            transaction: OnceLock::new(),
         });
         registry.insert(
             key,
@@ -254,7 +325,7 @@ impl SharedFile {
                 transfers: VecDeque::new(),
             },
         );
-        Ok(Self(owner))
+        Ok(Self(owner, None))
     }
     /// Import an FD delivered by the native bridge. Known inodes recover their
     /// original logical-size/lifetime capability instead of inventing a copy.
@@ -269,12 +340,18 @@ impl SharedFile {
         self.0.file.as_fd().try_clone_to_owned()
     }
     pub fn export(&self) -> io::Result<(OwnedFd, ExportLease)> {
+        let _context = self.context_scope();
         // The receiver imports this identity with its lease and recovers all windows.
         let fd = self.0.file.as_fd().try_clone_to_owned()?;
         let lease = Arc::new(Transfer {
             _file: self.clone(),
             claimed: AtomicBool::new(false),
             readiness: Arc::default(),
+            context: self
+                .0
+                .accounting
+                .get()
+                .and_then(|accounting| accounting.context()),
         });
         let mut registry = registry().lock().map_err(lock_error)?;
         let entry = registry.get_mut(&self.key()).ok_or_else(invalid)?;
@@ -295,6 +372,26 @@ impl SharedFile {
     }
     pub fn attachment<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.0.attachment.get()?.downcast_ref()
+    }
+    pub fn set_accounting(&self, accounting: Arc<dyn SharedFileAccounting>) -> io::Result<()> {
+        let context = accounting.context();
+        self.0
+            .accounting
+            .set(accounting)
+            .map_err(|_| io::Error::from(io::ErrorKind::AlreadyExists))?;
+        if let Some(context) = context {
+            let _ = self.0.default_context.set(context);
+        }
+        Ok(())
+    }
+    pub fn accounting<T: SharedFileAccounting>(&self) -> Option<&T> {
+        self.0.accounting.get()?.as_any().downcast_ref()
+    }
+    fn context_scope(&self) -> Option<Box<dyn std::any::Any>> {
+        self.1
+            .as_ref()
+            .or_else(|| self.0.default_context.get())
+            .map(|context| context.enter())
     }
     pub fn len(&self) -> usize {
         self.0.logical.load(Ordering::Acquire)
@@ -327,34 +424,62 @@ impl SharedFile {
     /// Charge only ranges that are mapped, written or explicitly allocated.
     /// Merely extending a sparse memfd does not instantiate its holes.
     pub fn reserve_range(&self, offset: usize, length: usize) -> io::Result<()> {
-        self.with_charge(offset, length, || Ok(()))
+        self.with_charge(offset, length, SharedFileAccess::Allocate, || Ok(()))
     }
     fn with_charge<T>(
         &self,
         offset: usize,
         length: usize,
+        access: SharedFileAccess,
         operation: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
+        self.with_charge_and_pin(offset, length, access, |_| length, operation)
+            .map(|(value, _pin)| value)
+    }
+    fn with_charge_and_pin<T>(
+        &self,
+        offset: usize,
+        length: usize,
+        access: SharedFileAccess,
+        used: impl FnOnce(&T) -> usize,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<(T, Option<Arc<dyn Send + Sync>>)> {
+        let _context = self.context_scope();
         let end = offset
             .checked_add(length)
             .filter(|n| *n <= MAX_SHARED_LENGTH + 1)
             .ok_or_else(invalid)?;
         if length == 0 {
-            return operation();
+            return operation().map(|value| (value, None));
         }
         let page = host_page();
         let range = (offset & !(page - 1))..round(end, page)?;
         let mut charges = self.0.charged.lock().map_err(lock_error)?;
+        if access != SharedFileAccess::Map {
+            self.check_transaction()?;
+        }
+        let accounting = self
+            .0
+            .accounting
+            .get()
+            .map(|accounting| accounting.reserve(offset, length, access))
+            .transpose()?;
         let Some((extent, extra)) = charges.extension(range) else {
-            drop(charges);
-            return operation();
+            if accounting.as_ref().is_none_or(|charge| !charge.changed()) {
+                drop(charges);
+            }
+            return operation().map(|value| {
+                let count = used(&value);
+                (value, accounting.map(|charge| charge.commit(count)))
+            });
         };
         self.0.budget.reserve(extra)?;
         match operation() {
             Ok(value) => {
                 charges.insert(extent);
                 self.0.allocated.fetch_add(extra, Ordering::Release);
-                Ok(value)
+                let count = used(&value);
+                Ok((value, accounting.map(|charge| charge.commit(count))))
             }
             Err(error) => {
                 self.0.budget.release(extra);
@@ -363,9 +488,16 @@ impl SharedFile {
         }
     }
     pub fn set_len(&self, length: usize) -> io::Result<()> {
+        let _context = self.context_scope();
         if !self.0.owned || length > MAX_SHARED_LENGTH {
             return Err(invalid());
         }
+        // Preserve the existing charged -> resize lock order for allocation
+        // changes. Never hold an accounting callback lock across host IO.
+        let _allocation = (self.0.accounting.get().is_some() || self.0.transaction.get().is_some())
+            .then(|| self.0.charged.lock().map_err(lock_error))
+            .transpose()?;
+        self.check_transaction()?;
         let _resize = self.0.resize.lock().map_err(lock_error)?;
         self.resize_locked(length)
     }
@@ -383,6 +515,11 @@ impl SharedFile {
             }
         }
         self.publish_len(length);
+        if length <= old {
+            if let Some(accounting) = self.0.accounting.get() {
+                accounting.truncate(length);
+            }
+        }
         Ok(())
     }
     // Caller holds the resize lock. A failed extending write may leave spare
@@ -485,6 +622,7 @@ impl SharedFile {
         Ok(bytes)
     }
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+        let _context = self.context_scope();
         let offset = usize::try_from(offset).map_err(|_| invalid())?;
         let end = offset.checked_add(bytes.len()).ok_or_else(invalid)?;
         if bytes.is_empty() {
@@ -493,7 +631,13 @@ impl SharedFile {
         if end > MAX_SHARED_LENGTH {
             return Err(invalid());
         }
-        if !self.0.owned || end <= WINDOW {
+        let chunk = |offset, length| {
+            self.0
+                .accounting
+                .get()
+                .map_or(length, |accounting| accounting.write_chunk(offset, length))
+        };
+        if (!self.0.owned || end <= WINDOW) && chunk(offset, bytes.len()) >= bytes.len() {
             return self.write_part(offset, bytes.len(), || {
                 self.0.file.write_at(bytes, offset as u64)
             });
@@ -503,12 +647,19 @@ impl SharedFile {
         let mut done = 0;
         while done < bytes.len() {
             let at = offset + done;
-            let local = at % WINDOW;
-            let n = (bytes.len() - done).min(WINDOW - local);
+            let local = if self.0.owned { at % WINDOW } else { at };
+            let remaining = bytes.len() - done;
+            let n = remaining
+                .min(if self.0.owned {
+                    WINDOW - local
+                } else {
+                    remaining
+                })
+                .min(chunk(at, remaining).max(1));
             let part = &bytes[done..done + n];
             let result = self.write_part(at, n, || {
-                if at < WINDOW {
-                    self.0.file.write_at(part, local as u64)
+                if !self.0.owned || at < WINDOW {
+                    self.0.file.write_at(part, at as u64)
                 } else {
                     let file = self.0.windows.get(at - local, true)?.unwrap();
                     file.write_at(part, local as u64)
@@ -517,6 +668,9 @@ impl SharedFile {
             match result {
                 Ok(written) if written == n => done += written,
                 Ok(written) => return Ok(done + written),
+                Err(error) if ResourcePending::from_io(&error).is_some() => {
+                    return Err(ResourcePending::add_progress(error, done));
+                }
                 Err(_) if done != 0 => return Ok(done),
                 Err(error) => return Err(error),
             }
@@ -529,24 +683,31 @@ impl SharedFile {
         length: usize,
         write: impl FnOnce() -> io::Result<usize>,
     ) -> io::Result<usize> {
-        self.with_charge(offset, length, || {
-            let end = offset + length;
-            if end > self.len() {
-                let _resize = self.0.resize.lock().map_err(lock_error)?;
+        self.with_charge_and_pin(
+            offset,
+            length,
+            SharedFileAccess::Write,
+            |written| *written,
+            || {
+                let end = offset + length;
                 if end > self.len() {
-                    if !self.0.owned {
-                        return Err(invalid());
+                    let _resize = self.0.resize.lock().map_err(lock_error)?;
+                    if end > self.len() {
+                        if !self.0.owned {
+                            return Err(invalid());
+                        }
+                        self.ensure_capacity(end)?;
+                        let written = write()?;
+                        if written != 0 && offset + written > self.len() {
+                            self.publish_len(offset + written);
+                        }
+                        return Ok(written);
                     }
-                    self.ensure_capacity(end)?;
-                    let written = write()?;
-                    if written != 0 && offset + written > self.len() {
-                        self.publish_len(offset + written);
-                    }
-                    return Ok(written);
                 }
-            }
-            write()
-        })
+                write()
+            },
+        )
+        .map(|(written, _pin)| written)
     }
     /// Map retained physical bytes. Callers separately enforce logical EOF; this
     /// permits page-contained guest mappings and safe retained views at truncate.
@@ -559,24 +720,32 @@ impl SharedFile {
         let mapped_len = round(end - start, MAP_BLOCK)?.min(self.capacity() - start);
         let mut mappings = self.0.mappings.lock().map_err(lock_error)?;
         let key = (start, mapped_len);
-        let region = match mappings.get(&key).and_then(Weak::upgrade) {
-            Some(region) => {
-                self.reserve_range(offset, length)?;
-                region
-            }
+        let (region, accounting) = match mappings.get(&key).and_then(Weak::upgrade) {
+            Some(region) => self.with_charge_and_pin(
+                offset,
+                length,
+                SharedFileAccess::Map,
+                |_| length,
+                || Ok(region),
+            )?,
             None => {
-                let region = Arc::new(
-                    self.with_charge(offset, length, || self.map_region(start, mapped_len))?,
-                );
+                let (region, accounting) = self.with_charge_and_pin(
+                    offset,
+                    length,
+                    SharedFileAccess::Map,
+                    |_| length,
+                    || self.map_region(start, mapped_len).map(Arc::new),
+                )?;
                 mappings.retain(|_, p| p.strong_count() != 0);
                 mappings.insert(key, Arc::downgrade(&region));
-                region
+                (region, accounting)
             }
         };
         Ok(Mapping {
             region,
             offset: offset - start,
             length,
+            _accounting: accounting,
         })
     }
 }
@@ -609,6 +778,7 @@ pub struct Mapping {
     region: Arc<Region>,
     offset: usize,
     length: usize,
+    _accounting: Option<Arc<dyn Send + Sync>>,
 }
 impl Mapping {
     pub fn len(&self) -> usize {
@@ -667,6 +837,73 @@ impl Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_wait_keeps_committed_write_prefix_instead_of_returning_a_short_write() {
+        struct Wait {
+            ready: AtomicBool,
+            changed: Arc<Readiness>,
+        }
+        impl ResourceWait for Wait {
+            fn ready(&self) -> bool {
+                self.ready.load(Ordering::Relaxed)
+            }
+            fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
+                vec![self.changed.subscribe(signal)]
+            }
+        }
+        struct Account(Arc<Wait>);
+        struct Loan;
+        impl SharedFileCharge for Loan {
+            fn changed(&self) -> bool {
+                true
+            }
+            fn commit(self: Box<Self>, _: usize) -> Arc<dyn Send + Sync> {
+                Arc::new(())
+            }
+        }
+        impl SharedFileAccounting for Account {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn reserve(
+                &self,
+                offset: usize,
+                _: usize,
+                _: SharedFileAccess,
+            ) -> io::Result<Box<dyn SharedFileCharge>> {
+                if offset != 0 && !self.0.ready() {
+                    Err(ResourcePending::io_error(self.0.clone()))
+                } else {
+                    Ok(Box::new(Loan))
+                }
+            }
+            fn truncate(&self, _: usize) {}
+            fn write_chunk(&self, _: usize, _: usize) -> usize {
+                1
+            }
+        }
+        let wait = Arc::new(Wait {
+            ready: AtomicBool::new(false),
+            changed: Arc::default(),
+        });
+        let file = SharedFile::anonymous().unwrap();
+        file.set_accounting(Arc::new(Account(wait.clone())))
+            .unwrap();
+        let error = file.write_at(0, b"abc").unwrap_err();
+        let pending = ResourcePending::detail(&error).unwrap();
+        assert_eq!(pending.progress, 1);
+        assert!(!pending.wait.ready());
+        assert_eq!(file.read_at(0, 3).unwrap(), b"a");
+        wait.ready.store(true, Ordering::Relaxed);
+        wait.changed.notify_atomic();
+        assert_eq!(
+            file.write_at(pending.progress as u64, &b"abc"[pending.progress..])
+                .unwrap(),
+            2
+        );
+        assert_eq!(file.read_at(0, 3).unwrap(), b"abc");
+    }
     #[test]
     fn export_acknowledgement_notifies_after_releasing_the_shared_inode_registry() {
         struct Target {
@@ -858,7 +1095,9 @@ mod tests {
         assert_eq!(file.allocated(), 6 * page);
         assert!(file.reserve_range(0, 8 * page).is_err());
         assert!(file
-            .with_charge(0, page, || Err::<(), _>(invalid()))
+            .with_charge(0, page, SharedFileAccess::Allocate, || Err::<(), _>(
+                invalid()
+            ))
             .is_err());
         assert_eq!(budget.available(), page);
         file.reserve_range(0, page).unwrap();

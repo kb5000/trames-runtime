@@ -165,6 +165,7 @@ impl Import {
         direct: &DirectSyscalls,
         context: &Context,
         memory: &mut impl CpuMemory,
+        pid: u32,
     ) -> Result<Option<Arc<PageWait>>, Errno> {
         if self.raw.is_none() {
             let reader = file_input::Reader::new(memory, &self.bytes);
@@ -185,12 +186,15 @@ impl Import {
             self.reserved = true;
         }
         if self.accepted.is_none() {
-            self.accepted = Some(direct.bind_iocb(self.address, self.raw.unwrap())?);
+            self.accepted = Some(direct.bind_iocb(self.address, self.raw.unwrap(), pid)?);
             self.key.capture(
                 self.address.checked_add(8).ok_or(Errno(14))?,
                 &0u32.to_le_bytes(),
             );
         }
+        // The IOCB already owns its file and origin. Payload/key faults may
+        // resume on a different worker after the source task has migrated.
+        let _resources = self.accepted.as_ref().unwrap().resources.enter();
         match self.key.progress(memory) {
             Ok(()) => {}
             Err(trames_memory::MemoryError::Pending(fault)) => return Ok(Some(fault.wait)),
@@ -274,6 +278,7 @@ impl Submit {
         direct: &DirectSyscalls,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
+        pid: u32,
         exiting: bool,
     ) -> Next {
         if let Some(result) = self.done {
@@ -319,7 +324,7 @@ impl Submit {
             .current
             .as_mut()
             .unwrap()
-            .progress(direct, &self.context, memory)
+            .progress(direct, &self.context, memory, pid)
         {
             Ok(Some(wait)) => {
                 if exiting {

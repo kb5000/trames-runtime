@@ -7,7 +7,7 @@ pub(super) struct Fsync {
     inner: Mutex<Inner>,
     executor: Weak<dyn FileExecutor>,
     layouts: Weak<crate::FileLayouts>,
-    actor: Option<trames_vfs::FileActorSnapshot>,
+    actor: Option<Arc<trames_vfs::FileActorSnapshot>>,
     signal: std::sync::OnceLock<Arc<IoSignal>>,
     me: Weak<Self>,
 }
@@ -19,7 +19,7 @@ struct Inner {
 struct Task {
     work: Option<trames_vfs::FileWork>,
     result: Option<Arc<FileResult>>,
-    actor: Option<trames_vfs::FileActorSnapshot>,
+    actor: Option<Arc<trames_vfs::FileActorSnapshot>>,
     layout: bool,
 }
 impl Drop for Task {
@@ -64,6 +64,7 @@ pub(super) fn start(
     let Work::Disk(work) = work else {
         unreachable!("only files accept asynchronous fsync");
     };
+    let actor = request.actor.clone();
     let pending = Arc::new_cyclic(|me| Fsync {
         context: context.clone(),
         inner: Mutex::new(Inner {
@@ -73,7 +74,7 @@ pub(super) fn start(
         }),
         executor: Arc::downgrade(executor),
         layouts: Arc::downgrade(layouts),
-        actor: trames_vfs::FileActorScope::frozen(),
+        actor,
         signal: Default::default(),
         me: me.clone(),
     });

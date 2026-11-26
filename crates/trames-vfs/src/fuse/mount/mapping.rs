@@ -27,6 +27,7 @@ impl Mapping {
         writer: Option<Arc<writeback::OpenWriter>>,
     ) -> Arc<Self> {
         let page = file.attr.cache.mapped_page(index);
+        file.attr.cache.remember_pressure(&original);
         let source = file.cached_source(original.clone(), index, page.clone());
         let executor = file.attr.cache.executor();
         Arc::new(Self {
@@ -66,6 +67,12 @@ impl Drop for Mapping {
     }
 }
 impl PageBacking for Mapping {
+    fn reclaimed(&self, group: &trames_memory::MemoryCgroup) -> bool {
+        self.page.reclaimed_within(group)
+    }
+    fn invalidation_generation(&self) -> u64 {
+        self.page.invalidation_generation.load(Ordering::Relaxed)
+    }
     fn mapped_residents(&self) -> Option<&trames_memory::MappedResidents> {
         Some(&self.page.owners)
     }
@@ -120,7 +127,7 @@ impl PageBacking for Mapping {
         Some(self.index * PAGE_SIZE)
     }
     fn shared_page(&self) -> Option<Arc<SharedPage>> {
-        self.page.valid().then(|| self.page.bytes().clone())
+        self.page.valid().then(|| self.page.bytes())
     }
     fn page_source(&self) -> Option<Arc<dyn PageSource>> {
         Some(self.source.clone())

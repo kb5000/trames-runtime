@@ -563,6 +563,7 @@ impl<C: Cpu> Starter<C> {
                     let mut fatal_fault = None;
                     let mut yielded = false;
                     let mut vm_checkpoint = false;
+                    let mut memory_policy_checkpoint = false;
                     let mut interrupt_prepared = false;
                     let execution_guard = domain.as_ref().and_then(|domain| domain.enter(index, barrier_pending.clone()));
                     let control_lease = work.syscalls.as_ref().map(|s|s.io_signals.lifecycle().enter(&s.io_signals,work.pid));
@@ -572,7 +573,7 @@ impl<C: Cpu> Starter<C> {
                         snapshot.direct.swap_disk_cache(&mut file_cache);
                     }
                     let cpu_share = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).and_then(trames_vfs::CgroupTask::cpu_share);
-                    let _memory_scope = work.syscalls.as_ref().and_then(|snapshot| snapshot.io_signals.cgroup()).map(trames_vfs::CgroupTask::memory_scope);
+                    let _resource_scope = work.syscalls.as_ref().and_then(|snapshot| snapshot.io_signals.cgroup()).map(trames_vfs::CgroupTask::resource_scope);
                     let _file_actor = work.syscalls.as_ref().map(|snapshot| trames_vfs::FileActorScope::enter_with_sync(
                         snapshot.io_signals.credentials().clone(), snapshot.io_signals.tid(), snapshot.direct.sync_executor()));
                     let began = Instant::now();
@@ -598,6 +599,15 @@ impl<C: Cpu> Starter<C> {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if let Some(snapshot) = &work.syscalls {
+                                if snapshot.io_signals.cgroup().is_some_and(trames_vfs::CgroupTask::memory_controlled)
+                                    && work.memory.as_ref().is_some_and(|memory| memory.hardware_ranges_enabled()) {
+                                    // A live migration/controller update revokes the
+                                    // original mm's coarse exports at its existing
+                                    // joined checkpoint before executing new bytes.
+                                    memory_policy_checkpoint = true;
+                                    vm_checkpoint = true;
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
                                 if let Some(state) = (!(snapshot.io_signals.has_pending_frame() || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending))).then(||snapshot.io_signals.take_trace_update()).flatten() {
                                     work.cpu.restore_architectural_state(&state);
                                 }
@@ -682,7 +692,7 @@ impl<C: Cpu> Starter<C> {
                                     }
                                 }
                                 if let Some(crate::run_queue::WaitState::Custody(wait)) = &job.waiting {
-                                    if wait.signal.ready() { job.waiting=None; }
+                                    if wait.ready() { job.waiting=None; }
                                     else { maintenance=true;break SliceOutcome::Yield {instructions:0}; }
                                 }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
@@ -1281,7 +1291,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                     .ok();
                     C::finish_execution(&mut engine);
                     let work = &mut job.work;
-                    if let Some(epoch) = epoch.as_ref().filter(|_|thread_exit.is_none()) {
+                    if let Some(epoch) = epoch.as_ref().filter(|_|thread_exit.is_none() && !memory_policy_checkpoint) {
                         if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                         if let Some(ring) = &mut job.uring {
                             match ring.progress(work.memory.as_deref_mut().expect("source task View")) {

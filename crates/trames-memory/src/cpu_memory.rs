@@ -214,11 +214,13 @@ impl CpuMemory for Memory {
             .is_some_and(|&(_, end, _)| address < end)
     }
     fn async_faults_possible(&self) -> bool {
-        self.shared
-            .as_ref()
-            .map_or(self.has_async_sources, |shared| {
-                shared.borrow().has_async_sources
-            })
+        crate::CgroupMemoryTarget::active()
+            || self
+                .shared
+                .as_ref()
+                .map_or(self.has_async_sources, |shared| {
+                    shared.borrow().has_async_sources
+                })
     }
     fn numa_mode_at(&self, address: u64) -> u32 {
         if let Some(shared) = &self.shared {

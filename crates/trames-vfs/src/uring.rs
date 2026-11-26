@@ -343,6 +343,9 @@ impl Vfs {
 pub struct UringRequest {
     pub owner: u64,
     pub task: u32,
+    /// Original acceptance origin also covers stateless fast requests which
+    /// have no execution actor until a later resource/admission boundary.
+    pub resources: crate::CgroupResourceContext,
     pub sequence: u64,
     pub sqe: UringSqe,
     pub resource: Option<UringResource>,
@@ -456,6 +459,65 @@ pub struct UringRetirement(ipc::ownership::Retirement);
 impl UringRetirement {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+/// Unpublished original ring and FD reservation retained through page admission.
+pub struct UringPreparation {
+    entries: u32,
+    cq_entries: u32,
+    ring_bytes: u64,
+    sqe_bytes: u64,
+    open: Option<OpenDescription>,
+    reservation: Option<fd_table::ReservedFd>,
+    pages: mapped::UringPages,
+    resources: CgroupResourceContext,
+    ownership: std::sync::Weak<ipc::ownership::Ownership>,
+}
+impl UringPreparation {
+    pub fn wait(&self) -> Option<&Arc<trames_memory::PageWait>> {
+        self.pages.wait.as_ref()
+    }
+    pub fn progress(&mut self) -> Result<Option<(PreparedDescriptor, Arc<Uring>)>> {
+        let _resources = self.resources.enter();
+        if !self.pages.progress()? {
+            return Ok(None);
+        }
+        let pages = self.pages.bytes.clone();
+        let ring = Arc::new(Uring {
+            entries: self.entries,
+            cq_entries: self.cq_entries,
+            ring_bytes: self.ring_bytes,
+            sqe_bytes: self.sqe_bytes,
+            pages,
+            _file_pages: self.pages.pages.clone(),
+            state: Default::default(),
+            readiness: Arc::default(),
+            ownership: self.ownership.clone(),
+        });
+        for (offset, value) in [
+            (8, self.entries - 1),
+            (12, self.entries),
+            (72, self.cq_entries - 1),
+            (76, self.cq_entries),
+        ] {
+            ring.store_queue(offset, value);
+        }
+        let mut open = self.open.take().expect("unpublished ring");
+        let shared = Arc::get_mut(&mut open.shared).unwrap();
+        shared.kind = FdKind::Anonymous;
+        shared.control = Some(events::SharedControl::Uring(ring.clone()));
+        open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
+        let descriptor = Descriptor {
+            open: OpenHandle::new(open),
+            cloexec: true.into(),
+        };
+        Ok(Some((
+            PreparedDescriptor {
+                reservation: self.reservation.take().unwrap(),
+                descriptor,
+            },
+            ring,
+        )))
     }
 }
 pub struct Uring {
@@ -740,11 +802,7 @@ impl Vfs {
         let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
         Ok((fd, ring))
     }
-    pub fn prepare_uring(
-        &mut self,
-        entries: u32,
-        cq_entries: u32,
-    ) -> Result<(PreparedDescriptor, Arc<Uring>)> {
+    pub fn begin_uring(&mut self, entries: u32, cq_entries: u32) -> Result<UringPreparation> {
         if entries == 0
             || entries > URING_MAX_ENTRIES
             || !entries.is_power_of_two()
@@ -762,49 +820,40 @@ impl Vfs {
             .as_ref()
             .map_or_else(|| self.shared_files(), |q| q.files.clone());
         let reservation = files.reserve()?;
-        let mut open = self.memfd_open(b"io_uring", 1)?;
+        let open = self.memfd_open(b"io_uring", 1)?;
         let file = Self::shared_file_open(&open)?;
         if ring_bytes + sqe_bytes > self.file_size_limit.get() {
             return Err(Errno(27));
         }
         file.set_len((ring_bytes + sqe_bytes) as usize)
             .map_err(storage::host_errno)?;
-        let (_file_pages, pages) =
-            mapped::uring_pages(open.node.as_ref().unwrap(), ring_bytes + sqe_bytes)?;
-        let ring = Arc::new(Uring {
+        let pages = mapped::uring_pages(open.node.as_ref().unwrap(), ring_bytes + sqe_bytes)?;
+        Ok(UringPreparation {
             entries,
             cq_entries,
             ring_bytes,
             sqe_bytes,
+            open: Some(open),
+            resources: CgroupResourceContext::capture(),
+            reservation: Some(reservation),
             pages,
-            _file_pages,
-            state: Default::default(),
-            readiness: Arc::default(),
             ownership: Arc::downgrade(&files.0.local_ownership),
-        });
-        for (offset, value) in [
-            (8, entries - 1),
-            (12, entries),
-            (72, cq_entries - 1),
-            (76, cq_entries),
-        ] {
-            ring.store_queue(offset, value);
+        })
+    }
+    pub fn prepare_uring(
+        &mut self,
+        entries: u32,
+        cq_entries: u32,
+    ) -> Result<(PreparedDescriptor, Arc<Uring>)> {
+        let mut work = self.begin_uring(entries, cq_entries)?;
+        // Synchronous embedding callers wait outside VFS/node/layout custody.
+        let mut wait = host_sync::Wait::default();
+        loop {
+            match work.progress()? {
+                Some(prepared) => return Ok(prepared),
+                None => wait.page(work.wait().expect("original ring page admission"))?,
+            }
         }
-        let shared = Arc::get_mut(&mut open.shared).unwrap();
-        shared.kind = FdKind::Anonymous;
-        shared.control = Some(events::SharedControl::Uring(ring.clone()));
-        open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
-        let descriptor = Descriptor {
-            open: OpenHandle::new(open),
-            cloexec: true.into(),
-        };
-        Ok((
-            PreparedDescriptor {
-                reservation,
-                descriptor,
-            },
-            ring,
-        ))
     }
     pub fn uring(&self, fd: u32) -> Result<Arc<Uring>> {
         match &self.descriptor(fd)?.open.borrow().anonymous {
@@ -1073,6 +1122,67 @@ mod original_tests {
             .unwrap();
             assert!(weak.upgrade().is_none());
             v.close(ring_fd).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod preparation_resource_tests {
+    use super::*;
+    use trames_memory::{
+        CgroupMemoryKind, CgroupMemoryTarget, CgroupPageCharge, CgroupReclaim, MemoryCgroup,
+        PageWait,
+    };
+    struct Held(Arc<PageWait>);
+    impl CgroupReclaim for Held {
+        fn reclaim(&self, _: &MemoryCgroup, _: usize) -> usize {
+            0
+        }
+        fn writeback(&self, _: &Arc<MemoryCgroup>, _: usize) -> Option<Arc<PageWait>> {
+            Some(self.0.clone())
+        }
+    }
+    #[test]
+    fn page_admission_retains_original_ring_fd_prefix_and_group_until_publication_or_cancel() {
+        for cancel in [false, true] {
+            let mut v = Vfs::default();
+            let group = MemoryCgroup::new(None);
+            group.set_limit(3 * PAGE_SIZE as usize);
+            let other = MemoryCgroup::new(None);
+            let target = Arc::new(CgroupMemoryTarget::default());
+            target.set(Some(group.clone()));
+            let _scope = target.scope();
+            let held = Arc::new(Held(Arc::default()));
+            let resource: Arc<dyn CgroupReclaim> = held.clone();
+            let allocation = CgroupPageCharge::new(CgroupMemoryKind::Anonymous).unwrap();
+            allocation.register_reclaimer(&resource);
+            let mut work = v.begin_uring(4, 8).unwrap();
+            let slot = work.reservation.as_ref().unwrap().number();
+            assert!(work.progress().unwrap().is_none());
+            assert_eq!(work.pages.bytes.len(), 2);
+            let original = work.pages.bytes[0].clone();
+            let next = v.eventfd(0, 0).unwrap();
+            assert_ne!(slot, next);
+            target.set(Some(other.clone()));
+            if cancel {
+                drop(original);
+                drop(work);
+                assert_eq!(v.eventfd(0, 0).unwrap(), slot);
+                assert_eq!(group.current(), PAGE_SIZE as usize);
+            } else {
+                group.set_limit(usize::MAX);
+                assert!(work.wait().unwrap().ready());
+                assert!(!held.0.ready());
+                let (prepared, ring) = work.progress().unwrap().unwrap();
+                assert!(Arc::ptr_eq(&original, &ring.pages[0]));
+                assert_eq!(prepared.publish().unwrap(), slot);
+                assert_eq!(other.current(), 0);
+                assert_eq!(ring.entries, 4);
+                v.close(slot).unwrap();
+                drop((work, ring, original));
+            }
+            drop(allocation);
+            assert_eq!(group.current(), 0);
         }
     }
 }

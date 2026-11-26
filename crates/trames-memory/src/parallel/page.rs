@@ -58,6 +58,11 @@ impl Bytes {
     }
 }
 pub struct MutablePage {
+    // Cached file bytes can outlive their inode entry or VMA during layout
+    // retirement. Their physical lease follows the last actual byte pin.
+    pub(crate) cgroup:
+        parking_lot::Mutex<Option<Option<std::sync::Arc<crate::cgroup_memory::PhysicalCharge>>>>,
+    pub(crate) cgroup_ready: AtomicBool,
     resource: Option<std::sync::Arc<crate::SharedMapping>>,
     external_revision: Option<std::sync::Arc<AtomicU64>>,
     pub(crate) identity: u64,
@@ -484,6 +489,8 @@ impl MutablePage {
             #[cfg(test)]
             acquisitions: AtomicU64::new(0),
             reservations: OnceLock::new(),
+            cgroup: Default::default(),
+            cgroup_ready: AtomicBool::new(false),
             reservation_base: AtomicU64::new(0),
             reservation_written: AtomicU64::new(0),
         }

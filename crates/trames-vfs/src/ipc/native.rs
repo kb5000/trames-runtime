@@ -898,6 +898,7 @@ impl Importer {
         owner: (u32, u32),
     ) -> Result<Arc<SharedOpenDescription>> {
         let file = SharedFile::import(fd).map_err(io_errno)?;
+        crate::shared_account::install(&file, true)?;
         let mut fs = self.fs.borrow_mut();
         fs.admit_inode()?;
         let inode = fs.next_inode;

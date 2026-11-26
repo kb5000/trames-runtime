@@ -140,20 +140,82 @@ pub fn image() -> Vec<u8> {
     bytes
 }
 pub fn install(memory: &mut Memory) -> Result<u64, MemoryError> {
-    // Keep the stack/signal trampoline independent and randomize the free slot.
-    let mut entropy = [0; 2];
-    crate::fill_entropy(&mut entropy).map_err(|e| MemoryError::BackingIo(e.0))?;
-    let start = 0x0000_7fff_fe00_0000 + ((u16::from_le_bytes(entropy) as u64 & 255) * 0x10000);
-    let base = memory
-        .find_free(start, 2 * PAGE_SIZE)
-        .ok_or(MemoryError::Limit)?;
-    memory.map(base, 2 * PAGE_SIZE, Permissions::RW)?;
-    static IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    memory.write(base, IMAGE.get_or_init(image))?;
-    memory.protect(base, PAGE_SIZE, Permissions::RX)?;
-    memory.protect(base + DATA, PAGE_SIZE, Permissions::R)?;
-    memory.identify_vdso(base);
-    Ok(base)
+    let mut install = Install::new(memory)?;
+    let mut wait = None;
+    loop {
+        match install.run(memory) {
+            Err(MemoryError::Pending(fault)) => {
+                let wait = match &mut wait {
+                    Some(wait) => wait,
+                    slot @ None => slot.insert(
+                        trames_shared::HostWait::new().map_err(|_| MemoryError::BackingIo(5))?,
+                    ),
+                };
+                wait.begin();
+                wait.retain(fault.wait.subscribe(wait.signal()));
+                if let Some(deadline) = fault.wait.deadline() {
+                    wait.until(deadline);
+                }
+                if !fault.wait.ready() {
+                    wait.wait().map_err(|_| MemoryError::BackingIo(5))?;
+                }
+            }
+            result => return result,
+        }
+    }
+}
+pub struct Install {
+    base: u64,
+    mapped: bool,
+    written: usize,
+    protected: u8,
+    resources: trames_memory::CgroupMemoryContext,
+}
+impl Install {
+    pub fn new(memory: &Memory) -> Result<Self, MemoryError> {
+        // Keep the stack/signal trampoline independent and randomize the free slot.
+        let mut entropy = [0; 2];
+        crate::fill_entropy(&mut entropy).map_err(|e| MemoryError::BackingIo(e.0))?;
+        let start = 0x0000_7fff_fe00_0000 + ((u16::from_le_bytes(entropy) as u64 & 255) * 0x10000);
+        let base = memory
+            .find_free(start, 2 * PAGE_SIZE)
+            .ok_or(MemoryError::Limit)?;
+        Ok(Self {
+            base,
+            mapped: false,
+            written: 0,
+            protected: 0,
+            resources: trames_memory::CgroupMemoryContext::capture(),
+        })
+    }
+    pub fn run(&mut self, memory: &mut Memory) -> Result<u64, MemoryError> {
+        let _resources = self.resources.enter();
+        let base = self.base;
+        if !self.mapped {
+            memory.map(base, 2 * PAGE_SIZE, Permissions::RW)?;
+            self.mapped = true;
+        }
+        static IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let bytes = IMAGE.get_or_init(image);
+        while self.written < bytes.len() {
+            let count = (bytes.len() - self.written).min(PAGE_SIZE as usize);
+            memory.write(
+                base + self.written as u64,
+                &bytes[self.written..self.written + count],
+            )?;
+            self.written += count;
+        }
+        if self.protected == 0 {
+            memory.protect(base, PAGE_SIZE, Permissions::RX)?;
+            self.protected = 1;
+        }
+        if self.protected == 1 {
+            memory.protect(base + DATA, PAGE_SIZE, Permissions::R)?;
+            self.protected = 2;
+        }
+        memory.identify_vdso(base);
+        Ok(base)
+    }
 }
 pub fn initialize(memory: &mut Memory, base: u64, time: TimeBase) -> Result<(), MemoryError> {
     let address = base.checked_add(DATA).ok_or(MemoryError::InvalidRange)?;
@@ -178,6 +240,51 @@ pub fn initialize(memory: &mut Memory, base: u64, time: TimeBase) -> Result<(), 
 mod tests {
     use super::*;
     use trames_memory::Access;
+    #[test]
+    fn partial_install_keeps_its_original_address_owner_and_written_prefix() {
+        use std::sync::Arc;
+        use trames_memory::{
+            CgroupMemoryKind, CgroupMemoryTarget, CgroupPageCharge, CgroupReclaim, MemoryCgroup,
+            PageWait,
+        };
+        struct Held(Arc<PageWait>);
+        impl CgroupReclaim for Held {
+            fn reclaim(&self, _: &MemoryCgroup, _: usize) -> usize {
+                0
+            }
+            fn writeback(&self, _: &Arc<MemoryCgroup>, _: usize) -> Option<Arc<PageWait>> {
+                (!self.0.ready()).then(|| self.0.clone())
+            }
+        }
+        let group = MemoryCgroup::new(None);
+        group.set_limit(2 * PAGE_SIZE as usize);
+        let other = MemoryCgroup::new(None);
+        let target = Arc::new(CgroupMemoryTarget::default());
+        target.set(Some(group.clone()));
+        let _scope = target.scope();
+        let ballast = CgroupPageCharge::new(CgroupMemoryKind::File).unwrap();
+        let held = Arc::new(Held(Arc::default()));
+        ballast.register_reclaimer(&(held.clone() as Arc<dyn CgroupReclaim>));
+        let mut memory = Memory::default();
+        let mut work = Install::new(&memory).unwrap();
+        let base = work.base;
+        assert!(matches!(
+            work.run(&mut memory),
+            Err(MemoryError::Pending(_))
+        ));
+        assert_eq!(work.written, PAGE_SIZE as usize);
+        memory.write(base + 300, &[99]).unwrap();
+        target.set(Some(other.clone()));
+        drop(ballast);
+        held.0.finish();
+        assert_eq!(work.run(&mut memory).unwrap(), base);
+        assert_eq!(memory.read_array::<1>(base + 300).unwrap(), [99]);
+        assert!(memory.check(base, 1, Access::Write).is_err());
+        assert_eq!(group.current(), 2 * PAGE_SIZE as usize);
+        assert_eq!(other.current(), 0);
+        drop(memory);
+        assert_eq!(group.current(), 0);
+    }
     fn time() -> TimeBase {
         TimeBase {
             counter: 71,
