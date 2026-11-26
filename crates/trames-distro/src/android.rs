@@ -660,7 +660,12 @@ mod tests {
         assert!(props
             .windows(b"waydroid.background_start=false".len())
             .any(|s| s == b"waydroid.background_start=false"));
-        vfs.mount(None, b"/", None, 32 | 1, None).unwrap();
+        // Android init uses "remount bind ro nodev": only this mount becomes
+        // read-only, while its previously established /data bind stays writable.
+        // A filesystem-wide remount without MS_BIND correctly affects both.
+        // https://android.googlesource.com/platform/system/core/+/refs/heads/main/rootdir/init.rc
+        vfs.mount(None, b"/", None, 32 | 4096 | 1 | 4, None)
+            .unwrap();
         directory(&mut vfs, b"/mnt/user", 0o755).unwrap();
         directory(&mut vfs, b"/mnt/user/0", 0o755).unwrap();
         crate::systemd::file(&mut vfs, b"/mnt/user/0/live", b"volatile").unwrap();
@@ -669,5 +674,13 @@ mod tests {
             vfs.open_at(AT_FDCWD, b"/system/new", 0x41, 0o600),
             Err(Errno(30))
         ));
+        // Without MS_BIND this is a filesystem-wide read-only remount: binds
+        // of the same filesystem also become read-only, but another tmpfs does not.
+        vfs.mount(None, b"/", None, 32 | 1, None).unwrap();
+        assert!(matches!(
+            vfs.open_at(AT_FDCWD, b"/data/fs-wide", 0x41, 0o600),
+            Err(Errno(30))
+        ));
+        crate::systemd::file(&mut vfs, b"/mnt/user/0/separate", b"volatile").unwrap();
     }
 }
