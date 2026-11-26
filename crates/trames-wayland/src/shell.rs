@@ -279,7 +279,10 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
             if let xdg_toplevel::Request::SetParent { parent } = request {
                 let parent = parent.and_then(|p| p.data::<SurfaceKey>().map(|k| k.0));
                 if !state.window_parent(key.0, parent) {
-                    r.post_error(3u32, "cyclic window parent");
+                    r.post_error(
+                        xdg_toplevel::Error::InvalidParent as u32,
+                        "cyclic window parent",
+                    );
                 }
             }
             return;
