@@ -200,7 +200,11 @@ fn faulting_source_setname_keeps_the_original_comm_and_completes_once() {
     k.processes.insert(1, root);
     k.processes.insert(2, peer);
     assert!(k
-        .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+        .parallel_epoch(
+            &mut trames_linux::CapturedOutput::default(),
+            1_000_000,
+            true
+        )
         .unwrap());
     let root = k.processes.read(&1);
     assert_eq!(root.cpu.x(19), 0u64.wrapping_sub(14));

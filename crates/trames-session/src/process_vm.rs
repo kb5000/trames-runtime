@@ -674,7 +674,7 @@ mod tests {
         peer.linux.trace = true; // manually excluded original task, with diagnostics enabled
         drop(peer);
         k.processes.insert(2, child);
-        assert!(k.parallel_epoch(&mut output, 100000000, false).unwrap());
+        assert!(k.parallel_epoch(&mut output, 100000000, true).unwrap());
         assert!(matches!(k.processes.read(&2).state, State::Zombie(status) if status == 23 << 8));
         assert!(
             k.processes.read(&2).memory.read_array::<1>(0x6000).is_err(),
@@ -1023,9 +1023,16 @@ mod tests {
         b.signals.io.scheduling.set_affinity(2);
         k.processes.insert(1, a);
         k.processes.insert(2, b);
-        assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), u64::MAX)
-            .unwrap());
+        let watchdog = Instant::now() + Duration::from_secs(5);
+        while k.processes.read(&1).seccomp.evaluations() == 0 {
+            assert!(k
+                .parallel_round(&mut trames_linux::CapturedOutput::default(), u64::MAX)
+                .unwrap());
+            assert!(
+                Instant::now() < watchdog,
+                "filtered mapping did not execute"
+            );
+        }
         let p = &k.processes.read(&1);
         assert_eq!(p.cpu.x(0), error(Errno(13)));
         assert!(p.memory.read_array::<1>(0x8000).is_ok());
@@ -1272,9 +1279,13 @@ mod tests {
                 p.cpu.set_x(8, number);
                 k.processes.insert(id, p);
             }
-            assert!(k
-                .parallel_round(&mut trames_linux::CapturedOutput::default(), 1000)
-                .unwrap());
+            let watchdog = Instant::now() + Duration::from_secs(5);
+            while k.syscalls == 0 {
+                assert!(k
+                    .parallel_round(&mut trames_linux::CapturedOutput::default(), 1000)
+                    .unwrap());
+                assert!(Instant::now() < watchdog, "profiled call did not execute");
+            }
             assert_eq!(
                 k.cohort_return_syscalls.contains_key(&(number as u32)),
                 returned
