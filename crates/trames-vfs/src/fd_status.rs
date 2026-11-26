@@ -310,7 +310,9 @@ pub(super) fn check_status(
     if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
         let (uid, gid) = open.metadata_node().map_or(open.owner, |node| {
             let n = node.borrow();
-            (n.uid, n.gid)
+            open.mount.as_ref().map_or((n.uid, n.gid), |m| {
+                mounts::idmap::Ids::from_mount(&m.identity).owner(n.uid, n.gid)
+            })
         });
         if credentials.fsuid != uid && !credentials.inode_cap(capabilities::FOWNER, uid, gid) {
             return Err(Errno(1));

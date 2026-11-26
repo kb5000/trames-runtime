@@ -223,7 +223,7 @@ impl Vfs {
             return Ok(fs.clone());
         }
         let owner = &self.ipc_namespace.user_namespace;
-        let fs = mounts::ram_filesystem(
+        let mut fs = mounts::ram_filesystem(
             0,
             257,
             0o1777,
@@ -231,6 +231,7 @@ impl Vfs {
             owner.to_global(true, 0).unwrap_or(0),
             false,
         )?;
+        fs.owner = owner.clone();
         Ok(cell.get_or_init(|| fs).clone())
     }
     pub fn mq_open(

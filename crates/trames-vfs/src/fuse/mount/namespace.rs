@@ -623,6 +623,7 @@ impl Mutation {
                     &node,
                     !self.source.path.fs.local_permissions()
                         || self.link_checked && !self.link_error,
+                    crate::mounts::idmap::Ids::plain(&self.credentials.user_namespace),
                 )?;
                 if node.links == 0 {
                     return Err(Errno(2));

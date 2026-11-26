@@ -547,8 +547,7 @@ impl DirectFile {
         if offset.is_some_and(|n| n > i64::MAX as u64) {
             return Some(Err(Errno(22)));
         }
-        let denied = !fd_can_write(self.prepared.0.flags);
-        if denied && offset.is_none() {
+        if !fd_can_write(self.prepared.0.flags) {
             return Some(Err(Errno(9)));
         }
         if self
@@ -562,9 +561,6 @@ impl DirectFile {
         }
         if let Some(error) = self.prepared.0.write_error {
             return Some(Err(error));
-        }
-        if denied {
-            return Some(Err(Errno(9)));
         }
         if bytes.is_empty() {
             return Some(Ok(0));
@@ -626,12 +622,26 @@ impl DirectFile {
         if let Some(result) = self.data.host_stat() {
             return result;
         }
-        let inode = self
+        let file = self
             .file
             .as_ref()
-            .and_then(|fd| fd.open.node.as_ref())
-            .expect("accepted ordinary file owns its inode");
-        let mut out = Vfs::stat_node_fields(&inode.borrow(), self.prepared.0.device);
+            .expect("accepted ordinary file owns its OFD");
+        let inode = file
+            .open
+            .node
+            .as_ref()
+            .expect("ordinary file owns its inode");
+        let node = inode.borrow();
+        let mut out = Vfs::stat_node_fields(&node, self.prepared.0.device);
+        if let Some(mount) = file.open.mount_resource.get() {
+            let ids = mounts::idmap::Ids::from_mount(&mount.identity);
+            if ids.is_mapped() {
+                let (uid, gid) = ids.owner(node.uid, node.gid);
+                out[24..28].copy_from_slice(&uid.to_le_bytes());
+                out[28..32].copy_from_slice(&gid.to_le_bytes());
+            }
+        }
+        drop(node);
         out[64..72].copy_from_slice(&self.data.blocks()?.to_le_bytes());
         Ok(out)
     }
@@ -858,7 +868,13 @@ mod tests {
         vfs.import_file(b"/src/data", vec![42; 64]).unwrap();
         vfs.mkdir_at(AT_FDCWD, b"/dst", 0o755).unwrap();
         vfs.mount(Some(b"/src"), b"/dst", None, 4096, None).unwrap();
-        let fd = vfs.open_at(AT_FDCWD, b"/dst/data", 2, 0).unwrap();
+        let writer = vfs.open_at(AT_FDCWD, b"/dst/data", 2, 0).unwrap();
+        assert_eq!(
+            vfs.mount(None, b"/dst", None, 4096 | 32 | 1, None),
+            Err(Errno(16))
+        );
+        vfs.close(writer).unwrap();
+        let fd = vfs.open_at(AT_FDCWD, b"/dst/data", 0, 0).unwrap();
         vfs.mount(None, b"/dst", None, 4096 | 32 | 1, None).unwrap();
         let node = vfs
             .descriptor(fd)
@@ -878,8 +894,8 @@ mod tests {
         assert!(!Arc::ptr_eq(&a.0, &b.0));
         let mut cache = DiskReadCache::default();
         let file = a.get(fd).unwrap();
-        assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Err(Errno(30))));
-        assert_eq!(file.write(&[], None, &mut cache), Some(Err(Errno(30))));
+        assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Err(Errno(9))));
+        assert_eq!(file.write(&[], None, &mut cache), Some(Err(Errno(9))));
         assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), [42]);
         assert_eq!(
             i64::from_le_bytes(file.stat().unwrap()[72..80].try_into().unwrap()),
@@ -889,7 +905,9 @@ mod tests {
         // Keep using the same prepared descriptor through both remounts.
         vfs.mount(None, b"/dst", None, 4096 | 32 | mounts::MS_NOATIME, None)
             .unwrap();
-        assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Ok(1)));
+        let writer = vfs.open_at(AT_FDCWD, b"/dst/data", 2, 0).unwrap();
+        assert_eq!(vfs.pwrite(writer, b"X", 0), Ok(1));
+        vfs.close(writer).unwrap();
         assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), b"X");
         assert_eq!(
             i64::from_le_bytes(file.stat().unwrap()[72..80].try_into().unwrap()),

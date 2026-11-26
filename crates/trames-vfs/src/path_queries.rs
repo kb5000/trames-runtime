@@ -303,6 +303,7 @@ impl Vfs {
             let root = publication.borrow();
             Arc::new(SharedCell::new(pseudo::PseudoFs {
                 debug_fs: root.debug_fs.clone(),
+                special_supers: root.special_supers.clone(),
                 fuse_control: root.fuse_control.clone(),
                 boot_id: root.boot_id.clone(),
                 user_namespace_limits: Default::default(), // Resolved through publication.

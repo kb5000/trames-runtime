@@ -15,14 +15,37 @@ pub(crate) struct FileCaps {
 }
 
 impl FileCaps {
+    pub(super) fn mapped(mut self, ids: mounts::idmap::Ids<'_>) -> Option<Self> {
+        self.root = ids.visible(false, self.root);
+        (self.root != u32::MAX).then_some(self)
+    }
+    pub(super) fn for_inode(
+        bytes: &[u8],
+        c: &Credentials,
+        node: &Node,
+        ids: mounts::idmap::Ids<'_>,
+    ) -> Result<Self> {
+        let mut caps = Self::record(bytes)?;
+        let (uid, gid) = ids.owner(node.uid, node.gid);
+        if !c.inode_cap(capabilities::SETFCAP, uid, gid) {
+            return Err(Errno(1));
+        }
+        caps.root = ids.capability_root(caps.root, bytes.len() == 20, c)?;
+        Ok(caps)
+    }
     pub(super) fn parse(bytes: &[u8], ns: &UserNamespace) -> Result<Self> {
-        Self::decode_record(bytes, ns, true)
+        Self::decode_record(bytes, ns)
     }
     // Daemon records carry namespace-relative IDs, not setter authority.
     pub(super) fn decode(bytes: &[u8], ns: &UserNamespace) -> Result<Self> {
-        Self::decode_record(bytes, ns, false)
+        Self::decode_record(bytes, ns)
     }
-    fn decode_record(bytes: &[u8], ns: &UserNamespace, setter: bool) -> Result<Self> {
+    fn decode_record(bytes: &[u8], ns: &UserNamespace) -> Result<Self> {
+        let mut caps = Self::record(bytes)?;
+        caps.root = ns.to_global(false, caps.root).ok_or(Errno(22))?;
+        Ok(caps)
+    }
+    fn record(bytes: &[u8]) -> Result<Self> {
         if !matches!(bytes.len(), 20 | 24) {
             return Err(Errno(22));
         }
@@ -33,11 +56,8 @@ impl FileCaps {
             (V3, 24) => word(20),
             _ => return Err(Errno(22)),
         };
-        if setter && root != 0 && !ns.is_initial() {
-            return Err(Errno(1));
-        }
         Ok(Self {
-            root: ns.to_global(false, root).ok_or(Errno(22))?,
+            root,
             permitted: u64::from(word(4)) | (u64::from(word(12)) << 32),
             inheritable: u64::from(word(8)) | (u64::from(word(16)) << 32),
             effective: magic & 1 != 0,

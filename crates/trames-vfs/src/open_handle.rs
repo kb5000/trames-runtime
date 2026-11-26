@@ -323,6 +323,8 @@ mod tests {
         v.mkdir_at(AT_FDCWD, b"/mounted", 0o755).unwrap();
         v.mount(None, b"/mounted", Some(b"tmpfs"), 0, None).unwrap();
         let fd = v.open_at(AT_FDCWD, b"/mounted/file", 0x42, 0o600).unwrap();
+        v.close(fd).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/mounted/file", 0, 0).unwrap();
         v.set_runtime_info(
             1,
             RuntimeInfo {
@@ -341,7 +343,7 @@ mod tests {
         assert_eq!(v.readlink_at(AT_FDCWD, &path).unwrap(), b"/mounted/file");
         v.mount(None, b"/mounted", None, 32 | mounts::MS_RDONLY, None)
             .unwrap();
-        assert_eq!(v.write(fd, b"x"), Err(Errno(30)));
+        assert_eq!(v.write(fd, b"x"), Err(Errno(9)));
         assert_eq!(v.open_at(AT_FDCWD, &path, 2, 0), Err(Errno(30)));
         assert_eq!(
             u64::from_le_bytes(v.statfs_fd(fd).unwrap()[80..88].try_into().unwrap()) & 1,

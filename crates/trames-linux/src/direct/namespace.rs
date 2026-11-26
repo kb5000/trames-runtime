@@ -81,6 +81,7 @@ pub(super) fn import(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
     check_mount_admin: impl FnOnce() -> Result<(), Errno>,
+    mount_idmap: impl FnOnce(u64) -> Result<std::sync::Arc<trames_vfs::MountIdmap>, Errno>,
 ) -> Result<(Call, FileOutput), Errno> {
     let output = FileOutput::None;
     let call = match number {
@@ -157,7 +158,10 @@ pub(super) fn import(
                 return Err(Errno(7));
             }
             let u64_at = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-            let attrs = trames_vfs::MountAttributes::new(u64_at(0), u64_at(8), u64_at(16))?;
+            let mut attrs = trames_vfs::MountAttributes::new(u64_at(0), u64_at(8), u64_at(16))?;
+            if attrs.needs_idmap() {
+                attrs = attrs.with_idmap(mount_idmap(u64_at(24))?);
+            }
             Call::MountFd(trames_vfs::MountFdCall::SetAttr {
                 fd: fd as i32,
                 path: if attrs.is_empty() {
@@ -480,7 +484,13 @@ impl DirectSyscalls {
             return self.invoke_path_input(number, args, memory);
         }
         let paths = self.paths.as_ref()?;
-        let (call, output) = match import(number, args, memory, || paths.check_mount_admin()) {
+        let (call, output) = match import(
+            number,
+            args,
+            memory,
+            || paths.check_mount_admin(),
+            |fd| paths.capture_mount_idmap(fd),
+        ) {
             Ok(call) => call,
             Err(error) => return Some(Err(error)),
         };
@@ -502,7 +512,13 @@ pub(crate) fn owner(
     memory: &mut impl CpuMemory,
     vfs: &mut trames_vfs::Vfs,
 ) -> Result<u64, Errno> {
-    let (call, output) = import(number, args, memory, || vfs.check_mount_admin())?;
+    let (call, output) = import(
+        number,
+        args,
+        memory,
+        || vfs.check_mount_admin(),
+        |fd| vfs.capture_mount_idmap(fd),
+    )?;
     output.apply(call.execute(vfs), memory)
 }
 

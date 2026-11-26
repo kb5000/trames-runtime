@@ -629,6 +629,9 @@ fn native_path(file: &File) -> Result<std::path::PathBuf> {
     }
 }
 impl HostFs {
+    pub(super) fn reconfigure_writable(&self) -> Result<()> {
+        self.root.writable()
+    }
     pub fn stat_at(&self, key: &[u8]) -> Result<[u8; 128]> {
         Ok(encode_stat(&self.root, &self.root.metadata(key)?))
     }
@@ -1280,6 +1283,7 @@ impl Vfs {
         filesystem.host = Some(backend.clone());
         let root = backend.lookup(&filesystem, b"/")?;
         let mount = Arc::new(Mount::new(MountInit {
+            idmap: None,
             id: mounts::new_mount_id()?,
             fs: filesystem,
             root,

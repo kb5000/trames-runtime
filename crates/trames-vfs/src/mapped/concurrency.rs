@@ -49,7 +49,7 @@ fn mapping_handoff_retains_original_ofd_until_last_remote_unmap() {
         vfs.initialize_mounts().unwrap();
         let fd = vfs.open_at(AT_FDCWD, b"/handoff", 0x42, 0o600).unwrap();
         vfs.truncate_fd(fd, PAGE_SIZE * 3).unwrap();
-        let contender = vfs.open_at(AT_FDCWD, b"/handoff", 2, 0).unwrap();
+        let contender = vfs.open_at(AT_FDCWD, b"/handoff", 0, 0).unwrap();
         vfs.flock(fd, 6).unwrap();
         let notify = vfs.inotify_init(O_NONBLOCK).unwrap();
         vfs.inotify_add(notify, b"/handoff", 8).unwrap();
@@ -97,7 +97,8 @@ fn mapping_handoff_retains_original_ofd_until_last_remote_unmap() {
             .unwrap();
         assert_eq!(vfs.flock(contender, 6), Err(Errno(11)));
         assert_eq!(vfs.read(notify, 4096), Err(Errno(11)));
-        assert_eq!(mount.writers.active(), shared);
+        // Both private and shared VMAs retain the original writable OFD.
+        assert!(mount.writers.active());
         vfs.seek(contender, PAGE_SIZE as i64, 0).unwrap();
         assert_eq!(
             vfs.read(contender, 8).unwrap(),

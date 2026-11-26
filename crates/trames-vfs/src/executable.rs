@@ -10,7 +10,10 @@ impl ExecutingFile {
         &self.0
     }
 }
-pub(super) struct WriteAccess(NodeRef);
+pub(super) struct WriteAccess {
+    node: NodeRef,
+    _mount: Option<mapped::MountWrite>,
+}
 
 impl Inode {
     fn claim_text_access(&self, writer: bool) -> Result<()> {
@@ -30,14 +33,22 @@ impl Inode {
     }
 }
 impl WriteAccess {
-    pub(super) fn acquire(node: &NodeRef) -> Result<Self> {
+    pub(super) fn acquire(
+        node: &NodeRef,
+        mount: Option<&Arc<mounts::MountIdentity>>,
+    ) -> Result<Self> {
         node.claim_text_access(true)?;
-        Ok(Self(node.clone()))
+        let mut access = Self {
+            node: node.clone(),
+            _mount: None,
+        };
+        access._mount = mount.map(mapped::MountWrite::new).transpose()?;
+        Ok(access)
     }
 }
 impl Drop for WriteAccess {
     fn drop(&mut self) {
-        self.0
+        self.node
             .text_users
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -181,7 +192,11 @@ impl Vfs {
         {
             return Err(Errno(13));
         }
-        if !matches!(n.content, Content::File(_)) || !self.allowed(&n, 1) {
+        let ids = mount.as_ref().map_or_else(
+            || mounts::idmap::Ids::plain(&self.fs.owner),
+            |m| mounts::idmap::Ids::from_mount(&m.identity),
+        );
+        if !matches!(n.content, Content::File(_)) || !self.credentials.allows_mapped(&n, 1, ids) {
             return Err(Errno(13));
         }
         drop(n);

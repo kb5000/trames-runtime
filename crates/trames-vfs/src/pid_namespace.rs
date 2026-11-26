@@ -11,6 +11,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0xd000_0000);
 
 pub(super) struct PidSpace {
     pub(super) user_namespace: UserNamespace,
+    pub(super) proc_super: std::sync::OnceLock<Arc<fs_data::PseudoSuper>>,
     inode: u64,
     parent: Option<PidNamespace>,
     depth: usize,
@@ -83,6 +84,7 @@ impl PidNamespace {
             .map_err(|_| Errno(28))?;
         let n = Self(Arc::new(PidSpace {
             user_namespace,
+            proc_super: Default::default(),
             inode,
             ptrace_scope: parent
                 .as_ref()

@@ -114,6 +114,11 @@ impl Vfs {
             return Err(Errno(22));
         }
         self.pseudo_immutable(&node)?;
+        if matches!(request, FileResize::Truncate(_)) {
+            let n = node.borrow();
+            self.open_ids(open.mount.as_ref())
+                .valid_owner(n.uid, n.gid)?;
+        }
         let mut n = node.borrow_mut();
         let seals = n.seals;
         let Content::File(data) = &mut n.content else {

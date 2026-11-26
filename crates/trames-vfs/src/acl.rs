@@ -72,6 +72,19 @@ pub(super) fn normalize(bytes: &mut [u8]) {
         }
     }
 }
+pub(super) fn translate(
+    bytes: &mut [u8],
+    mut map: impl FnMut(bool, u32) -> Result<u32>,
+) -> Result<()> {
+    for entry in bytes.get_mut(4..).ok_or(Errno(22))?.chunks_exact_mut(8) {
+        let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
+        if matches!(tag, 2 | 8) {
+            let id = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+            entry[4..8].copy_from_slice(&map(tag == 8, id)?.to_le_bytes());
+        }
+    }
+    Ok(())
+}
 pub(super) fn mode(bytes: &[u8], mode: u32) -> u32 {
     let mut bits = 0;
     for (tag, p, _) in entries(bytes) {
@@ -129,16 +142,22 @@ pub(super) fn inherit(
     }
     attrs
 }
-pub(super) fn allows(bytes: &[u8], node: &Node, c: &Credentials, want: u32) -> bool {
+pub(super) fn allows_mapped(
+    bytes: &[u8],
+    node: &Node,
+    c: &Credentials,
+    want: u32,
+    ids: mounts::idmap::Ids<'_>,
+) -> bool {
     let mask = entries(bytes)
         .find(|(tag, _, _)| *tag == 16)
         .map_or(7, |(_, p, _)| p);
     let mut group = false;
     for (tag, p, id) in entries(bytes) {
         match tag {
-            1 if c.fsuid == node.uid => return p & want == want,
-            2 if c.fsuid == id => return p & mask & want == want,
-            4 | 8 if c.in_group(if tag == 4 { node.gid } else { id }) => {
+            1 if c.fsuid == ids.visible(false, node.uid) => return p & want == want,
+            2 if c.fsuid == ids.visible(false, id) => return p & mask & want == want,
+            4 | 8 if c.in_group(ids.visible(true, if tag == 4 { node.gid } else { id })) => {
                 group = true;
                 // Linux requires one matching group entry to cover the request;
                 // a denied group class never falls through to OTHER permissions.

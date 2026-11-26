@@ -36,7 +36,7 @@ impl Vfs {
         let node = self.node(&canonical)?;
         {
             let n = node.borrow();
-            if !self.allowed(&n, 4) {
+            if !self.allowed_on(&n, 4, &canonical) {
                 return Err(Errno(13));
             }
             if !matches!(n.content, Content::File(_)) {

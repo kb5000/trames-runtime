@@ -47,7 +47,7 @@ pub(super) fn options(
 }
 
 impl Vfs {
-    pub(super) fn debug_filesystem(&self, data: &[u8]) -> Result<FsHandle> {
+    pub(super) fn debug_filesystem(&self, data: &[u8], readonly: bool) -> Result<FsHandle> {
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
@@ -63,6 +63,10 @@ impl Vfs {
                 gid.unwrap_or(0),
                 false,
             )?;
+            fs.super_readonly
+                .as_ref()
+                .unwrap()
+                .store(readonly, Ordering::Relaxed);
             {
                 let mut files = fs.borrow_mut();
                 let root = files.paths[b"/".as_slice()].clone();
@@ -185,7 +189,7 @@ mod tests {
             0o750
         );
         vfs.unshare_user().unwrap();
-        assert!(matches!(vfs.debug_filesystem(b""), Err(Errno(1))));
+        assert!(matches!(vfs.debug_filesystem(b"", false), Err(Errno(1))));
     }
 
     #[test]

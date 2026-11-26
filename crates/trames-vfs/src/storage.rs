@@ -1835,7 +1835,7 @@ impl Vfs {
         let canonical = self.resolve(AT_FDCWD, path)?;
         let node = self.node(&canonical)?;
         let n = node.borrow();
-        if !self.allowed(&n, 4) {
+        if !self.allowed_on(&n, 4, &canonical) {
             return Err(Errno(13));
         }
         let Content::File(data) = &n.content else {

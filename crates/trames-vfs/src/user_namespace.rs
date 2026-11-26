@@ -115,6 +115,29 @@ struct Extent {
     lower: u32,
     count: u32,
 }
+/// A mount takes a copy, including an empty map. Later uid_map/gid_map writes
+/// to the namespace cannot change the already accepted mount translation.
+pub(super) struct IdMapping([Vec<Extent>; 2]);
+impl IdMapping {
+    pub(super) fn down(&self, group: bool, id: u32) -> Option<u32> {
+        if id == u32::MAX {
+            return None;
+        }
+        let e = self.0[usize::from(group)]
+            .iter()
+            .find(|e| id >= e.first && id - e.first < e.count)?;
+        Some(e.lower + (id - e.first))
+    }
+    pub(super) fn up(&self, group: bool, id: u32) -> Option<u32> {
+        if id == u32::MAX {
+            return None;
+        }
+        let e = self.0[usize::from(group)]
+            .iter()
+            .find(|e| id >= e.lower && id - e.lower < e.count)?;
+        Some(e.first + (id - e.lower))
+    }
+}
 impl std::fmt::Debug for UserNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("UserNamespace").field(&self.id()).finish()
@@ -131,6 +154,23 @@ impl PartialEq for UserNamespace {
 }
 impl Eq for UserNamespace {}
 impl UserNamespace {
+    pub(super) fn idmapping(&self) -> IdMapping {
+        let groups = [false, true].map(|group| {
+            self.child()
+                .and_then(|ns| ns.maps[usize::from(group)].get())
+                .into_iter()
+                .flatten()
+                .map(|e| Extent {
+                    first: e.first,
+                    lower: self
+                        .global_range(group, e.first, e.count)
+                        .expect("published namespace range remains mapped"),
+                    count: e.count,
+                })
+                .collect()
+        });
+        IdMapping(groups)
+    }
     fn child(&self) -> Option<&Arc<UserSpace>> {
         match &self.0 {
             Namespace::Child(n) => Some(n),
@@ -257,9 +297,9 @@ impl UserNamespace {
             .unwrap_or_else(|| self.overflow().get(group))
     }
     pub fn stat(&self, mut bytes: [u8; 128]) -> [u8; 128] {
-        if !self.is_initial() {
-            for (group, at) in [(false, 24), (true, 28)] {
-                let id = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        for (group, at) in [(false, 24), (true, 28)] {
+            let id = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            if !self.is_initial() || id == u32::MAX {
                 bytes[at..at + 4].copy_from_slice(&self.visible(group, id).to_le_bytes());
             }
         }

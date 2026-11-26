@@ -487,13 +487,16 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        let MetadataTarget { node, _magic, .. } =
-            self.metadata_target(AT_FDCWD, path, mask & 0x02000000 == 0)?;
+        let MetadataTarget {
+            node,
+            path: target_path,
+            _magic,
+        } = self.metadata_target(AT_FDCWD, path, mask & 0x02000000 == 0)?;
         let n = node.borrow();
         if mask & 0x01000000 != 0 && !matches!(n.content, Content::Directory) {
             return Err(Errno(20));
         }
-        if !self.allowed(&n, 4) {
+        if !self.allowed_on(&n, 4, &target_path) {
             return Err(Errno(13));
         }
         let source = n.notifications.source().clone();

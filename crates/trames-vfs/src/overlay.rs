@@ -786,6 +786,13 @@ impl Vfs {
             let at = self.mount_location(path, true)?;
             let mount = at.mount.as_ref().ok_or(Errno(22))?;
             mounts::fd::check_overlay_layer(self, &at)?;
+            // This merged-inode backend shares upper inode objects. Until layer
+            // copy-up carries both ID domains, reject a shifted backing layer
+            // rather than publish filesystem IDs in the wrong domain. The
+            // overlay mount itself can still receive an independent idmap.
+            if mount.idmap.get().is_some() {
+                return Err(Errno(95));
+            }
             let fs = at.filesystem(self);
             match at.mount.as_ref().map(|m| m.kind) {
                 Some(mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Ramfs) => {}
@@ -800,7 +807,7 @@ impl Vfs {
             if !matches!(n.borrow().content, Content::Directory) {
                 return Err(Errno(20));
             }
-            if !self.allowed(&n.borrow(), 5) {
+            if !self.allowed_on(&n.borrow(), 5, &at) {
                 return Err(Errno(13));
             }
             let identity = mount.identity.clone();
@@ -858,8 +865,8 @@ impl Vfs {
                     }
                 }
             }
-            if !self.allowed(&self.node(&u.at.resolved())?.borrow(), 3)
-                || !self.allowed(&self.node(&w.at.resolved())?.borrow(), 3)
+            if !self.allowed_on(&self.node(&u.at.resolved())?.borrow(), 3, &u.at.resolved())
+                || !self.allowed_on(&self.node(&w.at.resolved())?.borrow(), 3, &w.at.resolved())
             {
                 return Err(Errno(13));
             }
@@ -965,7 +972,13 @@ impl Vfs {
             disk: None,
             volume: None,
         };
-        Ok((FsHandle::with_overlay(fs, o), ro))
+        let mut fs = FsHandle::with_overlay(fs, o);
+        fs.owner = self.credentials.user_namespace.clone();
+        fs.super_readonly
+            .as_ref()
+            .unwrap()
+            .store(ro, Ordering::Relaxed);
+        Ok((fs, ro))
     }
     pub(super) fn overlay_prepare(
         &self,

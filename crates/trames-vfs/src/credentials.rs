@@ -273,9 +273,14 @@ pub struct ExecCredentials {
 impl ExecCredentials {
     pub fn include_interpreter(&mut self, view: &Vfs, file: &ExecutableFile) {
         let node = file.node.borrow();
-        if !view.allowed(&node, 4) {
+        let ids = file.mount.as_ref().map_or_else(
+            || mounts::idmap::Ids::plain(&view.fs.owner),
+            |m| mounts::idmap::Ids::from_mount(&m.identity),
+        );
+        if !view.credentials.allows_mapped(&node, 4, ids) {
             self.readable = false;
-            Self::include_owner(&mut self.mm_namespace, node.uid, node.gid);
+            let (uid, gid) = ids.owner(node.uid, node.gid);
+            Self::include_owner(&mut self.mm_namespace, uid, gid);
         }
     }
     fn include_owner(namespace: &mut UserNamespace, uid: u32, gid: u32) {
@@ -423,20 +428,32 @@ impl Credentials {
         )
     }
     pub(super) fn allows_node(&self, node: &Node, bits: u32) -> bool {
+        self.allows_mapped(node, bits, mounts::idmap::Ids::plain(&self.user_namespace))
+    }
+    pub(super) fn allows_mapped(
+        &self,
+        node: &Node,
+        bits: u32,
+        ids: mounts::idmap::Ids<'_>,
+    ) -> bool {
         let mode = node.file_metadata().mode;
         let directory = matches!(node.content, Content::Directory);
-        if self.fsuid != node.uid {
+        let (uid, gid) = ids.owner(node.uid, node.gid);
+        if bits & 2 != 0 && (uid == u32::MAX || gid == u32::MAX) {
+            return false;
+        }
+        if self.fsuid != uid {
             if let Some(value) = node.xattrs.get(acl::ACCESS) {
                 return self.allows_dac(
-                    (node.uid, node.gid),
+                    (uid, gid),
                     mode,
                     directory,
                     bits,
-                    acl::allows(value, node, self, bits),
+                    acl::allows_mapped(value, node, self, bits, ids),
                 );
             }
         }
-        self.allows_mode(node.uid, node.gid, mode, directory, bits)
+        self.allows_mode(uid, gid, mode, directory, bits)
     }
     pub(super) fn allows_acl(&self, node: &Node, bits: u32, access: Option<&[u8]>) -> Result<bool> {
         let mode = node.file_metadata().mode;
@@ -517,7 +534,9 @@ impl Credentials {
         self.renew_open_identity();
     }
     pub fn inode_cap(&self, cap: u32, uid: u32, gid: u32) -> bool {
-        self.has_local_cap(cap)
+        uid != u32::MAX
+            && (cap == capabilities::FOWNER || gid != u32::MAX)
+            && self.has_local_cap(cap)
             && (self.user_namespace.is_initial()
                 || self.user_namespace.from_global(false, uid).is_some()
                     && (cap == capabilities::FOWNER
@@ -796,6 +815,11 @@ impl Vfs {
     }
     pub fn exec_credentials(&self, file: &ExecutableFile) -> Result<ExecCredentials> {
         let node = file.node.borrow();
+        let ids = file.mount.as_ref().map_or_else(
+            || mounts::idmap::Ids::plain(&self.fs.owner),
+            |m| mounts::idmap::Ids::from_mount(&m.identity),
+        );
+        let (uid, gid) = ids.owner(node.uid, node.gid);
         let nosuid = file
             .mount
             .as_ref()
@@ -804,6 +828,7 @@ impl Vfs {
             None
         } else {
             node.file_caps()
+                .and_then(|caps| caps.mapped(ids))
                 .filter(|caps| caps.applies(&self.credentials.user_namespace))
         };
         if let Some(file) = file_caps {
@@ -817,17 +842,17 @@ impl Vfs {
                 return Err(Errno(1));
             }
         }
-        let readable = self.allowed(&node, 4);
+        let readable = self.credentials.allows_mapped(&node, 4, ids);
         let mut mm_namespace = self.credentials.user_namespace.clone();
         if !readable {
-            ExecCredentials::include_owner(&mut mm_namespace, node.uid, node.gid);
+            ExecCredentials::include_owner(&mut mm_namespace, uid, gid);
         }
         Ok(ExecCredentials {
             original: self.credentials.clone(),
             readable,
             mm_namespace,
-            uid: node.uid,
-            gid: node.gid,
+            uid,
+            gid,
             mode: node.file_metadata().mode,
             file_caps,
             nosuid,
@@ -1069,7 +1094,7 @@ impl Vfs {
             }
             return Err(Errno(13));
         }
-        if self.allowed(&node.borrow(), mode) {
+        if self.allowed_on(&node.borrow(), mode, &path) {
             Ok(())
         } else {
             Err(Errno(13))
@@ -1082,10 +1107,18 @@ impl Vfs {
         let parent = self.node(&path.parent())?;
         let p = parent.borrow();
         let uid = self.credentials.fsuid;
+        let ids = path.ids(self);
+        let target = self.node(path)?;
+        let (owner, group) = {
+            let node = target.borrow();
+            ids.valid_owner(node.uid, node.gid)?
+        };
         if p.mode & 0o1000 != 0
-            && !self.credentials.has_cap(capabilities::FOWNER)
-            && uid != p.uid
-            && uid != self.node(path)?.borrow().uid
+            && uid != ids.visible(false, p.uid)
+            && uid != owner
+            && !self
+                .credentials
+                .inode_cap(capabilities::FOWNER, owner, group)
         {
             return Err(Errno(1));
         }
@@ -1101,6 +1134,7 @@ impl Vfs {
         uid: u32,
         gid: u32,
         filesystem: Option<&FsHandle>,
+        ids: mounts::idmap::Ids<'_>,
     ) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
         #[cfg(all(feature = "hostfs", unix))]
@@ -1110,10 +1144,22 @@ impl Vfs {
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
-        if !c.inode_cap(capabilities::CHOWN, n.uid, n.gid)
-            && (c.fsuid != n.uid
-                || (uid != u32::MAX && uid != n.uid)
-                || (gid != u32::MAX && gid != n.gid && !c.in_group(gid)))
+        let (owner, group) = ids.owner(n.uid, n.gid);
+        if uid == u32::MAX && owner == u32::MAX || gid == u32::MAX && group == u32::MAX {
+            return Err(Errno(75));
+        }
+        let capable = c.inode_cap(capabilities::CHOWN, owner, group);
+        if uid != u32::MAX
+            && !(c.fsuid == owner && uid == n.uid
+                || capable
+                || owner == u32::MAX && ids.fs_capable(c, capabilities::CHOWN))
+        {
+            return Err(Errno(1));
+        }
+        if gid != u32::MAX
+            && !(c.fsuid == owner && (gid == n.gid || c.in_group(ids.visible(true, gid)))
+                || capable
+                || group == u32::MAX && ids.fs_capable(c, capabilities::CHOWN))
         {
             return Err(Errno(1));
         }
@@ -1177,7 +1223,14 @@ impl Vfs {
         }
         let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
-        self.chown_node(node, uid, gid, Some(&path.filesystem(self)))
+        let ids = path.ids(self);
+        self.chown_node(
+            node,
+            ids.stored(false, uid)?,
+            ids.stored(true, gid)?,
+            Some(&path.filesystem(self)),
+            ids,
+        )
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -1219,13 +1272,15 @@ impl Vfs {
                 .map_err(|e| Errno(e.0));
         }
         let node = open.metadata_node().ok_or(Errno(22))?;
+        let ids = self.open_ids(open.mount.as_ref());
         self.chown_node(
             node,
-            uid,
-            gid,
+            ids.stored(false, uid)?,
+            ids.stored(true, gid)?,
             open.node
                 .as_ref()
                 .map(|_| open.mount.as_ref().map_or(&self.fs, |m| &m.fs)),
+            ids,
         )
     }
 }
@@ -1257,6 +1312,10 @@ mod process_transfer_tests {
         for directory in ["/proc/1/fd", "/proc/1/task/2/fd"] {
             let path = format!("{directory}/{fd}");
             assert!(v.stat_at(AT_FDCWD, path.as_bytes()).is_ok(), "{path}");
+            let fd = v
+                .open_at(AT_FDCWD, directory.as_bytes(), O_DIRECTORY, 0)
+                .unwrap();
+            v.close(fd).unwrap();
         }
         for directory in ["/proc/3/fd", "/proc/1/fdinfo"] {
             let path = format!("{directory}/{fd}");

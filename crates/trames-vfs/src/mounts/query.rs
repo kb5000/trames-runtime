@@ -229,7 +229,8 @@ impl Vfs {
                             (flags & 15)
                                 | atime
                                 | (u64::from(flags & MS_NODIRATIME != 0) << 7)
-                                | (u64::from(flags & MS_NOSYMFOLLOW != 0) << 21),
+                                | (u64::from(flags & MS_NOSYMFOLLOW != 0) << 21)
+                                | (u64::from(m.idmap.get().is_some()) << 20),
                         );
                         let shared = state.shared.as_ref().map_or(0, |g| g.id);
                         let master = state.master.as_ref().map_or(0, |g| g.id);

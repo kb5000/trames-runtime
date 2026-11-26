@@ -245,6 +245,7 @@ fn concurrent_socket_creation_uses_the_original_complete_namespace_and_ofds() {
         credentials: Credentials::user(501, 502),
         ..Vfs::default()
     };
+    v.set_runtime_info(42, Default::default());
     let factory = v.descriptor_factory().with_local_identity([42, 501, 502]);
     let original = Arc::downgrade(&v.root_network);
     v.credentials = Credentials::default();
@@ -292,6 +293,10 @@ fn concurrent_socket_creation_uses_the_original_complete_namespace_and_ofds() {
     });
     assert_eq!(v.fd_snapshot().len(), 3);
     drop(factory);
+    // The original sysfs superblock also owns this network namespace. Closing
+    // socket factories must not destroy a namespace still exposed by a mount.
+    assert!(original.upgrade().is_some());
+    v.umount(b"/sys", 2).unwrap();
     assert!(original.upgrade().is_none());
 }
 

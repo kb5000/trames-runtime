@@ -2,7 +2,7 @@
 //! Persistent inode attributes, including the original guest POSIX ACL policy.
 use super::*;
 enum AttributeNode {
-    Stored(NodeRef, FsHandle),
+    Stored(NodeRef, FsHandle, Option<Arc<mounts::MountIdentity>>),
     #[cfg(all(feature = "hostfs", unix))]
     Host(hostfs::XattrTarget),
 }
@@ -37,7 +37,11 @@ impl Vfs {
                     call,
                     self.event_link(&target.path, &target.node),
                 )?;
-                return Ok(AttributeNode::Stored(target.node, mount.fs.clone()));
+                return Ok(AttributeNode::Stored(
+                    target.node,
+                    mount.fs.clone(),
+                    Some(mount.identity.clone()),
+                ));
             }
             let at = target.path;
             #[cfg(all(feature = "hostfs", unix))]
@@ -65,7 +69,11 @@ impl Vfs {
             if write {
                 at.writable()?;
             }
-            Ok(AttributeNode::Stored(target.node, at.filesystem(self)))
+            Ok(AttributeNode::Stored(
+                target.node,
+                at.filesystem(self),
+                at.mount.as_ref().map(|m| m.identity.clone()),
+            ))
         } else {
             let descriptor = self.descriptor(fd as u32)?;
             if !write {
@@ -92,7 +100,11 @@ impl Vfs {
                     call,
                     open.notification.as_ref().and_then(|n| n.link.clone()),
                 )?;
-                return Ok(AttributeNode::Stored(node, mount.fs.clone()));
+                return Ok(AttributeNode::Stored(
+                    node,
+                    mount.fs.clone(),
+                    Some(mount.identity.clone()),
+                ));
             }
             #[cfg(all(feature = "hostfs", unix))]
             if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
@@ -118,6 +130,7 @@ impl Vfs {
                 open.mount
                     .as_ref()
                     .map_or_else(|| self.fs.clone(), |m| m.fs.clone()),
+                open.mount.as_ref().map(|m| m.identity.clone()),
             ))
         }
     }
@@ -130,14 +143,24 @@ impl Vfs {
         }
         Ok(())
     }
+    #[cfg(all(feature = "hostfs", unix))]
     pub(super) fn xattr_allowed(&self, node: &Node, name: &[u8], write: bool) -> Result<()> {
+        self.xattr_allowed_mapped(node, name, write, mounts::idmap::Ids::plain(&self.fs.owner))
+    }
+    fn xattr_allowed_mapped(
+        &self,
+        node: &Node,
+        name: &[u8],
+        write: bool,
+        ids: mounts::idmap::Ids<'_>,
+    ) -> Result<()> {
+        let (uid, gid) = ids.owner(node.uid, node.gid);
+        if write && (uid == u32::MAX || gid == u32::MAX) {
+            return Err(Errno(1));
+        }
         // Public get/set import and validate the name before resolving an inode.
         if name == file_caps::NAME {
-            if write
-                && !self
-                    .credentials
-                    .inode_cap(capabilities::SETFCAP, node.uid, node.gid)
-            {
+            if write && !self.credentials.inode_cap(capabilities::SETFCAP, uid, gid) {
                 return Err(Errno(1));
             }
             return Ok(());
@@ -152,10 +175,8 @@ impl Vfs {
                 return if write { Ok(()) } else { Err(Errno(61)) };
             }
             if write
-                && self.credentials.fsuid != node.uid
-                && !self
-                    .credentials
-                    .inode_cap(capabilities::FOWNER, node.uid, node.gid)
+                && self.credentials.fsuid != uid
+                && !self.credentials.inode_cap(capabilities::FOWNER, uid, gid)
             {
                 return Err(Errno(1));
             }
@@ -174,16 +195,17 @@ impl Vfs {
             if !matches!(node.content, Content::File(_) | Content::Directory) {
                 return Err(Errno(if write { 1 } else { 61 }));
             }
-            if !self.allowed(node, if write { 2 } else { 4 }) {
+            if !self
+                .credentials
+                .allows_mapped(node, if write { 2 } else { 4 }, ids)
+            {
                 return Err(Errno(13));
             }
             if write
                 && matches!(node.content, Content::Directory)
                 && node.mode & 0o1000 != 0
-                && self.credentials.fsuid != node.uid
-                && !self
-                    .credentials
-                    .inode_cap(capabilities::FOWNER, node.uid, node.gid)
+                && self.credentials.fsuid != uid
+                && !self.credentials.inode_cap(capabilities::FOWNER, uid, gid)
             {
                 return Err(Errno(1));
             }
@@ -193,7 +215,7 @@ impl Vfs {
             // Unimplemented security/system policies report absence.
             return Err(Errno(61));
         }
-        if !write && !self.allowed(node, 4) {
+        if !write && !self.credentials.allows_mapped(node, 4, ids) {
             return Err(Errno(13));
         }
         Err(Errno(95))
@@ -227,9 +249,9 @@ impl Vfs {
         if let Some(name) = name {
             Self::xattr_name(name)?;
         }
-        let node =
+        let (node, fs, mount) =
             match self.xattr_node(fd, path, follow, fuse::XattrCall::Read { name, capacity })? {
-                AttributeNode::Stored(node, _) => node,
+                AttributeNode::Stored(node, fs, mount) => (node, fs, mount),
                 #[cfg(all(feature = "hostfs", unix))]
                 AttributeNode::Host(target) => {
                     let value = target.read(self, name, capacity);
@@ -238,14 +260,30 @@ impl Vfs {
                 }
             };
         let n = node.borrow();
+        let ids = mount.as_ref().map_or_else(
+            || mounts::idmap::Ids::plain(&fs.owner),
+            |m| mounts::idmap::Ids::from_mount(m),
+        );
         let bytes = if let Some(name) = name {
-            self.xattr_allowed(&n, name, false)?;
+            self.xattr_allowed_mapped(&n, name, false, ids)?;
             if name == file_caps::NAME {
                 n.file_caps()
                     .ok_or(Errno(61))?
+                    .mapped(ids)
+                    .ok_or(Errno(61))?
                     .encode(&self.credentials.user_namespace)?
             } else {
-                n.xattrs.get(name).cloned().ok_or(Errno(61))?
+                let mut value = n.xattrs.get(name).cloned().ok_or(Errno(61))?;
+                if acl::name(name) {
+                    acl::translate(&mut value, |group, id| {
+                        Ok(self
+                            .credentials
+                            .user_namespace
+                            .from_global(group, ids.visible(group, id))
+                            .unwrap_or(u32::MAX))
+                    })?;
+                }
+                value
             }
         } else {
             let mut names: Vec<u8> = n
@@ -287,13 +325,13 @@ impl Vfs {
             return Err(Errno(7));
         }
         Self::xattr_name(name)?;
-        let (node, fs) = match self.xattr_node(
+        let (node, fs, mount) = match self.xattr_node(
             fd,
             path,
             follow,
             fuse::XattrCall::Write { name, value, flags },
         )? {
-            AttributeNode::Stored(node, fs) => (node, fs),
+            AttributeNode::Stored(node, fs, mount) => (node, fs, mount),
             #[cfg(all(feature = "hostfs", unix))]
             AttributeNode::Host(target) => return target.write(self, name, value, flags),
         };
@@ -320,10 +358,17 @@ impl Vfs {
             self.pseudo_immutable(&node)?;
         }
         let mut n = node.borrow_mut();
-        self.xattr_allowed(&n, name, true)?;
+        let ids = mount.as_ref().map_or_else(
+            || mounts::idmap::Ids::plain(&fs.owner),
+            |m| mounts::idmap::Ids::from_mount(m),
+        );
+        let (uid, gid) = ids.owner(n.uid, n.gid);
         if name == file_caps::NAME {
+            if value.is_none() {
+                self.xattr_allowed_mapped(&n, name, true, ids)?;
+            }
             let caps = value
-                .map(|bytes| file_caps::FileCaps::parse(bytes, &self.credentials.user_namespace))
+                .map(|bytes| file_caps::FileCaps::for_inode(bytes, &self.credentials, &n, ids))
                 .transpose()?;
             n.edit_caps(caps, flags)?;
             n.times[2] = storage::Timestamp::now();
@@ -331,6 +376,7 @@ impl Vfs {
             inotify::notify(&node, inotify::ATTRIB, None);
             return Ok(());
         }
+        self.xattr_allowed_mapped(&n, name, true, ids)?;
         let old = n.xattrs.get(name).cloned();
         if name == acl::ACCESS && value.is_none() && old.is_none() && lower_acl_remove {
             return Err(Errno(61));
@@ -349,6 +395,10 @@ impl Vfs {
         if acl::name(name) {
             if let Some(value) = &mut next {
                 acl::validate(value)?;
+                acl::translate(value, |group, id| {
+                    ids.stored(group, self.credentials.mapped_id(group, id)?)
+                        .map_err(|_| Errno(22))
+                })?;
                 acl::normalize(value);
                 if value.len() == 4 {
                     next = None;
@@ -362,10 +412,8 @@ impl Vfs {
                 }
             }
             if name == acl::ACCESS
-                && !self
-                    .credentials
-                    .inode_cap(capabilities::FSETID, n.uid, n.gid)
-                && !self.credentials.in_group(n.gid)
+                && !self.credentials.inode_cap(capabilities::FSETID, uid, gid)
+                && !self.credentials.in_group(gid)
             {
                 n.mode &= !0o2000;
             }

@@ -11,6 +11,7 @@ mod concurrency;
 mod writers;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
+pub(crate) use writers::Admission as WriterAdmission;
 pub(crate) use writers::MountWrite;
 use writers::WriteLease;
 pub(super) use writers::Writers;
@@ -1613,12 +1614,17 @@ mod tests {
         std::thread::spawn(move || drop(retained)).join().unwrap();
         assert!(v.epoch_file_io(fd, false));
         assert!(v.epoch_file_io(fd, true));
+        assert_eq!(
+            v.mount(None, b"/mapped-mount", None, 32 | mounts::MS_RDONLY, None),
+            Err(Errno(16))
+        );
+        v.close(fd).unwrap();
         v.mount(None, b"/mapped-mount", None, 32 | mounts::MS_RDONLY, None)
             .unwrap();
-        assert!(matches!(
-            v.mapping_pages(fd, 0, PAGE_SIZE, true, true),
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/mapped-mount/file", 2, 0),
             Err(Errno(30))
-        ));
+        );
     }
     #[test]
     fn retained_writer_keeps_original_ofd_after_last_mapping_provider_is_retired() {

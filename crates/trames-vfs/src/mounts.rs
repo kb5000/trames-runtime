@@ -5,6 +5,7 @@ use std::borrow::Cow;
 pub(super) mod admin;
 mod detach;
 pub(crate) mod fd;
+pub(super) mod idmap;
 mod propagation;
 pub(crate) mod query;
 mod registry;
@@ -176,6 +177,7 @@ pub(super) struct MountDisplay {
     tmpfs_mode: Option<u32>,
 }
 pub(super) struct MountInit {
+    pub idmap: Option<Arc<user_namespace::IdMapping>>,
     pub id: u64,
     pub fs: FsHandle,
     pub root: NodeRef,
@@ -193,6 +195,7 @@ pub(super) struct MountInit {
 // Resource identity is independent of parent topology. Overlay layers must
 // retain this identity rather than the old root's parent chain after pivot.
 pub(super) struct MountIdentity {
+    pub idmap: std::sync::OnceLock<Arc<user_namespace::IdMapping>>,
     inherited: AtomicU64,
     anonymous_tree: std::sync::OnceLock<fd::TreeOrigin>,
     users: std::sync::atomic::AtomicUsize,
@@ -260,12 +263,8 @@ impl MountIdentity {
     pub(super) fn in_use(&self) -> bool {
         self.users.load(Ordering::Relaxed) != 0
     }
-    fn hold_mount_writers(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
-        let guard = self.writer_admission.lock().unwrap();
-        if self.writers.active() {
-            return Err(Errno(16));
-        }
-        Ok(guard)
+    fn hold_mount_writers(&self) -> Result<mapped::WriterAdmission<'_>> {
+        self.writers.hold(&self.writer_admission)
     }
 }
 impl Drop for MountUse {
@@ -399,6 +398,9 @@ impl Mount {
         ));
         let namespace = init.namespace.clone();
         let identity = Arc::new(MountIdentity {
+            idmap: init
+                .idmap
+                .map_or_else(Default::default, std::sync::OnceLock::from),
             inherited: AtomicU64::new(0),
             anonymous_tree: Default::default(),
             users: Default::default(),
@@ -793,9 +795,11 @@ impl ResolvedPath {
         self.key
     }
     pub(super) fn filesystem(&self, vfs: &Vfs) -> FsHandle {
-        self.mount
-            .as_ref()
-            .map_or_else(|| vfs.fs.clone(), |m| m.fs.clone())
+        self.filesystem_ref(vfs).clone()
+    }
+    #[inline]
+    pub(super) fn filesystem_ref<'a>(&'a self, vfs: &'a Vfs) -> &'a FsHandle {
+        self.mount.as_ref().map_or(&vfs.fs, |m| &m.fs)
     }
     pub(super) fn writable(&self) -> Result<()> {
         self.mount.as_ref().map_or(Ok(()), |m| m.writable())
@@ -893,6 +897,7 @@ impl Vfs {
             .cloned()
             .ok_or(Errno(2))?;
         let root = Arc::new(Mount::new(MountInit {
+            idmap: None,
             id: 1,
             fs: self.fs.clone(),
             root,
@@ -917,8 +922,9 @@ impl Vfs {
         ] {
             let node = self.pseudo_node(path)?.ok_or(Errno(2))?;
             mounts.push(Arc::new(Mount::new(MountInit {
+                idmap: None,
                 id,
-                fs: self.fs.clone(),
+                fs: self.pseudo_mount_filesystem(kind, &self.fs, None, false),
                 root: node.clone(),
                 root_key: path.to_vec(),
                 root_entry: None,
@@ -941,6 +947,7 @@ impl Vfs {
         let fs = self.cgroups.borrow().fs.clone();
         let cgroup_root = fs.borrow().paths[b"/".as_slice()].clone();
         mounts.push(Arc::new(Mount::new(MountInit {
+            idmap: None,
             id: 5,
             fs,
             root: cgroup_root,
@@ -1795,9 +1802,6 @@ impl Vfs {
             {
                 return Err(Errno(30));
             }
-            if parent.devpts.is_some() && data.is_some_and(|d| !d.is_empty()) {
-                return Err(Errno(95));
-            }
             // Linux accepts MS_REC here but MS_REMOUNT|MS_BIND updates only
             // this mount. Recursive attribute changes require mount_setattr.
             let ignored = if flags & BIND != 0 { REC } else { 0 };
@@ -1832,35 +1836,15 @@ impl Vfs {
             let _writers = (attrs & MS_RDONLY != 0 && !parent.readonly())
                 .then(|| parent.hold_mount_writers())
                 .transpose()?;
-            if parent.kind == Kind::Cgroup && flags & BIND == 0 {
-                if let Some(value) = self.cgroup_mount_options(data)? {
-                    self.cgroups
-                        .borrow()
-                        .nsdelegate
-                        .store(value, Ordering::Relaxed);
-                }
-            }
-            if parent.kind == Kind::Debugfs
-                && flags & BIND == 0
-                && data.is_some_and(|d| !d.is_empty())
-            {
-                if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
-                    return Err(Errno(1));
-                }
-                let mut root = parent.root.borrow_mut();
-                let (mode, uid, gid) = special::options(data.unwrap(), root.mode & 0o7777, true)?;
-                root.mode = 0o40000 | mode;
-                if let Some(uid) = uid {
-                    root.uid = uid;
-                }
-                if let Some(gid) = gid {
-                    root.gid = gid;
-                }
-            }
             if flags & BIND == 0 {
-                if let Some(readonly) = &parent.fs.super_readonly {
-                    readonly.store(attrs & MS_RDONLY != 0, Ordering::Relaxed);
-                }
+                let parameters = self.mount_parameters(parent.kind, data.unwrap_or_default())?;
+                self.reconfigure_filesystem(
+                    parent.kind,
+                    &parent.fs,
+                    parent.devpts.as_deref(),
+                    &parameters,
+                    Some(attrs & MS_RDONLY != 0),
+                )?;
             }
             parent.flags.set(attrs);
             let events = self.mounts.as_ref().unwrap().0.borrow().events.clone();
@@ -2017,6 +2001,14 @@ impl Vfs {
             match kind.ok_or(Errno(22))? {
                 b"fuse" => {
                     let (fs, binding) = fuse::prepare(self, data.ok_or(Errno(22))?)?;
+                    // The first mount creates the superblock; a reused FUSE
+                    // connection keeps its existing state across aliases.
+                    if binding.as_ref().is_some_and(|b| b.is_new()) {
+                        fs.super_readonly
+                            .as_ref()
+                            .unwrap()
+                            .store(flags & MS_RDONLY != 0, Ordering::Relaxed);
+                    }
                     fuse_binding = binding;
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Fuse, flags & ATTRS)
@@ -2059,10 +2051,12 @@ impl Vfs {
                     (fs, root, b"/".to_vec(), Kind::Mqueue, flags & ATTRS)
                 }
                 b"tmpfs" => {
-                    let (limit, nodes, mode, uid, gid) = tmpfs_options(
-                        data.unwrap_or_default(),
-                        self.pseudo.borrow().runtime.memory_limit as u64,
-                    )?;
+                    let parameters =
+                        self.mount_parameters(Kind::Tmpfs, data.unwrap_or_default())?;
+                    let options: Vec<_> = parameters.values().map(Vec::as_slice).collect();
+                    let options = options.join(&b',');
+                    let (limit, nodes, mode, uid, gid) =
+                        tmpfs_options(&options, self.pseudo.borrow().runtime.memory_limit as u64)?;
                     tmpfs_mode = (mode != 0o1777).then_some(mode);
                     let mut fs = ram_filesystem(
                         limit,
@@ -2089,7 +2083,10 @@ impl Vfs {
                     (fs, root, b"/".to_vec(), Kind::Ramfs, flags & ATTRS)
                 }
                 b"debugfs" => {
-                    let fs = self.debug_filesystem(data.unwrap_or_default())?;
+                    let parameters =
+                        self.mount_parameters(Kind::Debugfs, data.unwrap_or_default())?;
+                    let options: Vec<_> = parameters.values().map(Vec::as_slice).collect();
+                    let fs = self.debug_filesystem(&options.join(&b','), flags & MS_RDONLY != 0)?;
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Debugfs, flags & ATTRS)
                 }
@@ -2117,8 +2114,16 @@ impl Vfs {
                     (fs, root, key, Kind::Cgroup, flags & ATTRS)
                 }
                 b"devpts" => {
-                    let pts = pty::Devpts::new(new_mount_id()?, data.unwrap_or_default())?;
-                    let fs = pts.fs.clone();
+                    let parameters =
+                        self.mount_parameters(Kind::Devpts, data.unwrap_or_default())?;
+                    let options: Vec<_> = parameters.values().map(Vec::as_slice).collect();
+                    let pts = pty::Devpts::new(new_mount_id()?, &options.join(&b','))?;
+                    let mut fs = pts.fs.clone();
+                    fs.owner = self.credentials.user_namespace.clone();
+                    fs.super_readonly
+                        .as_ref()
+                        .unwrap()
+                        .store(flags & MS_RDONLY != 0, Ordering::Relaxed);
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     devpts = Some(Arc::new(pts));
                     (fs, root, b"/".to_vec(), Kind::Devpts, flags & ATTRS)
@@ -2133,10 +2138,21 @@ impl Vfs {
                         _ => unreachable!(),
                     };
                     let node = self.pseudo_node(key)?.ok_or(Errno(19))?;
-                    (self.fs.clone(), node, key.to_vec(), k, flags & ATTRS)
+                    (
+                        self.pseudo_mount_filesystem(k, &self.fs, None, flags & MS_RDONLY != 0),
+                        node,
+                        key.to_vec(),
+                        k,
+                        flags & ATTRS,
+                    )
                 }
                 _ => return Err(Errno(19)),
             }
+        };
+        let fs = if mount_kind == Kind::Nsfs {
+            self.pseudo_mount_filesystem(mount_kind, &fs, namespace.as_ref(), false)
+        } else {
+            fs
         };
         if ns.0.borrow().mounts.len() + additions.len() + 1 > self.mount_limit() {
             return Err(Errno(28));
@@ -2160,6 +2176,7 @@ impl Vfs {
             0
         };
         let root = Arc::new(Mount::new(MountInit {
+            idmap: bind_origin.as_ref().and_then(|m| m.idmap.get().cloned()),
             id: new_mount_id()?,
             fs,
             root,
@@ -2563,6 +2580,7 @@ fn copy_mount_root(
     root_entry: Option<Arc<fuse::Entry>>,
 ) -> Result<Arc<Mount>> {
     let copy = Arc::new(Mount::new(MountInit {
+        idmap: m.idmap.get().cloned(),
         id: new_mount_id()?,
         fs: m.fs.clone(),
         root,
@@ -3024,6 +3042,8 @@ mod tests {
         let mut v = setup();
         v.mount(None, b"/dst", Some(b"tmpfs"), 0, None).unwrap();
         let fd = v.open_at(AT_FDCWD, b"/dst/file", 0x42, 0o600).unwrap();
+        v.close(fd).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/dst/file", 0, 0).unwrap();
         let at = v.mount_location(b"/dst", true).unwrap();
         let mount = at.mount.as_ref().unwrap();
         let shared = mount.shared.clone();
@@ -3032,7 +3052,7 @@ mod tests {
         let filesystem = Arc::downgrade(&shared.fs.shared);
         let root = Arc::downgrade(&shared.root);
         v.mount(None, b"/dst", None, 32 | MS_RDONLY, None).unwrap();
-        assert_eq!(v.write(fd, b"x"), Err(Errno(30)));
+        assert_eq!(v.open_at(AT_FDCWD, b"/dst/file", 2, 0), Err(Errno(30)));
         let reader = shared.clone();
         assert!(
             std::thread::spawn(move || reader.flags.get() & MS_RDONLY != 0)

@@ -409,6 +409,7 @@ pub(super) struct PathInput {
     pub(super) paths: trames_vfs::PathQueries,
     pub(super) files: trames_vfs::DirectFiles,
     pub(super) bytes: Bytes,
+    mount_idmap: std::sync::OnceLock<Result<Arc<trames_vfs::MountIdmap>, Errno>>,
 }
 pub(super) enum Step {
     Pending(PageFault),
@@ -422,6 +423,7 @@ impl PathInput {
             paths,
             files,
             bytes: Bytes::default(),
+            mount_idmap: Default::default(),
         }
     }
     pub(super) fn read(&self, number: u32, a: [u64; 6], memory: &impl CpuMemory) -> Step {
@@ -450,8 +452,17 @@ impl PathInput {
         reader: &mut impl CpuMemory,
     ) -> Result<Step, Errno> {
         if namespace::supported(number) {
-            let (call, output) =
-                namespace::import(number, a, reader, || self.paths.check_mount_admin())?;
+            let (call, output) = namespace::import(
+                number,
+                a,
+                reader,
+                || self.paths.check_mount_admin(),
+                |fd| {
+                    self.mount_idmap
+                        .get_or_init(|| self.paths.capture_mount_idmap(fd))
+                        .clone()
+                },
+            )?;
             return Ok(match self.paths.namespace_attempt(call) {
                 trames_vfs::NamespaceAttempt::Complete(reply) => Step::Reply(reply, output),
                 trames_vfs::NamespaceAttempt::Retained(work) => Step::Work(work, output),

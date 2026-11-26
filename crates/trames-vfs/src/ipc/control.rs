@@ -197,7 +197,7 @@ impl Vfs {
             Err(Errno(2)) => {}
             Err(error) => return Err(error),
         }
-        self.check_parent_write(&path)?;
+        self.check_create_parent_write(&path)?;
         let mut binding = self.path_bindings.bind(socket);
         if let Some(mount) = &path.mount {
             binding.retain_mount(&mount.identity);
@@ -255,7 +255,7 @@ impl Vfs {
             let p = self.resolve_final(-100, &name[2..name.len() - 1], true)?;
             let node = self.node(&p)?;
             let n = node.borrow();
-            if !self.allowed(&n, 2) {
+            if !self.allowed_on(&n, 2, &p) {
                 return Err(Errno(13));
             }
             let Content::Socket(peer) = &n.content else {

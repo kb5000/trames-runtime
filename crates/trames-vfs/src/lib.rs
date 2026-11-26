@@ -130,6 +130,7 @@ mod memfd;
 pub use memfd::MemfdParameters;
 mod mounts;
 pub use mounts::fd::{MountAttributes, MountFdCall};
+pub use mounts::idmap::MountIdmap;
 pub use mounts::query::{MountQuery, MountQueryKind, UNIQUE_MOUNT_ID_BASE};
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
@@ -1431,10 +1432,19 @@ impl Vfs {
             .map(|_| ())
     }
     fn check_parent_write(&self, path: &ResolvedPath) -> Result<NodeRef> {
+        self.check_parent_write_mode(path, false)
+    }
+    fn check_create_parent_write(&self, path: &ResolvedPath) -> Result<NodeRef> {
+        self.check_parent_write_mode(path, true)
+    }
+    fn check_parent_write_mode(&self, path: &ResolvedPath, create: bool) -> Result<NodeRef> {
         if self.proc_directory_tree(path) {
             self.node(path)?;
         }
         path.writable()?;
+        if create {
+            path.ids(self).creator(&self.credentials)?;
+        }
         if Self::cgroup_mount(path)
             || path.mount.as_ref().is_some_and(|m| {
                 m.devpts.is_some()
@@ -1451,13 +1461,15 @@ impl Vfs {
             if self.proc_task_directory(&parent) && self.node(path).is_ok() {
                 return Err(Errno(1));
             }
-            if self.proc_directory_tree(path) && !self.allowed(&self.node(&parent)?.borrow(), 3) {
+            if self.proc_directory_tree(path)
+                && !self.allowed_on(&self.node(&parent)?.borrow(), 3, &parent)
+            {
                 return Err(Errno(13));
             }
             return Err(Errno(30));
         }
         let parent = self.node(&path.parent())?;
-        if !self.allowed(&parent.borrow(), 3) {
+        if !self.allowed_on(&parent.borrow(), 3, path) {
             return Err(Errno(13));
         }
         Ok(parent)
@@ -1707,25 +1719,34 @@ impl Vfs {
             }
             Some(parent)
         };
-        let xattrs = acl::inherit(
-            parent.as_ref().map(|p| p.borrow()).as_deref(),
-            &content,
-            &mut mode,
-            self.umask(),
-            exclusive,
-        );
-        let inherited = parent.as_ref().and_then(|p| {
-            let p = p.borrow();
-            (p.mode & 0o2000 != 0).then_some(p.gid)
-        });
-        if inherited.is_some() && matches!(content, Content::Directory) {
-            mode |= 0o2000;
-        }
+        let (inherited, xattrs) = {
+            let state = parent.as_ref().map(|p| p.borrow());
+            let p = state.as_deref();
+            let inherited = p.filter(|p| p.mode & 0o2000 != 0).map(|p| p.gid);
+            if inherited.is_some() {
+                if matches!(content, Content::Directory) {
+                    mode |= 0o2000;
+                } else if mode & 0o2010 == 0o2010 {
+                    let p = p.unwrap();
+                    let (uid, gid) = path.ids(self).owner(p.uid, p.gid);
+                    if !self.credentials.in_group(gid)
+                        && !self.credentials.inode_cap(capabilities::FSETID, uid, gid)
+                    {
+                        mode &= !0o2000;
+                    }
+                }
+            }
+            (
+                inherited,
+                acl::inherit(p, &content, &mut mode, self.umask(), exclusive),
+            )
+        };
         let parent_times = directory::EntryTimes::lock(parent.as_deref(), None);
         let mut fs = filesystem.borrow_mut();
         if exclusive && fs.paths.contains_key(&path.key) {
             return Err(Errno(17));
         }
+        let (uid, gid) = path.ids(self).creator(&self.credentials)?;
         fs.admit_inode()?;
         if fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
@@ -1763,8 +1784,8 @@ impl Vfs {
                 .map_or(0xfd01, |m| m.root.borrow().device),
             content,
             mode,
-            uid: self.credentials.fsuid,
-            gid: inherited.unwrap_or(self.credentials.fsgid),
+            uid,
+            gid: inherited.unwrap_or(gid),
             volatile: false,
             inode,
             links: 1,
@@ -2207,7 +2228,7 @@ impl Vfs {
         if entry.1.is_none() {
             let node = self.node(&entry.0)?;
             #[cfg(all(feature = "hostfs", unix))]
-            let native = entry.0.filesystem(self).host.is_some();
+            let native = entry.0.filesystem_ref(self).host.is_some();
             #[cfg(not(all(feature = "hostfs", unix)))]
             let native = false;
             // A named host walk already retains its accepted native position.
@@ -2312,40 +2333,34 @@ impl Vfs {
         }
         Ok((path, node))
     }
-    fn path_native_work(&self, path: &ResolvedPath) -> bool {
-        let fs = path.filesystem(self);
+    fn filesystem_native_work(fs: &FsHandle) -> bool {
         #[cfg(all(feature = "hostfs", unix))]
         if fs.host.is_some() {
             return true;
         }
         fs.borrow().disk.is_some() || fs.has_overlay()
     }
+    fn path_native_work(&self, path: &ResolvedPath) -> bool {
+        Self::filesystem_native_work(path.filesystem_ref(self))
+    }
     fn entry_native_work(&self, (path, target): &ResolvedEntry) -> bool {
-        let fs = match target {
+        match target {
             Some(ResolvedTarget::Descriptor(open)) => {
                 let open = open.borrow();
                 #[cfg(all(feature = "hostfs", unix))]
                 if open.host_file.is_some() {
                     return true;
                 }
-                let Some(mount) = &open.mount else {
-                    return false;
-                };
-                mount.fs.clone()
+                open.mount
+                    .as_ref()
+                    .is_some_and(|mount| Self::filesystem_native_work(&mount.fs))
             }
-            Some(ResolvedTarget::Inode(file)) => {
-                let Some(mount) = &file.mount else {
-                    return false;
-                };
-                mount.fs.clone()
-            }
-            None => path.filesystem(self),
-        };
-        #[cfg(all(feature = "hostfs", unix))]
-        if fs.host.is_some() {
-            return true;
+            Some(ResolvedTarget::Inode(file)) => file
+                .mount
+                .as_ref()
+                .is_some_and(|mount| Self::filesystem_native_work(&mount.fs)),
+            None => self.path_native_work(path),
         }
-        fs.borrow().disk.is_some() || fs.has_overlay()
     }
     fn resolve_walk(
         &self,
@@ -2459,9 +2474,9 @@ impl Vfs {
             let parent_node = self.node(&current)?;
             #[cfg(all(feature = "hostfs", unix))]
             if let Some(position) = &current.host_position {
-                let fs = current.filesystem(self);
+                let fs = current.filesystem_ref(self);
                 position
-                    .pin(fs.host.as_ref().ok_or(Errno(5))?, &fs, &current.key)?
+                    .pin(fs.host.as_ref().ok_or(Errno(5))?, fs, &current.key)?
                     .file
                     .refresh_permissions(&parent_node)?;
             }
@@ -2530,13 +2545,12 @@ impl Vfs {
                 }
             }
             permission_checked = false;
-            if !self.allowed(&n, 1)
+            if !self.allowed_on(&n, 1, &current)
                 && !current.mount.as_ref().is_some_and(|m| m.fs.fuse.is_some())
-                && !self.proc_fd_search_allowed(&current)
             {
                 return Err(Errno(13));
             }
-            let parent_owner = n.uid;
+            let parent_owner = current.ids(self).visible(false, n.uid);
             let parent_mode = n.mode;
             drop(n);
             if part == b"." {
@@ -2853,8 +2867,8 @@ impl Vfs {
                     if n.mode & 0o170000 == 0o120000 && node.fuse_leaf.get().is_some() {
                         if parts.is_empty()
                             && parent_mode & 0o1002 == 0o1002
-                            && n.uid != self.credentials.fsuid
-                            && n.uid != parent_owner
+                            && current.ids(self).visible(false, n.uid) != self.credentials.fsuid
+                            && current.ids(self).visible(false, n.uid) != parent_owner
                             && self.namei_policy.get(sysctl::Protection::Symlinks) != 0
                         {
                             return Err(Errno(13));
@@ -2932,8 +2946,8 @@ impl Vfs {
                     if let Content::Symlink(target) = &n.content {
                         if parts.is_empty()
                             && parent_mode & 0o1002 == 0o1002
-                            && n.uid != self.credentials.fsuid
-                            && n.uid != parent_owner
+                            && current.ids(self).visible(false, n.uid) != self.credentials.fsuid
+                            && current.ids(self).visible(false, n.uid) != parent_owner
                             && self.namei_policy.get(sysctl::Protection::Symlinks) != 0
                         {
                             return Err(Errno(13));
@@ -3047,7 +3061,7 @@ impl Vfs {
             Err(Errno(2)) if !trailing => {}
             Err(error) => return Err(error),
         }
-        self.check_parent_write(&dest)?;
+        self.check_create_parent_write(&dest)?;
         self.insert_entry(dest, Content::Symlink(target.to_vec()), 0o120777, true)
     }
     pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
@@ -3251,8 +3265,8 @@ impl Vfs {
         }
         if import_executable.is_none() {
             dest.writable()?;
-            self.check_link_source(&source.borrow())?;
-            self.check_parent_write(dest)?;
+            self.check_link_source(&source.borrow(), source_path)?;
+            self.check_create_parent_write(dest)?;
             if self.credentials.landlock.fs_mask() != 0 {
                 let mode = source.borrow().mode;
                 self.landlock_check_parent(dest, None, landlock::make(mode))?;
@@ -3363,7 +3377,7 @@ impl Vfs {
             self.landlock_check_parent(&p, None, landlock::MAKE_DIR)?;
             return self.cgroup_mkdir(&p, mode);
         }
-        self.check_parent_write(&p)?;
+        self.check_create_parent_write(&p)?;
         self.insert_entry(p, Content::Directory, 0o40000 | (mode & 0o7777), true)
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
@@ -3409,7 +3423,7 @@ impl Vfs {
             Err(Errno(2)) => {}
             Err(e) => return Err(e),
         }
-        self.check_parent_write(&p)?;
+        self.check_create_parent_write(&p)?;
         let content = match type_ {
             0o20000 | 0o60000 => {
                 if !self.credentials.has_cap(capabilities::MKNOD) {
@@ -3489,7 +3503,7 @@ impl Vfs {
         }
         if is_queue {
             p.writable()?;
-            if !self.allowed(&self.node(&p.parent())?.borrow(), 3) {
+            if !self.allowed_on(&self.node(&p.parent())?.borrow(), 3, &p) {
                 return Err(Errno(13));
             }
         } else {
@@ -3973,9 +3987,9 @@ impl Vfs {
                 return Err(Errno(2));
             }
             check_write(None)?;
-            self.check_parent_write(&p)?;
+            self.check_create_parent_write(&p)?;
             #[cfg(all(feature = "hostfs", unix))]
-            let native_created = if let Some(host) = &p.filesystem(self).host {
+            let native_created = if let Some(host) = &p.filesystem_ref(self).host {
                 let filesystem = p.filesystem(self);
                 let _namespace = filesystem.namespace.lock().unwrap();
                 self.landlock_check_parent(&p, None, landlock::MAKE_REG)?;
@@ -4031,13 +4045,13 @@ impl Vfs {
         {
             let n = node.borrow();
             self.check_device_open(&n, flags)?;
-            if flags & O_NOATIME != 0
-                && self.credentials.fsuid != n.uid
-                && !self
-                    .credentials
-                    .inode_cap(capabilities::FOWNER, n.uid, n.gid)
-            {
-                return Err(Errno(1));
+            if flags & O_NOATIME != 0 {
+                let (uid, gid) = p.ids(self).owner(n.uid, n.gid);
+                if self.credentials.fsuid != uid
+                    && !self.credentials.inode_cap(capabilities::FOWNER, uid, gid)
+                {
+                    return Err(Errno(1));
+                }
             }
             if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
                 return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
@@ -4060,8 +4074,8 @@ impl Vfs {
                 && !network_control
                     .as_ref()
                     .is_some_and(|control| control.authorized(&self.credentials, self.lock_owner))
-                && ((flags & 3 != 1 && !self.allowed(&n, 4))
-                    || ((flags & 3 != 0 || flags & 0x200 != 0) && !self.allowed(&n, 2)))
+                && ((flags & 3 != 1 && !self.allowed_on(&n, 4, &p))
+                    || ((flags & 3 != 0 || flags & 0x200 != 0) && !self.allowed_on(&n, 2, &p)))
             {
                 return Err(Errno(13));
             }
@@ -4082,7 +4096,10 @@ impl Vfs {
         }
         let mut write_access = if node.regular_file && (fd_can_write(flags) || flags & O_TRUNC != 0)
         {
-            Some(executable::WriteAccess::acquire(&node)?)
+            Some(executable::WriteAccess::acquire(
+                &node,
+                p.mount.as_ref().map(|m| &m.identity),
+            )?)
         } else {
             None
         };
@@ -4103,10 +4120,10 @@ impl Vfs {
         let host_file = match created_host_file {
             Some(file) => Some(file),
             None => p
-                .filesystem(self)
+                .filesystem_ref(self)
                 .host
                 .as_ref()
-                .map(|host| host.lease_path(&p.filesystem(self), &p, &node, flags))
+                .map(|host| host.lease_path(p.filesystem_ref(self), &p, &node, flags))
                 .transpose()?
                 .flatten(),
         };
@@ -4933,15 +4950,15 @@ impl Vfs {
         if offset.is_some() && o.pipe.is_some() {
             return Err(Errno(29));
         }
+        if !fd_can_write(o.flags.get()) {
+            return Err(Errno(9));
+        }
         let readonly = o.mount.as_ref().is_some_and(|mount| mount.readonly());
         if readonly && !mounts::special_file(o.node.as_ref()) {
             return Err(Errno(30));
         }
         let available = self.description_available_bytes(&o);
         let memfd_available = self.memfd_available();
-        if !fd_can_write(o.flags.get()) {
-            return Err(Errno(9));
-        }
         if let Some(control) = &o.sysctl_control {
             let count = if let Some(mut explicit) = offset {
                 control.write(bytes, &mut explicit, self)?
@@ -5373,6 +5390,12 @@ impl Vfs {
     }
     fn stat_node(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
         let mut out = Self::stat_node_fields(node, node.stat_device(mount));
+        let ids = self.open_ids(mount);
+        if ids.is_mapped() {
+            let (uid, gid) = ids.owner(node.uid, node.gid);
+            out[24..28].copy_from_slice(&uid.to_le_bytes());
+            out[28..32].copy_from_slice(&gid.to_le_bytes());
+        }
         let blocks = match &node.content {
             Content::File(data) if !node.volatile => data.blocks()?,
             _ => 0,
@@ -5600,10 +5623,10 @@ impl Vfs {
         }
         let id = p.mount.as_ref().map_or(1, |m| m.id);
         #[cfg(all(feature = "hostfs", unix))]
-        if let Some(host) = &p.filesystem(self).host {
+        if let Some(host) = &p.filesystem_ref(self).host {
             if let Some(position) = &p.host_position {
                 let stat = position
-                    .pin(host, &p.filesystem(self), &p.key)?
+                    .pin(host, p.filesystem_ref(self), &p.key)?
                     .file
                     .stat()?;
                 let is_root = position.known_node().is_some_and(|node| {
@@ -5913,7 +5936,7 @@ impl Vfs {
         if let Some(file) = &retained_host {
             file.refresh_permissions(&n)?;
         }
-        if !self.allowed(&n.borrow(), 1) {
+        if !self.allowed_on(&n.borrow(), 1, &p) {
             return Err(Errno(13));
         }
         #[cfg(all(feature = "hostfs", unix))]

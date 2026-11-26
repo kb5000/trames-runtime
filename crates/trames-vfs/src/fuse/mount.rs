@@ -152,6 +152,9 @@ pub(crate) struct Binding {
     _usage: Arc<ConnectionUse>,
 }
 impl Binding {
+    pub(crate) fn is_new(&self) -> bool {
+        self.daemon.is_some()
+    }
     pub(crate) fn publish(mut self) {
         if let Some(daemon) = self.daemon.take() {
             self.device.as_ref().unwrap().install(daemon);
@@ -199,6 +202,7 @@ pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Option<Binding>
         pid: v.pid_ns.local(v.pid),
     };
     let mut fs = mounts::ram_filesystem(0, 1, opts.mode, opts.uid, opts.gid, false)?;
+    fs.owner = ns.clone();
     let connection = Connection::new(c);
     dev.reserve()?;
     let root = fs.borrow().paths[b"/".as_slice()].clone();

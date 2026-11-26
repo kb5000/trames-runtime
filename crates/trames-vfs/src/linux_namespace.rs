@@ -27,6 +27,7 @@ fn reserve_namespace(live: &std::sync::atomic::AtomicUsize) -> Result<u64> {
 /// Existing socket FDs retain their creating stack after unshare/setns.
 pub(super) struct RootNetwork {
     pub(super) user_namespace: UserNamespace,
+    pub(super) sys_super: fs_data::SuperSlot,
     inode: u64,
     pub network: SharedCell<trames_net::Network>,
     pub local: Arc<SharedCell<ipc::LocalNamespace>>,
@@ -36,6 +37,7 @@ impl Default for RootNetwork {
     fn default() -> Self {
         Self {
             user_namespace: UserNamespace::default(),
+            sys_super: Default::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             network: SharedCell::default(),
             local: Arc::default(),
@@ -269,7 +271,7 @@ pub(super) enum SharedNamespace {
     Cgroup(Arc<CgroupNamespace>),
 }
 impl SharedNamespace {
-    fn capture(namespace: &NamespaceHandle) -> Option<Self> {
+    pub(super) fn capture(namespace: &NamespaceHandle) -> Option<Self> {
         Some(match namespace {
             NamespaceHandle::User(n) => Self::User(n.clone()),
             NamespaceHandle::Uts(n) => Self::Uts(n.clone()),
@@ -559,6 +561,7 @@ impl Vfs {
         };
         self.root_network = Arc::new(RootNetwork {
             user_namespace: self.credentials.user_namespace.clone(),
+            sys_super: Default::default(),
             inode,
             network: SharedCell::new(network.clone()),
             local: Arc::default(),

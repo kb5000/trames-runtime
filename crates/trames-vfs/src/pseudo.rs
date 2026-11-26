@@ -1018,6 +1018,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) special_supers: Arc<fs_data::SpecialSupers>,
     pub(super) debug_fs: Arc<std::sync::Mutex<Option<FsHandle>>>,
     pub(super) fuse_control: Arc<fuse::Controller>,
     pub(super) user_namespace_limits: std::sync::OnceLock<Arc<user_namespace::UserNamespaceLimits>>,

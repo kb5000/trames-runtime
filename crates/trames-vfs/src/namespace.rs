@@ -30,17 +30,20 @@ pub(super) fn link_permission(
     policy: u32,
     source: &Node,
     delegated: bool,
+    ids: mounts::idmap::Ids<'_>,
 ) -> Result<()> {
-    if c.fsuid == source.uid
-        || policy == 0
-        || c.inode_cap(capabilities::FOWNER, source.uid, source.gid)
-    {
+    let (uid, gid) = ids.owner(source.uid, source.gid);
+    if uid == u32::MAX || gid == u32::MAX {
+        return Err(Errno(75));
+    }
+    if c.fsuid == uid || policy == 0 || c.inode_cap(capabilities::FOWNER, uid, gid) {
         return Ok(());
     }
     let safe = source.mode & 0o170000 == 0o100000
         && source.mode & 0o4000 == 0
         && source.mode & 0o2010 != 0o2010
-        && (delegated && matches!(source.content, Content::Fuse) || c.allows_node(source, 6));
+        && (delegated && matches!(source.content, Content::Fuse)
+            || c.allows_mapped(source, 6, ids));
     if safe {
         Ok(())
     } else {
@@ -48,10 +51,16 @@ pub(super) fn link_permission(
     }
 }
 
-fn sticky_create_permission(c: &Credentials, level: u32, owner: u32, dir: &Node) -> Result<()> {
+fn sticky_create_permission(
+    c: &Credentials,
+    level: u32,
+    owner: u32,
+    dir: &Node,
+    dir_uid: u32,
+) -> Result<()> {
     if level != 0
         && owner != c.fsuid
-        && owner != dir.uid
+        && owner != dir_uid
         && dir.mode & 0o1000 != 0
         && (dir.mode & 2 != 0 || level == 2 && dir.mode & 0o020 != 0)
     {
@@ -170,17 +179,19 @@ impl Vfs {
             _original: original,
         })
     }
-    pub(super) fn check_link_source(&self, source: &Node) -> Result<()> {
+    pub(super) fn check_link_source(&self, source: &Node, path: &ResolvedPath) -> Result<()> {
         link_permission(
             &self.credentials,
             self.namei_policy.get(sysctl::Protection::Hardlinks),
             source,
             true,
+            path.ids(self),
         )
     }
     pub(super) fn check_sticky_create(&self, path: &ResolvedPath, node: &NodeRef) -> Result<()> {
         let n = node.borrow();
-        if n.uid == self.credentials.fsuid {
+        let ids = path.ids(self);
+        if ids.visible(false, n.uid) == self.credentials.fsuid {
             return Ok(());
         }
         let level = match n.content {
@@ -191,11 +202,17 @@ impl Vfs {
         if level == 0 {
             return Ok(());
         }
-        let owner = n.uid;
+        let owner = ids.visible(false, n.uid);
         drop(n);
         let parent = self.node(&path.parent())?;
         let dir = parent.borrow();
-        sticky_create_permission(&self.credentials, level, owner, &dir)
+        sticky_create_permission(
+            &self.credentials,
+            level,
+            owner,
+            &dir,
+            ids.visible(false, dir.uid),
+        )
     }
     pub(super) fn check_sticky_create_in(
         &self,
@@ -211,7 +228,8 @@ impl Vfs {
         if level == 0 || owner == self.credentials.fsuid {
             return Ok(());
         }
-        sticky_create_permission(&self.credentials, level, owner, &parent.borrow())
+        let parent = parent.borrow();
+        sticky_create_permission(&self.credentials, level, owner, &parent, parent.uid)
     }
     /// Move or exchange complete subtrees under one namespace transaction.
     pub fn rename_at(
@@ -316,12 +334,23 @@ impl Vfs {
         if target.as_ref().is_some_and(|n| Arc::ptr_eq(n, &src)) {
             return Ok(());
         }
-        let old_parent = self.check_parent_write(&source)?;
-        let new_parent = self.check_parent_write(&dest)?;
-        self.check_remove(&source)?;
-        if target.is_some() {
-            self.check_remove(&dest)?;
+        {
+            let node = src.borrow();
+            source.ids(self).valid_owner(node.uid, node.gid)?;
         }
+        let old_parent = self.check_parent_write(&source)?;
+        self.check_remove(&source)?;
+        let new_parent = if let Some(target) = &target {
+            {
+                let node = target.borrow();
+                dest.ids(self).valid_owner(node.uid, node.gid)?;
+            }
+            let parent = self.check_parent_write(&dest)?;
+            self.check_remove(&dest)?;
+            parent
+        } else {
+            self.check_create_parent_write(&dest)?
+        };
         let is_dir = matches!(src.borrow().content, Content::Directory);
         let target_dir = target
             .as_ref()
@@ -519,6 +548,7 @@ impl Vfs {
         mode: u32,
         filesystem: Option<&FsHandle>,
         link: Option<&Arc<inotify::Link>>,
+        ids: mounts::idmap::Ids<'_>,
     ) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
         #[cfg(all(feature = "hostfs", unix))]
@@ -527,10 +557,9 @@ impl Vfs {
         }
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
-        if !self
-            .credentials
-            .inode_cap(capabilities::FOWNER, n.uid, n.gid)
-            && self.credentials.fsuid != n.uid
+        let (uid, gid) = ids.valid_owner(n.uid, n.gid)?;
+        if !self.credentials.inode_cap(capabilities::FOWNER, uid, gid)
+            && self.credentials.fsuid != uid
         {
             return Err(Errno(1));
         }
@@ -538,10 +567,8 @@ impl Vfs {
         let old_time = n.times[2];
         let old_acl = n.xattrs.get(acl::ACCESS).cloned();
         let mut applied_mode = (n.mode & !0o7777) | (mode & 0o7777);
-        if !self
-            .credentials
-            .inode_cap(capabilities::FSETID, n.uid, n.gid)
-            && !self.credentials.in_group(n.gid)
+        if !self.credentials.inode_cap(capabilities::FSETID, uid, gid)
+            && !self.credentials.in_group(gid)
         {
             applied_mode &= !0o2000;
         }
@@ -591,7 +618,13 @@ impl Vfs {
         let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
         let link = self.event_link(&path, &node);
-        self.chmod_node(node, mode, Some(&path.filesystem(self)), link.as_ref())
+        self.chmod_node(
+            node,
+            mode,
+            Some(&path.filesystem(self)),
+            link.as_ref(),
+            path.ids(self),
+        )
     }
     pub fn chmod_at_flags(
         &mut self,
@@ -611,7 +644,13 @@ impl Vfs {
             return Err(Errno(95));
         }
         let link = self.event_link(&path, &node);
-        self.chmod_node(node, mode, Some(&path.filesystem(self)), link.as_ref())
+        self.chmod_node(
+            node,
+            mode,
+            Some(&path.filesystem(self)),
+            link.as_ref(),
+            path.ids(self),
+        )
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -656,6 +695,7 @@ impl Vfs {
             open.notification
                 .as_ref()
                 .and_then(|lease| lease.link.as_ref()),
+            self.open_ids(open.mount.as_ref()),
         )
     }
     pub fn set_times(
@@ -717,7 +757,7 @@ impl Vfs {
             }
             self.fd_writable(dirfd as u32)?;
         }
-        let (node, link, filesystem) = match path {
+        let (node, link, filesystem, mount) = match path {
             Some(p) => {
                 let target = self.metadata_target(dirfd, p, flags & 0x100 == 0)?;
                 if let Some(result) =
@@ -732,7 +772,12 @@ impl Vfs {
                     .and_then(|m| m.file.as_ref()?.notification.as_ref()?.link.clone())
                     .or_else(|| self.event_link(&target.path, &target.node));
                 let filesystem = target.path.filesystem(self);
-                (target.node, link, Some(filesystem))
+                (
+                    target.node,
+                    link,
+                    Some(filesystem),
+                    target.path.mount.map(|m| m.identity.clone()),
+                )
             }
             None => {
                 let descriptor = self.descriptor(dirfd as u32)?;
@@ -747,6 +792,7 @@ impl Vfs {
                             .as_ref()
                             .map_or_else(|| self.fs.clone(), |m| m.fs.clone())
                     }),
+                    open.mount.as_ref().map(|m| m.identity.clone()),
                 )
             }
         };
@@ -754,17 +800,20 @@ impl Vfs {
         self.pseudo_immutable(&node)?;
         {
             let n = node.borrow();
-            let owner = self.credentials.fsuid == n.uid
-                || self
-                    .credentials
-                    .inode_cap(capabilities::FOWNER, n.uid, n.gid);
-            if !owner {
-                if times.is_some_and(|t| !t.iter().all(|pair| pair[1] == UTIME_NOW)) {
-                    return Err(Errno(1));
-                }
-                if !self.allowed(&n, 2) {
-                    return Err(Errno(13));
-                }
+            let ids = mount.as_ref().map_or_else(
+                || mounts::idmap::Ids::plain(&self.fs.owner),
+                |m| mounts::idmap::Ids::from_mount(m),
+            );
+            let (uid, gid) = ids.owner(n.uid, n.gid);
+            let owner = self.credentials.fsuid == uid
+                || self.credentials.inode_cap(capabilities::FOWNER, uid, gid);
+            let explicit = times.is_some_and(|t| !t.iter().all(|pair| pair[1] == UTIME_NOW));
+            if !explicit && !owner && !self.credentials.allows_mapped(&n, 2, ids) {
+                return Err(Errno(13));
+            }
+            ids.valid_owner(n.uid, n.gid)?;
+            if explicit && !owner {
+                return Err(Errno(1));
             }
         }
         #[cfg(all(feature = "hostfs", unix))]

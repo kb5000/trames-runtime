@@ -356,14 +356,19 @@ pub(super) fn peer_descriptor(
 /// remain guest-wide so controlling terminals cannot alias across containers.
 pub(super) struct Devpts {
     pub fs: FsHandle,
+    options: SharedCell<DevptsOptions>,
+    device: u64,
+}
+#[derive(Clone)]
+struct DevptsOptions {
     uid: Option<u32>,
     gid: Option<u32>,
     mode: u32,
+    ptmxmode: u32,
     max: u32,
-    device: u64,
 }
 impl Devpts {
-    pub fn new(device: u64, data: &[u8]) -> Result<Self> {
+    fn options(data: &[u8]) -> Result<DevptsOptions> {
         let mut uid = None;
         let mut gid = None;
         let mut mode = 0o600;
@@ -391,6 +396,35 @@ impl Devpts {
                 _ => return Err(Errno(22)),
             }
         }
+        Ok(DevptsOptions {
+            uid,
+            gid,
+            mode,
+            ptmxmode,
+            max,
+        })
+    }
+    pub(super) fn validate(data: &[u8]) -> Result<()> {
+        Self::options(data).map(|_| ())
+    }
+    pub(super) fn reconfigure(&self, data: &[u8]) -> Result<()> {
+        let options = Self::options(data)?;
+        let _namespace = self.fs.namespace.lock().unwrap();
+        let ptmx = self
+            .fs
+            .borrow()
+            .paths
+            .get(b"/ptmx".as_slice())
+            .cloned()
+            .ok_or(Errno(5))?;
+        let _metadata = ptmx.metadata.lock().unwrap();
+        ptmx.borrow_mut().mode = 0o20000 | options.ptmxmode;
+        *self.options.borrow_mut() = options;
+        Ok(())
+    }
+    pub fn new(device: u64, data: &[u8]) -> Result<Self> {
+        let options = Self::options(data)?;
+        let ptmxmode = options.ptmxmode;
         let out = Self {
             fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
@@ -401,10 +435,7 @@ impl Devpts {
                 disk: None,
                 volume: None,
             }),
-            uid,
-            gid,
-            mode,
-            max,
+            options: SharedCell::new(options),
             device,
         };
         out.node(b"/".to_vec(), Content::Directory, 0o40755, 0, 0);
@@ -420,16 +451,17 @@ impl Devpts {
     fn allocate_slave(&self, id: u32, credentials: &Credentials) -> Result<(u32, NodeRef)> {
         let _namespace = self.fs.namespace.lock().unwrap();
         let mut fs = self.fs.borrow_mut();
-        let number = (0..self.max)
+        let options = self.options.borrow();
+        let number = (0..options.max)
             .find(|number| !fs.paths.contains_key(format!("/{number}").as_bytes()))
             .ok_or(Errno(28))?;
         let node = self.insert_node(
             &mut fs,
             format!("/{number}").into_bytes(),
             Content::Device(pseudo::Device::Pts(id, number)),
-            0o20000 | self.mode,
-            self.uid.unwrap_or(credentials.fsuid),
-            self.gid.unwrap_or(credentials.fsgid),
+            0o20000 | options.mode,
+            options.uid.unwrap_or(credentials.fsuid),
+            options.gid.unwrap_or(credentials.fsgid),
         );
         Ok((number, node))
     }
