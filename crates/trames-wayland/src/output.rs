@@ -9,13 +9,15 @@ use wayland_server::{
 
 pub(crate) struct Outputs {
     pub default_scale: i32,
+    pub global_ids: Vec<GlobalId>,
     globals: BTreeSet<i32>,
-    resources: BTreeMap<i32, Vec<wl_output::WlOutput>>,
+    pub(crate) resources: BTreeMap<i32, Vec<wl_output::WlOutput>>,
 }
 impl Default for Outputs {
     fn default() -> Self {
         Self {
             default_scale: 1,
+            global_ids: vec![],
             globals: BTreeSet::new(),
             resources: BTreeMap::new(),
         }
@@ -24,10 +26,14 @@ impl Default for Outputs {
 impl State {
     pub(crate) fn ensure_output(&mut self, handle: &DisplayHandle, scale: i32) {
         if self.outputs.globals.insert(scale) {
-            let _: GlobalId = handle.create_global::<Self, wl_output::WlOutput, _>(3, scale);
+            let id = handle.create_global::<Self, wl_output::WlOutput, _>(3, scale);
+            self.outputs.global_ids.push(id);
         }
     }
     pub(crate) fn surface_output(&mut self, id: u64, scale: i32) {
+        if self.monitors.active {
+            return;
+        }
         let Some(surface) = self.surfaces.get_mut(&id) else {
             return;
         };
@@ -54,6 +60,10 @@ impl State {
         }
     }
     pub(crate) fn inherit_output(&mut self, id: u64) {
+        if self.monitors.active {
+            self.inherit_monitor(id);
+            return;
+        }
         let scale = self
             .surfaces
             .get(&id)

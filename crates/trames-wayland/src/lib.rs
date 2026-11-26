@@ -6,7 +6,9 @@ mod android;
 mod frame;
 mod gpu;
 mod input;
+mod monitors;
 mod output;
+pub use monitors::DesktopOutput;
 mod selection;
 mod viewport;
 mod wsi;
@@ -59,6 +61,7 @@ struct State {
     viewport: (u32, u32),
     native_windows: bool,
     outputs: output::Outputs,
+    monitors: monitors::Monitors,
     seat: input::Seat,
     selection: selection::Selection,
     text: text::TextInputs,
@@ -76,6 +79,7 @@ impl Default for State {
             viewport: (1024, 768),
             native_windows: false,
             outputs: Default::default(),
+            monitors: Default::default(),
             seat: Default::default(),
             selection: Default::default(),
             text: Default::default(),
@@ -106,6 +110,9 @@ impl Compositor {
     }
     /// Host logical points stay unchanged; only the preferred buffer density changes.
     pub fn output_scale(&mut self, window: u64, scale: i32) {
+        if self.state.monitors.active {
+            return;
+        }
         if !(1..=4).contains(&scale) {
             return;
         }
