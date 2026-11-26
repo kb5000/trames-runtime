@@ -1,2 +1,5 @@
 # Preserve published third-party whitespace; local Rust patches are rustfmt checked.
 vendor/smoltcp/** -whitespace
+
+# Preserve the exact original upstream license text.
+THIRD_PARTY_NOTICES.txt -whitespace

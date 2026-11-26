@@ -1,0 +1,19 @@
+name: Third-party license records
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Verify reviewed dependencies and generated notices
+        run: python3 scripts/prepare-third-party-notices.py --check
