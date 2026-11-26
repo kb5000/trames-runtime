@@ -34,11 +34,14 @@ pub(crate) struct Window {
     pub override_redirect: bool,
     pub min: (u32, u32),
     pub max: (u32, u32),
+    pub state: crate::WindowState,
     pub(super) delete: bool,
     pub(super) take_focus: bool,
 }
 pub(crate) enum Update {
     Window(Window),
+    State(u32, crate::WindowState, u8),
+    Interaction(u32, u32),
     Remove(u32),
     Focus(u64, u32),
     Clipboard(String),
@@ -47,6 +50,7 @@ pub(crate) enum Update {
 }
 pub(crate) enum Command {
     Resize(u32, u32, u32),
+    State(u32, crate::WindowState),
     Focus(u64, Option<u32>),
     Close(u32),
     ClipboardProxy(bool),
@@ -103,6 +107,14 @@ struct Atoms {
     check: u32,
     wm: u32,
     cm: u32,
+    state: u32,
+    max_h: u32,
+    max_v: u32,
+    full: u32,
+    hidden: u32,
+    wm_state: u32,
+    change_state: u32,
+    moveresize: u32,
 }
 impl Atoms {
     fn new(c: &RustConnection) -> Result<Self> {
@@ -119,6 +131,14 @@ impl Atoms {
             check: atom(b"_NET_SUPPORTING_WM_CHECK")?,
             wm: atom(b"WM_S0")?,
             cm: atom(b"_NET_WM_CM_S0")?,
+            state: atom(b"_NET_WM_STATE")?,
+            max_h: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            max_v: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
+            full: atom(b"_NET_WM_STATE_FULLSCREEN")?,
+            hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+            wm_state: atom(b"WM_STATE")?,
+            change_state: atom(b"WM_CHANGE_STATE")?,
+            moveresize: atom(b"_NET_WM_MOVERESIZE")?,
         })
     }
 }
@@ -128,6 +148,16 @@ fn property(c: &RustConnection, window: u32, atom: u32) -> Result<GetPropertyRep
         .reply()?)
 }
 fn metadata(c: &RustConnection, a: &Atoms, id: u32, serial: u64) -> Result<Window> {
+    let bits = property(c, id, a.state)?
+        .value32()
+        .map(|i| i.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let state = crate::WindowState {
+        maximized: bits.contains(&a.max_h) && bits.contains(&a.max_v),
+        fullscreen: bits.contains(&a.full),
+        minimized: bits.contains(&a.hidden),
+        resizing: false,
+    };
     let g = c.get_geometry(id)?.reply()?;
     let attrs = c.get_window_attributes(id)?.reply()?;
     let name = property(c, id, a.name)?;
@@ -160,6 +190,7 @@ fn metadata(c: &RustConnection, a: &Atoms, id: u32, serial: u64) -> Result<Windo
             .is_some_and(|mut v| v.any(|p| p == atom))
     };
     Ok(Window {
+        state,
         id,
         serial,
         title: String::from_utf8_lossy(&name.value)
@@ -229,7 +260,17 @@ fn run(
         root,
         a.supported,
         AtomEnum::ATOM,
-        &[a.name, a.active, a.check],
+        &[
+            a.name,
+            a.active,
+            a.check,
+            a.state,
+            a.max_h,
+            a.max_v,
+            a.full,
+            a.hidden,
+            a.moveresize,
+        ],
     )?;
     c.flush()?;
     let mut clipboard = clipboard::Clipboard::new(&c, owner)?;
@@ -237,6 +278,8 @@ fn run(
     x11rb::protocol::xtest::get_version(&c, 2, 2)?.reply()?;
     let mut keys = keys::Keys::default();
     let mut windows: BTreeMap<u32, Window> = BTreeMap::new();
+    let mut requested: BTreeMap<u32, crate::WindowState> = BTreeMap::new();
+    let mut confirmed: BTreeMap<u32, crate::WindowState> = BTreeMap::new();
     // A full bounded queue disconnects this XWM, never blocks compositor teardown.
     let publish = |u| {
         updates
@@ -275,6 +318,41 @@ fn run(
                 Command::Key(key, pressed, modifiers) => keys.key(&c, key, pressed, modifiers)?,
                 Command::RawKey(key, pressed) => keys.raw(&c, key, pressed)?,
                 Command::Modifiers(m) => keys.native_modifiers(&c, m)?,
+                Command::State(id, next) => {
+                    if requested.get(&id) == Some(&next) {
+                        requested.remove(&id);
+                    }
+                    if let Some(w) = windows.get_mut(&id) {
+                        if confirmed.get(&id) != Some(&next) {
+                            let mut atoms = Vec::new();
+                            if next.maximized {
+                                atoms.extend([a.max_h, a.max_v]);
+                            }
+                            if next.fullscreen {
+                                atoms.push(a.full);
+                            }
+                            if next.minimized {
+                                atoms.push(a.hidden);
+                            }
+                            c.change_property32(
+                                PropMode::REPLACE,
+                                id,
+                                a.state,
+                                AtomEnum::ATOM,
+                                &atoms,
+                            )?;
+                            c.change_property32(
+                                PropMode::REPLACE,
+                                id,
+                                a.wm_state,
+                                a.wm_state,
+                                &[if next.minimized { 3 } else { 1 }, NONE],
+                            )?;
+                            w.state = next;
+                            confirmed.insert(id, next);
+                        }
+                    }
+                }
                 Command::Resize(id, w, h) => {
                     c.configure_window(
                         id,
@@ -393,6 +471,55 @@ fn run(
                         publish(Update::Window(w.clone()))?;
                     }
                 }
+                Event::ClientMessage(e) if e.format == 32 && e.type_ == a.state => {
+                    if let Some(w) = windows.get(&e.window) {
+                        let d = e.data.as_data32();
+                        if d[0] > 2 {
+                            continue;
+                        }
+                        let mut next = requested.get(&e.window).copied().unwrap_or(w.state);
+                        let mut fields = 0;
+                        let apply = |old| match d[0] {
+                            0 => false,
+                            1 => true,
+                            2 => !old,
+                            _ => old,
+                        };
+                        if [d[1], d[2]].contains(&a.full) {
+                            next.fullscreen = apply(next.fullscreen);
+                            fields |= 2;
+                        }
+                        if [d[1], d[2]]
+                            .iter()
+                            .any(|a1| *a1 == a.max_h || *a1 == a.max_v)
+                        {
+                            next.maximized = apply(next.maximized);
+                            fields |= 1;
+                        }
+                        if fields != 0 {
+                            requested.insert(e.window, next);
+                            publish(Update::State(e.window, next, fields))?;
+                        }
+                    }
+                }
+                Event::ClientMessage(e)
+                    if e.format == 32
+                        && e.type_ == a.change_state
+                        && e.data.as_data32()[0] == 3 =>
+                {
+                    if let Some(w) = windows.get(&e.window) {
+                        let mut next = requested.get(&e.window).copied().unwrap_or(w.state);
+                        next.minimized = true;
+                        requested.insert(e.window, next);
+                        publish(Update::State(e.window, next, 4))?;
+                    }
+                }
+                Event::ClientMessage(e) if e.format == 32 && e.type_ == a.moveresize => {
+                    let direction = e.data.as_data32()[2];
+                    if let Some(edges) = [5, 1, 9, 8, 10, 2, 6, 4, 0].get(direction as usize) {
+                        publish(Update::Interaction(e.window, *edges))?;
+                    }
+                }
                 Event::ClientMessage(e) if e.type_ == a.serial && e.format == 32 => {
                     let v = e.data.as_data32();
                     let serial = u64::from(v[0]) | u64::from(v[1]) << 32;
@@ -408,6 +535,8 @@ fn run(
                 }
                 Event::DestroyNotify(DestroyNotifyEvent { window, .. })
                 | Event::UnmapNotify(UnmapNotifyEvent { window, .. }) => {
+                    requested.remove(&window);
+                    confirmed.remove(&window);
                     if windows.remove(&window).is_some() {
                         publish(Update::Remove(window))?;
                     }

@@ -230,6 +230,7 @@ impl State {
             false
         });
         let s = self.surfaces.get_mut(&id).unwrap();
+        let first = s.x11.is_none();
         s.x11 = Some((key, w.id));
         s.title = w.title;
         s.app_id = w.class;
@@ -257,6 +258,12 @@ impl State {
                 ));
                 self.surfaces.get_mut(&parent).unwrap().children.push(id);
             }
+        }
+        if first && w.state != WindowState::default() {
+            let fields = u8::from(w.state.maximized)
+                | (u8::from(w.state.fullscreen) * 2)
+                | (u8::from(w.state.minimized) * 4);
+            self.request_window_state(id, w.state, fields);
         }
         self.changed();
     }
@@ -286,6 +293,26 @@ impl State {
         }
         for (key, update) in updates {
             match update {
+                xwm::Update::State(xid, next, fields) => {
+                    if let Some(id) = self
+                        .surfaces
+                        .iter()
+                        .find_map(|(&id, s)| (s.x11 == Some((key, xid))).then_some(id))
+                    {
+                        self.request_window_state(id, next, fields);
+                    }
+                }
+                xwm::Update::Interaction(xid, edges) => {
+                    if let Some(id) = self
+                        .surfaces
+                        .iter()
+                        .find_map(|(&id, s)| (s.x11 == Some((key, xid))).then_some(id))
+                    {
+                        if let Some((serial, _)) = self.seat.press_serial {
+                            self.request_interaction(id, serial, edges);
+                        }
+                    }
+                }
                 xwm::Update::Clipboard(text) => self.set_xclipboard(key, text),
                 xwm::Update::ReadClipboard(fd) => {
                     if self

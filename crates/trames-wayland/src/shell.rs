@@ -39,17 +39,28 @@ impl State {
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
         };
+        let window_state = if self.native_windows {
+            s.confirmed_window_state
+        } else {
+            s.window_state
+        };
         let mut states = Vec::new();
         if activated {
             states.extend_from_slice(&(xdg_toplevel::State::Activated as u32).to_ne_bytes());
         }
-        if s.mode == WindowMode::Maximized {
+        if window_state.maximized {
             states.extend_from_slice(&(xdg_toplevel::State::Maximized as u32).to_ne_bytes());
+        }
+        if window_state.fullscreen {
+            states.extend_from_slice(&(xdg_toplevel::State::Fullscreen as u32).to_ne_bytes());
+        }
+        if window_state.resizing {
+            states.extend_from_slice(&(xdg_toplevel::State::Resizing as u32).to_ne_bytes());
         }
         if let Some(top) = &s.top {
             let clamp = |value: u32, min: u32, max: u32| {
-                if value == 0 {
-                    0
+                if value == 0 || window_state.fullscreen || window_state.maximized {
+                    value
                 } else {
                     value
                         .max(min)
@@ -244,7 +255,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &xdg_toplevel::XdgToplevel,
+        r: &xdg_toplevel::XdgToplevel,
         request: xdg_toplevel::Request,
         key: &SurfaceKey,
         _: &DisplayHandle,
@@ -264,10 +275,58 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
             }
             _ => {}
         }
+        if matches!(request, xdg_toplevel::Request::SetParent { .. }) {
+            if let xdg_toplevel::Request::SetParent { parent } = request {
+                let parent = parent.and_then(|p| p.data::<SurfaceKey>().map(|k| k.0));
+                if !state.window_parent(key.0, parent) {
+                    r.post_error(3u32, "cyclic window parent");
+                }
+            }
+            return;
+        }
+        let mode_change = matches!(
+            request,
+            xdg_toplevel::Request::SetMaximized
+                | xdg_toplevel::Request::UnsetMaximized
+                | xdg_toplevel::Request::SetFullscreen { .. }
+                | xdg_toplevel::Request::UnsetFullscreen
+                | xdg_toplevel::Request::SetMinimized
+        );
+        if mode_change {
+            let Some(surface) = state.surfaces.get(&key.0) else {
+                return;
+            };
+            let mut next = surface.window_state;
+            let mut fields = 0;
+            match request {
+                xdg_toplevel::Request::SetMaximized => {
+                    next.maximized = true;
+                    fields |= 1;
+                }
+                xdg_toplevel::Request::UnsetMaximized => {
+                    next.maximized = false;
+                    fields |= 1;
+                }
+                xdg_toplevel::Request::SetFullscreen { .. } => {
+                    next.fullscreen = true;
+                    fields |= 2;
+                }
+                xdg_toplevel::Request::UnsetFullscreen => {
+                    next.fullscreen = false;
+                    fields |= 2;
+                }
+                xdg_toplevel::Request::SetMinimized => {
+                    next.minimized = true;
+                    fields |= 4;
+                }
+                _ => unreachable!(),
+            }
+            state.request_window_state(key.0, next, fields);
+            return;
+        }
         let Some(s) = state.surfaces.get_mut(&key.0) else {
             return;
         };
-        let mut configure = false;
         match request {
             xdg_toplevel::Request::Destroy => {
                 s.top = None;
@@ -277,25 +336,6 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
             }
             xdg_toplevel::Request::SetAppId { app_id } => {
                 s.app_id = app_id.chars().take(128).collect()
-            }
-            xdg_toplevel::Request::SetMaximized | xdg_toplevel::Request::SetFullscreen { .. } => {
-                if s.mode == WindowMode::Floating {
-                    s.restore_size = s.size;
-                }
-                s.mode = WindowMode::Maximized;
-                s.requested_size = state.viewport;
-                configure = true;
-            }
-            xdg_toplevel::Request::UnsetMaximized | xdg_toplevel::Request::UnsetFullscreen => {
-                s.mode = WindowMode::Floating;
-                s.requested_size = s.restore_size;
-                configure = true;
-            }
-            xdg_toplevel::Request::SetMinimized => s.mode = WindowMode::Minimized,
-            xdg_toplevel::Request::SetParent { parent } => {
-                s.top_parent = parent
-                    .and_then(|p| p.data::<SurfaceKey>().map(|p| p.0))
-                    .filter(|id| *id != key.0);
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
                 if width >= 0 && height >= 0 {
@@ -315,9 +355,6 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
             | xdg_toplevel::Request::Move { .. }
             | xdg_toplevel::Request::Resize { .. } => {}
             _ => {}
-        }
-        if configure {
-            state.configure(key.0);
         }
         state.changed();
     }

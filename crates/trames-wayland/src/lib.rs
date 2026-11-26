@@ -23,6 +23,8 @@ pub use server::{Server, Snapshot, SurfaceInfo};
 mod popup;
 mod protocol;
 mod shell;
+mod window;
+pub use window::{WindowRequest, WindowState};
 mod subsurface;
 mod xwayland;
 mod xwm;
@@ -53,6 +55,7 @@ struct State {
     serial: u32,
     revision: u64,
     viewport: (u32, u32),
+    native_windows: bool,
     outputs: output::Outputs,
     seat: input::Seat,
     selection: selection::Selection,
@@ -68,6 +71,7 @@ impl Default for State {
             serial: 0,
             revision: 0,
             viewport: (1024, 768),
+            native_windows: false,
             outputs: Default::default(),
             seat: Default::default(),
             selection: Default::default(),
@@ -146,20 +150,15 @@ impl Compositor {
         }
     }
     pub fn set_mode(&mut self, id: u64, mode: WindowMode) {
-        if let Some(s) = self.state.surfaces.get_mut(&id) {
-            if mode == WindowMode::Maximized && s.mode == WindowMode::Floating {
-                s.restore_size = s.size;
-            }
-            if mode == WindowMode::Floating && s.mode == WindowMode::Maximized {
-                s.requested_size = s.restore_size;
-            }
-            if mode == WindowMode::Maximized {
-                s.requested_size = self.state.viewport;
-            }
-            s.mode = mode;
-            self.state.configure(id);
-            self.state.changed();
-        }
+        self.state.request_window_state(
+            id,
+            WindowState {
+                maximized: mode == WindowMode::Maximized,
+                minimized: mode == WindowMode::Minimized,
+                ..WindowState::default()
+            },
+            7,
+        );
         if mode == WindowMode::Minimized
             && self
                 .state

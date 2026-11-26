@@ -17,6 +17,8 @@ pub struct Snapshot {
     pub revision: u64,
     pub text: Option<TextContext>,
     pub windows: Vec<WindowSnapshot>,
+    pub window_states: BTreeMap<u64, WindowState>,
+    pub window_requests: BTreeMap<u64, WindowRequest>,
     /// Connection-scoped protocol IDs, never guest pointers or host layer IDs.
     pub surfaces: BTreeMap<(u64, u32), SurfaceInfo>,
     /// Live shared-inode capabilities delivered through the actual protocol
@@ -40,6 +42,8 @@ enum Command {
     OutputScale(u64, i32),
     PopupBounds(u64, i32, i32, u32, u32),
     Mode(u64, WindowMode),
+    ManageWindows,
+    ConfigureWindow(u64, u32, u32, WindowState, u64),
     Close(u64),
     Presented(u64, u64, u32),
     KeyboardMap(Arc<trames_shared::SharedFile>, Arc<[u8]>),
@@ -211,6 +215,20 @@ impl Server {
     pub fn resize(&self, id: u64, w: u32, h: u32) -> io::Result<()> {
         self.0.send(Command::Resize(id, w, h))
     }
+    pub fn manage_windows(&self) -> io::Result<()> {
+        self.0.send(Command::ManageWindows)
+    }
+    pub fn configure_window(
+        &self,
+        id: u64,
+        width: u32,
+        height: u32,
+        state: WindowState,
+        request: u64,
+    ) -> io::Result<()> {
+        self.0
+            .send(Command::ConfigureWindow(id, width, height, state, request))
+    }
     pub fn set_mode(&self, id: u64, mode: WindowMode) -> io::Result<()> {
         self.0.send(Command::Mode(id, mode))
     }
@@ -320,6 +338,10 @@ fn run(
                 Command::OutputScale(window, scale) => compositor.output_scale(window, scale),
                 Command::PopupBounds(id, x, y, w, h) => compositor.popup_bounds(id, x, y, w, h),
                 Command::Mode(id, mode) => compositor.set_mode(id, mode),
+                Command::ManageWindows => compositor.manage_windows(),
+                Command::ConfigureWindow(id, w, h, state, request) => {
+                    compositor.configure_window(id, w, h, state, request)
+                }
                 Command::Close(id) => compositor.close(id),
                 Command::Presented(id, revision, time) => compositor.presented(id, revision, time),
                 Command::KeyboardMap(map, bytes) => compositor.state.keyboard_map(map, bytes),
@@ -377,6 +399,8 @@ fn run(
             let snapshot = Snapshot {
                 revision: compositor.state.revision,
                 windows: compositor.windows(),
+                window_states: compositor.window_states(),
+                window_requests: compositor.window_requests(),
                 text: compositor.state.text_context(),
                 surfaces,
                 wsi_connections: compositor.state.wsi.connections(),
