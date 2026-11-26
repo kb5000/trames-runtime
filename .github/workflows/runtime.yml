@@ -1,9 +1,9 @@
 name: Runtime
 on:
   push:
-    paths-ignore: ['tests/acceptance/**', 'docs/architecture/acceptance.md', 'docs/validation/acceptance/**', '.github/workflows/acceptance.yml']
+    paths-ignore: ['third-party/inputs.json', 'tests/acceptance/**', 'docs/architecture/acceptance.md', 'docs/validation/acceptance/**', '.github/workflows/acceptance.yml']
   pull_request:
-    paths-ignore: ['tests/acceptance/**', 'docs/architecture/acceptance.md', 'docs/validation/acceptance/**', '.github/workflows/acceptance.yml']
+    paths-ignore: ['third-party/inputs.json', 'tests/acceptance/**', 'docs/architecture/acceptance.md', 'docs/validation/acceptance/**', '.github/workflows/acceptance.yml']
 permissions:
   contents: read
 jobs:
