@@ -301,6 +301,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
             };
             let mut next = surface.window_state;
             let mut fields = 0;
+            if let xdg_toplevel::Request::SetFullscreen { ref output } = request {
+                let surface_id = key.0;
+                if let Some(monitor) = output.as_ref().and_then(|o| state.monitor_output_id(o)) {
+                    state.monitors.fullscreen.insert(surface_id, monitor);
+                } else {
+                    state.monitors.fullscreen.remove(&key.0);
+                }
+            }
             match request {
                 xdg_toplevel::Request::SetMaximized => {
                     next.maximized = true;
@@ -315,6 +323,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
                     fields |= 2;
                 }
                 xdg_toplevel::Request::UnsetFullscreen => {
+                    state.monitors.fullscreen.remove(&key.0);
                     next.fullscreen = false;
                     fields |= 2;
                 }

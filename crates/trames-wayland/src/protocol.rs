@@ -310,6 +310,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
         key: &SurfaceKey,
     ) {
         state.surface_unmapped(key.0);
+        state.monitors.forget(key.0);
         if let Some(s) = state.surfaces.remove(&key.0) {
             if let Some((parent, ..)) = s.parent {
                 if let Some(p) = state.surfaces.get_mut(&parent) {

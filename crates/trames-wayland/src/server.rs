@@ -19,6 +19,7 @@ pub struct Snapshot {
     pub windows: Vec<WindowSnapshot>,
     pub window_states: BTreeMap<u64, WindowState>,
     pub window_requests: BTreeMap<u64, WindowRequest>,
+    pub fullscreen_outputs: BTreeMap<u64, u64>,
     /// Connection-scoped protocol IDs, never guest pointers or host layer IDs.
     pub surfaces: BTreeMap<(u64, u32), SurfaceInfo>,
     /// Live shared-inode capabilities delivered through the actual protocol
@@ -40,6 +41,8 @@ enum Command {
     ConnectXwm(UnixStream, crate::xwm::Identity),
     Resize(u64, u32, u32),
     OutputScale(u64, i32),
+    DesktopOutputs(Vec<DesktopOutput>),
+    WindowOutputs(u64, Vec<u64>, u32),
     PopupBounds(u64, i32, i32, u32, u32),
     Mode(u64, WindowMode),
     ManageWindows,
@@ -206,6 +209,13 @@ impl Server {
             .map(|s| s.clone())
             .unwrap_or_default()
     }
+    pub fn desktop_outputs(&self, outputs: Vec<DesktopOutput>) -> io::Result<()> {
+        self.0.send(Command::DesktopOutputs(outputs))
+    }
+    pub fn window_outputs(&self, window: u64, outputs: Vec<u64>, scale_120: u32) -> io::Result<()> {
+        self.0
+            .send(Command::WindowOutputs(window, outputs, scale_120))
+    }
     pub fn output_scale(&self, window: u64, scale: i32) -> io::Result<()> {
         self.0.send(Command::OutputScale(window, scale))
     }
@@ -336,6 +346,10 @@ fn run(
                     compositor.resize(id, w, h);
                 }
                 Command::OutputScale(window, scale) => compositor.output_scale(window, scale),
+                Command::DesktopOutputs(outputs) => compositor.desktop_outputs(outputs),
+                Command::WindowOutputs(window, outputs, scale) => {
+                    compositor.window_outputs(window, outputs, scale)
+                }
                 Command::PopupBounds(id, x, y, w, h) => compositor.popup_bounds(id, x, y, w, h),
                 Command::Mode(id, mode) => compositor.set_mode(id, mode),
                 Command::ManageWindows => compositor.manage_windows(),
@@ -401,6 +415,7 @@ fn run(
                 windows: compositor.windows(),
                 window_states: compositor.window_states(),
                 window_requests: compositor.window_requests(),
+                fullscreen_outputs: compositor.fullscreen_outputs(),
                 text: compositor.state.text_context(),
                 surfaces,
                 wsi_connections: compositor.state.wsi.connections(),
