@@ -258,10 +258,11 @@ impl State {
         let serial = self.next_serial();
         if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
             for k in &self.seat.keyboards {
-                if k.is_alive() && connection(k) == s.connection {
-                    if s.x11.is_none() || self.seat.native_modifiers.is_none() {
-                        k.modifiers(serial, m.depressed, m.latched, m.locked, m.group);
-                    }
+                if k.is_alive()
+                    && connection(k) == s.connection
+                    && (s.x11.is_none() || self.seat.native_modifiers.is_none())
+                {
+                    k.modifiers(serial, m.depressed, m.latched, m.locked, m.group);
                 }
             }
         }
