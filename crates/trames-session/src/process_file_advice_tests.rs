@@ -110,7 +110,11 @@ fn guest_file_cache_advice_and_live_fd_replacement_complete_on_source() {
             k.processes.insert(pid, p);
         }
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         eprintln!("file-advice CPUs={cpus} slots={slots} filter={filtered} cohorts={} returned={:?} scopes={}", k.parallel_rounds, k.cohort_return_syscalls, k.vm_checkpoint_groups);
         for pid in [1, 2] {

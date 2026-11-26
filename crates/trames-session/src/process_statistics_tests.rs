@@ -270,13 +270,14 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
         first: Option<u64>,
         last: u64,
         done: bool,
+        console: Arc<trames_vfs::CapturedConsole>,
     }
     impl GuestOutput for Host {
         fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
         }
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
-            Arc::new(trames_vfs::CapturedConsole::default())
+            self.console.clone()
         }
         fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
             wait.until(std::time::Instant::now() + Duration::from_millis(1));
@@ -288,11 +289,14 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
                 ProcQuery::new(b"/proc/stat", ProcRefresh::Metadata, &self.namespace, 1),
             );
             assert!(info.idle <= info.uptime.saturating_mul(info.cpu_count as u32));
-            if self.started.elapsed() >= Duration::from_millis(20) {
+            let ready = self.console.output.snapshot();
+            if (1..=self.source.cpus).all(|pid| ready.contains(&(pid as u8))) {
                 self.first.get_or_insert(info.cpu_user_ticks);
             }
             self.last = info.cpu_user_ticks;
-            self.done = self.started.elapsed() >= Duration::from_millis(200);
+            // Observe a real live-clock advance, including slow worker startup.
+            self.done = self.first.is_some_and(|first| self.last > first)
+                || self.started.elapsed() >= Duration::from_secs(5);
             Ok(trames_linux::HostState::from_cancelled(self.done))
         }
     }
@@ -312,10 +316,21 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
             p.vm_id = id as u64;
             p.signals.io_directory = source.directory.clone();
             p.signals.io.scheduling.set_affinity((1 << slots) - 1);
-            // Reset the output pointer on every call; count completed entries
-            // in x19 without consuming any host-observed guest byte lease.
+            // Complete sysinfo once, then publish this task's readiness through
+            // its original console. Host observation takes no guest byte lease.
+            p.memory.write_array(0x1800, [id as u8]).unwrap();
             let words = [
                 0xd2820000u32,
+                0xd2801668,
+                0xd4000001,
+                0x91000673,
+                0xd2800020,
+                0xd2830001,
+                0xd2800022,
+                0xd2800808,
+                0xd4000001,
+                // Continue the original sysinfo loop after the one-shot notice.
+                0xd2820000,
                 0xd2801668,
                 0xd4000001,
                 0x91000673,
@@ -342,6 +357,7 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
             first: None,
             last: 0,
             done: false,
+            console: Arc::new(trames_vfs::CapturedConsole::default()),
         };
         assert!(matches!(
             k.drive(&mut host, u64::MAX),

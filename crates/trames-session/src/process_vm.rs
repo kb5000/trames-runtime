@@ -954,7 +954,8 @@ mod tests {
             wait.recv_timeout(Duration::from_secs(3)).unwrap();
             let before = count(&progressing);
             let other_before = count(&paused);
-            let deadline = Instant::now() + Duration::from_millis(100);
+            // This is a progress/quiescence assertion, not a 100 ms latency SLA.
+            let deadline = Instant::now() + Duration::from_secs(5);
             while (count(&progressing) == before || relation >= 3 && count(&paused) == other_before)
                 && Instant::now() < deadline
             {

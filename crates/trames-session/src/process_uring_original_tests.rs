@@ -273,7 +273,11 @@ fn original_uring_body_keeps_accepted_resources_without_a_join_in_blocking_and_a
             k.processes.insert(1, root);
             k.processes.insert(2, peer);
             assert!(k
-                .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+                .parallel_epoch(
+                    &mut trames_linux::CapturedOutput::default(),
+                    1_000_000,
+                    true
+                )
                 .unwrap());
             let mut root = k.processes.get_mut(&1).unwrap();
             eprintln!("original-uring CPUs={cpus} slots={slots} filtered={filtered} flags={flags} marker={:?} cohorts={} returned={:?}", root.memory.read_array::<4>(0x2800).unwrap(), k.parallel_rounds, k.cohort_return_syscalls);

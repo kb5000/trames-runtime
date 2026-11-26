@@ -85,7 +85,11 @@ fn time_observations_complete_on_source_with_faults_nulls_overlap_and_filter() {
         k.processes.insert(1, root);
         k.processes.insert(2, peer);
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         let root = k.processes.read(&1);
         eprintln!("time CPUs={cpus} slots={slots} filtered={filtered} marker={:?} cohorts={} returned={:?}", root.memory.read_array::<4>(0x2800).unwrap(), k.parallel_rounds, k.cohort_return_syscalls);

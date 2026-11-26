@@ -6920,7 +6920,11 @@ mod tests {
         k.processes.insert(2, peer);
         assert!(k.parallel_candidate(false));
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         for id in [1, 2] {
             assert_eq!(
@@ -6937,6 +6941,17 @@ mod tests {
         assert_eq!(k.parallel_rounds, 1);
         assert!(k.cohort_return_syscalls.is_empty());
         assert_eq!(k.service_requests, 0);
+    }
+    // Observe actual guest progress through the ordinary shared-page model.
+    // Host cancellation must not race worker startup on a slow oracle.
+    pub(super) fn progress_page(p: &mut Process) -> Arc<trames_memory::SharedPage> {
+        let pages = trames_memory::SharedAnonymousPages::fixed_mapping(1);
+        let bytes = pages[0].shared_page().unwrap();
+        p.memory.unmap(0x1000, PAGE_SIZE).unwrap();
+        p.memory
+            .map_backed(0x1000, pages, true, Permissions::RW, false)
+            .unwrap();
+        bytes
     }
     pub(super) fn admitted_process(k: &Kernel) -> Box<Process> {
         process_with_presence(Arc::new(k.task_capacity.reserve().unwrap().into_presence()))
@@ -8443,14 +8458,25 @@ mod tests {
     }
     #[test]
     fn continuous_peers_cancel_at_control_checkpoints_and_commit_the_exact_budget() {
-        struct CancelAt(Instant);
-        impl GuestOutput for CancelAt {
+        struct CancelAfterProgress(Option<Arc<trames_memory::SharedPage>>, Instant);
+        impl GuestOutput for CancelAfterProgress {
             fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
-                wait.until(self.0);
+                wait.until(if self.0.is_some() {
+                    Instant::now() + Duration::from_millis(1)
+                } else {
+                    self.1
+                });
                 Ok(())
             }
             fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
-                Ok(HostState::from_cancelled(Instant::now() >= self.0))
+                let progressed = self.0.as_ref().is_some_and(|page| {
+                    page.with_read(0, 8, |bytes| {
+                        u64::from_le_bytes(bytes.try_into().unwrap()) != 0
+                    })
+                });
+                Ok(HostState::from_cancelled(
+                    progressed || Instant::now() >= self.1,
+                ))
             }
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
@@ -8461,9 +8487,31 @@ mod tests {
             }
         }
         let mut k = spinning_peers();
+        let progress = {
+            let mut p = k.processes.get_mut(&1).unwrap();
+            let progress = progress_page(&mut p);
+            p.memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RW)
+                .unwrap();
+            for (i, word) in [0x91000400u32, 0xf9000020, 0x17fffffe]
+                .into_iter()
+                .enumerate()
+            {
+                p.memory
+                    .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            p.memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                .unwrap();
+            progress
+        };
+        for pid in [1, 2] {
+            k.processes.get_mut(&pid).unwrap().cpu.set_x(1, 0x1000);
+        }
         assert!(matches!(
             k.drive(
-                &mut CancelAt(Instant::now() + Duration::from_millis(20)),
+                &mut CancelAfterProgress(Some(progress), Instant::now() + Duration::from_secs(5)),
                 u64::MAX
             ),
             Err(RuntimeError::Cancelled)
@@ -8471,9 +8519,16 @@ mod tests {
         assert!(k.instructions > 0);
         assert!(k.worker_chunks > 0);
         for limit in [1, 17, 65_539] {
+            eprintln!("checking continuous source budget {limit}");
             let mut k = spinning_peers();
+            let began = Instant::now();
+            let watchdog = began + Duration::from_secs(5);
             assert!(
-                matches!(k.drive(&mut trames_linux::CapturedOutput::default(), limit), Err(RuntimeError::BudgetExceeded(n)) if n == limit)
+                matches!(k.drive(&mut CancelAfterProgress(None, watchdog), limit), Err(RuntimeError::BudgetExceeded(n)) if n == limit)
+            );
+            assert!(
+                Instant::now() < watchdog,
+                "budget {limit} missed its completion wake"
             );
             assert_eq!(k.instructions, limit);
             assert_eq!(

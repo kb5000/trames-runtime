@@ -123,7 +123,11 @@ fn caught_cpu_and_rejected_native_faults_restore_the_original_frame_on_source() 
                 k.processes.insert(1, root);
                 k.processes.insert(2, other);
                 assert!(k
-                    .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+                    .parallel_epoch(
+                        &mut trames_linux::CapturedOutput::default(),
+                        1_000_000,
+                        true
+                    )
                     .unwrap());
                 let root = k.processes.get_mut(&1).unwrap();
                 eprintln!("source-fault CPUs={cpus} slots={slots} filter={filtered} alt={alternate} kind={kind} cohorts={} marker={:?} returned={:?}", k.parallel_rounds, root.memory.read_array::<4>(0x2800).unwrap(), k.cohort_return_syscalls);
@@ -228,7 +232,11 @@ fn signal_frame_failures_and_bad_sigreturn_finish_on_source_without_stopping_pee
             k.processes.insert(2, root);
             k.processes.insert(1, other);
             assert!(k
-                .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+                .parallel_epoch(
+                    &mut trames_linux::CapturedOutput::default(),
+                    1_000_000,
+                    true
+                )
                 .unwrap());
             assert_eq!(group.exit_status(), Some(11));
             assert_eq!(

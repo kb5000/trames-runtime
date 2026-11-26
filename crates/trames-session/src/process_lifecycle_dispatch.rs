@@ -710,6 +710,9 @@ mod tests {
                 }
                 let expected = p.cpu.x(0);
                 let mut k = fixture(number, args);
+                // times() returns elapsed USER_HZ ticks, not a stable ABI value.
+                // Give both paths the same origin and bracket the later read.
+                k.started = canonical.started;
                 let lifecycle = Lifecycle::capture(&k);
                 let epoch =
                     Epoch::with_events(Arc::new(Control::new(10000)), k.workers.events(), true);
@@ -759,11 +762,20 @@ mod tests {
                     }
                     job.retry = Some(crate::run_queue::IoCall::from(&wait));
                 }
-                assert_eq!(
-                    job.work.cpu.x(0),
-                    expected,
-                    "syscall={number} args={args:?}"
-                );
+                if number == 153 && (expected as i64) >= 0 {
+                    let upper = (k.started.elapsed().as_millis() / 10) as u64;
+                    assert!(
+                        (expected..=upper).contains(&job.work.cpu.x(0)),
+                        "times returned {} outside {expected}..={upper}",
+                        job.work.cpu.x(0)
+                    );
+                } else {
+                    assert_eq!(
+                        job.work.cpu.x(0),
+                        expected,
+                        "syscall={number} args={args:?}"
+                    );
+                }
                 drop(p);
                 epoch.park(job, None);
                 epoch.stop();

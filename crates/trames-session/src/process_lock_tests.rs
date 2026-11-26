@@ -57,7 +57,11 @@ fn filter(k: &mut Kernel<trames_cpu::Cpu>, root: &mut Process<trames_cpu::Cpu>, 
 }
 fn check(k: &mut Kernel<trames_cpu::Cpu>, cpus: usize, slots: usize, filtered: bool) {
     assert!(k
-        .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+        .parallel_epoch(
+            &mut trames_linux::CapturedOutput::default(),
+            1_000_000,
+            true
+        )
         .unwrap());
     eprintln!(
         "file-lock CPUs={cpus} slots={slots} filter={filtered} cohorts={} returned={:?}",

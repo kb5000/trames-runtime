@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use super::tests::{admitted_process, kernel};
+use super::tests::{admitted_process, kernel, progress_page};
 use super::*;
 use crate::execution_control::{Control, End};
 use trames_execution::Registers;
@@ -385,7 +385,8 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
     struct Output {
         cancel: bool,
         polls: usize,
-        cancel_after: Instant,
+        progress: Arc<trames_memory::SharedPage>,
+        watchdog: Instant,
     }
     impl GuestOutput for Output {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
@@ -400,7 +401,11 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         }
         fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
             self.polls += 1;
-            self.cancel = Instant::now() >= self.cancel_after;
+            self.cancel = self.polls > 1
+                && self
+                    .progress
+                    .with_read(0, 4, |bytes| bytes == 42u32.to_le_bytes())
+                || Instant::now() >= self.watchdog;
             Ok(trames_linux::HostState::Running)
         }
         fn cancellation_requested(&self) -> bool {
@@ -412,13 +417,15 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         k.cpu_count = cpus;
         k.per_cpu.resize(cpus, Duration::ZERO);
         let mut root = admitted_process(&k);
+        let progress = progress_page(&mut root);
         executable(&mut root, &[0xd2820001, 0xd2800540, 0xb9000020, 0x14000000]);
         k.publish_task(1, &root);
         k.processes.insert(1, root);
         let mut output = Output {
             cancel: false,
             polls: 0,
-            cancel_after: Instant::now() + Duration::from_millis(10),
+            progress,
+            watchdog: Instant::now() + Duration::from_secs(5),
         };
         assert!(matches!(
             k.drive(&mut output, u64::MAX),

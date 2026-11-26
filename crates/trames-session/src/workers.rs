@@ -3618,7 +3618,9 @@ mod tests {
             // SAFETY: root memory is not accessed until both owned Views stop.
             assert!(unsafe { View::try_private_epoch(&mut [&mut first, &mut second]) });
             let control = Arc::new(Control::new(1000));
-            let epoch = crate::run_queue::Epoch::new(control.clone());
+            // Exact retirement is checked at the close checkpoint, not at a
+            // host-load-dependent scheduling quantum.
+            let epoch = crate::run_queue::Epoch::unpreempted(control.clone());
             for (pid, pc, number, arg0, address, count, view) in [
                 (
                     1,

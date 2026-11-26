@@ -105,7 +105,11 @@ fn cross_mm_shared_futex_wake_admits_the_original_dormant_task_without_joining_p
         k.processes.insert(2, peer);
         k.processes.insert(3, sleeper);
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         eprintln!("dormant CPUs={cpus} slots={slots} root_x0={} root_x19={} marker={:?} cohorts={} scopes={} returned={:?}", k.processes.read(&1).cpu.x(0),k.processes.read(&1).cpu.x(19),k.processes.read(&3).memory.read_array::<4>(0x2800).unwrap(),k.parallel_rounds,k.vm_checkpoint_spaces,k.cohort_return_syscalls);
         assert_eq!(
@@ -277,7 +281,11 @@ fn caught_and_fatal_signals_reach_cold_futex_tasks_without_owner_adoption() {
         k.processes.insert(3, cold);
         let original = k.processes.handle(&3).unwrap();
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         assert_eq!(k.processes.read(&1).cpu.x(19), 0);
         if fatal {

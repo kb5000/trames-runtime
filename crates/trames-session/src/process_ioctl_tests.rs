@@ -166,7 +166,11 @@ fn binder_call_reply_parks_original_workers_with_one_or_many_cpu_slots() {
         k.processes.insert(1, service);
         k.processes.insert(2, client);
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         assert_eq!(
             k.processes.read(&1).memory.read_array::<4>(0x2800).unwrap(),
@@ -273,7 +277,11 @@ fn descriptor_ioctl_family_finishes_on_source_workers_without_joined_dispatch() 
         k.processes.insert(1, root);
         k.processes.insert(2, peer);
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         let root = k.processes.read(&1);
         eprintln!("ioctl CPUs={cpus} slots={slots} filtered={filtered} marker={:?} cohorts={} scopes={} returned={:?}",root.memory.read_array::<4>(0x2800).unwrap(),k.parallel_rounds,k.vm_checkpoint_spaces,k.cohort_return_syscalls);
