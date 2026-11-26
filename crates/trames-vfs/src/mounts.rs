@@ -199,7 +199,6 @@ pub(super) struct MountIdentity {
     inherited: AtomicU64,
     anonymous_tree: std::sync::OnceLock<fd::TreeOrigin>,
     users: std::sync::atomic::AtomicUsize,
-    #[cfg(all(feature = "hostfs", unix))]
     has_children: std::sync::atomic::AtomicBool,
     pub id: u64,
     // Immutable mount identity; stat must not acquire the filesystem or root
@@ -349,7 +348,6 @@ impl SharedAttachment {
 }
 impl Drop for ParentWrite<'_> {
     fn drop(&mut self) {
-        #[cfg(all(feature = "hostfs", unix))]
         if let Some(attachment) = &*self.owner {
             attachment.node.mount_target.store(true, Ordering::Relaxed);
             attachment
@@ -382,7 +380,6 @@ impl Mount {
         Some(self.shared.clone())
     }
     pub(super) fn new(init: MountInit) -> Self {
-        #[cfg(all(feature = "hostfs", unix))]
         if let Some(attachment) = init.parent.borrow().as_ref() {
             attachment.node.mount_target.store(true, Ordering::Relaxed);
             attachment
@@ -404,7 +401,6 @@ impl Mount {
             inherited: AtomicU64::new(0),
             anonymous_tree: Default::default(),
             users: Default::default(),
-            #[cfg(all(feature = "hostfs", unix))]
             has_children: std::sync::atomic::AtomicBool::new(false),
             id: init.id,
             device: init
@@ -1171,12 +1167,14 @@ impl Vfs {
             let Some(current) = &path.mount else {
                 return Ok(path);
             };
-            #[cfg(all(feature = "hostfs", unix))]
             if !current.has_children.load(Ordering::Relaxed) {
                 return Ok(path);
             }
             #[cfg(all(feature = "hostfs", unix))]
-            if current.fs.host.is_none()
+            let local = current.fs.host.is_none();
+            #[cfg(not(all(feature = "hostfs", unix)))]
+            let local = true;
+            if local
                 && self
                     .node(&path)
                     .is_ok_and(|node| !node.mount_target.load(Ordering::Relaxed))

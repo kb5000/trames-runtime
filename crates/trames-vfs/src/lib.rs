@@ -473,7 +473,6 @@ struct Inode {
     metadata: std::sync::Mutex<()>,
     // Immutable device behavior belongs to inode identity, not its pathname.
     simple_device: Option<simple_device::Kind>,
-    #[cfg(all(feature = "hostfs", unix))]
     mount_target: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "hostfs", unix))]
     host: std::sync::OnceLock<Arc<hostfs::HostFile>>,
@@ -509,7 +508,6 @@ impl Inode {
             layout: Default::default(),
             metadata: std::sync::Mutex::new(()),
             simple_device: simple_device::Kind::content(&node.content),
-            #[cfg(all(feature = "hostfs", unix))]
             mount_target: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(feature = "hostfs", unix))]
             host: std::sync::OnceLock::new(),

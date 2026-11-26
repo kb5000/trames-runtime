@@ -89,6 +89,9 @@ unsafe impl Sync for ReservationRows {}
 // only under the existing exclusive/immutable epoch proof.
 unsafe impl Sync for MutablePage {}
 
+// Keep fixed-width interpreter/native accesses visible to the optimizer. The
+// same bounds and region checks remain at every original access boundary.
+#[inline(always)]
 fn mask(offset: usize, len: usize) -> u64 {
     assert!(offset <= PAGE && len <= PAGE - offset);
     if len == 0 {
@@ -669,6 +672,7 @@ impl<'a> Guard<'a> {
     fn is_locked(&self) -> bool {
         matches!(self.page.addr() & 3, 0 | 3)
     }
+    #[inline]
     fn covers(&self, offset: usize, len: usize) {
         assert_eq!(mask(offset, len) & !self.mask, 0, "unguarded byte range");
     }
@@ -700,6 +704,7 @@ impl<'a> Guard<'a> {
             _ => None,
         }
     }
+    #[inline]
     pub fn read(&self, offset: usize, len: usize) -> &[u8] {
         self.covers(offset, len);
         // SAFETY: UnsafeCell is transparent over u8; bounds and ownership of
