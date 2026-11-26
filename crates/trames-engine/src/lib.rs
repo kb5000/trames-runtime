@@ -120,6 +120,18 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     ) -> Result<Option<std::sync::Arc<dyn ExecutionInterrupt>>, CpuFault> {
         Ok(None)
     }
+    /// Begin one worker assignment before binding its interrupt. A backend may
+    /// retain a bounded execution budget across short syscall returns. Direct
+    /// and quiesced CPU calls retain their existing per-call lifetime.
+    fn begin_execution(
+        engine: &mut Self::Engine,
+    ) -> Result<Option<std::sync::Arc<dyn ExecutionInterrupt>>, CpuFault> {
+        Self::execution_interrupt(engine)
+    }
+    /// Release assignment-local host resources on the original worker before
+    /// parking, switching tasks, returning a fault, or completing a caught panic.
+    /// Called even when entry/binding failed; default backends compile to a no-op.
+    fn finish_execution(_: &mut Self::Engine) {}
     const FEATURES: Features;
     const FEATURE_NAMES: &'static str;
     /// A backend may query its actual execution configuration once at runtime.

@@ -1064,7 +1064,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 pending
                             } else {
                                 if !interrupt_prepared {
-                                    let interrupt = match C::execution_interrupt(&mut engine) {
+                                    let interrupt = match C::begin_execution(&mut engine) {
                                         Ok(interrupt) => interrupt,
                                         Err(error) => break SliceOutcome::Fault(error),
                                     };
@@ -1279,6 +1279,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                         }
                     }))
                     .ok();
+                    C::finish_execution(&mut engine);
                     let work = &mut job.work;
                     if let Some(epoch) = epoch.as_ref().filter(|_|thread_exit.is_none()) {
                         if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
