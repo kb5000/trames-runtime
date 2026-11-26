@@ -90,6 +90,16 @@ fn install_library(
     replace(vfs, path, &bytes)
 }
 fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
+    replace_mode(vfs, path, bytes, 0o644)
+}
+
+/// Cold SDK replacement through the current namespace, including executable SDKs.
+pub(crate) fn replace_mode(
+    vfs: &mut Vfs,
+    path: &[u8],
+    bytes: &[u8],
+    mode: u32,
+) -> Result<bool, Error> {
     if let Ok(fd) = vfs.open_at(AT_FDCWD, path, 0, 0) {
         // VFS reads may be short (including its per-call transfer ceiling).
         // Compare in bounded chunks so large Gallium files keep their inode
@@ -109,6 +119,13 @@ fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
         })();
         vfs.close(fd)?;
         if current == Ok(true) {
+            if mode == 0o755 {
+                let stat = vfs.stat_at(AT_FDCWD, path)?;
+                if u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o7777 != mode {
+                    vfs.chmod_at(AT_FDCWD, path, mode)?;
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         }
     }
@@ -133,7 +150,7 @@ fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
             )
             .as_bytes(),
         );
-        match vfs.open_at(AT_FDCWD, &candidate, 0xc1, 0o644) {
+        match vfs.open_at(AT_FDCWD, &candidate, 0xc1, mode) {
             Ok(fd) => {
                 staging = Some((candidate, fd));
                 break;
@@ -153,6 +170,10 @@ fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
                 }
                 remaining = &remaining[count..];
             }
+        }
+        if mode == 0o755 {
+            vfs.chown_fd(fd, 0, 0)?;
+            vfs.chmod_fd(fd, mode)?;
         }
         vfs.sync_fd(fd, false)
     })();
