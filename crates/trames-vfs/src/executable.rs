@@ -4,7 +4,7 @@ use super::*;
 
 /// A file being loaded or retained by a guest executable image. Cloning the
 /// image across fork shares the lease. Procfs observers retain only file identity.
-pub struct ExecutingFile(Arc<ExecutableFile>);
+pub struct ExecutingFile(Arc<ExecutableFile>, Vec<NodeRef>);
 impl ExecutingFile {
     pub fn file(&self) -> &Arc<ExecutableFile> {
         &self.0
@@ -13,6 +13,7 @@ impl ExecutingFile {
 pub(super) struct WriteAccess {
     node: NodeRef,
     _mount: Option<mapped::MountWrite>,
+    _layer: Option<Box<WriteAccess>>,
 }
 
 impl Inode {
@@ -41,9 +42,30 @@ impl WriteAccess {
         let mut access = Self {
             node: node.clone(),
             _mount: None,
+            _layer: None,
         };
         access._mount = mount.map(mapped::MountWrite::new).transpose()?;
+        access.retain_layer()?;
         Ok(access)
+    }
+    pub(super) fn retain_provider(
+        &mut self,
+        node: &NodeRef,
+        mount: &Arc<mounts::MountIdentity>,
+    ) -> Result<()> {
+        if self._layer.is_none() {
+            self._layer = Some(Box::new(Self::acquire(node, Some(mount))?));
+        }
+        Ok(())
+    }
+    pub(super) fn retain_layer(&mut self) -> Result<()> {
+        if self._layer.is_none() {
+            let layer = overlay::writable_layer(&self.node);
+            if let Some((node, mount)) = layer {
+                self._layer = Some(Box::new(Self::acquire(&node, Some(&mount))?));
+            }
+        }
+        Ok(())
     }
 }
 impl Drop for WriteAccess {
@@ -55,6 +77,10 @@ impl Drop for WriteAccess {
 }
 impl Drop for ExecutingFile {
     fn drop(&mut self) {
+        for node in &self.1 {
+            node.text_users
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.0
             .node
             .text_users
@@ -291,7 +317,31 @@ pub fn script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>> {
 impl ExecutableFile {
     pub fn begin_execution(self: &Arc<Self>) -> Result<Arc<ExecutingFile>> {
         self.node.claim_text_access(false)?;
-        Ok(Arc::new(ExecutingFile(self.clone())))
+        let mut sources = Vec::new();
+        let mut node = self.node.clone();
+        loop {
+            let source = match &node.borrow().content {
+                Content::File(data) => data.source_node(),
+                _ => None,
+            };
+            let Some(source) = source else {
+                break;
+            };
+            if let Err(error) = source.claim_text_access(false) {
+                self.node
+                    .text_users
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for old in sources {
+                    let old: NodeRef = old;
+                    old.text_users
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+            sources.push(source.clone());
+            node = source;
+        }
+        Ok(Arc::new(ExecutingFile(self.clone(), sources)))
     }
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let bytes = match &self.node.borrow().content {

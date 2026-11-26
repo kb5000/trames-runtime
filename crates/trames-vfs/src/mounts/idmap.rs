@@ -88,7 +88,11 @@ impl<'a> Ids<'a> {
             return Ok(id);
         }
         match self.map {
-            None => Ok(id),
+            None => self
+                .owner
+                .from_global(group, id)
+                .map(|_| id)
+                .ok_or(Errno(75)),
             Some(map) => map
                 .up(group, id)
                 .and_then(|id| self.owner.to_global(group, id))

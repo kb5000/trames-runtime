@@ -167,7 +167,7 @@ impl Linux {
         }
         if flags > u32::MAX as u64
             || mode & !0o7777 != 0
-            || mode != 0 && flags & 0x40 == 0
+            || mode != 0 && flags & 0x400040 == 0
             || resolve & !63 != 0
         {
             return Err(Errno(22));

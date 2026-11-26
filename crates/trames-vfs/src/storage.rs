@@ -111,6 +111,8 @@ impl Timestamp {
 pub(super) enum FileData {
     /// Read-through reference; overlay copy-up replaces this before mutation.
     Lower(NodeRef),
+    /// A projected overlay inode retains the original layer provider.
+    Layer(Arc<overlay::LayerFile>),
     Plain(Arc<crate::file_data::PlainFile>),
     Shared(trames_shared::SharedFile),
     Mapped(Box<mapped::MappedData>),
@@ -307,6 +309,29 @@ impl Drop for DiskBacking {
     }
 }
 impl FileData {
+    pub(super) fn lower_links(&self) -> Option<u32> {
+        match self {
+            Self::Layer(file) if !file.upper => Some(file.node.borrow().links),
+            Self::Lower(node) => Some(node.borrow().links),
+            Self::Mapped(data) => data.lower_links(),
+            _ => None,
+        }
+    }
+    pub(super) fn source_node(&self) -> Option<NodeRef> {
+        match self {
+            Self::Layer(file) => Some(file.node.clone()),
+            Self::Lower(node) => Some(node.clone()),
+            Self::Mapped(data) => data.source_node(),
+            _ => None,
+        }
+    }
+    pub(super) fn layer_mount(&self) -> Option<Arc<mounts::MountIdentity>> {
+        match self {
+            Self::Layer(file) => Some(file.mount.clone()),
+            Self::Mapped(data) => data.layer_mount(),
+            _ => None,
+        }
+    }
     pub(super) fn mapped_work(&self) -> bool {
         matches!(self, Self::Mapped(data) if data.has_live_pages())
     }
@@ -317,6 +342,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.metadata(),
             Self::Mapped(data) => data.metadata(),
+            Self::Layer(file) if file.upper => Some(file.node.borrow().file_metadata()),
             _ => None,
         }
     }
@@ -331,6 +357,17 @@ impl FileData {
         match self {
             Self::Plain(data) => data.patch_metadata(before, after),
             Self::Mapped(data) => data.patch_metadata(before, after),
+            Self::Layer(file) if file.upper => {
+                let mut n = file.node.borrow_mut();
+                if before.mode != after.mode {
+                    n.mode = after.mode;
+                }
+                for i in 0..3 {
+                    if before.times[i] != after.times[i] {
+                        n.times[i] = after.times[i];
+                    }
+                }
+            }
             _ => (),
         }
     }
@@ -354,6 +391,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.private_lease(write),
             Self::Mapped(data) => data.private_lease(write),
+            Self::Layer(file) => file.read(|data| data.private_lease(write)),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.private_lease(write),
                 _ => Err(Errno(22)),
@@ -365,6 +403,7 @@ impl FileData {
     pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
         match self {
             Self::Plain(data) => data.append_host(bytes),
+            Self::Layer(file) => file.read(|data| Ok(data.append_host(bytes))).ok().flatten(),
             _ => None,
         }
     }
@@ -381,6 +420,7 @@ impl FileData {
     pub(super) fn disk_backed(&self) -> bool {
         match self {
             Self::Plain(data) => data.disk_backed(),
+            Self::Layer(file) => file.read(|data| Ok(data.disk_backed())).unwrap_or(false),
             Self::Lower(node) => {
                 matches!(&node.borrow().content, Content::File(data) if data.disk_backed())
             }
@@ -390,6 +430,7 @@ impl FileData {
     pub(super) fn disk_source(&self) -> Option<(Arc<DiskBacking>, u64)> {
         match self {
             Self::Plain(data) => data.disk_source(),
+            Self::Layer(file) => file.read(|data| Ok(data.disk_source())).ok().flatten(),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.disk_source(),
                 _ => None,
@@ -402,6 +443,9 @@ impl FileData {
             Self::Plain(_) => true,
             Self::Shared(_) => false,
             Self::Mapped(data) => data.epoch_io_safe(write),
+            Self::Layer(file) => file
+                .read(|data| Ok(data.epoch_io_safe(write)))
+                .unwrap_or(false),
             Self::Lower(node) => {
                 let node = node.borrow();
                 !node.volatile
@@ -413,6 +457,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.blocks(),
             Self::Mapped(data) => data.blocks(),
+            Self::Layer(file) => file.read(FileData::blocks),
             Self::Shared(file) => Ok(file.allocated().div_ceil(512) as u64),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.blocks(),
@@ -424,6 +469,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.inode(),
             Self::Mapped(data) => data.inode(),
+            Self::Layer(file) => file.read(|data| Ok(data.inode())).ok().flatten(),
             _ => None,
         }
     }
@@ -432,6 +478,7 @@ impl FileData {
             Self::Plain(data) => data.len(),
             Self::Shared(file) => file.len() as u64,
             Self::Mapped(data) => data.len(),
+            Self::Layer(file) => file.node.logical_size().load(Ordering::Relaxed),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.len(),
                 _ => 0,
@@ -443,6 +490,7 @@ impl FileData {
             Self::Plain(data) => data.logical_size(),
             Self::Shared(file) => file.logical_size(),
             Self::Lower(node) => node.logical_size(),
+            Self::Layer(file) => file.node.logical_size(),
             Self::Mapped(data) => data.logical_size(),
         }
     }
@@ -450,6 +498,7 @@ impl FileData {
         match self {
             Self::Shared(file) => Some(file.clone()),
             Self::Mapped(data) => data.shared_file(),
+            Self::Layer(file) => file.read(|data| Ok(data.shared_file())).ok().flatten(),
             _ => None,
         }
     }
@@ -457,12 +506,18 @@ impl FileData {
         match self {
             Self::Plain(file) if file.tmpfs => Some(file.clone()),
             Self::Mapped(data) => data.tmpfs_file(),
+            Self::Layer(file) => file.read(|data| Ok(data.tmpfs_file())).ok().flatten(),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.tmpfs_file(),
+                _ => None,
+            },
             _ => None,
         }
     }
     pub(super) fn reserve_keep_size(&self, offset: u64, end: u64) -> Result<()> {
         match self {
             Self::Plain(file) => file.reserve_keep_size(offset, end),
+            Self::Layer(file) => file.read(|data| data.reserve_keep_size(offset, end)),
             Self::Mapped(data) => data
                 .plain_file()
                 .ok_or(Errno(95))?
@@ -481,6 +536,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.read_at(offset, count, None),
             Self::Mapped(data) => data.read_at(offset, count),
+            Self::Layer(file) => file.read(|data| data.read_at(offset, count)),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.read_at(offset, count),
                 _ => Err(Errno(5)),
@@ -506,6 +562,9 @@ impl FileData {
         if let Self::Plain(data) = self {
             return data.write_limited(offset, bytes, append, limit, signal);
         }
+        if let Self::Layer(file) = self {
+            return file.write(|data| data.write_transfer(offset, bytes, append, limit, signal));
+        }
         let position = if append { self.len() } else { offset };
         #[cfg(all(feature = "hostfs", unix))]
         if append {
@@ -520,6 +579,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.write_at(offset, bytes),
             Self::Mapped(data) => data.write_at(offset, bytes),
+            Self::Layer(file) => file.write(|data| data.write_at(offset, bytes)),
             Self::Lower(_) => Err(Errno(30)),
             Self::Shared(file) => file.write_at(offset, bytes).map_err(host_errno),
         }
@@ -528,6 +588,7 @@ impl FileData {
         match self {
             Self::Plain(data) => data.truncate(length),
             Self::Mapped(data) => data.truncate(length),
+            Self::Layer(file) => file.write(|data| data.truncate(length)),
             Self::Lower(_) => Err(Errno(30)),
             Self::Shared(file) => file
                 .set_len(usize::try_from(length).map_err(|_| Errno(27))?)
@@ -538,12 +599,18 @@ impl FileData {
         match self {
             Self::Plain(data) => data.sync(data_only),
             Self::Mapped(data) => data.sync(data_only),
+            Self::Layer(file) => file.read(|data| data.sync(data_only)),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.sync(data_only),
+                _ => Err(Errno(5)),
+            },
             _ => Ok(()),
         }
     }
     pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
         match self {
             Self::Mapped(data) => data.sync_range(offset, length, flags),
+            Self::Layer(file) => file.read(|data| data.sync_range(offset, length, flags)),
             Self::Plain(data) => data.sync_range(offset, length, flags),
             Self::Lower(_) | Self::Shared(_) => Ok(()),
         }

@@ -191,6 +191,9 @@ pub(crate) struct FsContext {
     pid: PidNamespace,
     net: Arc<linux_namespace::RootNetwork>,
     devpts: Option<Arc<pty::Devpts>>,
+    ipc: Arc<linux_namespace::IpcNamespace>,
+    cgroup: Arc<linux_namespace::CgroupNamespace>,
+    cgroup_fs: FsHandle,
     state: std::sync::Mutex<ContextState>,
 }
 enum Phase {
@@ -204,6 +207,8 @@ struct ContextState {
     parameters: BTreeMap<Vec<u8>, Vec<u8>>,
     readonly: Option<bool>,
     phase: Phase,
+    layers: overlay::MountConfig,
+    devpts: Option<Arc<pty::Devpts>>,
 }
 /// The originating OFD owns the detached tree. Membership moves to its new
 /// parent (or namespace) on attach. Mount identities only point back weakly.
@@ -361,9 +366,13 @@ impl Vfs {
             }
             b"proc" => Kind::Proc,
             b"sysfs" => Kind::Sysfs,
-            b"cgroup2" | b"mqueue" | b"devpts" | b"overlay" => return Err(Errno(95)),
+            b"cgroup2" => Kind::Cgroup,
+            b"mqueue" => Kind::Mqueue,
+            b"devpts" => Kind::Devpts,
+            b"overlay" => Kind::Overlay,
             _ => return Err(Errno(19)),
         };
+        let cgroup_fs = self.cgroups.borrow().fs.clone();
         self.anonymous(
             if flags == 1 { O_CLOEXEC } else { 0 },
             events::Anonymous::FsContext(Arc::new(FsContext {
@@ -373,11 +382,16 @@ impl Vfs {
                 pid: self.pid_ns.clone(),
                 net: self.root_network.clone(),
                 devpts: None,
+                ipc: self.ipc_namespace.clone(),
+                cgroup: self.cgroup_namespace.clone(),
+                cgroup_fs,
                 state: std::sync::Mutex::new(ContextState {
                     source: None,
                     parameters: BTreeMap::new(),
                     readonly: None,
                     phase: Phase::Parameters,
+                    layers: Default::default(),
+                    devpts: None,
                 }),
             })),
         )
@@ -403,6 +417,7 @@ impl Vfs {
             Some(linux_namespace::SharedNamespace::Net(net)) => net.clone(),
             _ => self.root_network.clone(),
         };
+        let cgroup_fs = self.cgroups.borrow().fs.clone();
         self.anonymous(
             if flags & 1 != 0 { O_CLOEXEC } else { 0 },
             events::Anonymous::FsContext(Arc::new(FsContext {
@@ -412,11 +427,16 @@ impl Vfs {
                 pid,
                 net,
                 devpts: mount.devpts.clone(),
+                ipc: self.ipc_namespace.clone(),
+                cgroup: self.cgroup_namespace.clone(),
+                cgroup_fs,
                 state: std::sync::Mutex::new(ContextState {
                     source: None,
                     parameters: BTreeMap::new(),
                     readonly: None,
                     phase: Phase::Reconfigure(mount.fs.clone()),
+                    layers: Default::default(),
+                    devpts: mount.devpts.clone(),
                 }),
             })),
         )
@@ -485,7 +505,7 @@ impl Vfs {
         self.reconfigure_filesystem(
             ctx.kind,
             fs,
-            ctx.devpts.as_deref(),
+            state.devpts.as_deref().or(ctx.devpts.as_deref()),
             &state.parameters,
             state.readonly,
         )?;
@@ -711,6 +731,35 @@ impl Vfs {
                 }
                 state.parameters.insert(key.to_vec(), option);
             }
+            (
+                1,
+                Some(key @ (b"lowerdir" | b"lowerdir+" | b"upperdir" | b"workdir")),
+                Some(value),
+            ) if ctx.kind == Kind::Overlay && matches!(state.phase, Phase::Parameters) => {
+                state.layers.configure(self, key, value)?;
+            }
+            (0, Some(b"userxattr"), None)
+                if ctx.kind == Kind::Overlay && matches!(state.phase, Phase::Parameters) =>
+            {
+                state
+                    .parameters
+                    .insert(b"userxattr".to_vec(), b"userxattr".to_vec());
+            }
+            (1, Some(key), Some(value))
+                if ctx.kind == Kind::Overlay && matches!(state.phase, Phase::Parameters) =>
+            {
+                if !matches!(
+                    (key, value),
+                    (b"index" | b"metacopy", b"off")
+                        | (b"redirect_dir", b"off" | b"nofollow")
+                        | (b"xino", b"off" | b"auto")
+                ) {
+                    return Err(Errno(22));
+                }
+                state
+                    .parameters
+                    .insert(key.to_vec(), [key, b"=", value].concat());
+            }
             (1, Some(key), Some(value)) if ctx.kind == Kind::Devpts => {
                 if value.contains(&b',') {
                     return Err(Errno(22));
@@ -740,6 +789,8 @@ impl Vfs {
                 let owner = match ctx.kind {
                     Kind::Proc => ctx.pid.user_namespace(),
                     Kind::Sysfs => &ctx.net.user_namespace,
+                    Kind::Mqueue => &ctx.ipc.user_namespace,
+                    Kind::Cgroup => &ctx.cgroup.user_namespace,
                     _ => &ctx.creator.user_namespace,
                 };
                 if !self.credentials.has_ns_cap(owner, capabilities::SYS_ADMIN) {
@@ -759,9 +810,12 @@ impl Vfs {
                             ctx.kind == Kind::Debugfs,
                         )?;
                         (u64::MAX, usize::MAX, mode, uid, gid)
-                    } else {
+                    } else if ctx.kind == Kind::Tmpfs {
                         tmpfs_options(&data, self.pseudo.borrow().runtime.memory_limit as u64)?
+                    } else {
+                        (u64::MAX, usize::MAX, 0o755, None, None)
                     };
+                let mut devpts = None;
                 let (fs, root, root_key) = match ctx.kind {
                     Kind::Ramfs | Kind::Debugfs => {
                         let fs = if ctx.kind == Kind::Ramfs {
@@ -788,6 +842,54 @@ impl Vfs {
                         let root = fs.borrow().paths[b"/".as_slice()].clone();
                         (fs, root, b"/".to_vec())
                     }
+                    Kind::Devpts => {
+                        let pts = Arc::new(pty::Devpts::new(new_mount_id()?, &data)?);
+                        let mut fs = pts.fs.clone();
+                        fs.owner = ctx.owner.clone();
+                        fs.super_readonly
+                            .as_ref()
+                            .unwrap()
+                            .store(state.readonly.unwrap_or(false), Ordering::Relaxed);
+                        let root = fs.borrow().paths[b"/".as_slice()].clone();
+                        devpts = Some(pts);
+                        (fs, root, b"/".to_vec())
+                    }
+                    Kind::Mqueue => {
+                        let fs = ctx.ipc.mqueue_filesystem()?;
+                        let root = fs.borrow().paths[b"/".as_slice()].clone();
+                        (fs, root, b"/".to_vec())
+                    }
+                    Kind::Cgroup => {
+                        let fs = ctx.cgroup_fs.clone();
+                        let root = ctx
+                            .cgroup
+                            .root
+                            .clone()
+                            .unwrap_or_else(|| fs.borrow().paths[b"/".as_slice()].clone());
+                        let key = root
+                            .borrow()
+                            .path_in(&fs.borrow().paths, b"/")
+                            .ok_or(Errno(2))?;
+                        if let Some(value) = self.cgroup_mount_options(Some(&data))? {
+                            self.cgroups
+                                .borrow()
+                                .nsdelegate
+                                .store(value, Ordering::Relaxed);
+                        }
+                        (fs, root, key)
+                    }
+                    Kind::Overlay => {
+                        let options = state.layers.options(&state.parameters)?;
+                        let (mut fs, _) = self.overlay_mount_captured(
+                            &options,
+                            state.readonly.unwrap_or(false),
+                            Some(&state.layers),
+                            Some(&ctx.creator),
+                        )?;
+                        fs.owner = ctx.owner.clone();
+                        let root = fs.borrow().paths[b"/".as_slice()].clone();
+                        (fs, root, b"/".to_vec())
+                    }
                     Kind::Proc | Kind::Sysfs => {
                         let key = if ctx.kind == Kind::Proc {
                             b"/proc".as_slice()
@@ -805,6 +907,7 @@ impl Vfs {
                     }
                     _ => return Err(Errno(19)),
                 };
+                state.devpts = devpts.clone();
                 state.phase = Phase::Created(Arc::new(Mount::new(MountInit {
                     idmap: None,
                     id: new_mount_id()?,
@@ -826,7 +929,7 @@ impl Vfs {
                     },
                     namespace: None,
                     pid_namespace: (ctx.kind == Kind::Proc).then(|| ctx.pid.clone()),
-                    devpts: None,
+                    devpts,
                     flags: Cell::new(if state.readonly.unwrap_or(false) {
                         MS_RDONLY
                     } else {
@@ -1433,3 +1536,58 @@ mod tests {
 #[cfg(test)]
 #[path = "idmap_tests.rs"]
 mod idmap_tests;
+
+#[cfg(test)]
+mod modern_context_tests {
+    use super::*;
+    #[test]
+    fn new_overlay_context_keeps_accepted_directories_after_rename() {
+        let mut v = Vfs::default();
+        for path in [b"/lower".as_slice(), b"/upper", b"/work", b"/merged"] {
+            v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        }
+        v.import_file(b"/lower/file", b"original".to_vec()).unwrap();
+        let ctx = v.fsopen(b"overlay", 0).unwrap();
+        for (k, p) in [
+            (b"lowerdir+".as_slice(), b"/lower".as_slice()),
+            (b"upperdir", b"/upper"),
+            (b"workdir", b"/work"),
+        ] {
+            v.fsconfigure(ctx, 1, Some(k), Some(p)).unwrap();
+        }
+        v.rename_at(AT_FDCWD, b"/lower", AT_FDCWD, b"/renamed", 0)
+            .unwrap();
+        v.fsconfigure(ctx, 6, None, None).unwrap();
+        let tree = v.fsmount(ctx, 0, 0).unwrap();
+        v.move_mount_fd(tree as i32, b"", AT_FDCWD, b"/merged", 4)
+            .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/merged/file", 0, 0).unwrap();
+        assert_eq!(v.read(fd, 8).unwrap(), b"original");
+    }
+    #[test]
+    fn modern_devpts_and_mqueue_contexts_retain_their_original_instances() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        for path in [b"/pts".as_slice(), b"/queues"] {
+            v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        }
+        let ctx = v.fsopen(b"devpts", 0).unwrap();
+        v.fsconfigure(ctx, 1, Some(b"ptmxmode"), Some(b"0666"))
+            .unwrap();
+        v.fsconfigure(ctx, 6, None, None).unwrap();
+        let tree = v.fsmount(ctx, 0, 0).unwrap();
+        v.move_mount_fd(tree as i32, b"", AT_FDCWD, b"/pts", 4)
+            .unwrap();
+        assert!(v.stat_at(AT_FDCWD, b"/pts/ptmx").is_ok());
+        let q = v.mq_open(b"original", 0x42, 0o600, None).unwrap();
+        let ctx = v.fsopen(b"mqueue", 0).unwrap();
+        v.unshare_ipc().unwrap();
+        v.fsconfigure(ctx, 6, None, None).unwrap();
+        let tree = v.fsmount(ctx, 0, 0).unwrap();
+        v.move_mount_fd(tree as i32, b"", AT_FDCWD, b"/queues", 4)
+            .unwrap();
+        assert!(v.stat_at(AT_FDCWD, b"/queues/original").is_ok());
+        assert_eq!(v.mq_open(b"original", 0, 0, None), Err(Errno(2)));
+        v.close(q).unwrap();
+    }
+}

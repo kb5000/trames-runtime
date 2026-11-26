@@ -1022,9 +1022,21 @@ mod tests {
             }
         }
         assert_eq!(v.open_at(AT_FDCWD, b"/sock", O_NONBLOCK, 0), Err(Errno(13)));
+        let query = v.path_queries();
+        let files = FileEpoch::default().capture(&v, true);
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/sock", O_NONBLOCK, 0, 0, &files),
+            Some(Err(Errno(13)))
+        );
         v.open_at(AT_FDCWD, b"/sock", O_PATH, 0).unwrap();
         v.credentials = Credentials::default();
         assert_eq!(v.open_at(AT_FDCWD, b"/sock", O_NONBLOCK, 0), Err(Errno(6)));
+        let query = v.path_queries();
+        let files = FileEpoch::default().capture(&v, true);
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/sock", O_NONBLOCK, 0, 0, &files),
+            Some(Err(Errno(6)))
+        );
     }
 
     #[test]

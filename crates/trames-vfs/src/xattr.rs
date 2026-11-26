@@ -370,9 +370,26 @@ impl Vfs {
             let caps = value
                 .map(|bytes| file_caps::FileCaps::for_inode(bytes, &self.credentials, &n, ids))
                 .transpose()?;
+            let old = n.file_caps();
+            let old_time = n.times[2];
+            if old.is_some() && flags & 1 != 0 {
+                return Err(Errno(17));
+            }
+            if old.is_none() && (caps.is_none() || flags & 2 != 0) {
+                return Err(Errno(61));
+            }
+            drop(n);
+            fs.prepare_metadata(&node)?;
+            let mut n = node.borrow_mut();
             n.edit_caps(caps, flags)?;
             n.times[2] = storage::Timestamp::now();
             drop(n);
+            if let Err(error) = fs.checkpoint_metadata(&node) {
+                let mut n = node.borrow_mut();
+                let _ = n.edit_caps(old, 0);
+                n.times[2] = old_time;
+                return Err(error);
+            }
             inotify::notify(&node, inotify::ATTRIB, None);
             return Ok(());
         }

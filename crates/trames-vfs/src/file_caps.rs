@@ -15,6 +15,13 @@ pub(crate) struct FileCaps {
 }
 
 impl FileCaps {
+    pub(super) fn translate(mut self, map: impl FnOnce(u32) -> Result<u32>) -> Result<Self> {
+        self.root = map(self.root)?;
+        if self.root == u32::MAX {
+            return Err(Errno(75));
+        }
+        Ok(self)
+    }
     pub(super) fn mapped(mut self, ids: mounts::idmap::Ids<'_>) -> Option<Self> {
         self.root = ids.visible(false, self.root);
         (self.root != u32::MAX).then_some(self)
@@ -99,36 +106,52 @@ impl FileCaps {
     }
 }
 
+impl storage::FileData {
+    pub(super) fn capabilities(&self) -> Option<FileCaps> {
+        match self {
+            Self::Plain(file) => file.capabilities(),
+            Self::Mapped(data) => data.capabilities(),
+            Self::Layer(file) => file.caps(),
+            Self::Lower(node) => node.borrow().file_caps(),
+            Self::Shared(_) => None,
+        }
+    }
+    pub(super) fn edit_capabilities(&self, caps: Option<FileCaps>, flags: u32) -> Result<()> {
+        match self {
+            Self::Plain(file) => file.edit_capabilities(caps, flags),
+            Self::Mapped(data) => data.edit_capabilities(caps, flags),
+            Self::Layer(file) => file.edit_caps(caps, flags),
+            _ => Err(Errno(95)),
+        }
+    }
+    pub(super) fn revoke_capabilities(&self) -> Result<()> {
+        if let Self::Plain(file) = self {
+            return file.revoke_capabilities();
+        }
+        if self.capabilities().is_none() {
+            return Ok(());
+        }
+        self.edit_capabilities(None, 0)
+    }
+}
 impl Node {
-    fn cap_file(&self) -> Option<Arc<file_data::PlainFile>> {
+    pub(super) fn file_caps(&self) -> Option<FileCaps> {
         match &self.content {
-            Content::File(storage::FileData::Plain(file)) => Some(file.clone()),
-            Content::File(storage::FileData::Mapped(data)) => data.plain_file(),
+            Content::File(data) => data.capabilities(),
             _ => None,
         }
     }
-
-    pub(super) fn file_caps(&self) -> Option<FileCaps> {
-        self.cap_file()?.capabilities()
-    }
-
     pub(super) fn edit_caps(&self, caps: Option<FileCaps>, flags: u32) -> Result<()> {
-        if caps.is_some() {
-            if let Content::File(storage::FileData::Mapped(data)) = &self.content {
-                if data.has_writers() {
-                    return Err(Errno(16));
-                }
-                data.sync(false)?;
-            }
+        match &self.content {
+            Content::File(data) => data.edit_capabilities(caps, flags),
+            _ => Err(Errno(95)),
         }
-        self.cap_file()
-            .ok_or(Errno(95))?
-            .edit_capabilities(caps, flags)
     }
-
     pub(super) fn revoke_file_caps(&self) -> Result<()> {
-        self.cap_file()
-            .map_or(Ok(()), |file| file.revoke_capabilities())
+        match &self.content {
+            Content::File(data) => data.revoke_capabilities(),
+            _ => Ok(()),
+        }
     }
 }
 

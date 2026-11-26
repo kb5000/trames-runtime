@@ -25,6 +25,7 @@ pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
 mod hostfs;
+mod tmpfile;
 mod tmpfs;
 use fs_context::FsContext;
 pub use fs_context::{FsOwner, Umask};
@@ -257,6 +258,7 @@ pub const AT_FDCWD: i32 = -100;
 const O_CREAT: u32 = 0x40;
 const O_TRUNC: u32 = 0x200;
 pub const O_DIRECTORY: u32 = 0x4000;
+pub const O_TMPFILE: u32 = tmpfile::BIT | O_DIRECTORY;
 pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_DIRECT: u32 = 0x10000;
 pub const O_LARGEFILE: u32 = 0x20000;
@@ -457,6 +459,7 @@ enum Content {
 type NodeRef = Arc<Inode>;
 struct Inode {
     text_users: std::sync::atomic::AtomicIsize,
+    tmpfile: std::sync::atomic::AtomicU8,
     proc_node: std::sync::OnceLock<proc_source::ProcNode>,
     removed_directory_parent: std::sync::OnceLock<NodeRef>,
     fuse_abort: std::sync::OnceLock<fuse::Abort>,
@@ -493,6 +496,7 @@ impl Inode {
         node.identity = trames_memory::new_backing_identity();
         Self {
             text_users: Default::default(),
+            tmpfile: 0.into(),
             seq_file: false,
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             directory: matches!(node.content, Content::Directory),
@@ -3256,7 +3260,12 @@ impl Vfs {
         let source_path = source;
         #[cfg(all(feature = "hostfs", unix))]
         let host_source = source.clone();
-        let source = self.node(source)?;
+        let source = match retained.filter(|node| {
+            node.tmpfile.load(Ordering::Relaxed) & 2 != 0 && node.borrow().links == 0
+        }) {
+            Some(node) => node.clone(),
+            None => self.node(source)?,
+        };
         if retained.is_some_and(|node| !Arc::ptr_eq(node, &source)) {
             return Err(Errno(2));
         }
@@ -3292,7 +3301,10 @@ impl Vfs {
             {
                 return Err(Errno(1));
             }
-            if import_executable.is_none() && n.links == 0 {
+            if import_executable.is_none()
+                && n.links == 0
+                && source.tmpfile.load(Ordering::Relaxed) & 2 == 0
+            {
                 return Err(Errno(2));
             }
         }
@@ -3337,6 +3349,10 @@ impl Vfs {
         drop(fs);
         drop(source_metadata);
         drop(parent_times);
+        source.tmpfile.fetch_and(!2, Ordering::Relaxed);
+        if let Content::File(data) = &mut source.borrow_mut().content {
+            data.orphan(false);
+        }
         self.notification_link(dest, &source, true);
         source
             .borrow()
@@ -3627,6 +3643,7 @@ impl Vfs {
             return Err(Errno(11));
         }
         const ALLOWED: u32 = 3
+            | tmpfile::BIT
             | 0x40
             | 0x80
             | 0x100
@@ -3646,7 +3663,10 @@ impl Vfs {
         } else {
             flags
         };
-        if flags & !ALLOWED != 0 || flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY) {
+        if flags & !ALLOWED != 0
+            || flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY)
+            || flags & tmpfile::BIT != 0 && (flags & O_DIRECTORY == 0 || flags & 3 == 0)
+        {
             return Err(Errno(22));
         }
         if flags & 0x40 != 0 && path.last() == Some(&b'/') {
@@ -3672,7 +3692,8 @@ impl Vfs {
             true,
             policy,
             true,
-            (!PATH_TRUNCATE).then_some(ResolveOperation::Fuse(fuse::PathOperation::Open(flags))),
+            (!PATH_TRUNCATE && flags & tmpfile::BIT == 0)
+                .then_some(ResolveOperation::Fuse(fuse::PathOperation::Open(flags))),
             None,
         );
         let entry = match resolved {
@@ -3691,9 +3712,12 @@ impl Vfs {
                 return Err(e);
             }
         };
-        let result =
-            self.open_resolved::<PATH_TRUNCATE>(entry, flags, mode, publication, reservation);
-        if !PATH_TRUNCATE {
+        let result = if flags & tmpfile::BIT != 0 {
+            self.open_tmpfile::<PATH_TRUNCATE>(entry, flags, mode, publication, reservation)
+        } else {
+            self.open_resolved::<PATH_TRUNCATE>(entry, flags, mode, publication, reservation)
+        };
+        if !PATH_TRUNCATE && flags & tmpfile::BIT == 0 {
             fuse::PathRetry::arm(
                 self,
                 dirfd,
@@ -3970,7 +3994,10 @@ impl Vfs {
                             && (flags & O_PATH != 0 || matches!(n.content, Content::Directory)))
                         && (n.volatile
                             || n.seals.is_some() && magic.as_ref().is_none_or(|m| m.file.is_none())
-                            || !matches!(n.content, Content::File(_) | Content::Directory))
+                            || !matches!(
+                                n.content,
+                                Content::File(_) | Content::Directory | Content::Socket(_)
+                            ))
                     {
                         return query.defer();
                     }
@@ -4065,10 +4092,14 @@ impl Vfs {
             {
                 return Err(Errno(22));
             }
-            if flags & O_DIRECTORY != 0 && !matches!(n.content, Content::Directory) {
+            if flags & O_DIRECTORY != 0
+                && flags & tmpfile::BIT == 0
+                && !matches!(n.content, Content::Directory)
+            {
                 return Err(Errno(20));
             }
             if existed
+                && !(flags & tmpfile::BIT != 0 && node.tmpfile.load(Ordering::Relaxed) != 0)
                 && !fuse_special
                 && flags & O_PATH == 0
                 && !network_control
@@ -4105,6 +4136,15 @@ impl Vfs {
         };
         if fd_can_write(flags) || flags & O_TRUNC != 0 {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
+            if let Some(access) = &mut write_access {
+                access.retain_layer()?;
+                if let Some(o) = p.filesystem_ref(self).overlay_handle() {
+                    o.retain_writer(&node, access)?;
+                }
+            }
+        }
+        if flags & O_PATH == 0 {
+            self.overlay_check_open(&p, &node, flags)?;
         }
         let disk_file = if flags & O_PATH == 0 {
             match &node.borrow().content {
@@ -4228,6 +4268,7 @@ impl Vfs {
         let read_node = if flags & O_PATH == 0 && flags & 3 == 0 {
             match &node.borrow().content {
                 Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
+                Content::File(storage::FileData::Layer(file)) => Some(file.node.clone()),
                 _ => None,
             }
         } else {
@@ -5409,7 +5450,15 @@ impl Vfs {
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         let metadata = node.file_metadata();
         out[16..20].copy_from_slice(&metadata.mode.to_le_bytes());
-        out[20..24].copy_from_slice(&node.links.to_le_bytes());
+        let links = if node.links != 0 {
+            match &node.content {
+                Content::File(data) => data.lower_links().unwrap_or(node.links),
+                _ => node.links,
+            }
+        } else {
+            0
+        };
+        out[20..24].copy_from_slice(&links.to_le_bytes());
         out[24..28].copy_from_slice(&node.uid.to_le_bytes());
         out[28..32].copy_from_slice(&node.gid.to_le_bytes());
         let rdev = if !matches!(node.mode & 0o170000, 0o20000 | 0o60000) {

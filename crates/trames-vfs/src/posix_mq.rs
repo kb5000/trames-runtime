@@ -216,13 +216,13 @@ fn key(name: &[u8], unlink: bool) -> Result<Vec<u8>> {
     }
     Ok([b"/", name].concat())
 }
-impl Vfs {
-    pub(super) fn mqueue_fs(&self) -> Result<FsHandle> {
-        let cell = &self.ipc_namespace.mqueue;
+impl linux_namespace::IpcNamespace {
+    pub(super) fn mqueue_filesystem(&self) -> Result<FsHandle> {
+        let cell = &self.mqueue;
         if let Some(fs) = cell.get() {
             return Ok(fs.clone());
         }
-        let owner = &self.ipc_namespace.user_namespace;
+        let owner = &self.user_namespace;
         let mut fs = mounts::ram_filesystem(
             0,
             257,
@@ -233,6 +233,11 @@ impl Vfs {
         )?;
         fs.owner = owner.clone();
         Ok(cell.get_or_init(|| fs).clone())
+    }
+}
+impl Vfs {
+    pub(super) fn mqueue_fs(&self) -> Result<FsHandle> {
+        self.ipc_namespace.mqueue_filesystem()
     }
     pub fn mq_open(
         &mut self,

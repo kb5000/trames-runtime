@@ -130,6 +130,135 @@ impl Layer {
         (None, false)
     }
 }
+/// The overlay inode owns projected metadata; data and VM pages keep the
+/// original layer provider and its accounting. No view rewrites a layer cache.
+pub(super) struct LayerFile {
+    pub(super) node: NodeRef,
+    pub(super) mount: Arc<mounts::MountIdentity>,
+    pub(super) upper: bool,
+}
+impl LayerFile {
+    pub(super) fn read<T>(&self, call: impl FnOnce(&storage::FileData) -> Result<T>) -> Result<T> {
+        let n = self.node.borrow();
+        let Content::File(data) = &n.content else {
+            return Err(Errno(5));
+        };
+        call(data)
+    }
+    pub(super) fn write<T>(
+        &self,
+        call: impl FnOnce(&mut storage::FileData) -> Result<T>,
+    ) -> Result<T> {
+        if !self.upper {
+            return Err(Errno(30));
+        }
+        let mut n = self.node.borrow_mut();
+        let Content::File(data) = &mut n.content else {
+            return Err(Errno(5));
+        };
+        call(data)
+    }
+    fn ids(&self) -> mounts::idmap::Ids<'_> {
+        mounts::idmap::Ids::from_mount(&self.mount)
+    }
+    pub(super) fn caps(&self) -> Option<file_caps::FileCaps> {
+        self.node.borrow().file_caps()?.mapped(self.ids())
+    }
+    pub(super) fn edit_caps(&self, caps: Option<file_caps::FileCaps>, flags: u32) -> Result<()> {
+        if !self.upper {
+            return Err(Errno(30));
+        }
+        let caps = caps
+            .map(|c| c.translate(|id| self.ids().stored(false, id)))
+            .transpose()?;
+        self.node.borrow().edit_caps(caps, flags)
+    }
+}
+pub(super) fn writable_layer(node: &NodeRef) -> Option<(NodeRef, Arc<mounts::MountIdentity>)> {
+    match &node.borrow().content {
+        Content::File(storage::FileData::Layer(file)) if file.upper => {
+            Some((file.node.clone(), file.mount.clone()))
+        }
+        _ => None,
+    }
+}
+pub(super) fn mapping_node(mut node: NodeRef) -> NodeRef {
+    loop {
+        let backing = match &node.borrow().content {
+            Content::File(storage::FileData::Layer(file)) if file.upper => Some(file.node.clone()),
+            _ => None,
+        };
+        let Some(backing) = backing else {
+            return node;
+        };
+        node = backing;
+    }
+}
+struct ProjectionEdit {
+    view: NodeRef,
+    raw: NodeRef,
+    old: Option<(
+        Metadata,
+        [storage::Timestamp; 3],
+        Option<file_caps::FileCaps>,
+    )>,
+    caps: Option<file_caps::FileCaps>,
+    moved: bool,
+}
+#[derive(Default)]
+struct ProjectionEdits {
+    entries: Vec<ProjectionEdit>,
+    committed: bool,
+}
+impl Drop for ProjectionEdits {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for e in self.entries.iter().rev() {
+            if let Some((old, times, caps)) = &e.old {
+                let mut raw = e.raw.borrow_mut();
+                raw.mode = old.mode;
+                raw.uid = old.uid;
+                raw.gid = old.gid;
+                raw.times = *times;
+                raw.xattrs = old.attrs.clone();
+                let _ = raw.edit_caps(*caps, 0);
+            } else if e.moved {
+                let mut view = e.view.borrow_mut();
+                let mut raw = e.raw.borrow_mut();
+                let content = std::mem::replace(
+                    &mut raw.content,
+                    Content::File(storage::FileData::memory(Vec::new())),
+                );
+                view.content = content;
+                let _ = view.edit_caps(e.caps, 0);
+            }
+        }
+    }
+}
+fn projected_attrs(
+    attrs: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ids: mounts::idmap::Ids<'_>,
+    stored: bool,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut attrs = attrs.clone();
+    for (name, value) in &mut attrs {
+        if acl::name(name) {
+            acl::translate(value, |group, id| {
+                if stored {
+                    if id == u32::MAX {
+                        return Err(Errno(75));
+                    }
+                    ids.stored(group, id)
+                } else {
+                    Ok(ids.visible(group, id))
+                }
+            })?;
+        }
+    }
+    Ok(attrs)
+}
 #[derive(Clone, PartialEq, Eq)]
 struct Metadata {
     mode: u32,
@@ -169,6 +298,8 @@ fn snapshot(paths: &Tree) -> BTreeMap<Vec<u8>, Entry> {
         })
         .collect()
 }
+type UpperNodes = BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<Inode>)>;
+
 pub(super) struct Overlay {
     pub(super) depth: usize,
     // Metadata/FsHandle observers retain no semantic layer use. Namespace
@@ -180,11 +311,15 @@ pub(super) struct Overlay {
     upper: Option<Layer>,
     work: Option<Layer>,
     lower: SharedCell<Tree>,
+    lower_numbers: SharedCell<BTreeMap<usize, u64>>,
     baseline: SharedCell<BTreeMap<Vec<u8>, Entry>>,
     uncopied: SharedCell<BTreeSet<usize>>,
     dirty: SharedCell<BTreeSet<usize>>,
     userxattr: bool,
     options: Vec<u8>,
+    projected: bool,
+    creator: Credentials,
+    upper_nodes: SharedCell<UpperNodes>,
 }
 pub(super) struct LayerUses {
     _layers: Vec<mounts::MountUse>,
@@ -194,14 +329,14 @@ impl Overlay {
         if self.lower.borrow().contains_key(key) {
             return Err(Errno(2));
         }
-        let (source, upper) = self
+        let (source, source_layer, upper) = self
             .upper
             .iter()
             .map(|layer| (layer, true))
             .chain(self.lowers.iter().map(|layer| (layer, false)))
             .find_map(|(layer, upper)| {
                 let (node, hidden) = layer.lookup(key, self.userxattr);
-                node.map(|node| Ok((node, upper)))
+                node.map(|node| Ok((node, layer, upper)))
                     .or_else(|| hidden.then_some(Err(Errno(2))))
             })
             .ok_or(Errno(2))??;
@@ -226,24 +361,49 @@ impl Overlay {
         if fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
         }
-        let node = if upper {
+        let node = if upper && !self.projected {
             source.clone()
-        } else if let Some(alias) = lower.iter().find_map(|(path, backing)| {
-            Arc::ptr_eq(backing, &source)
-                .then(|| fs.paths.get(path).cloned())
-                .flatten()
-        }) {
-            alias.borrow_mut().links += 1;
-            alias
-        } else {
-            let inode = if self.upper.is_some() {
-                self.allocate_inode()?
+        } else if upper {
+            let existing = {
+                let refs = self.upper_nodes.borrow();
+                refs.values().find_map(|(view, raw)| {
+                    raw.upgrade()
+                        .filter(|raw| Arc::ptr_eq(raw, &source))
+                        .and_then(|_| view.upgrade())
+                })
+            };
+            if let Some(view) = existing {
+                view.borrow_mut().links += 1;
+                view
             } else {
-                let inode = fs.next_inode;
-                fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
+                let inode = source.borrow().inode;
+                let node = Vfs::overlay_layer_inode(&source, inode, Some((source_layer, true)))?;
+                node.borrow_mut().links = 1;
+                self.upper_nodes.borrow_mut().insert(
+                    pointer(&node),
+                    (Arc::downgrade(&node), Arc::downgrade(&source)),
+                );
+                fs.track_inode(&node)?;
+                node
+            }
+        } else {
+            let known = self.lower_numbers.borrow().get(&pointer(&source)).copied();
+            let inode = if let Some(inode) = known {
+                inode
+            } else {
+                let inode = if self.upper.is_some() {
+                    self.allocate_inode()?
+                } else {
+                    let inode = fs.next_inode;
+                    fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
+                    inode
+                };
+                self.lower_numbers
+                    .borrow_mut()
+                    .insert(pointer(&source), inode);
                 inode
             };
-            let node = Vfs::overlay_lower_inode(&source, inode)?;
+            let node = Vfs::overlay_layer_inode(&source, inode, Some((source_layer, false)))?;
             node.borrow_mut().links = 1;
             fs.track_inode(&node)?;
             self.uncopied.borrow_mut().insert(pointer(&node));
@@ -328,6 +488,48 @@ fn merge(layers: impl Iterator<Item = Tree>, userxattr: bool) -> Tree {
     merged
 }
 impl Overlay {
+    fn check_open(&self, fs: &Filesystem, node: &NodeRef, flags: u32) -> Result<()> {
+        let (source, mount) = {
+            let n = node.borrow();
+            match &n.content {
+                Content::File(data) => (data.source_node(), data.layer_mount()),
+                _ => return Ok(()),
+            }
+        };
+        let source = source.unwrap_or_else(|| node.clone());
+        let mount = mount
+            .or_else(|| {
+                let path = node.borrow().path_in(&fs.paths, b"/")?;
+                self.lowers
+                    .iter()
+                    .find(|layer| {
+                        layer
+                            .lookup(&path, self.userxattr)
+                            .0
+                            .is_some_and(|n| Arc::ptr_eq(&n, &source))
+                    })
+                    .map(|layer| layer.at.identity.clone())
+            })
+            .or_else(|| self.upper.as_ref().map(|l| l.at.identity.clone()))
+            .ok_or(Errno(5))?;
+        let bits = if fd_can_write(flags) {
+            if flags & 3 == 2 {
+                6
+            } else {
+                2
+            }
+        } else {
+            4
+        };
+        if !self.creator.allows_mapped(
+            &source.borrow(),
+            bits,
+            mounts::idmap::Ids::from_mount(&mount),
+        ) {
+            return Err(Errno(13));
+        }
+        Ok(())
+    }
     pub(super) fn has_upper(&self) -> bool {
         self.upper.is_some()
     }
@@ -361,23 +563,41 @@ impl Overlay {
     pub(super) fn uncopied_inode(&self, node: &NodeRef) -> bool {
         self.uncopied.borrow().contains(&pointer(node))
     }
-    fn copy_up(&self, node: &NodeRef, truncate: bool) -> Result<()> {
+    pub(super) fn copy_up(&self, node: &NodeRef, truncate: bool) -> Result<()> {
         let id = pointer(node);
         if !self.uncopied.borrow().contains(&id) {
             return Ok(());
         }
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
-        // Upper namespace/checkpoint takes filesystem -> inode too. Never
-        // wait for that filesystem while holding the merged inode write guard.
+        let copied_inode = self.allocate_inode()?;
         let fs = upper.fs.borrow();
         let available = Vfs::filesystem_bytes(&fs).2;
         let mut n = node.borrow_mut();
-        if let Content::File(storage::FileData::Lower(source)) = &n.content {
-            let source = source.borrow();
-            let Content::File(data) = &source.content else {
-                return Err(Errno(5));
-            };
+        let ids = mounts::idmap::Ids::from_mount(&upper.at.identity);
+        if n.uid == u32::MAX || n.gid == u32::MAX {
+            return Err(Errno(75));
+        }
+        ids.stored(false, n.uid)?;
+        ids.stored(true, n.gid)?;
+        ids.creator(&self.creator)?;
+        projected_attrs(&n.xattrs, ids, true)?;
+        if let Some(caps) = n.file_caps() {
+            caps.translate(|id| ids.stored(false, id))?;
+        }
+        if let Content::File(data) = &n.content {
+            let caps = data.capabilities();
             let length = if truncate { 0 } else { data.len() };
+            if length != 0 {
+                if let (Some(source), Some(mount)) = (data.source_node(), data.layer_mount()) {
+                    if !self.creator.allows_mapped(
+                        &source.borrow(),
+                        4,
+                        mounts::idmap::Ids::from_mount(&mount),
+                    ) {
+                        return Err(Errno(13));
+                    }
+                }
+            }
             let sparse = fs.quota.tmpfs.then(|| data.tmpfs_file()).flatten();
             if sparse.is_none() && length > available {
                 return Err(Errno(28));
@@ -385,13 +605,11 @@ impl Overlay {
             let copy = if let Some(file) = sparse.filter(|_| !truncate) {
                 let quota = fs.quota.clone();
                 drop(fs);
-                // Include bytes held by live shared mappings before taking the
-                // source byte lock for an independent copy of its sparse pages.
                 data.sync(false)?;
                 file.copy_up_tmpfs(&quota)?
             } else {
                 let mut copy = if let Some(disk) = &fs.disk {
-                    disk.create(n.inode)?
+                    disk.create(copied_inode)?
                 } else {
                     Vfs::ram_file(fs.quota)?
                 };
@@ -414,8 +632,13 @@ impl Overlay {
                 }
                 copy
             };
+            if caps.is_some() {
+                copy.edit_capabilities(caps, 0)?;
+            } else {
+                copy.revoke_capabilities()?;
+            }
             copy.sync(false)?;
-            drop(source);
+            n.inode = copied_inode;
             n.content = Content::File(copy);
         }
         self.uncopied.borrow_mut().remove(&id);
@@ -423,6 +646,7 @@ impl Overlay {
         Ok(())
     }
     pub(super) fn prepare(&self, fs: &Filesystem, node: &NodeRef, truncate: bool) -> Result<()> {
+        self.upper.as_ref().ok_or(Errno(30))?.at.writable()?;
         self.copy_up(node, truncate)?;
         self.checkpoint(fs)
     }
@@ -450,6 +674,110 @@ impl Overlay {
         };
         name.extend_from_slice(tail);
         name
+    }
+    fn projected_upper(&self, view: &NodeRef, edits: &mut ProjectionEdits) -> Result<NodeRef> {
+        if let Some(edit) = edits
+            .entries
+            .iter()
+            .find(|edit| Arc::ptr_eq(&edit.view, view))
+        {
+            return Ok(edit.raw.clone());
+        }
+        let upper = self.upper.as_ref().ok_or(Errno(30))?;
+        let ids = mounts::idmap::Ids::from_mount(&upper.at.identity);
+        let n = view.borrow();
+        if n.uid == u32::MAX || n.gid == u32::MAX {
+            return Err(Errno(75));
+        }
+        let uid = ids.stored(false, n.uid)?;
+        let gid = ids.stored(true, n.gid)?;
+        let attrs = projected_attrs(&n.xattrs, ids, true)?;
+        let caps = n.file_caps();
+        let stored_caps = caps
+            .map(|c| c.translate(|id| ids.stored(false, id)))
+            .transpose()?;
+        let metadata = n.file_metadata();
+        let inode = n.inode;
+        drop(n);
+        let original = self
+            .upper_nodes
+            .borrow()
+            .get(&pointer(view))
+            .and_then(|(_, raw)| raw.upgrade());
+        if let Some(raw) = original {
+            let mut n = raw.borrow_mut();
+            let old = (Metadata::of(&n), n.file_metadata().times, n.file_caps());
+            edits.entries.push(ProjectionEdit {
+                view: view.clone(),
+                raw: raw.clone(),
+                old: Some(old),
+                caps,
+                moved: false,
+            });
+            n.mode = metadata.mode;
+            n.uid = uid;
+            n.gid = gid;
+            n.times = metadata.times;
+            n.xattrs = attrs;
+            if n.file_caps() != stored_caps {
+                n.edit_caps(stored_caps, 0)?;
+            }
+            drop(n);
+            return Ok(raw);
+        }
+        let mut n = view.borrow_mut();
+        let moved = matches!(n.content, Content::File(_));
+        let content = match &n.content {
+            Content::Directory => Content::Directory,
+            Content::Symlink(target) => Content::Symlink(target.clone()),
+            Content::Null => Content::Null,
+            Content::Terminal => Content::Terminal,
+            Content::Device(d) => Content::Device(*d),
+            Content::Fifo(p) => Content::Fifo(p.clone()),
+            Content::Socket(s) => Content::Socket(s.clone()),
+            Content::File(_) => std::mem::replace(
+                &mut n.content,
+                Content::File(storage::FileData::memory(Vec::new())),
+            ),
+            _ => return Err(Errno(95)),
+        };
+        let raw = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: Default::default(),
+            whole_locks: Default::default(),
+            notifications: Default::default(),
+            path_hint: Default::default(),
+            device: upper.fs_device(),
+            content,
+            mode: metadata.mode,
+            uid,
+            gid,
+            volatile: false,
+            inode,
+            links: n.links,
+            times: metadata.times,
+            xattrs: attrs,
+            seals: None,
+        }));
+        if moved {
+            n.content = Content::File(storage::FileData::Layer(Arc::new(LayerFile {
+                node: raw.clone(),
+                mount: upper.at.identity.clone(),
+                upper: true,
+            })));
+        }
+        drop(n);
+        edits.entries.push(ProjectionEdit {
+            view: view.clone(),
+            raw: raw.clone(),
+            old: None,
+            caps,
+            moved,
+        });
+        if stored_caps != caps {
+            raw.borrow().edit_caps(stored_caps, 0)?;
+        }
+        Ok(raw)
     }
     pub(super) fn checkpoint(&self, fs: &Filesystem) -> Result<()> {
         let Some(upper) = &self.upper else {
@@ -495,7 +823,8 @@ impl Overlay {
             return Ok(());
         }
         // Parent directories must exist in upper before any copied child. Copy
-        // every visible alias of a lower hard link together (index-free inode map).
+        // each modified dentry. With index=off, untouched lower hard links
+        // retain their original provider; explicit new links share one upper.
         loop {
             let before = changed.len();
             for p in changed.clone() {
@@ -529,6 +858,7 @@ impl Overlay {
         let old_inodes = backing.inodes.clone();
         let mut paths = old_paths.clone();
         let mut attrs_restore = Vec::new();
+        let mut projections = ProjectionEdits::default();
         // Deleting a directory discards its hidden whiteouts as well. A parent
         // whiteout is sufficient to hide the whole lower subtree.
         for p in &removed {
@@ -538,6 +868,8 @@ impl Overlay {
             let at = key(p);
             paths.retain(|path, _| !below(path, &at));
             if self.lower.borrow().contains_key(p) {
+                let (uid, gid) =
+                    mounts::idmap::Ids::from_mount(&upper.at.identity).creator(&self.creator)?;
                 let inode = backing.next_inode;
                 backing.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
                 let n = Arc::new(Inode::new(Node {
@@ -549,8 +881,8 @@ impl Overlay {
                     device: upper.fs_device(),
                     content: pseudo::Device::node(0, false),
                     mode: 0o20000,
-                    uid: 0,
-                    gid: 0,
+                    uid,
+                    gid,
                     volatile: false,
                     inode,
                     links: 1,
@@ -583,7 +915,25 @@ impl Overlay {
                 let old = n.borrow_mut().xattrs.insert(name.clone(), b"y".to_vec());
                 attrs_restore.push((n.clone(), name, old));
             }
-            paths.insert(key(p), n.clone());
+            let published = if self.projected {
+                match self.projected_upper(n, &mut projections) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        for (node, name, old) in attrs_restore {
+                            let mut n = node.borrow_mut();
+                            if let Some(value) = old {
+                                n.xattrs.insert(name, value);
+                            } else {
+                                n.xattrs.remove(&name);
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                n.clone()
+            };
+            paths.insert(key(p), published);
         }
         let mut all = BTreeMap::new();
         for n in old_paths.values().chain(paths.values()) {
@@ -652,11 +1002,52 @@ impl Overlay {
             }
         }
         drop(backing);
+        for e in &projections.entries {
+            self.upper_nodes.borrow_mut().insert(
+                pointer(&e.view),
+                (Arc::downgrade(&e.view), Arc::downgrade(&e.raw)),
+            );
+        }
+        projections.committed = true;
         drop(baseline);
         *self.baseline.borrow_mut() = snapshot(&fs.paths);
         self.dirty.borrow_mut().clear();
         let live: BTreeSet<_> = fs.paths.values().map(pointer).collect();
         self.uncopied.borrow_mut().retain(|id| live.contains(id));
+        Ok(())
+    }
+    pub(super) fn prepare_tmpfile(&self, node: &NodeRef) -> Result<()> {
+        let upper = self.upper.as_ref().ok_or(Errno(30))?;
+        upper.at.writable()?;
+        if self.projected {
+            let mut edits = ProjectionEdits::default();
+            let raw = self.projected_upper(node, &mut edits)?;
+            let mut fs = upper.fs.borrow_mut();
+            fs.admit_inode()?;
+            fs.track_inode(&raw)?;
+            self.upper_nodes
+                .borrow_mut()
+                .insert(pointer(node), (Arc::downgrade(node), Arc::downgrade(&raw)));
+            edits.committed = true;
+        }
+        Ok(())
+    }
+    pub(super) fn retain_writer(
+        &self,
+        node: &NodeRef,
+        access: &mut executable::WriteAccess,
+    ) -> Result<()> {
+        let upper = self.upper.as_ref().ok_or(Errno(30))?;
+        let raw = writable_layer(node).map_or_else(|| node.clone(), |(raw, _)| raw);
+        access.retain_provider(&raw, &upper.at.identity)
+    }
+    pub(super) fn unlinked_metadata(&self, node: &NodeRef) -> Result<()> {
+        if !self.projected || writable_layer(node).is_none() {
+            return Ok(());
+        }
+        let mut edits = ProjectionEdits::default();
+        self.projected_upper(node, &mut edits)?;
+        edits.committed = true;
         Ok(())
     }
     pub(super) fn options(&self) -> &[u8] {
@@ -700,13 +1091,102 @@ fn unescape(input: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(result)
 }
+#[derive(Clone, Default)]
+pub(super) struct MountConfig {
+    lowers: Vec<Layer>,
+    upper: Option<Layer>,
+    work: Option<Layer>,
+    _uses: Option<Arc<LayerUses>>,
+}
+impl MountConfig {
+    pub(super) fn configure(&mut self, v: &Vfs, name: &[u8], value: &[u8]) -> Result<()> {
+        match name {
+            b"lowerdir" => {
+                let layers = split(value, b':')
+                    .iter()
+                    .map(|p| v.overlay_layer(&unescape(p)?, true))
+                    .collect::<Result<Vec<_>>>()?;
+                if layers.is_empty() || layers.len() > 500 {
+                    return Err(Errno(22));
+                }
+                self.lowers = layers;
+            }
+            b"lowerdir+" => {
+                if self.lowers.len() >= 500 {
+                    return Err(Errno(22));
+                }
+                self.lowers.push(v.overlay_layer(value, true)?);
+            }
+            b"upperdir" => self.upper = Some(v.overlay_layer(value, false)?),
+            b"workdir" => self.work = Some(v.overlay_layer(value, false)?),
+            _ => return Err(Errno(22)),
+        }
+        self._uses = Some(Arc::new(LayerUses {
+            _layers: self
+                .lowers
+                .iter()
+                .chain(self.upper.iter())
+                .chain(self.work.iter())
+                .map(|l| mounts::MountUse::new(l.at.identity.clone()))
+                .collect(),
+        }));
+        Ok(())
+    }
+    pub(super) fn options(&self, parameters: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>> {
+        if self.lowers.is_empty() {
+            return Err(Errno(22));
+        }
+        let escape = |p: &[u8]| {
+            let mut out = Vec::new();
+            for &b in p {
+                if matches!(b, b'\\' | b',' | b':') {
+                    out.push(b'\\');
+                }
+                out.push(b);
+            }
+            out
+        };
+        let mut options = vec![[
+            b"lowerdir=".as_slice(),
+            &self
+                .lowers
+                .iter()
+                .map(|l| escape(&l.at.key))
+                .collect::<Vec<_>>()
+                .join(&b':'),
+        ]
+        .concat()];
+        for (name, layer) in [
+            (b"upperdir=".as_slice(), &self.upper),
+            (b"workdir=".as_slice(), &self.work),
+        ] {
+            if let Some(layer) = layer {
+                options.push([name, &escape(&layer.at.key)].concat());
+            }
+        }
+        options.extend(parameters.values().cloned());
+        Ok(options.join(&b','))
+    }
+}
 impl Vfs {
-    fn overlay_lower_inode(source: &NodeRef, inode: u64) -> Result<NodeRef> {
+    fn overlay_layer_inode(
+        source: &NodeRef,
+        inode: u64,
+        layer: Option<(&Layer, bool)>,
+    ) -> Result<NodeRef> {
         let n = source.borrow();
         let content = match &n.content {
             Content::Fuse => return Err(Errno(95)),
             Content::Directory => Content::Directory,
-            Content::File(_) => Content::File(storage::FileData::Lower(source.clone())),
+            Content::File(_) => Content::File(if let Some((layer, upper)) = layer {
+                storage::FileData::Layer(Arc::new(LayerFile {
+                    node: source.clone(),
+                    mount: layer.at.identity.clone(),
+                    upper,
+                }))
+            } else {
+                storage::FileData::Lower(source.clone())
+            }),
             Content::Symlink(target) => Content::Symlink(target.clone()),
             Content::Null => Content::Null,
             Content::Terminal => Content::Terminal,
@@ -724,8 +1204,12 @@ impl Vfs {
             device: n.device,
             content,
             mode: n.file_metadata().mode,
-            uid: n.uid,
-            gid: n.gid,
+            uid: layer.map_or(n.uid, |(l, _)| {
+                mounts::idmap::Ids::from_mount(&l.at.identity).visible(false, n.uid)
+            }),
+            gid: layer.map_or(n.gid, |(l, _)| {
+                mounts::idmap::Ids::from_mount(&l.at.identity).visible(true, n.gid)
+            }),
             volatile: false,
             inode,
             links: 0,
@@ -740,12 +1224,57 @@ impl Vfs {
                 .collect(),
             seals: None,
         }));
+        if let Some((layer, _)) = layer {
+            let ids = mounts::idmap::Ids::from_mount(&layer.at.identity);
+            let attrs = projected_attrs(&copy.borrow().xattrs, ids, false)?;
+            copy.borrow_mut().xattrs = attrs;
+        }
         Ok(copy)
+    }
+    fn overlay_layer(&self, path: &[u8], lower_layer: bool) -> Result<Layer> {
+        let at = self.mount_location(path, true)?;
+        let mount = at.mount.as_ref().ok_or(Errno(22))?;
+        mounts::fd::check_overlay_layer(self, &at)?;
+        let fs = at.filesystem(self);
+        match at.mount.as_ref().map(|m| m.kind) {
+            Some(mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Ramfs) => {}
+            Some(mounts::Kind::Overlay) if lower_layer => {
+                if fs.overlay_depth() >= 2 {
+                    return Err(Errno(40));
+                }
+            }
+            _ => return Err(Errno(95)),
+        }
+        let n = self.node(&at)?;
+        if !matches!(n.borrow().content, Content::Directory) {
+            return Err(Errno(20));
+        }
+        if !self.allowed_on(&n.borrow(), 5, &at) {
+            return Err(Errno(13));
+        }
+        let identity = mount.identity.clone();
+        Ok(Layer {
+            at: LayerPath {
+                key: at.key,
+                root: n,
+                identity,
+            },
+            fs,
+        })
     }
     pub(super) fn overlay_mount(
         &mut self,
         data: &[u8],
         readonly: bool,
+    ) -> Result<(FsHandle, bool)> {
+        self.overlay_mount_captured(data, readonly, None, None)
+    }
+    pub(super) fn overlay_mount_captured(
+        &mut self,
+        data: &[u8],
+        readonly: bool,
+        captured: Option<&MountConfig>,
+        creator: Option<&Credentials>,
     ) -> Result<(FsHandle, bool)> {
         self.reap_detached_mounts();
         let mut lower = None;
@@ -782,50 +1311,27 @@ impl Vfs {
         if lower.is_empty() || lower.len() > 500 || upper.is_some() != work.is_some() {
             return Err(Errno(22));
         }
-        let layer = |path: &[u8], lower_layer: bool| -> Result<Layer> {
-            let at = self.mount_location(path, true)?;
-            let mount = at.mount.as_ref().ok_or(Errno(22))?;
-            mounts::fd::check_overlay_layer(self, &at)?;
-            // This merged-inode backend shares upper inode objects. Until layer
-            // copy-up carries both ID domains, reject a shifted backing layer
-            // rather than publish filesystem IDs in the wrong domain. The
-            // overlay mount itself can still receive an independent idmap.
-            if mount.idmap.get().is_some() {
-                return Err(Errno(95));
-            }
-            let fs = at.filesystem(self);
-            match at.mount.as_ref().map(|m| m.kind) {
-                Some(mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Ramfs) => {}
-                Some(mounts::Kind::Overlay) if lower_layer => {
-                    if fs.overlay_depth() >= 2 {
-                        return Err(Errno(40));
-                    }
-                }
-                _ => return Err(Errno(95)),
-            }
-            let n = self.node(&at)?;
-            if !matches!(n.borrow().content, Content::Directory) {
-                return Err(Errno(20));
-            }
-            if !self.allowed_on(&n.borrow(), 5, &at) {
-                return Err(Errno(13));
-            }
-            let identity = mount.identity.clone();
-            Ok(Layer {
-                at: LayerPath {
-                    key: at.key,
-                    root: n,
-                    identity,
-                },
-                fs,
-            })
+        let (lowers, upper, work) = if let Some(config) = captured {
+            (
+                config.lowers.clone(),
+                config.upper.clone(),
+                config.work.clone(),
+            )
+        } else {
+            (
+                lower
+                    .iter()
+                    .map(|p| self.overlay_layer(p, true))
+                    .collect::<Result<Vec<_>>>()?,
+                upper
+                    .as_deref()
+                    .map(|p| self.overlay_layer(p, false))
+                    .transpose()?,
+                work.as_deref()
+                    .map(|p| self.overlay_layer(p, false))
+                    .transpose()?,
+            )
         };
-        let lowers = lower
-            .iter()
-            .map(|p| layer(p, true))
-            .collect::<Result<Vec<_>>>()?;
-        let upper = upper.as_deref().map(|p| layer(p, false)).transpose()?;
-        let work = work.as_deref().map(|p| layer(p, false)).transpose()?;
         let overlaps = |a: &Layer, b: &Layer| {
             a.fs.same_data(&b.fs) && (below(&a.at, &b.at) || below(&b.at, &a.at))
         };
@@ -896,6 +1402,10 @@ impl Vfs {
         if merged.len() > budget.nodes {
             return Err(Errno(28));
         }
+        let projected = lowers
+            .iter()
+            .chain(upper.iter())
+            .any(|layer| layer.at.identity.idmap.get().is_some());
         let o = Arc::new(Overlay {
             depth: 1 + lowers
                 .iter()
@@ -908,11 +1418,15 @@ impl Vfs {
             upper,
             work,
             lower: SharedCell::new(lower),
+            lower_numbers: SharedCell::default(),
             baseline: SharedCell::default(),
             uncopied: SharedCell::default(),
             dirty: SharedCell::default(),
             userxattr,
             options: data.to_vec(),
+            projected,
+            creator: creator.cloned().unwrap_or_else(|| self.credentials.clone()),
+            upper_nodes: SharedCell::default(),
         });
         let upper_nodes: BTreeSet<_> = o
             .upper
@@ -924,24 +1438,55 @@ impl Vfs {
         let mut next = 1;
         for (path, source) in merged {
             let id = pointer(&source);
-            let n = if upper_nodes.contains(&id) {
+            let is_upper = upper_nodes.contains(&id);
+            let n = if is_upper && !o.projected {
                 source
-            } else if let Some(n) = clones.get(&id) {
-                Arc::clone(n)
+            } else if is_upper && clones.contains_key(&id) {
+                Arc::clone(&clones[&id])
             } else {
-                let inode = if o.upper.is_some() {
-                    o.allocate_inode()?
+                let known = if is_upper {
+                    None
                 } else {
-                    let i = next;
-                    next += 1;
-                    i
+                    o.lower_numbers.borrow().get(&id).copied()
                 };
-                let copy = Self::overlay_lower_inode(&source, inode)?;
-                o.uncopied.borrow_mut().insert(pointer(&copy));
-                clones.insert(id, copy.clone());
+                let inode = if let Some(inode) = known {
+                    inode
+                } else {
+                    let inode = if o.upper.is_some() {
+                        o.allocate_inode()?
+                    } else {
+                        let i = next;
+                        next += 1;
+                        i
+                    };
+                    if !is_upper {
+                        o.lower_numbers.borrow_mut().insert(id, inode);
+                    }
+                    inode
+                };
+                let layer = if is_upper {
+                    o.upper.as_ref()
+                } else {
+                    o.lowers
+                        .iter()
+                        .find(|l| l.tree().get(&path).is_some_and(|n| Arc::ptr_eq(n, &source)))
+                }
+                .ok_or(Errno(5))?;
+                let copy = Self::overlay_layer_inode(&source, inode, Some((layer, is_upper)))?;
+                if is_upper {
+                    o.upper_nodes.borrow_mut().insert(
+                        pointer(&copy),
+                        (Arc::downgrade(&copy), Arc::downgrade(&source)),
+                    );
+                } else {
+                    o.uncopied.borrow_mut().insert(pointer(&copy));
+                }
+                if is_upper {
+                    clones.insert(id, copy.clone());
+                }
                 copy
             };
-            if o.uncopied.borrow().contains(&pointer(&n)) {
+            if o.uncopied.borrow().contains(&pointer(&n)) || is_upper && o.projected {
                 n.borrow_mut().links += 1;
             }
             paths.insert(path, n);
@@ -979,6 +1524,18 @@ impl Vfs {
             .unwrap()
             .store(ro, Ordering::Relaxed);
         Ok((fs, ro))
+    }
+    pub(super) fn overlay_check_open(
+        &self,
+        at: &ResolvedPath,
+        node: &NodeRef,
+        flags: u32,
+    ) -> Result<()> {
+        let fs = at.filesystem_ref(self);
+        if let Some(o) = fs.overlay_handle() {
+            o.check_open(&fs.borrow(), node, flags)?;
+        }
+        Ok(())
     }
     pub(super) fn overlay_prepare(
         &self,
@@ -1497,14 +2054,15 @@ mod tests {
                 & 0o777,
             0o644
         );
-        assert_eq!(
+        assert_ne!(
             &v.stat_at(AT_FDCWD, b"/merged/a").unwrap()[8..16],
             &v.stat_at(AT_FDCWD, b"/merged/b").unwrap()[8..16]
         );
         v.link_at(AT_FDCWD, b"/merged/a", AT_FDCWD, b"/merged/c")
             .unwrap();
         write(&mut v, b"/merged/c", b"changed");
-        assert_eq!(read(&mut v, b"/merged/b"), b"changed");
+        assert_eq!(read(&mut v, b"/merged/b"), b"original");
+        assert_eq!(read(&mut v, b"/merged/c"), b"changed");
         v.rename_at(AT_FDCWD, b"/merged/a", AT_FDCWD, b"/merged/new", 0)
             .unwrap();
         assert_eq!(
@@ -1524,7 +2082,8 @@ mod tests {
         mount(&mut v);
         assert_eq!(v.stat_at(AT_FDCWD, b"/merged/a"), Err(Errno(2)));
         assert_eq!(v.stat_at(AT_FDCWD, b"/merged/new"), Err(Errno(2)));
-        assert_eq!(read(&mut v, b"/merged/b"), b"openged");
+        assert_eq!(read(&mut v, b"/merged/b"), b"original");
+        assert_eq!(read(&mut v, b"/merged/c"), b"openged");
     }
     #[test]
     fn readonly_leases_options_and_layer_type_conflicts() {

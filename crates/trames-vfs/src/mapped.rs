@@ -318,6 +318,31 @@ impl MappedData {
             writers: Arc::default(),
         }
     }
+    pub(super) fn lower_links(&self) -> Option<u32> {
+        self.data.borrow().lower_links()
+    }
+    pub(super) fn source_node(&self) -> Option<NodeRef> {
+        self.data.borrow().source_node()
+    }
+    pub(super) fn layer_mount(&self) -> Option<Arc<mounts::MountIdentity>> {
+        self.data.borrow().layer_mount()
+    }
+    pub(super) fn capabilities(&self) -> Option<file_caps::FileCaps> {
+        self.data.borrow().capabilities()
+    }
+    pub(super) fn edit_capabilities(
+        &self,
+        caps: Option<file_caps::FileCaps>,
+        flags: u32,
+    ) -> Result<()> {
+        if caps.is_some() {
+            if self.has_writers() {
+                return Err(Errno(16));
+            }
+            self.sync(false)?;
+        }
+        self.data.borrow().edit_capabilities(caps, flags)
+    }
     pub(super) fn metadata(&self) -> Option<file_data::FileMeta> {
         self.data.borrow().metadata()
     }
@@ -1135,7 +1160,7 @@ impl MappingFile {
             drop(o);
             return file.mapping_pages(original, offset, len, shared, writable);
         }
-        let node = o.data_node().ok_or(Errno(19))?;
+        let node = overlay::mapping_node(o.data_node().ok_or(Errno(19))?);
         let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());
         if shared && writable && readonly {
             return Err(Errno(30));

@@ -5,7 +5,9 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
-pub(super) struct FsHandle {
+pub(super) struct FsHandle(Arc<FsResources>);
+#[derive(Clone)]
+pub(super) struct FsResources {
     pub owner: UserNamespace,
     // Logical proc/sysfs superblocks retain their namespace independently of
     // the private volume used for the rest of the guest's inode index.
@@ -21,6 +23,17 @@ pub(super) struct FsHandle {
     #[cfg(all(feature = "hostfs", unix))]
     pub host: Option<Arc<hostfs::HostFs>>,
     overlay: Option<Arc<overlay::Overlay>>,
+}
+impl Deref for FsHandle {
+    type Target = FsResources;
+    fn deref(&self) -> &FsResources {
+        &self.0
+    }
+}
+impl DerefMut for FsHandle {
+    fn deref_mut(&mut self) -> &mut FsResources {
+        Arc::make_mut(&mut self.0)
+    }
 }
 pub(super) struct FsBorrow<'a, G> {
     guard: G,
@@ -139,7 +152,7 @@ impl FsHandle {
             node.bind_quota(&quota)
                 .expect("validated initial filesystem");
         }
-        Self {
+        Self(Arc::new(FsResources {
             owner: UserNamespace::default(),
             super_namespace: None,
             _super_state: None,
@@ -153,7 +166,7 @@ impl FsHandle {
             quota,
             namespace: Arc::default(),
             overlay: None,
-        }
+        }))
     }
     pub fn with_overlay(data: Filesystem, overlay: Arc<overlay::Overlay>) -> Self {
         let quota = overlay.file_quota();
@@ -161,7 +174,7 @@ impl FsHandle {
             node.bind_quota(&quota)
                 .expect("validated initial filesystem");
         }
-        Self {
+        Self(Arc::new(FsResources {
             owner: UserNamespace::default(),
             super_namespace: None,
             _super_state: None,
@@ -175,7 +188,7 @@ impl FsHandle {
             quota,
             namespace: Arc::default(),
             overlay: Some(overlay),
-        }
+        }))
     }
     pub fn borrow(&self) -> FsBorrow<'_, RwLockReadGuard<'_, Filesystem>> {
         FsBorrow {
@@ -208,13 +221,29 @@ impl FsHandle {
     }
     /// Persist metadata only on the accepted inode's original filesystem.
     /// A tmpfs/host inode must not checkpoint an unrelated disk root or overlay.
+    pub(super) fn prepare_metadata(&self, node: &NodeRef) -> Result<()> {
+        if let Some(overlay) = &self.overlay {
+            overlay.copy_up(node, false)?;
+        }
+        Ok(())
+    }
     pub fn checkpoint_metadata(&self, node: &NodeRef) -> Result<()> {
         let n = node.borrow();
-        if n.volatile || n.links == 0 {
+        if n.volatile {
+            return Ok(());
+        }
+        if n.links == 0 {
+            drop(n);
+            if let Some(o) = &self.overlay {
+                o.unlinked_metadata(node)?;
+            }
             return Ok(());
         }
         drop(n);
         self.borrow().checkpoint()
+    }
+    pub(super) fn overlay_handle(&self) -> Option<&Arc<overlay::Overlay>> {
+        self.overlay.as_ref()
     }
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()

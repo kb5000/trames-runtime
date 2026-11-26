@@ -1142,7 +1142,7 @@ impl Vfs {
             host.metadata_file()?.refresh_permissions(&node)?;
         }
         self.pseudo_metadata_mutable(&node)?;
-        let mut n = node.borrow_mut();
+        let n = node.borrow_mut();
         let c = &self.credentials;
         let (owner, group) = ids.owner(n.uid, n.gid);
         if uid == u32::MAX && owner == u32::MAX || gid == u32::MAX && group == u32::MAX {
@@ -1163,6 +1163,11 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
+        drop(n);
+        if let Some(fs) = filesystem {
+            fs.prepare_metadata(&node)?;
+        }
+        let mut n = node.borrow_mut();
         let old = (n.uid, n.gid, n.mode, n.times[2]);
         if uid != u32::MAX || gid != u32::MAX {
             n.revoke_file_caps()?;
