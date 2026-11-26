@@ -256,11 +256,20 @@ impl Group {
             })
             .max()
     }
+    #[cfg(test)]
     pub fn admit(
         self: &Arc<Self>,
         bytes: u64,
         write: bool,
         now: Instant,
+    ) -> std::result::Result<Permit, Wait> {
+        self.admit_with_clock(bytes, write, || now)
+    }
+    pub(super) fn admit_with_clock(
+        self: &Arc<Self>,
+        bytes: u64,
+        write: bool,
+        clock: impl FnOnce() -> Instant,
     ) -> std::result::Result<Permit, Wait> {
         let nodes: Vec<_> = self
             .chain
@@ -274,9 +283,12 @@ impl Group {
             .iter()
             .map(|(_, device)| device.policy.lock().unwrap())
             .collect();
+        // Unlimited IO still records its exact original hierarchical stats,
+        // but has no token deadline for which a host clock is needed.
+        let now = (!nodes.is_empty()).then(clock);
         if let Some(_delay) = locks
             .iter_mut()
-            .filter_map(|policy| policy.direction(write).delay(bytes, now))
+            .filter_map(|policy| policy.direction(write).delay(bytes, now.unwrap()))
             .max()
         {
             return Err(Wait {
@@ -284,7 +296,7 @@ impl Group {
                 bytes,
                 write,
                 #[cfg(test)]
-                deadline: deadline(now, _delay),
+                deadline: deadline(now.unwrap(), _delay),
             });
         }
         for policy in &mut locks {
@@ -442,9 +454,13 @@ fn number(text: &str) -> Result<u64> {
 }
 impl Permit {
     pub fn complete(mut self, bytes: u64) {
-        self.complete_at(bytes, Instant::now());
+        self.complete_with_clock(bytes, Instant::now);
     }
+    #[cfg(test)]
     fn complete_at(&mut self, bytes: u64, now: Instant) {
+        self.complete_with_clock(bytes, || now);
+    }
+    fn complete_with_clock(&mut self, bytes: u64, clock: impl FnOnce() -> Instant) {
         debug_assert!(bytes <= self.bytes);
         for device in &*self.chain {
             let (count, operations) = if self.write {
@@ -455,14 +471,15 @@ impl Permit {
             count.fetch_add(bytes, Relaxed);
             operations.fetch_add(1, Relaxed);
         }
-        for &index in &self.debited {
-            self.chain[index]
-                .policy
-                .lock()
-                .unwrap()
-                .direction(self.write)
-                .refund(self.bytes - bytes, false, now);
-            if bytes != self.bytes {
+        if bytes != self.bytes && !self.debited.is_empty() {
+            let now = clock();
+            for &index in &self.debited {
+                self.chain[index]
+                    .policy
+                    .lock()
+                    .unwrap()
+                    .direction(self.write)
+                    .refund(self.bytes - bytes, false, now);
                 self.chain[index].changed.notify_atomic();
             }
         }
@@ -489,6 +506,24 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fully_completed_io_does_not_wait_for_an_unrelated_policy_update() {
+        let group = Group::new(None);
+        group.set_max("253:1 wiops=1").unwrap();
+        let permit = admitted(&group, 4096, true, Instant::now());
+        let policy = group.chain.last().unwrap().policy.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            permit.complete(4096);
+            send.send(()).unwrap();
+        });
+        let completed = receive.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(policy);
+        worker.join().unwrap();
+        assert!(completed, "full completion has no credit to refund");
+        assert!(group.format_stat().contains("wbytes=4096 "));
+        assert!(group.format_stat().contains("wios=1 "));
+    }
     fn admitted(group: &Arc<Group>, bytes: u64, write: bool, now: Instant) -> Permit {
         group
             .admit(bytes, write, now)

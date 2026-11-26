@@ -400,6 +400,17 @@ impl MappedResidents {
     pub fn reserve_cache(&self) -> Result<(), MemoryError> {
         self.1.get().map(|_| ())
     }
+    /// Reuse retired cache metadata only when no original mapping/charge
+    /// handle, including Weak handles, can still observe this charge cell.
+    /// Old byte/physical-lease pins retain their independent original owner.
+    pub fn reset_cache(&mut self) -> bool {
+        let Some(charge) = Arc::get_mut(&mut self.1) else {
+            return false;
+        };
+        *self.0.get_mut() = Members::Empty;
+        charge.reset();
+        true
+    }
     pub fn cache_charge(&self) -> Result<crate::CgroupPageCharge, MemoryError> {
         self.1.get().map(crate::CgroupPageCharge::existing)
     }

@@ -5,6 +5,7 @@
 use crate::Errno;
 use crate::Result;
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -28,6 +29,17 @@ pub(super) struct Page {
     contents: Mutex<Option<Contents>>,
 }
 impl Page {
+    fn recycled(mut page: Arc<Self>) -> Option<Arc<Self>> {
+        let state = Arc::get_mut(&mut page)?;
+        if !Arc::get_mut(&mut state.owners)?.reset_cache() {
+            return None;
+        }
+        // These bytes retire, rather than become a new allocation's identity.
+        // A weak byte observer must see them die even when metadata is reused.
+        drop(state.contents.get_mut().unwrap().take());
+        state.dirty.store(false, Relaxed);
+        Some(page)
+    }
     pub fn new(kind: CgroupMemoryKind) -> Arc<Self> {
         Arc::new(Self {
             owners: Arc::new(MappedResidents::with_kind(kind)),
@@ -52,24 +64,34 @@ impl Page {
         if let Some(contents) = &*contents {
             return Ok(contents.clone());
         }
-        self.owners
-            .reserve_cache()
+        let charge = self
+            .owners
+            .cache_charge()
             .map_err(crate::resource_io::memory_error)?;
         if let Some(resource) = resource {
-            self.owners.register_reclaimer(&resource);
+            // This fill registers again for every new physical allocation.
+            // Root-owned bytes need no per-page weak-resource vector; mapped
+            // providers keep their separate long-lived reclaimer registration.
+            charge.register_reclaimer(&resource);
         }
-        let input = match read() {
+        drop(charge);
+        let mut input = match read() {
             Ok(input) => input,
             Err(error) => {
                 self.owners.cancel_cache();
                 return Err(error);
             }
         };
-        let mut bytes = Box::new([0; PAGE_SIZE as usize]);
-        bytes[..input.len()].copy_from_slice(&input);
+        let valid = input.len();
+        assert!(valid <= PAGE_SIZE as usize, "one cache page per read");
+        // A complete backend page already owns exactly these bytes. Keep that
+        // allocation rather than allocate and copy a second physical buffer.
+        // Short EOF input still publishes a full, zero-tailed canonical page.
+        input.resize(PAGE_SIZE as usize, 0);
+        let bytes = input.into_boxed_slice().try_into().unwrap();
         let loaded = Contents {
             bytes: Arc::new(SharedPage::from_box(bytes)),
-            valid: input.len(),
+            valid,
         };
         self.owners
             .publish_cache(&loaded.bytes)
@@ -165,14 +187,19 @@ impl Cache {
             return page.clone();
         }
         let mut pages = self.pages.write().unwrap();
-        if pages.len() >= MAX_PAGES {
+        let recycled = if pages.len() >= MAX_PAGES {
             // A bounded per-file working set also applies to root-owned bytes.
             // Mappings/pins may temporarily retain more; never evict them.
-            Self::evict(&mut pages, None, PAGE_SIZE as usize);
-        }
+            pages
+                .extract_if(.., |_, page| Self::evictable(page))
+                .next()
+                .and_then(|(_, page)| Page::recycled(page))
+        } else {
+            None
+        };
         pages
             .entry(offset)
-            .or_insert_with(|| Page::new(CgroupMemoryKind::File))
+            .or_insert_with(|| recycled.unwrap_or_else(|| Page::new(CgroupMemoryKind::File)))
             .clone()
     }
     pub fn load(
@@ -249,13 +276,18 @@ impl Cache {
         group: Option<&MemoryCgroup>,
         wanted: usize,
     ) -> usize {
-        let mut freed = 0usize;
-        pages.retain(|_, page| {
-            if freed >= wanted
-                || !Self::evictable(page)
+        if wanted == 0 {
+            return 0;
+        }
+        let freed = Cell::new(0usize);
+        // retain() visits the entire working set after the first victim has
+        // satisfied a one-page cache miss. Lazy extraction stops at that victim;
+        // unvisited entries and all original ownership/pin checks remain intact.
+        for (_, page) in pages.extract_if(.., |_, page| {
+            if !Self::evictable(page)
                 || group.is_some_and(|group| !page.owners.charged_within(group))
             {
-                return true;
+                return false;
             }
             // Removing the last page and byte references releases both the
             // allocation and its original hierarchical physical lease.
@@ -265,13 +297,18 @@ impl Cache {
                 .is_ok_and(|contents| contents.is_some())
             {
                 if group.is_some() && !page.owners.mark_reclaimed() {
-                    return true;
+                    return false;
                 }
-                freed = freed.saturating_add(PAGE_SIZE as usize);
+                freed.set(freed.get().saturating_add(PAGE_SIZE as usize));
             }
-            false
-        });
-        freed
+            true
+        }) {
+            drop(page);
+            if freed.get() >= wanted {
+                break;
+            }
+        }
+        freed.get()
     }
 }
 impl CgroupReclaim for Cache {
@@ -359,5 +396,91 @@ mod tests {
         cache.truncated(1);
         contents.bytes.copy_read(0, &mut bytes);
         assert_eq!(bytes, [9, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn partial_reclaim_skips_pins_dirty_and_foreign_pages_and_keeps_the_remaining_bytes() {
+        let first = MemoryCgroup::new(None);
+        let other = MemoryCgroup::new(None);
+        let (target, _scope) = enter(&first);
+        let cache = Arc::new(Cache::default());
+        let pinned = cache.load(0, || Ok(vec![1; PAGE_SIZE as usize])).unwrap();
+        drop(
+            cache
+                .load(PAGE_SIZE, || Ok(vec![2; PAGE_SIZE as usize]))
+                .unwrap(),
+        );
+        cache.page(PAGE_SIZE).dirty.store(true, Relaxed);
+        target.set(Some(other.clone()));
+        let foreign = cache
+            .load(2 * PAGE_SIZE, || Ok(vec![3; PAGE_SIZE as usize]))
+            .unwrap();
+        let foreign_bytes = Arc::downgrade(&foreign.bytes);
+        drop(foreign);
+        target.set(Some(first.clone()));
+        drop(cache.page(3 * PAGE_SIZE)); // Unmaterialized metadata owns no bytes.
+        let victim = cache
+            .load(4 * PAGE_SIZE, || Ok(vec![4; PAGE_SIZE as usize]))
+            .unwrap();
+        let retired = Arc::downgrade(&victim.bytes);
+        drop(victim);
+        let retained = cache
+            .load(5 * PAGE_SIZE, || Ok(vec![5; PAGE_SIZE as usize]))
+            .unwrap();
+        let remaining = Arc::downgrade(&retained.bytes);
+        drop(retained);
+        assert_eq!(cache.reclaim(&first, 0), 0);
+        assert_eq!(first.current(), 4 * PAGE_SIZE as usize);
+        assert_eq!(
+            cache.reclaim(&first, PAGE_SIZE as usize),
+            PAGE_SIZE as usize
+        );
+        assert!(retired.upgrade().is_none());
+        assert!(foreign_bytes.upgrade().is_some());
+        let remaining = remaining
+            .upgrade()
+            .expect("only the requested bytes were reclaimed");
+        assert_eq!(first.current(), 3 * PAGE_SIZE as usize);
+        assert_eq!(other.current(), PAGE_SIZE as usize);
+        let mut value = [0; 1];
+        pinned.bytes.copy_read(0, &mut value);
+        assert_eq!(value, [1]);
+        remaining.copy_read(0, &mut value);
+        assert_eq!(value, [5]);
+    }
+
+    #[test]
+    fn capacity_churn_retires_old_bytes_and_rebinds_only_unreferenced_metadata() {
+        let first = MemoryCgroup::new(None);
+        let next = MemoryCgroup::new(None);
+        let (target, _scope) = enter(&first);
+        let cache = Arc::new(Cache::default());
+        let pinned = cache.load(0, || Ok(vec![7; PAGE_SIZE as usize])).unwrap();
+        let mut retired = None;
+        for index in 1..MAX_PAGES {
+            let bytes = cache
+                .load(index as u64 * PAGE_SIZE, || Ok(vec![8; PAGE_SIZE as usize]))
+                .unwrap();
+            if index == 1 {
+                retired = Some(Arc::downgrade(&bytes.bytes));
+            }
+        }
+        target.set(Some(next.clone()));
+        let current = cache
+            .load(MAX_PAGES as u64 * PAGE_SIZE, || {
+                Ok(vec![9; PAGE_SIZE as usize])
+            })
+            .unwrap();
+        assert!(retired.unwrap().upgrade().is_none());
+        assert_eq!(first.current(), (MAX_PAGES - 1) * PAGE_SIZE as usize);
+        assert_eq!(next.current(), PAGE_SIZE as usize);
+        let current_bytes = Arc::downgrade(&current.bytes);
+        drop(current);
+        assert_eq!(next.reclaim(PAGE_SIZE as usize), PAGE_SIZE as usize);
+        assert!(current_bytes.upgrade().is_none());
+        assert_eq!(next.current(), 0);
+        let mut value = [0; 1];
+        pinned.bytes.copy_read(0, &mut value);
+        assert_eq!(value, [7]);
     }
 }

@@ -87,7 +87,7 @@ pub(crate) fn admit(bytes: u64, write: bool) -> io::Result<Option<Permit>> {
     group
         .map(|group| {
             group
-                .admit(bytes, write, Instant::now())
+                .admit_with_clock(bytes, write, Instant::now)
                 .map_err(|wait| trames_shared::ResourcePending::io_error(Arc::new(wait)))
         })
         .transpose()

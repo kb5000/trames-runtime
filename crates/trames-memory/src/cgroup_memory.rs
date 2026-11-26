@@ -754,6 +754,9 @@ impl Default for SharedCharge {
     }
 }
 impl SharedCharge {
+    pub(super) fn reset(&mut self) {
+        *self.0.get_mut() = CacheOwner::default();
+    }
     fn register_resources(owner: &mut CacheOwner) {
         owner
             .resources

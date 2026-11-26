@@ -1,6 +1,6 @@
 # cgroup physical resources and retained I/O — 2026-11-27
 
-Status: functional, integration and performance measurements completed; delivery is being recorded. The measured HVF file-IO overhead remains an explicit performance follow-up. Runtime main was fast-forwarded from `fd1463f` to `aadee76`; its published Linux desktop queue/input/window work is preserved. No production coordinator/service thread was introduced.
+Status: functional delivery completed in `8bfc0948`; the cold-read performance follow-up has been implemented and validated in the [closeout record](cgroup-closeout-20261127.md). The original +7.72% observation and its raw evidence remain below as history.
 
 ## Scope and behavior
 
