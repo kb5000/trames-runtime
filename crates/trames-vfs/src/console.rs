@@ -348,3 +348,86 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod native_poll_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    struct Console(UnixStream);
+    impl ConsoleIo for Console {
+        fn read(&self, count: usize) -> Result<Vec<u8>> {
+            let mut bytes = vec![0; count];
+            let n = (&self.0).read(&mut bytes).map_err(storage::host_errno)?;
+            bytes.truncate(n);
+            Ok(bytes)
+        }
+        fn write(&self, _: ConsoleStream, bytes: &[u8]) -> Result<usize> {
+            (&self.0).write(bytes).map_err(storage::host_errno)
+        }
+        fn poll(&self, _: ConsoleStream, events: u16) -> (u16, [u64; 2]) {
+            let mut fd = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: events as i16,
+                revents: 0,
+            };
+            // SAFETY: initialized pollfd; zero-timeout readiness observation.
+            assert!(unsafe { libc::poll(&mut fd, 1, 0) } >= 0);
+            (fd.revents as u16, [0; 2])
+        }
+        fn native_wait_fds(&self, _: ConsoleStream) -> Vec<HostFd> {
+            vec![HostFd::from(std::os::fd::OwnedFd::from(
+                self.0.try_clone().unwrap(),
+            ))]
+        }
+    }
+    struct Wake(Option<Arc<HostEvents>>);
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> std::io::Result<Option<Arc<HostEvents>>> {
+            Ok(self.0.clone())
+        }
+    }
+    #[test]
+    fn native_console_poll_wakes_without_other_events_and_retains_closed_input() {
+        for embedded_hub in [false, true] {
+            let (input, mut peer) = UnixStream::pair().unwrap();
+            input.set_nonblocking(true).unwrap();
+            let mut vfs = Vfs::default();
+            vfs.bind_console(Arc::new(Console(input)));
+            let input = vfs.direct_descriptors().get(0).unwrap();
+            let output = vfs.direct_descriptors().get(1).unwrap();
+            let hub = HostEvents::new().unwrap();
+            let target: Arc<dyn IoWake> = Arc::new(Wake(embedded_hub.then(|| hub.clone())));
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let subscriptions = input.subscribe(&signal);
+            assert_eq!(subscriptions.len(), 1);
+            let mut joined = Vec::new();
+            for subscription in &subscriptions {
+                if let Some((fd, writing)) = subscription.direct_wait_interest().unwrap() {
+                    assert!(!writing);
+                    joined.push(hub.subscribe(fd, writing, &signal).unwrap());
+                }
+            }
+            assert_eq!(joined.is_empty(), embedded_hub);
+            vfs.close(0).unwrap();
+            assert_eq!(vfs.eventfd(99, O_NONBLOCK).unwrap(), 0);
+            assert!(!signal.ready());
+            peer.write_all(b"q").unwrap();
+            hub.wait(Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            ))
+            .unwrap();
+            assert!(signal.ready());
+            assert_eq!(input.read(1).unwrap(), b"q");
+            assert_eq!(vfs.read(0, 8).unwrap(), 99u64.to_le_bytes());
+            if !embedded_hub {
+                let subscriptions = output.subscribe(&signal);
+                assert!(subscriptions[0].direct_wait_interest().unwrap().unwrap().1);
+            }
+        }
+    }
+}

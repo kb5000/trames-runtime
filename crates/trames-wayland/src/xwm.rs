@@ -52,6 +52,8 @@ pub(crate) enum Command {
     ClipboardProxy(bool),
     Text(u64, String),
     Key(u32, bool, u32),
+    RawKey(u32, bool),
+    Modifiers(crate::KeyboardModifiers),
 }
 pub(crate) struct Manager {
     pub commands: mpsc::SyncSender<Command>,
@@ -271,6 +273,8 @@ fn run(
                 Command::ClipboardProxy(enabled) => clipboard.proxy(&c, enabled)?,
                 Command::Text(token, text) => ime.commit(token, &text)?,
                 Command::Key(key, pressed, modifiers) => keys.key(&c, key, pressed, modifiers)?,
+                Command::RawKey(key, pressed) => keys.raw(&c, key, pressed)?,
+                Command::Modifiers(m) => keys.native_modifiers(&c, m)?,
                 Command::Resize(id, w, h) => {
                     c.configure_window(
                         id,
@@ -341,6 +345,7 @@ fn run(
                 continue;
             }
             match event {
+                Event::MappingNotify(_) => keys.mapping(&c)?,
                 Event::MapRequest(e) => {
                     if windows.len() >= 256 && !windows.contains_key(&e.window) {
                         continue;

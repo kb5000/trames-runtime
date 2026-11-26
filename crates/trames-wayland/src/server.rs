@@ -42,6 +42,8 @@ enum Command {
     Mode(u64, WindowMode),
     Close(u64),
     Presented(u64, u64, u32),
+    KeyboardMap(Arc<trames_shared::SharedFile>, Arc<[u8]>),
+    KeyboardRepeat(i32, i32),
     Input(InputEvent),
     Text(TextEdit),
     Gpu(u64, Arc<dyn GpuImage>),
@@ -223,6 +225,26 @@ impl Server {
             .get()
             .map_or(frontend, |origin| origin.elapsed().as_millis() as u32)
     }
+    /// Configure the existing seat using an owned NUL-terminated XKB-v1 map.
+    pub fn keyboard_map(&self, bytes: Arc<[u8]>) -> io::Result<()> {
+        if bytes.len() < 2
+            || bytes.len() > 1024 * 1024
+            || bytes.last() != Some(&0)
+            || bytes[..bytes.len() - 1].contains(&0)
+            || std::str::from_utf8(&bytes[..bytes.len() - 1]).is_err()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let map = trames_shared::SharedFile::anonymous()?;
+        map.write_at(0, &bytes)?;
+        self.0.send(Command::KeyboardMap(Arc::new(map), bytes))
+    }
+    pub fn keyboard_repeat(&self, rate: i32, delay: i32) -> io::Result<()> {
+        if rate < 0 || delay < 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.0.send(Command::KeyboardRepeat(rate, delay))
+    }
     pub fn input(&self, mut event: InputEvent) -> io::Result<()> {
         // Frontends use host uptime (and can have different timestamp epochs).
         // Timestamp receipt in the same clock as the Linux client, before the
@@ -231,8 +253,9 @@ impl Server {
             InputEvent::Pointer { time, .. }
             | InputEvent::Button { time, .. }
             | InputEvent::Scroll { time, .. }
+            | InputEvent::RawKey { time, .. }
             | InputEvent::Key { time, .. } => *time = self.guest_milliseconds(*time),
-            InputEvent::Focus { .. } => {}
+            InputEvent::Focus { .. } | InputEvent::Modifiers(_) => {}
         }
         self.0.send(Command::Input(event))
     }
@@ -299,6 +322,10 @@ fn run(
                 Command::Mode(id, mode) => compositor.set_mode(id, mode),
                 Command::Close(id) => compositor.close(id),
                 Command::Presented(id, revision, time) => compositor.presented(id, revision, time),
+                Command::KeyboardMap(map, bytes) => compositor.state.keyboard_map(map, bytes),
+                Command::KeyboardRepeat(rate, delay) => {
+                    compositor.state.keyboard_repeat(rate, delay)
+                }
                 Command::Input(event) => compositor.state.input(event),
                 Command::Text(edit) => compositor.state.text_edit(edit),
                 Command::Gpu(id, image) => compositor.state.enqueue_gpu(id, image),

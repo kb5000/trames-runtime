@@ -16,7 +16,7 @@ mod scene;
 pub use gpu::{GpuBudget, GpuImage, GpuPermit};
 pub use trames_graphics::NativeHandle;
 mod text;
-pub use input::InputEvent;
+pub use input::{InputEvent, KeyboardModifiers};
 pub use text::{TextContext, TextEdit};
 mod server;
 pub use server::{Server, Snapshot, SurfaceInfo};

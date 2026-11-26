@@ -109,8 +109,22 @@ impl State {
         self.xcommand(surface, |_| xwm::Command::Key(key, pressed, modifiers));
         true
     }
+    pub(crate) fn xraw_key(&self, key: u32, pressed: bool) -> bool {
+        let Some(surface) = self
+            .seat
+            .focus
+            .filter(|id| self.surfaces.get(id).is_some_and(|s| s.x11.is_some()))
+        else {
+            return false;
+        };
+        self.xcommand(surface, |_| xwm::Command::RawKey(key, pressed));
+        true
+    }
     pub(crate) fn defer_xkey(&mut self, event: &InputEvent) -> bool {
-        if !matches!(event, InputEvent::Key { .. }) {
+        if !matches!(
+            event,
+            InputEvent::Key { .. } | InputEvent::RawKey { .. } | InputEvent::Modifiers(_)
+        ) {
             return false;
         }
 

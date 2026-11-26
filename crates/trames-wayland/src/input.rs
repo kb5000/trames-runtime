@@ -7,6 +7,23 @@ use std::{collections::BTreeSet, os::fd::AsFd};
 use wayland_server::protocol::{wl_keyboard, wl_pointer, wl_seat, wl_touch};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
+/// Native XKB masks refer to the accompanying host keymap, including layout group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyboardModifiers {
+    pub depressed: u32,
+    pub latched: u32,
+    pub locked: u32,
+    pub group: u32,
+}
+impl KeyboardModifiers {
+    pub(crate) fn legacy(modifiers: u32) -> Self {
+        Self {
+            depressed: modifiers & !2,
+            locked: modifiers & 2,
+            ..Self::default()
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub enum InputEvent {
     Focus {
@@ -28,6 +45,13 @@ pub enum InputEvent {
         vertical: f64,
         time: u32,
     },
+    /// Physical evdev event; modifier updates arrive separately in protocol order.
+    RawKey {
+        key: u32,
+        pressed: bool,
+        time: u32,
+    },
+    Modifiers(KeyboardModifiers),
     Key {
         key: u32,
         pressed: bool,
@@ -49,7 +73,10 @@ pub(crate) struct Seat {
     pub key_serial: Option<(u32, u64)>,
     pressed: BTreeSet<u32>,
     modifiers: u32,
-    keymap: Option<trames_shared::SharedFile>,
+    keymap: Option<std::sync::Arc<trames_shared::SharedFile>>,
+    keymap_bytes: std::sync::Arc<[u8]>,
+    native_modifiers: Option<KeyboardModifiers>,
+    repeat: Option<(i32, i32)>,
 }
 fn connection<R: Resource>(resource: &R) -> u64 {
     resource
@@ -81,6 +108,19 @@ impl State {
     /// keep selection/text focus so the pending transfer still belongs here.
     pub(crate) fn cancel_held_keys(&mut self) {
         let keys = self.seat.pressed.iter().copied().collect::<Vec<_>>();
+        if let Some(mut m) = self.seat.native_modifiers {
+            for key in keys {
+                self.input(InputEvent::RawKey {
+                    key,
+                    pressed: false,
+                    time: 0,
+                });
+            }
+            m.depressed = 0;
+            m.latched = 0;
+            self.input(InputEvent::Modifiers(m));
+            return;
+        }
         let modifiers = self.seat.modifiers & 2; // Preserve Caps Lock.
         for key in keys {
             self.input(InputEvent::Key {
@@ -148,8 +188,122 @@ impl State {
         let mut bytes = include_bytes!("../data/us.xkb").to_vec();
         bytes.push(0);
         map.write_at(0, &bytes)?;
-        self.seat.keymap = Some(map);
+        self.seat.keymap_bytes = bytes.into();
+        self.seat.keymap = Some(std::sync::Arc::new(map));
         Ok(())
+    }
+    pub(crate) fn keyboard_map(
+        &mut self,
+        map: std::sync::Arc<trames_shared::SharedFile>,
+        bytes: std::sync::Arc<[u8]>,
+    ) {
+        self.seat
+            .native_modifiers
+            .get_or_insert_with(KeyboardModifiers::default);
+        if bytes == self.seat.keymap_bytes {
+            return;
+        }
+        self.seat.keymap = Some(map);
+        self.seat.keymap_bytes = bytes;
+        self.seat.keyboards.retain(Resource::is_alive);
+        let serial = self.next_serial();
+        let modifiers = self
+            .seat
+            .native_modifiers
+            .unwrap_or_else(|| KeyboardModifiers::legacy(self.seat.modifiers));
+        for keyboard in &self.seat.keyboards {
+            if let Ok(fd) = self.seat.keymap.as_ref().unwrap().duplicate_fd() {
+                keyboard.keymap(
+                    wl_keyboard::KeymapFormat::XkbV1,
+                    fd.as_fd(),
+                    self.seat.keymap_bytes.len() as u32,
+                );
+                if self
+                    .seat
+                    .focus
+                    .and_then(|id| self.surfaces.get(&id))
+                    .is_some_and(|s| s.x11.is_none() && connection(keyboard) == s.connection)
+                {
+                    keyboard.modifiers(
+                        serial,
+                        modifiers.depressed,
+                        modifiers.latched,
+                        modifiers.locked,
+                        modifiers.group,
+                    );
+                }
+            }
+        }
+    }
+    pub(crate) fn keyboard_repeat(&mut self, rate: i32, delay: i32) {
+        self.seat.repeat = Some((rate, delay));
+        self.seat.keyboards.retain(Resource::is_alive);
+        for k in &self.seat.keyboards {
+            if k.version() >= 4 {
+                k.repeat_info(rate, delay);
+            }
+        }
+    }
+    fn modifiers(&mut self, m: KeyboardModifiers) {
+        self.seat.modifiers = m.depressed | m.latched | m.locked;
+        self.seat.native_modifiers = Some(m);
+        if let Some(id) = self
+            .seat
+            .focus
+            .filter(|id| self.surfaces.get(id).is_some_and(|s| s.x11.is_some()))
+        {
+            self.xcommand(id, |_| crate::xwm::Command::Modifiers(m));
+            return;
+        }
+        let serial = self.next_serial();
+        if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
+            for k in &self.seat.keyboards {
+                if k.is_alive() && connection(k) == s.connection {
+                    if s.x11.is_none() || self.seat.native_modifiers.is_none() {
+                        k.modifiers(serial, m.depressed, m.latched, m.locked, m.group);
+                    }
+                }
+            }
+        }
+    }
+    fn raw_key(&mut self, key: u32, pressed: bool, time: u32) {
+        if key > 767 {
+            return;
+        }
+        let changed = if pressed {
+            self.seat.pressed.insert(key)
+        } else {
+            self.seat.pressed.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        let serial = self.next_serial();
+        if let Some(id) = self.seat.focus {
+            self.seat.key_serial = Some((serial, id));
+            if pressed {
+                self.seat.press_serial = Some((serial, id));
+            }
+        }
+        if self.xraw_key(key, pressed) {
+            return;
+        }
+        if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
+            for k in &self.seat.keyboards {
+                if connection(k) == s.connection {
+                    k.key(
+                        serial,
+                        time,
+                        key,
+                        if pressed {
+                            wl_keyboard::KeyState::Pressed
+                        } else {
+                            wl_keyboard::KeyState::Released
+                        },
+                    );
+                }
+            }
+        }
     }
     pub(crate) fn focus_toplevel(&self, mut id: Option<u64>) -> Option<u64> {
         for _ in 0..256 {
@@ -183,11 +337,18 @@ impl State {
         // modifier stuck after switching to the terminal or another window.
         self.seat.pressed.clear();
         self.seat.modifiers = 0;
+        if let Some(m) = &mut self.seat.native_modifiers {
+            m.depressed = 0;
+            m.latched = 0;
+        }
         if let Some(s) = id.and_then(|id| self.surfaces.get(&id)) {
             for k in &self.seat.keyboards {
                 if k.is_alive() && connection(k) == s.connection {
                     k.enter(serial, &s.resource, Vec::new());
-                    k.modifiers(serial, 0, 0, 0, 0);
+                    let m = self.seat.native_modifiers.unwrap_or_default();
+                    if s.x11.is_none() || self.seat.native_modifiers.is_none() {
+                        k.modifiers(serial, m.depressed, m.latched, m.locked, m.group);
+                    }
                 }
             }
         }
@@ -397,6 +558,8 @@ impl State {
                     }
                 }
             }
+            InputEvent::RawKey { key, pressed, time } => self.raw_key(key, pressed, time),
+            InputEvent::Modifiers(m) => self.modifiers(m),
             InputEvent::Key {
                 key,
                 pressed,
@@ -411,6 +574,7 @@ impl State {
                 } else {
                     self.seat.pressed.remove(&key);
                 }
+                self.seat.native_modifiers = None;
                 self.seat.modifiers = modifiers;
                 let serial = self.next_serial();
                 if let Some(id) = self.seat.focus {
@@ -504,7 +668,8 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                     }
                 }
                 if k.version() >= 4 {
-                    k.repeat_info(25, 600);
+                    let (rate, delay) = state.seat.repeat.unwrap_or((25, 600));
+                    k.repeat_info(rate, delay);
                 }
                 if let Some(s) = state.seat.focus.and_then(|id| state.surfaces.get(&id)) {
                     if connection(&k) == s.connection {
@@ -518,13 +683,13 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                                 .flat_map(|v| v.to_ne_bytes())
                                 .collect(),
                         );
-                        k.modifiers(
-                            state.serial,
-                            state.seat.modifiers & !2,
-                            0,
-                            state.seat.modifiers & 2,
-                            0,
-                        );
+                        let m = state
+                            .seat
+                            .native_modifiers
+                            .unwrap_or_else(|| KeyboardModifiers::legacy(state.seat.modifiers));
+                        if s.x11.is_none() || state.seat.native_modifiers.is_none() {
+                            k.modifiers(state.serial, m.depressed, m.latched, m.locked, m.group);
+                        }
                     }
                 }
                 state.seat.keyboards.push(k);
@@ -856,5 +1021,61 @@ mod tests {
         state.focus_surface(Some(1));
         state.surface_unmapped(1);
         assert_eq!(state.seat.focus, None);
+    }
+}
+
+#[cfg(test)]
+mod native_keyboard_tests {
+    use super::*;
+    #[test]
+    fn native_permission_handoff_releases_physical_keys_and_retains_group_and_locks() {
+        let mut state = State::default();
+        state.input(InputEvent::Modifiers(KeyboardModifiers {
+            depressed: 129,
+            latched: 4,
+            locked: 16,
+            group: 1,
+        }));
+        for key in [42, 100, 16] {
+            state.input(InputEvent::RawKey {
+                key,
+                pressed: true,
+                time: 0,
+            });
+        }
+        state.cancel_held_keys();
+        assert!(state.seat.pressed.is_empty());
+        assert_eq!(
+            state.seat.native_modifiers,
+            Some(KeyboardModifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 16,
+                group: 1
+            })
+        );
+    }
+    #[test]
+    fn duplicate_host_repeat_does_not_create_a_second_physical_press() {
+        let mut state = State::default();
+        state.input(InputEvent::RawKey {
+            key: 30,
+            pressed: true,
+            time: 1,
+        });
+        let serial = state.serial;
+        state.input(InputEvent::RawKey {
+            key: 30,
+            pressed: true,
+            time: 2,
+        });
+        assert_eq!(state.serial, serial);
+        state.input(InputEvent::RawKey {
+            key: 30,
+            pressed: false,
+            time: 3,
+        });
+        assert!(state.seat.pressed.is_empty());
+        assert_ne!(state.serial, serial);
     }
 }

@@ -870,7 +870,19 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
-            ByteResource::Console(console) => console.io.subscribe(signal),
+            ByteResource::Console(console) => {
+                let mut subscriptions = console.io.subscribe(signal);
+                subscriptions.extend(console.io.native_wait_fds(console.stream).into_iter().map(
+                    |fd| {
+                        IoSubscription::native_direction(
+                            Ok(fd),
+                            console.stream != ConsoleStream::Input,
+                            signal,
+                        )
+                    },
+                ));
+                subscriptions
+            }
             ByteResource::SocketPoll(socket) => {
                 let Some(socket) = socket.upgrade() else {
                     return Vec::new();
