@@ -14,6 +14,12 @@ pub unsafe trait GpuImage: Send + Sync {
     fn dimensions(&self) -> (u32, u32);
     fn native_handle(&self) -> trames_graphics::NativeHandle;
     fn ready(&self) -> io::Result<bool>;
+    /// Native image and queue retain separate leases: retaining a device must
+    /// not pin a swapchain slot after the presenter's own GPU reads finish.
+    fn vulkan_queue(&self) -> Option<trames_graphics::VulkanQueue> {
+        None
+    }
+
     /// Whether the native plane carries premultiplied alpha. RGBX producers
     /// remain opaque even when their native texture has an unused alpha lane.
     fn has_alpha(&self) -> bool {

@@ -19,6 +19,59 @@ pub struct VulkanImage {
     pub format: u32,
     pub layout: u32,
 }
+/// A retained native Vulkan queue, shared only by actual producer/presenter
+/// submissions. Its object-level lock satisfies Vulkan external synchronization;
+/// ordinary CPU execution and unrelated queues never acquire it.
+#[derive(Clone)]
+pub struct VulkanQueue {
+    device: NativeDevice,
+    family: u32,
+    queue: u64,
+    surfaces: u32,
+    synchronization: Arc<std::sync::Mutex<()>>,
+    _owner: Arc<dyn Send + Sync>,
+}
+impl VulkanQueue {
+    /// # Safety
+    /// The owner retains this exact device/instance/queue. Every native access
+    /// to this queue uses the same synchronization object through final use.
+    pub unsafe fn retained(
+        device: NativeDevice,
+        family: u32,
+        queue: u64,
+        surfaces: u32,
+        synchronization: Arc<std::sync::Mutex<()>>,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            device,
+            family,
+            queue,
+            surfaces,
+            synchronization,
+            _owner: owner,
+        }
+    }
+    pub fn device(&self) -> NativeDevice {
+        self.device
+    }
+    pub fn family(&self) -> u32 {
+        self.family
+    }
+    pub fn raw(&self) -> u64 {
+        self.queue
+    }
+    pub fn supports_xcb(&self) -> bool {
+        self.surfaces & 1 != 0
+    }
+    pub fn supports_wayland(&self) -> bool {
+        self.surfaces & 2 != 0
+    }
+    pub fn synchronized<T>(&self, body: impl FnOnce() -> T) -> T {
+        let _guard = self.synchronization.lock().unwrap();
+        body()
+    }
+}
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum NativeHandle {

@@ -35,7 +35,7 @@ pub(super) struct Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.native.device_wait_idle();
+            let _ = self.device.wait_idle();
             ash::khr::swapchain::Device::new(&self.device.instance.native, &self.device.native)
                 .destroy_swapchain(self.raw, None);
         }
@@ -561,7 +561,9 @@ impl Backend {
                     .wait_semaphores(&semaphores)
                     .swapchains(&chains)
                     .image_indices(&indices);
-                let suboptimal = match unsafe { loader.queue_present(queue, &info) } {
+                let suboptimal = match device
+                    .with_queue(queue, || unsafe { loader.queue_present(queue, &info) })
+                {
                     Ok(suboptimal) => suboptimal,
                     Err(error) => {
                         // Consumption of native waits on a failed present is driver

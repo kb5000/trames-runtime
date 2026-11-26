@@ -84,6 +84,8 @@ struct Frame {
     completion: Arc<Completion>,
     mailbox: bool,
     _permit: trames_wayland::GpuPermit,
+    #[cfg(target_os = "linux")]
+    queue: trames_graphics::VulkanQueue,
 }
 impl Drop for Frame {
     fn drop(&mut self) {
@@ -119,6 +121,10 @@ unsafe impl GpuImage for Frame {
             .ready()
             .map_err(|e| io::Error::other(format!("native GPU presentation: {e:?}")))
     }
+    #[cfg(target_os = "linux")]
+    fn vulkan_queue(&self) -> Option<trames_graphics::VulkanQueue> {
+        Some(self.queue.clone())
+    }
     fn mailbox(&self) -> bool {
         self.mailbox
     }
@@ -146,9 +152,7 @@ impl Drop for Claim {
 }
 impl Drop for Pool {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.native.device_wait_idle();
-        }
+        let _ = self.device.wait_idle();
     }
 }
 
@@ -688,11 +692,11 @@ impl Backend {
                 let submit = vk::SubmitInfo::default()
                     .wait_semaphores(&waits)
                     .wait_dst_stage_mask(&stages);
-                if let Err(e) = unsafe {
+                if let Err(e) = device.with_queue(queue, || unsafe {
                     device
                         .native
                         .queue_submit(queue, &[submit], completion.fence)
-                } {
+                }) {
                     self.wayland.retire(a[2]);
                     return Err(e.into());
                 }
@@ -708,6 +712,8 @@ impl Backend {
                     completion,
                     mailbox: chain.mailbox,
                     _permit: permit,
+                    #[cfg(target_os = "linux")]
+                    queue: device.queue_capability(queue),
                 });
                 // This extra producer lease prevents cancellation/disconnect from releasing
                 // a slot/fence before native writes finish. UI leases extend it afterward.

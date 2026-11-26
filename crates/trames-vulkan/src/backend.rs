@@ -77,6 +77,8 @@ struct Instance {
     _entry: Entry,
     queries2: bool,
     surface_extension: Option<&'static std::ffi::CStr>,
+    #[cfg(target_os = "linux")]
+    native_surfaces: u32,
 }
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -84,6 +86,10 @@ impl Drop for Instance {
     }
 }
 struct Device {
+    #[cfg(target_os = "linux")]
+    queue_sync: BTreeMap<u64, (u32, Arc<std::sync::Mutex<()>>)>,
+    #[cfg(target_os = "linux")]
+    native_swapchain: bool,
     #[cfg_attr(target_vendor = "apple", allow(dead_code))]
     physical: vk::PhysicalDevice,
     queue_families: Vec<u32>,
@@ -115,11 +121,57 @@ struct Device {
     compute_features: u128,
     compute_extensions: u64,
 }
+impl Device {
+    #[inline]
+    fn with_queue<T>(&self, queue: vk::Queue, body: impl FnOnce() -> T) -> T {
+        #[cfg(target_os = "linux")]
+        let _guard = self
+            .queue_sync
+            .get(&queue.as_raw())
+            .map(|(_, lock)| lock.lock().unwrap());
+        #[cfg(not(target_os = "linux"))]
+        let _ = queue;
+        body()
+    }
+    fn wait_idle(&self) -> std::result::Result<(), vk::Result> {
+        #[cfg(target_os = "linux")]
+        let _guards: Vec<_> = self
+            .queue_sync
+            .values()
+            .map(|(_, lock)| lock.lock().unwrap())
+            .collect();
+        unsafe { self.native.device_wait_idle() }
+    }
+    #[cfg(target_os = "linux")]
+    fn queue_capability(self: &Arc<Self>, queue: vk::Queue) -> trames_graphics::VulkanQueue {
+        let (family, lock) = &self.queue_sync[&queue.as_raw()];
+        // SAFETY: this Device owns these handles and all queue entry points use
+        // the same per-queue mutex. The erased owner retains only the device.
+        unsafe {
+            trames_graphics::VulkanQueue::retained(
+                trames_graphics::NativeDevice::Vulkan {
+                    instance: self.instance.native.handle().as_raw(),
+                    physical: self.physical.as_raw(),
+                    device: self.native.handle().as_raw(),
+                },
+                *family,
+                queue.as_raw(),
+                if self.native_swapchain {
+                    self.instance.native_surfaces
+                } else {
+                    0
+                },
+                lock.clone(),
+                self.clone(),
+            )
+        }
+    }
+}
 impl Drop for Device {
     fn drop(&mut self) {
         // Final teardown only: no guest memory/worker guard is held here.
         unsafe {
-            let _ = self.native.device_wait_idle();
+            let _ = self.wait_idle();
             self.native.destroy_device(None);
         }
     }
@@ -850,7 +902,7 @@ impl Backend {
             timeline_completion,
         };
         self.submit_native(m, a[4], dev.clone(), resources, |fence| unsafe {
-            d.queue_submit(queue, &infos, fence)
+            dev.with_queue(queue, || d.queue_submit(queue, &infos, fence))
         })
     }
     fn submission_capacity(&self) -> Result<()> {
@@ -1466,6 +1518,21 @@ impl Backend {
             } else {
                 None
             };
+            #[cfg(target_os = "linux")]
+            if self.virtual_wsi {
+                for name in [
+                    ash::khr::surface::NAME,
+                    ash::khr::xcb_surface::NAME,
+                    ash::khr::wayland_surface::NAME,
+                ] {
+                    if extensions.iter().any(
+                        |e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == name,
+                    ) && !names.contains(&name.as_ptr())
+                    {
+                        names.push(name.as_ptr());
+                    }
+                }
+            }
             let simulator = cfg!(all(target_os = "ios", target_abi = "sim"));
             if simulator {
                 if !extensions.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == ash::ext::layer_settings::NAME) {
@@ -1514,6 +1581,12 @@ impl Backend {
                 _entry: entry,
                 queries2,
                 surface_extension,
+                #[cfg(target_os = "linux")]
+                native_surfaces: u32::from(names.iter().any(
+                    |p| unsafe { std::ffi::CStr::from_ptr(*p) } == ash::khr::xcb_surface::NAME,
+                )) | (u32::from(names.iter().any(
+                    |p| unsafe { std::ffi::CStr::from_ptr(*p) } == ash::khr::wayland_surface::NAME,
+                )) << 1),
             });
             let devices = unsafe { instance.native.enumerate_physical_devices() }?;
             self.physical = devices
@@ -1801,7 +1874,7 @@ impl Backend {
                 if a[3] > 1 || a[3] != 0 && !self.wsi_enabled {
                     return unsupported();
                 }
-                if a[3] != 0 && !self.virtual_wsi {
+                if a[3] != 0 && (!self.virtual_wsi || cfg!(target_os = "linux")) {
                     names.push(ash::khr::swapchain::NAME.as_ptr());
                 }
                 // Timeline scheduling exports the original shared event even
@@ -1916,6 +1989,17 @@ impl Backend {
                 }
                 .limits;
                 self.device = Some(Arc::new(Device {
+                    #[cfg(target_os = "linux")]
+                    queue_sync: self
+                        .queues
+                        .values()
+                        .filter(|_| self.virtual_wsi)
+                        .map(|(q, f, _)| (q.as_raw(), (*f, Arc::new(std::sync::Mutex::new(())))))
+                        .collect(),
+                    #[cfg(target_os = "linux")]
+                    native_swapchain: names.iter().any(
+                        |p| unsafe { std::ffi::CStr::from_ptr(*p) } == ash::khr::swapchain::NAME,
+                    ),
                     physical: self.physical,
                     queue_families: families,
                     metal_device,
@@ -1979,9 +2063,7 @@ impl Backend {
     fn clear_device(&mut self) {
         self.compiles.clear();
         if let Some(d) = &self.device {
-            unsafe {
-                let _ = d.native.device_wait_idle();
-            }
+            let _ = d.wait_idle();
         }
         self.submissions.clear();
         self.wayland.clear_device();

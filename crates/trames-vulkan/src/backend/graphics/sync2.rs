@@ -323,7 +323,9 @@ impl Backend {
             timeline_completion,
         };
         self.submit_native(m, a[4], dev.clone(), resources, |fence| unsafe {
-            dev.commands.sync2.queue_submit2(queue, &infos, fence)
+            dev.with_queue(queue, || {
+                dev.commands.sync2.queue_submit2(queue, &infos, fence)
+            })
         })
     }
 }
