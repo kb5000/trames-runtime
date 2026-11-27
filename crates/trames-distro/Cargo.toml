@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "=0.2.190"
 trames-vfs = { path = "../trames-vfs" }
 trames-elf = { path = "../trames-elf" }
 trames-memory = { path = "../trames-memory" }

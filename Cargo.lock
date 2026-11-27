@@ -850,6 +850,7 @@ version = "1.3.0"
 dependencies = [
  "ext4-view",
  "flate2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -889,6 +890,17 @@ dependencies = [
  "libc",
  "trames-memory",
  "trames-shared",
+]
+
+[[package]]
+name = "trames-host"
+version = "1.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trames-distro",
+ "trames-linux",
+ "trames-vfs",
 ]
 
 [[package]]
