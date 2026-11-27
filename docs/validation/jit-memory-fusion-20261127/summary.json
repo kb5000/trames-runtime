@@ -1,0 +1,58 @@
+[
+  {
+    "workload": "integer-loop",
+    "old_jit_ns": 3600922,
+    "old_interpreter_ns": 17060725,
+    "new_jit_ns": 3531467,
+    "new_interpreter_ns": 15832890,
+    "old_over_new": 1.0196674639746033
+  },
+  {
+    "workload": "svc-round-trip",
+    "old_jit_ns": 603021,
+    "old_interpreter_ns": 4859088,
+    "new_jit_ns": 641062,
+    "new_interpreter_ns": 4757300,
+    "old_over_new": 0.9406594057985032
+  },
+  {
+    "workload": "svc-only",
+    "old_jit_ns": 548107,
+    "old_interpreter_ns": 3235434,
+    "new_jit_ns": 597855,
+    "new_interpreter_ns": 3232101,
+    "old_over_new": 0.916789188013816
+  },
+  {
+    "workload": "svc-continuation",
+    "old_jit_ns": 851514,
+    "old_interpreter_ns": 3830081,
+    "new_jit_ns": 940843,
+    "new_interpreter_ns": 3583006,
+    "old_over_new": 0.9050542970506238
+  },
+  {
+    "workload": "integer-countdown-compare",
+    "old_jit_ns": 1820023,
+    "old_interpreter_ns": 12907237,
+    "new_jit_ns": 1765608,
+    "new_interpreter_ns": 13813915,
+    "old_over_new": 1.0308194117833631
+  },
+  {
+    "workload": "integer-countdown-flags",
+    "old_jit_ns": 1787941,
+    "old_interpreter_ns": 8332931,
+    "new_jit_ns": 1798565,
+    "new_interpreter_ns": 8195436,
+    "old_over_new": 0.9940930686408331
+  },
+  {
+    "workload": "scalar-memory-loop",
+    "old_jit_ns": 4462227,
+    "old_interpreter_ns": 919928,
+    "new_jit_ns": 1853522,
+    "new_interpreter_ns": 931177,
+    "old_over_new": 2.4074313657998125
+  }
+]

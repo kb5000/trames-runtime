@@ -15,6 +15,7 @@ enum Address {
     Literal(u64),
 }
 pub(super) struct Operation {
+    pc: u64,
     address: Address,
     rn: usize,
     rt: usize,
@@ -101,6 +102,7 @@ impl Operation {
             .transpose()
             .map_err(|e| CpuFault::Host(format!("JIT memory publication: {e}")))?;
         Ok(Some(Self {
+            pc,
             address,
             rn,
             rt,
@@ -108,6 +110,9 @@ impl Operation {
             load,
             code,
         }))
+    }
+    pub fn pc(&self) -> u64 {
+        self.pc
     }
     pub fn host_words(&self) -> u64 {
         if self.code.is_some() {

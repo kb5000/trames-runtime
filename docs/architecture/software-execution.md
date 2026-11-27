@@ -120,33 +120,49 @@ remain unchanged.
 See [native scalar validation](../validation/jit-host-scalars-20261127.md).
 
 
-## Native scalar memory fragments
+## Native scalar memory blocks
 
 Integer LDR/STR byte/halfword/word/doubleword, signed loads, immediate/unscaled,
 pre/post-index, extended register offsets, literal loads and optional PRFM hints
-now have cached native fragments. Cold decode selects the exact baseline host
-LDR/STR opcode. The driver computes the decoded guest address and commits result
-and base writeback only after success. Each real same-page access runs inside the
-existing `CpuMemory` read/full-write callback; no host pointer or lease is cached.
+have cached native fragments. Cold decode selects the exact baseline host LDR/STR
+opcode. The helper computes the decoded guest address and commits result/base
+writeback only after success. Each real same-page access stays inside the existing
+`CpuMemory` read/full-write callback; no host data pointer or lease is cached.
 
-`cpu_store_chunk` is a full-overwrite contract. Memory/View reuse the existing
-write borrowing and dirty/code/exclusive publication. A staging-only provider
-need not read previous bytes: the shared Memory helper specializes this choice
-at compile time. Ordinary read/write paths gain no fields, probes or extra
-permission policy. Cross-page data uses canonical read/write staging and then
-the same exact-width native fragment; CPU results remain precise on faults.
+`cpu_store_chunk` is a full-overwrite contract. Memory/View reuse existing write
+borrowing and dirty/code/exclusive publication. Staging-only providers need not
+read old bytes. Cross-page data uses canonical read/write staging before the same
+exact-width native fragment; CPU results remain precise on faults. Ordinary
+Memory read/write paths acquire no new fields, probes or permission policy.
 
-Memory fragments have a separate call ABI from integer chains. Cached metadata
-may resolve their continuation, but generated machine edges never target them.
-The worker returns to the existing instruction-identity boundary between memory
-fragments and subsequent code, including after executable stores. Generation
-handles reject evicted fragments. `Engine::memory_stats()` separately reports
-retired fragments and staging; scalar/SVC return ABI and counters stay unchanged.
-No guest bytes or published RX words are patched, and no additional extension
-register model, algorithm lock, coordinator or ordinary-memory fence is added.
+Embeddings with instruction-epoch capability now compile mixed integer/memory
+blocks. A generated call flushes dirty bindings before a typed, monomorphized
+helper and reloads a fresh register sub-borrow afterward. The helper takes one
+scoped access, checks current code identity, and returns either to the next native
+instruction or a precise fault/code-change exit. Faults publish the dirty prefix,
+SP/NZCV, reached PC and retired count without replay. Helpers return faults as
+values; Rust unwinding cannot cross the generated native stack.
 
-This is an initial checked lowering, not block fusion. Separate guest LDR and STR
-release their borrows independently and still allow lost updates. Tight memory
-loops are faster than the old JIT's per-instruction interpreter fallback but
-remain slower than the cached interpreter. Pairs, SIMD, acquire/release and
-atomic instructions retain their existing path until separately lowered.
+Same-block backedges stay inside the native entry through the existing budget
+and epoch guards. LDR and STR still release independent borrows: merging code
+never makes their read/modify/write algorithm atomic. Unknown epoch embeddings
+retain the existing single-access path. Helper-bearing blocks keep a separate
+entry-frame ABI; generation-checked metadata edges can point to them, but ordinary
+native machine links cannot. Boxed decoded operands remain stable and worker-owned
+until the code node is evicted. The existing node/block limits bound the cache.
+
+Cold indices, compilation totals and memory diagnostics are kept outside the hot
+entry state. Steady-state short SVC hits bypass the general block result path;
+the published scalar/SVC machine-entry ABI and existing Stats fields are retained.
+`Engine::memory_stats()` adds fused-entry/block counts to native-memory/staging
+counts; these are updated only by memory execution. No extension register model,
+algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is added.
+
+Fusion removes repeated main-dispatch returns but still calls the checked helper
+and a tiny native fragment for each access. The cached interpreter's scalar path
+already uses decoded tail handlers and its canonical fixed-width memory access;
+executing a host LDR/STR alone does not make the surrounding JIT machinery faster.
+Further memory-helper/translation integration remains necessary. Pairs, SIMD,
+acquire/release and atomics keep their existing path until separately lowered.
+
+See [fusion validation and complete measurements](../validation/jit-memory-fusion-20261127.md).

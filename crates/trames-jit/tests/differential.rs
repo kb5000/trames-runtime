@@ -1419,3 +1419,171 @@ fn separate_native_load_and_store_do_not_make_guest_rmw_atomic() {
         );
     }
 }
+
+#[test]
+fn fused_memory_loops_keep_state_and_retirement_at_every_budget() {
+    let words = [
+        0x910003e1, // add x1,sp,#0
+        0xf9400020, // ldr x0,[x1]
+        0xb1000400, // adds x0,x0,#1
+        0xf9000020, // str x0,[x1]
+        0x9a1f0003, // adc x3,x0,xzr (flags survive the memory helper)
+        0xf1000442, // subs x2,x2,#1
+        0x54ffff61, // b.ne 0x1004
+        0xd4000001,
+    ];
+    for parallel in [false, true] {
+        for budget in [0, 1, 2, 3, 4, 5, 6, 7, 8, 31, 32, 33, 63, 64, 65, 1024] {
+            let mut a = memory(&words);
+            let mut b = memory(&words);
+            a.write_array(0x2fe0, (u64::MAX - 3).to_le_bytes()).unwrap();
+            b.write_array(0x2fe0, (u64::MAX - 3).to_le_bytes()).unwrap();
+            let mut state = initial();
+            state.sp = 0x2fe0;
+            state.registers[2] = 17;
+            let mut expected = trames_interpreter::Cpu::new(0, 0);
+            let mut actual = Cpu::new(0, 0);
+            expected.restore_architectural_state(&state);
+            actual.restore_architectural_state(&state);
+            let mut engine = Engine::default();
+            let mut registry = trames_memory::parallel::Registry::default();
+            let mut view = parallel.then(|| b.parallel_view(&mut registry).unwrap());
+            for _ in 0..256 {
+                let x = expected.run_slice(&mut a, budget);
+                let y = if let Some(view) = &mut view {
+                    actual.run_parallel(&mut engine, view, budget)
+                } else {
+                    actual.run_slice(&mut engine, &mut b, budget)
+                };
+                assert_eq!(outcome(&x), outcome(&y), "budget={budget} view={parallel}");
+                assert_eq!(actual.architectural_state(), expected.architectural_state());
+                let bytes = if let Some(view) = &view {
+                    view.read_u64(0x2fe0).unwrap()
+                } else {
+                    b.read_u64(0x2fe0).unwrap()
+                };
+                assert_eq!(bytes, a.read_u64(0x2fe0).unwrap());
+                if matches!(x, SliceOutcome::Syscall { .. }) || budget == 0 {
+                    break;
+                }
+            }
+            if budget != 0 {
+                assert_eq!(actual.pc(), 0x1020);
+            }
+            if NATIVE_COMPILED {
+                assert_eq!(engine.stats.fallback_instructions, 0);
+                if budget == 1024 {
+                    assert!(engine.memory_stats().fused_entries < 8);
+                    assert!(engine.memory_stats().fused_blocks >= 17);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_memory_faults_publish_the_exact_dirty_prefix_and_do_not_replay() {
+    let prefix = [0x91000400, 0xd10043ff, 0xb1000463, 0xf9000020, 0x910004c6];
+    for cut in 0..=prefix.len() {
+        let mut words = prefix[..cut].to_vec();
+        words.extend_from_slice(&[0xf94000a4, 0x910004e7, 0xd4000001]); // ldr x4,[x5]
+        for parallel in [false, true] {
+            for budget in [1, 2, 3, 4, 64] {
+                let mut a = memory(&words);
+                let mut b = memory(&words);
+                let mut state = initial();
+                state.registers[1] = 0x2000;
+                state.registers[3] = u64::MAX;
+                state.registers[5] = 0x4000;
+                let mut expected = trames_interpreter::Cpu::new(0, 0);
+                let mut actual = Cpu::new(0, 0);
+                expected.restore_architectural_state(&state);
+                actual.restore_architectural_state(&state);
+                let mut engine = Engine::default();
+                let mut registry = trames_memory::parallel::Registry::default();
+                let mut view = parallel.then(|| b.parallel_view(&mut registry).unwrap());
+                for _ in 0..8 {
+                    let x = expected.run_slice(&mut a, budget);
+                    let y = if let Some(view) = &mut view {
+                        actual.run_parallel(&mut engine, view, budget)
+                    } else {
+                        actual.run_slice(&mut engine, &mut b, budget)
+                    };
+                    assert_eq!(format!("{x:?}"), format!("{y:?}"));
+                    assert_eq!(actual.architectural_state(), expected.architectural_state());
+                    if matches!(x, SliceOutcome::Fault(_)) {
+                        assert_eq!(actual.fault_retired(), expected.fault_retired());
+                        // A second attempt faults at its first instruction; no
+                        // retired prefix or successful store is replayed.
+                        let x = expected.run_slice(&mut a, budget);
+                        let y = if let Some(view) = &mut view {
+                            actual.run_parallel(&mut engine, view, budget)
+                        } else {
+                            actual.run_slice(&mut engine, &mut b, budget)
+                        };
+                        assert_eq!(format!("{x:?}"), format!("{y:?}"));
+                        assert_eq!(actual.fault_retired(), 0);
+                        assert_eq!(actual.architectural_state(), expected.architectural_state());
+                        break;
+                    }
+                }
+                if NATIVE_COMPILED {
+                    assert_eq!(engine.stats.native_instructions, cut as u64);
+                }
+                assert_eq!(actual.pc(), 0x1000 + cut as u64 * 4);
+                let bytes = if let Some(view) = &view {
+                    view.read_u64(0x2000).unwrap()
+                } else {
+                    b.read_u64(0x2000).unwrap()
+                };
+                assert_eq!(bytes, a.read_u64(0x2000).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_code_write_interrupts_a_running_fused_memory_loop() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    let mut m = memory(&[0xf9400020, 0x91000400, 0xf9000020, 0x17fffffd]);
+    m.protect(
+        0x1000,
+        PAGE_SIZE,
+        Permissions {
+            read: true,
+            write: true,
+            execute: true,
+        },
+    )
+    .unwrap();
+    let mut registry = trames_memory::parallel::Registry::default();
+    let mut reader = m.parallel_view(&mut registry).unwrap();
+    let mut writer = reader.clone();
+    let mut cpu = Cpu::new(0x1000, 0);
+    cpu.set_x(1, 0x2000);
+    let mut engine = Engine::default();
+    cpu.run_parallel(&mut engine, &mut reader, 128);
+    reader.write_array(0x2000, 0u64.to_le_bytes()).unwrap();
+    cpu.set_x(0, 0);
+    cpu.set_pc(0x1000);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        other.wait();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        writer
+            .write_array(0x1000, 0xd4000001u32.to_le_bytes())
+            .unwrap();
+    });
+    barrier.wait();
+    let result = cpu.run_parallel(&mut engine, &mut reader, 100_000_000);
+    thread.join().unwrap();
+    let SliceOutcome::Syscall { instructions } = result else {
+        panic!("fused loop missed changed code: {result:?}");
+    };
+    assert_eq!(instructions, cpu.x(0) * 4 + 1);
+    assert_eq!(cpu.pc(), 0x1004);
+    assert!(engine.memory_stats().fused_blocks > engine.memory_stats().fused_entries);
+}

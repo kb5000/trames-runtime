@@ -95,6 +95,8 @@ pub struct LinkStats {
 pub struct MemoryStats {
     pub instructions: u64,
     pub staged: u64,
+    pub fused_entries: u64,
+    pub fused_blocks: u64,
 }
 impl Engine {
     pub fn memory_stats(&self) -> MemoryStats {
@@ -104,7 +106,7 @@ impl Engine {
             any(target_os = "linux", target_os = "android")
         ))]
         {
-            self.native.memory_stats
+            self.native.memory_stats()
         }
         #[cfg(not(all(
             feature = "native-aarch64",
@@ -141,7 +143,7 @@ impl Engine {
             any(target_os = "linux", target_os = "android")
         ))]
         {
-            self.native.stats
+            self.native.compilation_stats()
         }
         #[cfg(not(all(
             feature = "native-aarch64",
@@ -180,6 +182,25 @@ impl Cpu {
                 target_arch = "aarch64",
                 any(target_os = "linux", target_os = "android")
             ))]
+            {
+                if let Some(instructions) =
+                    engine
+                        .native
+                        .syscall(&mut self.inner, memory, budget - retired)
+                {
+                    engine.stats.native_blocks += 1;
+                    engine.stats.native_instructions += instructions - 1;
+                    engine.stats.direct_syscall_exits += 1;
+                    return SliceOutcome::Syscall {
+                        instructions: retired + instructions,
+                    };
+                }
+            }
+            #[cfg(all(
+                feature = "native-aarch64",
+                target_arch = "aarch64",
+                any(target_os = "linux", target_os = "android")
+            ))]
             match engine
                 .native
                 .execute(&mut self.inner, memory, budget - retired)
@@ -200,7 +221,10 @@ impl Cpu {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.fault_retired = retired;
+                    let (instructions, blocks) = engine.native.take_fault_progress();
+                    self.fault_retired = retired + instructions;
+                    engine.stats.native_instructions += instructions;
+                    engine.stats.native_blocks += blocks;
                     return SliceOutcome::Fault(error);
                 }
             }

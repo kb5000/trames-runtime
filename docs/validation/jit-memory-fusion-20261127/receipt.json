@@ -1,0 +1,25 @@
+{
+  "base_runtime": "d764fc7b920aa73e31b7a91c88512b36c349c5eb",
+  "host": "existing ARM64 Lima/VZ Linux VM, 4096-byte pages",
+  "cpu_affinity": [
+    2
+  ],
+  "toolchain": "nightly-2026-10-16",
+  "profile": "release, thin LTO, overflow checks, incremental off",
+  "fixture": "unchanged cpu-boundary.rs; one warm-up plus five timed samples per process",
+  "cohort": "five alternating old/new process pairs after task-owned builds finished; median of process medians",
+  "old_binary_sha256": "8f8bca63d83e4ca624a1809c76e9d3fd19787ce4134bfca78619934ed0307763",
+  "new_binary_sha256": "5ab4f6710d47616f9fe617567a33bb4d2ea63439d6f523649da6b66b9f48c6f4",
+  "source_sha256": {
+    "crates/trames-jit/src/native.rs": "2efe74188ba912dedfb4582dc5e7d610befb9c6f46f36a634a263fdc5c516a53",
+    "crates/trames-jit/src/memory_ops.rs": "780468af830fd6655e6be5396bf34126048945315a082b9bba14b399413b5448",
+    "crates/trames-jit/src/lib.rs": "d36c34a5d6fd3d4bc92684f59f97cd470cb5d9700ca810105a27a087c9396424",
+    "crates/trames-jit/tests/differential.rs": "379194994ac52fba184649089347091d72546da40de2532ef1d25a931287a3f5"
+  },
+  "fixture_sha256": "f5f0649533decff930a95a7ef5be0655becfe22dc4d500bbb80fb226e022abf8",
+  "notes": [
+    "All final samples retained. No intermediate medians were spliced into the final cohort.",
+    "Intermediate development runs are archived separately, including periods of host scheduling/clock variation; their source revisions are not presented as the final implementation.",
+    "Android app-UID/device acceptance and actual syscall-handler timings are not covered."
+  ]
+}

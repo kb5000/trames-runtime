@@ -24,17 +24,18 @@ struct Node {
     page: Identity,
     generation: u64,
     block: Option<Block>,
-    memory: Option<Box<crate::memory_ops::Operation>>,
+    memory: Option<Box<MemoryOps>>,
     next: Option<Handle>,
 }
 impl Node {
     fn accepts(&self, pc: u64) -> bool {
         self.block.as_ref().is_some_and(|b| b.accepts(pc))
-            || (self.memory.is_some() && self.key.0.wrapping_add(4) == pc)
+            || (self.block.is_none() && self.memory.is_some() && self.key.0.wrapping_add(4) == pc)
     }
 }
 struct Block {
     code: Code,
+    has_memory: bool,
     instructions: u64,
     next_pc: u64,
     syscall: bool,
@@ -44,6 +45,39 @@ struct Block {
     context: bool,
     flow: Flow,
 }
+// Keep decoded memory ownership out of the hot Block/Node layout. The existing
+// optional pointer also owns legacy single-access embeddings without epochs.
+enum MemoryOps {
+    Single(crate::memory_ops::Operation),
+    // Generated literals require stable operation addresses across Vec growth.
+    #[allow(clippy::vec_box)]
+    Fused(Vec<Box<crate::memory_ops::Operation>>),
+}
+impl MemoryOps {
+    fn single(&self) -> Option<&crate::memory_ops::Operation> {
+        match self {
+            Self::Single(op) => Some(op),
+            Self::Fused(_) => None,
+        }
+    }
+    fn host_words(&self) -> u64 {
+        match self {
+            Self::Single(op) => op.host_words(),
+            Self::Fused(ops) => ops.iter().map(|op| op.host_words()).sum(),
+        }
+    }
+}
+struct Compiled {
+    block: Block,
+    memory: Option<Box<MemoryOps>>,
+}
+impl std::ops::Deref for Compiled {
+    type Target = Block;
+    fn deref(&self) -> &Block {
+        &self.block
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Flow {
     Fixed,
@@ -106,8 +140,85 @@ const _: () = {
     assert!(std::mem::offset_of!(Frame, nzcv) == 112);
 };
 
-pub(super) struct Cache {
+/// Extra state exists only for helper-bearing blocks. The original scalar/SVC
+/// frame, ABI and hot path stay unchanged. All pointers are entry-scoped; no data
+/// address or Memory/View borrow is retained in the compiled cache.
+#[repr(C)]
+struct MemoryFrame<M> {
+    frame: Frame,
+    helper: usize,
+    cpu: *mut Cpu,
+    memory: *mut M,
+    registers: *mut u64,
+    checked: Identity,
+    fault: Option<CpuFault>,
+    stats: crate::MemoryStats,
+}
+const _: () = {
+    assert!(std::mem::offset_of!(MemoryFrame<()>, helper) == 120);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, registers) == 144);
+};
+struct MemorySite {
+    adjust: usize,
+    stop: usize,
+    before: u64,
+}
+unsafe extern "C" fn memory_access<M: CpuMemory>(
+    pointer: *mut MemoryFrame<M>,
+    operation: *const crate::memory_ops::Operation,
+    remaining: u64,
+    blocks: u64,
+) -> u64 {
+    // SAFETY: generated entry receives this exact monomorphized frame/helper.
+    // CPU bindings have been flushed; both typed mutable borrows are exclusive
+    // until return, and the immutable boxed operation outlives native execution.
+    let (frame, op) = unsafe { (&mut *pointer, &*operation) };
+    let (cpu, memory) = unsafe { (&mut *frame.cpu, &mut *frame.memory) };
+    cpu.pc = op.pc();
+    cpu.sp = frame.frame.sp;
+    let result = op.execute(cpu, memory);
+    frame.frame.sp = cpu.sp;
+    let next = match result {
+        Ok(direct) => {
+            frame.stats.instructions += 1;
+            frame.stats.staged += u64::from(!direct);
+            if memory.instruction_identity() == frame.checked {
+                1
+            } else {
+                frame.frame.remaining = remaining - 1;
+                frame.frame.blocks = blocks + 1;
+                0
+            }
+        }
+        Err(error) => {
+            frame.fault = Some(error);
+            frame.frame.remaining = remaining;
+            frame.frame.blocks = blocks;
+            0
+        }
+    };
+    if next == 0 {
+        frame.frame.pc = cpu.pc;
+        frame.frame.last_slot = NO_SLOT;
+    }
+    // This mutable CPU reborrow can invalidate an older register sub-borrow.
+    // Re-derive it after the helper's last CPU observation; generated code reloads
+    // this pointer before touching any guest registers, including after a loop.
+    frame.registers = cpu.general_registers_mut().as_mut_ptr();
+    next
+}
+
+#[derive(Default)]
+struct Cold {
     index: BTreeMap<Key, usize>,
+    serial: u64,
+    victim: usize,
+    fault_progress: (u64, u64),
+    memory: crate::MemoryStats,
+    compilation: CompilationStats,
+}
+pub(super) struct Cache {
+    cold: Box<Cold>,
     nodes: Box<[Option<Node>; CACHE_LIMIT]>,
     // Addresses never move; only this worker writes cells, between native calls.
     links: Box<[usize; CACHE_LIMIT]>,
@@ -116,16 +227,12 @@ pub(super) struct Cache {
     active: Option<(Identity, u8)>,
     hot: Option<Handle>,
     last: Option<Handle>,
-    serial: u64,
-    victim: usize,
-    pub memory_stats: crate::MemoryStats,
-    pub stats: CompilationStats,
     pub links_stats: LinkStats,
 }
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            index: BTreeMap::new(),
+            cold: Box::default(),
             nodes: Box::new(std::array::from_fn(|_| None)),
             links: Box::new([0; CACHE_LIMIT]),
             tails: Box::new([0; CACHE_LIMIT]),
@@ -133,15 +240,20 @@ impl Default for Cache {
             active: None,
             hot: None,
             last: None,
-            serial: 0,
-            victim: 0,
-            memory_stats: crate::MemoryStats::default(),
-            stats: CompilationStats::default(),
             links_stats: LinkStats::default(),
         }
     }
 }
 impl Cache {
+    pub(super) fn memory_stats(&self) -> crate::MemoryStats {
+        self.cold.memory
+    }
+    pub(super) fn compilation_stats(&self) -> CompilationStats {
+        self.cold.compilation
+    }
+    pub(super) fn take_fault_progress(&mut self) -> (u64, u64) {
+        std::mem::take(&mut self.cold.fault_progress)
+    }
     fn node(&self, handle: Handle) -> Option<&Node> {
         self.nodes[handle.slot]
             .as_ref()
@@ -166,7 +278,7 @@ impl Cache {
     }
     fn remove(&mut self, slot: usize) {
         if let Some(node) = self.nodes[slot].take() {
-            self.index.remove(&node.key);
+            self.cold.index.remove(&node.key);
             if let Some(block) = &node.block {
                 let entry = block.entry();
                 let scalar = block.scalar_entry();
@@ -231,7 +343,7 @@ impl Cache {
             Some(handle.slot)
         } else {
             self.links_stats.lookups += 1;
-            self.index.get(&key).copied()
+            self.cold.index.get(&key).copied()
         };
         if let Some(slot) = slot {
             let node = self.nodes[slot].as_ref().expect("indexed code slot");
@@ -255,29 +367,33 @@ impl Cache {
                 .iter()
                 .position(Option::is_none)
                 .unwrap_or_else(|| {
-                    let slot = self.victim;
-                    self.victim = (self.victim + 1) % CACHE_LIMIT;
+                    let slot = self.cold.victim;
+                    self.cold.victim = (self.cold.victim + 1) % CACHE_LIMIT;
                     slot
                 })
         });
         self.remove(slot);
-        let block = compile(memory, pc, limit, slot, mode)?;
-        let memory_op = if block.is_none() {
-            crate::memory_ops::Operation::compile(memory, pc)?.map(Box::new)
+        let (block, memory_op) = if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
+            (Some(compiled.block), compiled.memory)
         } else {
-            None
+            (
+                None,
+                crate::memory_ops::Operation::compile(memory, pc)?
+                    .map(|op| Box::new(MemoryOps::Single(op))),
+            )
         };
         if let Some(op) = &memory_op {
-            self.stats.blocks += 1;
-            self.stats.host_words += op.host_words();
+            self.cold.compilation.blocks += u64::from(block.is_none());
+            self.cold.compilation.host_words += op.host_words();
         }
         if let Some(block) = &block {
-            self.stats.blocks += 1;
-            self.stats.host_words += block.traffic.host_words;
-            self.stats.register_loads += block.traffic.register_loads;
-            self.stats.register_stores += block.traffic.register_stores;
+            self.cold.compilation.blocks += 1;
+            self.cold.compilation.host_words += block.traffic.host_words;
+            self.cold.compilation.register_loads += block.traffic.register_loads;
+            self.cold.compilation.register_stores += block.traffic.register_stores;
         }
-        self.serial = self
+        self.cold.serial = self
+            .cold
             .serial
             .checked_add(1)
             .expect("worker code generation exhausted");
@@ -285,12 +401,12 @@ impl Cache {
             key,
             checked,
             page,
-            generation: self.serial,
+            generation: self.cold.serial,
             block,
             memory: memory_op,
             next: None,
         });
-        self.index.insert(key, slot);
+        self.cold.index.insert(key, slot);
         Ok(self.handle(slot))
     }
     fn connect(&mut self, source: Handle, target: Handle, checked: Identity) {
@@ -327,6 +443,14 @@ impl Cache {
             self.tails[source.slot] = 0;
             return;
         };
+        if from.has_memory || to.has_memory {
+            // Helper-bearing entries need a larger, typed frame. Their edges
+            // remain generation-checked metadata, never ordinary native jumps.
+            self.nodes[source.slot].as_mut().unwrap().next = Some(target);
+            self.links[source.slot] = 0;
+            self.tails[source.slot] = 0;
+            return;
+        }
         let entry = to.entry();
         let tail = if a.key.2 == 8
             && !from.syscall
@@ -344,12 +468,13 @@ impl Cache {
         self.link_pcs[source.slot] = self.nodes[target.slot].as_ref().unwrap().key.0;
         self.tails[source.slot] = tail;
     }
-    pub(super) fn execute(
+    #[inline(always)]
+    pub(super) fn syscall<M: CpuMemory>(
         &mut self,
         cpu: &mut Cpu,
-        memory: &mut impl CpuMemory,
+        memory: &M,
         budget: u64,
-    ) -> Result<Option<Executed>, CpuFault> {
+    ) -> Option<u64> {
         let pc = cpu.pc;
         // A terminal syscall block needs neither a native chain frame nor an
         // epoch guard beyond the existing one-block identity check. Keep its
@@ -372,14 +497,20 @@ impl Cache {
                     let instructions = block.instructions;
                     self.last = Some(handle);
                     self.links_stats.entries += 1;
-                    return Ok(Some(Executed {
-                        instructions,
-                        blocks: 1,
-                        syscall: true,
-                    }));
+                    return Some(instructions);
                 }
             }
         }
+        None
+    }
+    #[inline(always)]
+    pub(super) fn execute<M: CpuMemory>(
+        &mut self,
+        cpu: &mut Cpu,
+        memory: &mut M,
+        budget: u64,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let pc = cpu.pc;
         if let Some(handle) = self.hot {
             if let Some(node) = self.node(handle) {
                 if node.key.0 == pc && node.key.2 == 8 && self.tails[handle.slot] != 0 {
@@ -426,6 +557,18 @@ impl Cache {
                 }
             }
         }
+        self.execute_blocks(cpu, memory, budget)
+    }
+    // General lookup/compilation and the 120-byte chain frame are unnecessary
+    // for steady-state short syscall entries. Keep them beyond the fast entry.
+    #[inline(never)]
+    fn execute_blocks<M: CpuMemory>(
+        &mut self,
+        cpu: &mut Cpu,
+        memory: &mut M,
+        budget: u64,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let pc = cpu.pc;
         if let Some(target) = self
             .last
             .and_then(|h| self.node(h))
@@ -433,7 +576,9 @@ impl Cache {
             .filter(|h| {
                 self.node(*h).is_some_and(|n| {
                     n.key.0 == pc
-                        && n.memory.is_some()
+                        && n.memory
+                            .as_deref()
+                            .is_some_and(|ops| ops.single().is_some())
                         && n.checked == memory.instruction_identity()
                 })
             })
@@ -443,13 +588,18 @@ impl Cache {
         if let Some(op) = self
             .hot
             .and_then(|h| self.node(h))
-            .filter(|n| n.key.0 == pc && n.memory.is_some())
+            .filter(|n| {
+                n.key.0 == pc
+                    && n.memory
+                        .as_deref()
+                        .is_some_and(|ops| ops.single().is_some())
+            })
             .filter(|n| n.checked == memory.instruction_identity())
-            .and_then(|n| n.memory.as_ref())
+            .and_then(|n| n.memory.as_deref().and_then(MemoryOps::single))
         {
             let direct = op.execute(cpu, memory)?;
-            self.memory_stats.instructions += 1;
-            self.memory_stats.staged += u64::from(!direct);
+            self.cold.memory.instructions += 1;
+            self.cold.memory.staged += u64::from(!direct);
             self.last = self.hot;
             self.links_stats.entries += 1;
             return Ok(Some(Executed {
@@ -545,13 +695,16 @@ impl Cache {
         }
         self.hot = Some(handle);
         let Some(block) = self.node(handle).and_then(|n| n.block.as_ref()) else {
-            if let Some(op) = self.node(handle).and_then(|n| n.memory.as_ref()) {
+            if let Some(op) = self
+                .node(handle)
+                .and_then(|n| n.memory.as_deref().and_then(MemoryOps::single))
+            {
                 // Native epoch references are not used by this single checked
                 // access. The mutable borrow may invalidate executable bytes;
                 // return to the ordinary identity boundary before any next op.
                 let direct = op.execute(cpu, memory)?;
-                self.memory_stats.instructions += 1;
-                self.memory_stats.staged += u64::from(!direct);
+                self.cold.memory.instructions += 1;
+                self.cold.memory.staged += u64::from(!direct);
                 self.last = Some(handle);
                 self.links_stats.entries += 1;
                 return Ok(Some(Executed {
@@ -565,6 +718,9 @@ impl Cache {
         // SAFETY: slots/code remain owned and unchanged until this call returns.
         // Epoch references are borrowed from this live Memory/View. Native jumps
         // use only installed same-page entries, never a guest-provided pointer.
+        if block.has_memory {
+            return self.execute_memory_block(cpu, memory, budget, handle, frame);
+        }
         if block.syscall || self.links[handle.slot] == 0 {
             // Never pay chain-frame stores for an entry that cannot chain.
             unsafe {
@@ -607,6 +763,66 @@ impl Cache {
             instructions: budget - frame.remaining,
             blocks: frame.blocks,
             syscall: frame.syscall != 0,
+        }))
+    }
+    // Keep the larger typed helper frame out of scalar/SVC native entries.
+    #[inline(never)]
+    fn execute_memory_block<M: CpuMemory>(
+        &mut self,
+        cpu: &mut Cpu,
+        memory: &mut M,
+        budget: u64,
+        handle: Handle,
+        frame: Frame,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let checked = self.node(handle).unwrap().checked;
+        let block = self.node(handle).unwrap().block.as_ref().unwrap();
+        let cpu_pointer = cpu as *mut Cpu;
+        // Derive both reborrows from one raw parent, then suspend Rust CPU access
+        // until native return. Every helper publishes a fresh register sub-borrow.
+        let registers = unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() };
+        let block_length = block.instructions;
+        let mut fused = MemoryFrame {
+            frame,
+            helper: memory_access::<M> as *const () as usize,
+            cpu: cpu_pointer,
+            memory: memory as *mut _,
+            registers,
+            checked,
+            fault: None,
+            stats: crate::MemoryStats::default(),
+        };
+        // All Rust register references end before entry. The helper temporarily
+        // reborrows this same CPU/mm; no guest lease survives the callback.
+        unsafe { block.code.call_memory_block(registers, &mut fused) };
+        self.cold.memory.instructions += fused.stats.instructions;
+        self.cold.memory.staged += fused.stats.staged;
+        self.cold.memory.fused_entries += 1;
+        self.cold.memory.fused_blocks += fused.frame.blocks;
+        self.links_stats.entries += 1;
+        self.links_stats.linked_blocks += fused.frame.blocks.saturating_sub(1);
+        cpu.pc = fused.frame.pc;
+        cpu.sp = fused.frame.sp;
+        cpu.set_nzcv((fused.frame.nzcv >> 28) as u32);
+        if let Some(error) = fused.fault {
+            // Consumed only on the wrapper's fault path. The established scalar
+            // return ABI and hot counters acquire no memory-specific result tag.
+            let instructions = budget - fused.frame.remaining;
+            let blocks =
+                fused.frame.blocks + u64::from(instructions > fused.frame.blocks * block_length);
+            self.cold.fault_progress = (instructions, blocks);
+            return Err(error);
+        }
+        if fused.frame.last_slot < NO_SLOT {
+            self.last = Some(self.handle(fused.frame.last_slot as usize));
+        }
+        if fused.frame.blocks == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Executed {
+            instructions: budget - fused.frame.remaining,
+            blocks: fused.frame.blocks,
+            syscall: fused.frame.syscall != 0,
         }))
     }
 }
@@ -739,7 +955,7 @@ impl Assembler {
         self.flags_live = true;
         self.flags_dirty = true;
     }
-    fn finish(mut self) -> (Vec<u32>, CompilationStats, bool) {
+    fn flush(&mut self) {
         for slot in 0..self.bindings.len() {
             if let Some(binding) = self.bindings[slot] {
                 self.store(slot, binding);
@@ -751,6 +967,40 @@ impl Assembler {
             self.words.push(0xd53b420b); // mrs x11,nzcv
             store(&mut self.words, 11, 112);
         }
+        self.bindings.fill(None);
+        self.hosts.fill(u8::MAX);
+        self.flags_live = false;
+        self.flags_dirty = false;
+    }
+    fn memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
+        self.flush();
+        self.context = true;
+        // One AAPCS64 helper boundary. Caller-saved guest bindings were flushed;
+        // preserve only native entry context, budget/block counters and host LR.
+        self.words
+            .extend_from_slice(&[0xa9bd43e0, 0xa9013fee, 0xf90013fe]);
+        self.words.push(0xaa1003e0); // x0 = extended frame
+        constant(&mut self.words, 1, op as *const _ as usize as u64);
+        let adjust = self.words.len();
+        self.words.push(0x910001e2); // x2 = remaining budget at this instruction
+        self.words.push(0xaa0e03e3); // x3 = completed blocks
+        load(&mut self.words, 17, 16, 120);
+        self.words.push(0xd63f0220); // blr helper
+        self.words.extend_from_slice(&[
+            0xaa0003f1, // keep continuation decision across context restore
+            0xa9413fee, 0xf94013fe, 0xa8c343e0,
+        ]);
+        load(&mut self.words, 0, 16, 144); // refreshed CPU register reborrow
+        let stop = self.words.len();
+        self.words.push(0xb4000011); // cbz x17: precise fault/code-change exit
+        MemorySite {
+            adjust,
+            stop,
+            before,
+        }
+    }
+    fn finish(mut self) -> (Vec<u32>, CompilationStats, bool) {
+        self.flush();
         self.traffic.host_words = self.words.len() as u64;
         (self.words, self.traffic, self.context)
     }
@@ -789,12 +1039,12 @@ fn exit(words: &mut Vec<u32>, pc: u64, slot: u64, syscall: bool) {
 }
 fn render(
     body: &[u32],
-    start: u64,
-    next: u64,
+    (start, next): (u64, u64),
     slot: usize,
     count: u64,
     mask: u8,
     flow: Flow,
+    memory: &[MemorySite],
 ) -> Vec<u32> {
     let syscall = matches!(flow, Flow::Syscall);
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
@@ -819,6 +1069,7 @@ fn render(
     guards.push(words.len());
     words.push(0x54000003); // b.lo: no over-retirement
     words.push(0xd1000000 | ((count as u32) << 10) | (15 << 5) | 15);
+    let body_start = words.len();
     words.extend_from_slice(body);
     if dynamic {
         store(&mut words, 17, 16);
@@ -828,6 +1079,25 @@ fn render(
     if !syscall {
         done.push(words.len());
         words.push(0xb400000f); // cbz budget
+        if !memory.is_empty() {
+            // Loop back through the existing budget/epoch guards. This keeps a
+            // general same-block loop inside one native entry; each memory
+            // instruction still takes its own scoped borrow and code check.
+            match flow {
+                Flow::Choice(taken) if taken == start => {
+                    constant(&mut words, 11, start);
+                    words.push(0xeb0b023f); // cmp selected PC, loop start
+                    let at = words.len();
+                    words.push(0x54000000); // b.eq guarded chain entry
+                    branch(&mut words, at, CHAIN_ENTRY / 4);
+                }
+                Flow::Fixed if next == start => {
+                    let offset = (CHAIN_ENTRY as i64 / 4 - words.len() as i64) as u32;
+                    words.push(0x14000000 | (offset & 0x3ffffff));
+                }
+                _ => {}
+            }
+        }
         if dynamic {
             load(&mut words, 11, 16, 96);
             load(&mut words, 11, 11, slot as u32 * 8);
@@ -859,6 +1129,13 @@ fn render(
     }
     for at in guards {
         branch(&mut words, at, failed);
+    }
+    if !memory.is_empty() {
+        let stopped = words.len();
+        words.push(0xd65f03c0); // helper already published precise exit state
+        for site in memory {
+            branch(&mut words, body_start + site.stop, stopped);
+        }
     }
     words
 }
@@ -906,7 +1183,7 @@ fn compile(
     limit: u64,
     slot: usize,
     mode: u8,
-) -> Result<Option<Block>, CpuFault> {
+) -> Result<Option<Compiled>, CpuFault> {
     compile_with_features(
         memory,
         start,
@@ -923,8 +1200,10 @@ fn compile_with_features(
     slot: usize,
     mode: u8,
     host: trames_execution::Features,
-) -> Result<Option<Block>, CpuFault> {
+) -> Result<Option<Compiled>, CpuFault> {
     let mut code = Assembler::new();
+    let mut memory_ops = Vec::new();
+    let mut memory_sites = Vec::new();
     let mut count = 0;
     let mut next = start;
     let mut syscall = false;
@@ -1216,6 +1495,13 @@ fn compile_with_features(
             select_pc(&mut code, word & !0xffffe0, next, taken);
             flow = Flow::Choice(taken);
             terminal = true;
+        } else if mode & 8 != 0 {
+            let Some(op) = crate::memory_ops::Operation::compile(memory, pc)? else {
+                break;
+            };
+            let op = Box::new(op);
+            memory_sites.push(code.memory(&op, count));
+            memory_ops.push(op);
         } else {
             break;
         }
@@ -1229,35 +1515,55 @@ fn compile_with_features(
         return Ok(None);
     }
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
-    let (body, mut traffic, context) = code.finish();
-    let mut words = render(&body, start, next, slot, count, mode & 7, flow);
-    let fast_offset = words.len() * 4;
-    words.push(0xd50324df);
-    if context {
-        words.push(0xaa0103f0);
-    } // ctx=x1; ordinary C scalar entry
-    words.extend_from_slice(&body);
-    if dynamic {
-        store(&mut words, 17, 16);
+    for site in &memory_sites {
+        code.words[site.adjust] |= ((count - site.before) as u32) << 10;
     }
-    words.push(0xd65f03c0);
-    let tail_offset = words.len() * 4;
-    words.extend_from_slice(&[0xd503245f, 0xaa0103f0]);
-    words.extend_from_slice(&body);
-    load(&mut words, 17, 16, slot as u32 * 8);
-    words.push(0xd61f0220);
-    traffic.host_words = words.len() as u64;
-    Ok(Some(Block {
-        code: Code::publish(&words)
-            .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
-        instructions: count,
-        next_pc: next,
-        syscall,
-        traffic,
-        fast_offset,
-        tail_offset,
-        context,
+    let (body, mut traffic, context) = code.finish();
+    let mut words = render(
+        &body,
+        (start, next),
+        slot,
+        count,
+        mode & 7,
         flow,
+        &memory_sites,
+    );
+    let fast_offset = words.len() * 4;
+    let tail_offset;
+    if memory_sites.is_empty() {
+        words.push(0xd50324df);
+        if context {
+            words.push(0xaa0103f0);
+        } // ctx=x1; ordinary C scalar entry
+        words.extend_from_slice(&body);
+        if dynamic {
+            store(&mut words, 17, 16);
+        }
+        words.push(0xd65f03c0);
+        tail_offset = words.len() * 4;
+        words.extend_from_slice(&[0xd503245f, 0xaa0103f0]);
+        words.extend_from_slice(&body);
+        load(&mut words, 17, 16, slot as u32 * 8);
+        words.push(0xd61f0220);
+    } else {
+        tail_offset = 0;
+    }
+    traffic.host_words = words.len() as u64;
+    Ok(Some(Compiled {
+        memory: (!memory_ops.is_empty()).then(|| Box::new(MemoryOps::Fused(memory_ops))),
+        block: Block {
+            code: Code::publish(&words)
+                .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
+            has_memory: !memory_sites.is_empty(),
+            instructions: count,
+            next_pc: next,
+            syscall,
+            traffic,
+            fast_offset,
+            tail_offset,
+            context,
+            flow,
+        },
     }))
 }
 
@@ -1305,6 +1611,15 @@ impl Code {
             }
         }
         Ok(mapping)
+    }
+    unsafe fn call_memory_block<M: CpuMemory>(
+        &self,
+        registers: *mut u64,
+        frame: *mut MemoryFrame<M>,
+    ) {
+        let function: unsafe extern "C" fn(*mut u64, *mut MemoryFrame<M>) =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(registers, frame) };
     }
     pub(super) unsafe fn call_memory(&self, pointer: *mut u8, value: u64) -> u64 {
         // SAFETY: the decoder selects a single baseline LDR/STR with exactly
@@ -1498,7 +1813,15 @@ mod tests {
         let source = cache.hot.unwrap();
         cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
         let target = cache.hot.unwrap();
-        assert!(cache.node(target).unwrap().memory.is_some());
+        assert!(
+            cache
+                .node(target)
+                .unwrap()
+                .block
+                .as_ref()
+                .unwrap()
+                .has_memory
+        );
         assert_eq!(cache.node(source).unwrap().next, Some(target));
         assert_eq!(cache.links[source.slot], 0); // The fragment uses a different ABI.
         cache.remove(target.slot);
