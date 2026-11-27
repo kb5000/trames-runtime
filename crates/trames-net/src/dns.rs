@@ -280,7 +280,13 @@ pub(crate) fn answer(q: &[u8], addresses: &[IpAddr], code: u8, limit: usize) -> 
                 out.extend_from_slice(&[0xc0, 0x0c]);
                 out.extend_from_slice(&q.kind.to_be_bytes());
                 out.extend_from_slice(&1u16.to_be_bytes());
-                out.extend_from_slice(&30u32.to_be_bytes());
+                // Local names follow live endpoint leases, including immediate name reuse.
+                let ttl = if q.name.ends_with(".trames") {
+                    0u32
+                } else {
+                    30
+                };
+                out.extend_from_slice(&ttl.to_be_bytes());
                 out.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 out.extend_from_slice(&data);
                 count += 1;

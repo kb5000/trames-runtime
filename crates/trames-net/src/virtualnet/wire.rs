@@ -285,6 +285,7 @@ impl Inbound {
     }
 }
 pub(super) struct Wire {
+    _discovery: super::discovery::Discovery,
     listener: Arc<UnixListener>,
     accept: Interest,
     pub wait: Arc<WireWait>,
@@ -295,9 +296,14 @@ pub(super) struct Wire {
     outgoing: BTreeMap<u8, Outbound>,
 }
 impl Wire {
+    #[cfg(test)]
     pub fn bind(path: PathBuf, id: u8, nat: bool) -> io::Result<Self> {
+        Self::bind_named(path, id, nat, None)
+    }
+    pub fn bind_named(path: PathBuf, id: u8, nat: bool, name: Option<&str>) -> io::Result<Self> {
         let listener = Arc::new(UnixListener::bind(&path)?);
         let result = (|| {
+            let discovery = super::discovery::Discovery::bind(path.parent().unwrap(), id, name)?;
             listener.set_nonblocking(true)?;
             let wait = WireWait::new()?;
             let accept = wait.subscribe(
@@ -305,6 +311,7 @@ impl Wire {
                 false,
             )?;
             Ok(Self {
+                _discovery: discovery,
                 listener,
                 accept,
                 wait,
@@ -439,7 +446,7 @@ mod tests {
         assert!(a.outgoing[&3].queue.is_empty());
         assert!(!a.runnable());
         drop((a, b));
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn malformed_peer_frame_is_rejected_without_allocating_its_claimed_length() {
@@ -455,6 +462,6 @@ mod tests {
         assert!(b.incoming.is_empty());
         assert!(!b.runnable());
         drop((client, b));
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

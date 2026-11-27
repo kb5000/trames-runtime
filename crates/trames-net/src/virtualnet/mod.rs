@@ -5,6 +5,7 @@ use crate::shared_state::FabricState;
 use crate::shared_state::{Cell, State as SharedState};
 use crate::socket_quota::{Quota, Reservation};
 use std::ops::Deref;
+mod discovery;
 mod ethernet;
 mod multicast;
 mod wire;
@@ -685,6 +686,16 @@ impl Fabric {
     /// Attach a host-authorized private Trames network. The product owns its
     /// directory/lease; bind is exclusive and never replaces a live endpoint.
     pub fn attach(&self, directory: &std::path::Path, id: u8, nat: bool) -> Result<()> {
+        self.attach_named(directory, id, nat, None)
+    }
+    /// Host-owned DNS identity. Leases belong to the endpoint, including crash cleanup.
+    pub fn attach_named(
+        &self,
+        directory: &std::path::Path,
+        id: u8,
+        nat: bool,
+        name: Option<&str>,
+    ) -> Result<()> {
         if !(2..=254).contains(&id) {
             return Err(NetError(22));
         }
@@ -694,9 +705,10 @@ impl Fabric {
         }
         let path = directory.join(format!("p{id}"));
         inner.external = Some(
-            wire::Wire::bind(path, id, nat)
+            wire::Wire::bind_named(path, id, nat, name)
                 .map_err(|e| NetError(e.raw_os_error().unwrap_or(5) as u32))?,
         );
+        inner.gateway.discovery = Some(directory.to_owned());
         Ok(())
     }
     pub(crate) fn bind_driver(&self, changed: &Arc<trames_shared::Readiness>) {

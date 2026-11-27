@@ -66,6 +66,7 @@ struct Published {
     peers: BTreeMap<SocketAddr, SocketHandle>,
 }
 pub(super) struct Gateway {
+    pub discovery: Option<std::path::PathBuf>,
     pub node: Box<Node>,
     published: Vec<Published>,
     next_port: u16,
@@ -107,6 +108,7 @@ impl Gateway {
             }
         }
         Ok(Self {
+            discovery: None,
             published: Vec::new(),
             next_port: 40000,
             node,
@@ -889,13 +891,25 @@ impl Gateway {
             .and_then(|n| n.strip_suffix(".trames"))
             .and_then(|n| n.parse::<u8>().ok())
         {
-            Some(if nodes.values().any(|n| n.id == id) {
-                vec![v4(id).into(), v6(id).into()]
-            } else {
-                Vec::new()
-            })
+            Some(
+                if nodes.values().any(|n| n.id == id)
+                    || self
+                        .discovery
+                        .as_ref()
+                        .is_some_and(|dir| super::discovery::resolve(dir, &q.name) == Some(id))
+                {
+                    vec![v4(id).into(), v6(id).into()]
+                } else {
+                    Vec::new()
+                },
+            )
         } else if q.name.ends_with(".trames") {
-            Some(Vec::new())
+            Some(
+                self.discovery
+                    .as_ref()
+                    .and_then(|dir| super::discovery::resolve(dir, &q.name))
+                    .map_or_else(Vec::new, |id| vec![v4(id).into(), v6(id).into()]),
+            )
         } else {
             None
         };

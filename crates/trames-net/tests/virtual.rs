@@ -568,3 +568,81 @@ fn tcp_gateway_preserves_urgent_data_in_both_directions() {
     assert_eq!(until(&client, || client.recv(16, 0)).data, b".");
     host.join().unwrap();
 }
+
+#[test]
+fn named_dns_tracks_remote_endpoint_leases_over_udp_tcp_and_both_address_families() {
+    let dir = std::env::temp_dir().join(format!("trames-named-dns-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let f = Fabric::new().unwrap();
+    f.attach_named(&dir, 2, false, Some("web")).unwrap();
+    let n = net(&f, 2);
+    let peer = Fabric::new().unwrap();
+    peer.attach_named(&dir, 3, false, Some("DB")).unwrap();
+    let query = |name: &str, kind: u16| {
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&kind.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q
+    };
+    let stream = socket(&n, false, true);
+    connect(&stream, parse("169.254.0.53:53"));
+    let resolve = |name: &str, kind, tcp| {
+        let c = if tcp {
+            stream.clone()
+        } else {
+            socket(&n, false, false)
+        };
+        if !tcp {
+            c.connect(parse("169.254.0.53:53")).unwrap();
+        }
+        let q = query(name, kind);
+        let data = if tcp {
+            [&(q.len() as u16).to_be_bytes()[..], &q].concat()
+        } else {
+            q.clone()
+        };
+        c.send(&data, 0, None).unwrap();
+        let mut answer = until(&c, || c.recv(512, 0)).data;
+        if tcp {
+            answer.drain(..2);
+        }
+        (q, answer)
+    };
+    for tcp in [false, true] {
+        for name in ["db.trames", "DB.trames", "db.env.trames", "env3.trames"] {
+            for kind in [1, 28] {
+                let (q, answer) = resolve(name, kind, tcp);
+                assert_eq!(answer[3] & 15, 0);
+                assert_eq!(
+                    &answer[q.len() + 6..q.len() + 10],
+                    &[0; 4],
+                    "local TTL must not cache old names"
+                );
+                if kind == 1 {
+                    assert!(answer.ends_with(&[10, 0, 0, 3]));
+                } else {
+                    assert!(answer.ends_with(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]));
+                }
+            }
+        }
+        assert_eq!(resolve("absent.trames", 1, tcp).1[3] & 15, 3);
+    }
+    drop(peer);
+    assert_eq!(resolve("db.trames", 1, false).1[3] & 15, 3);
+    assert_eq!(resolve("env3.trames", 1, true).1[3] & 15, 3);
+    let replacement = Fabric::new().unwrap();
+    replacement
+        .attach_named(&dir, 3, false, Some("renamed"))
+        .unwrap();
+    assert_eq!(resolve("db.trames", 1, false).1[3] & 15, 3);
+    assert!(resolve("renamed.trames", 1, false)
+        .1
+        .ends_with(&[10, 0, 0, 3]));
+    drop((replacement, stream, n, f));
+    std::fs::remove_dir_all(dir).unwrap();
+}

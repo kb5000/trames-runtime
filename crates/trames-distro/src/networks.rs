@@ -153,6 +153,7 @@ impl Networks {
             "--network-nat".into(),
             b.nat.to_string(),
         ];
+        args.extend(["--network-name".into(), c.environment.name.clone()]);
         for p in &c.network.publish {
             args.extend([
                 "--publish".into(),
@@ -243,7 +244,9 @@ mod tests {
         assert_eq!(first[5], "false");
         c.environment.name = "renamed".into();
         r.register(&dir, &c, true).unwrap();
-        assert_eq!(nets.arguments(&c, &Grant::allowed()).unwrap(), first);
+        let renamed = nets.arguments(&c, &Grant::allowed()).unwrap();
+        assert_eq!(&renamed[..6], &first[..6]);
+        assert_eq!(&renamed[6..], &["--network-name", "renamed"]);
         c.network.publish.push(model::Publish {
             protocol: "tcp".into(),
             host: "127.0.0.1:38080".parse().unwrap(),
