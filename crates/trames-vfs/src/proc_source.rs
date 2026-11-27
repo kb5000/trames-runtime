@@ -792,7 +792,9 @@ impl Default for ProcessView {
     }
 }
 impl ProcessView {
-    pub fn bind_pressure(&self,pressure:Arc<trames_memory::PressureTask>) {self.pressure.get_or_init(||pressure);}
+    pub fn bind_pressure(&self, pressure: Arc<trames_memory::PressureTask>) {
+        self.pressure.get_or_init(|| pressure);
+    }
 
     /// The counting resource retains neither the process image nor its Files.
     pub fn perf_clock(&self) -> crate::perf::Clock {
@@ -806,7 +808,9 @@ impl ProcessView {
         clock
     }
     pub fn retire_perf(&self) {
-        if let Some(pressure)=self.pressure.get(){pressure.retire();}
+        if let Some(pressure) = self.pressure.get() {
+            pressure.retire();
+        }
         *self.perf_retired.lock() = true;
         if let Some(clock) = self.perf.get() {
             clock.retire();
@@ -867,7 +871,9 @@ impl ProcessView {
         }
     }
     pub fn dispatched(&self, cpu: usize) {
-        if let Some(pressure)=self.pressure.get(){pressure.dispatched(cpu);}
+        if let Some(pressure) = self.pressure.get() {
+            pressure.dispatched(cpu);
+        }
         self.cpu.store(cpu as u32, Ordering::Relaxed);
         self.waiting(false);
         if let Some(counters) = self.counters.get() {
@@ -885,7 +891,9 @@ impl ProcessView {
         self.time.publish(elapsed);
     }
     pub fn waiting(&self, waiting: bool) {
-        if let Some(pressure)=self.pressure.get(){pressure.runnable(!waiting);}
+        if let Some(pressure) = self.pressure.get() {
+            pressure.runnable(!waiting);
+        }
         self.state
             .store(if waiting { b'S' } else { b'R' } as u32, Ordering::Relaxed);
     }

@@ -14,35 +14,86 @@ fn userfault_control_retains_original_mm_from_a_foreign_caller_without_async_pag
     original.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
     original.memory_report().bind_read_waker(Arc::new(|_| {}));
     let file = original.userfaultfd(false);
-    let fd = vfs.descriptor_factory().userfaultfd(file.clone(), trames_vfs::O_NONBLOCK).unwrap();
-    assert!(vfs.fd_flags_snapshot().descriptor_control(fd).unwrap().shared_file().userfault_file().is_some());
+    let fd = vfs
+        .descriptor_factory()
+        .userfaultfd(file.clone(), trames_vfs::O_NONBLOCK)
+        .unwrap();
+    assert!(vfs
+        .fd_flags_snapshot()
+        .descriptor_control(fd)
+        .unwrap()
+        .shared_file()
+        .userfault_file()
+        .is_some());
     let source = source(&vfs);
     let mut foreign = Memory::default();
     foreign.map(0x1000, PAGE_SIZE * 3, Permissions::RW).unwrap();
     assert!(!foreign.async_faults_possible());
-    foreign.write_array(0x1000, [0xaa,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0]).unwrap();
-    assert_eq!(source.invoke(29,args(fd,0xc018aa3f,0x1000),&mut foreign),Some(Ok(0)));
+    foreign
+        .write_array(
+            0x1000,
+            [
+                0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        source.invoke(29, args(fd, 0xc018aa3f, 0x1000), &mut foreign),
+        Some(Ok(0))
+    );
     assert!(file.initialized());
-    let mut register = [0;32];
+    let mut register = [0; 32];
     register[0..8].copy_from_slice(&0x10000u64.to_le_bytes());
     register[8..16].copy_from_slice(&PAGE_SIZE.to_le_bytes());
     register[16..24].copy_from_slice(&1u64.to_le_bytes());
-    foreign.write(0x1000,&register).unwrap();
+    foreign.write(0x1000, &register).unwrap();
     let wake: Arc<dyn IoWake> = Arc::new(Wake);
     let target = Arc::downgrade(&wake);
-    let wait = blocked(source.start(29,args(fd,0xc020aa00,0x1000),&mut foreign,7,&target,None).unwrap());
+    let wait = blocked(
+        source
+            .start(
+                29,
+                args(fd, 0xc020aa00, 0x1000),
+                &mut foreign,
+                7,
+                &target,
+                None,
+            )
+            .unwrap(),
+    );
     assert!(original.activate_proc_reads());
-    assert!(matches!(source.resume(wait,&mut foreign),IoAttempt::Complete(Ok(0))));
-    let MemoryError::Pending(fault) = original.read_array::<1>(0x10000).unwrap_err() else { panic!("registered original mm must fault") };
-    foreign.write(0x2000,&[42;PAGE_SIZE as usize]).unwrap();
-    let mut copy = [0;40];
-    for (i,value) in [0x10000u64,0x2000,PAGE_SIZE,0,0].iter().enumerate() {copy[i*8..i*8+8].copy_from_slice(&value.to_le_bytes());}
-    foreign.write(0x1000,&copy).unwrap();
-    let wait = blocked(source.start(29,args(fd,0xc028aa03,0x1000),&mut foreign,7,&target,None).unwrap());
+    assert!(matches!(
+        source.resume(wait, &mut foreign),
+        IoAttempt::Complete(Ok(0))
+    ));
+    let MemoryError::Pending(fault) = original.read_array::<1>(0x10000).unwrap_err() else {
+        panic!("registered original mm must fault")
+    };
+    foreign.write(0x2000, &[42; PAGE_SIZE as usize]).unwrap();
+    let mut copy = [0; 40];
+    for (i, value) in [0x10000u64, 0x2000, PAGE_SIZE, 0, 0].iter().enumerate() {
+        copy[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    foreign.write(0x1000, &copy).unwrap();
+    let wait = blocked(
+        source
+            .start(
+                29,
+                args(fd, 0xc028aa03, 0x1000),
+                &mut foreign,
+                7,
+                &target,
+                None,
+            )
+            .unwrap(),
+    );
     assert!(original.activate_proc_reads());
-    assert!(matches!(source.resume(wait,&mut foreign),IoAttempt::Complete(Ok(0))));
+    assert!(matches!(
+        source.resume(wait, &mut foreign),
+        IoAttempt::Complete(Ok(0))
+    ));
     assert!(fault.wait.ready());
-    assert_eq!(original.read_array::<1>(0x10000).unwrap(),[42]);
+    assert_eq!(original.read_array::<1>(0x10000).unwrap(), [42]);
 }
 
 #[test]
@@ -65,18 +116,37 @@ fn userfault_copy_keeps_imported_bytes_across_original_budget_pressure_and_fd_re
     file.initialize().unwrap();
     let register = file.register(destination, PAGE_SIZE).unwrap();
     assert!(original.activate_proc_reads());
-    assert_eq!(register.result(), Some(Ok((1u64 << 2 | 1 << 3 | 1 << 4).to_le_bytes().to_vec())));
+    assert_eq!(
+        register.result(),
+        Some(Ok((1u64 << 2 | 1 << 3 | 1 << 4).to_le_bytes().to_vec()))
+    );
     let fd = vfs.descriptor_factory().userfaultfd(file, 0).unwrap();
     let source = source(&vfs);
     let mut foreign = Memory::default();
     foreign.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
     foreign.write(0x2000, &[42; PAGE_SIZE as usize]).unwrap();
-    for (i, value) in [destination, 0x2000, PAGE_SIZE, 0, 0].into_iter().enumerate() {
-        foreign.write(0x1000 + i as u64 * 8, &value.to_le_bytes()).unwrap();
+    for (i, value) in [destination, 0x2000, PAGE_SIZE, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
+        foreign
+            .write(0x1000 + i as u64 * 8, &value.to_le_bytes())
+            .unwrap();
     }
     let wake: Arc<dyn IoWake> = Arc::new(Wake);
     let target = Arc::downgrade(&wake);
-    let wait = blocked(source.start(29, args(fd, 0xc028aa03, 0x1000), &mut foreign, 7, &target, None).unwrap());
+    let wait = blocked(
+        source
+            .start(
+                29,
+                args(fd, 0xc028aa03, 0x1000),
+                &mut foreign,
+                7,
+                &target,
+                None,
+            )
+            .unwrap(),
+    );
     let before = original.resident_bytes();
     assert!(original.activate_proc_reads());
     let wait = blocked(source.resume(wait, &mut foreign));
@@ -87,9 +157,15 @@ fn userfault_copy_keeps_imported_bytes_across_original_budget_pressure_and_fd_re
     original.unmap(0x10000, 16 * PAGE_SIZE).unwrap();
     let wait = blocked(source.resume(wait, &mut foreign));
     assert!(original.activate_proc_reads());
-    assert!(matches!(source.resume(wait, &mut foreign), IoAttempt::Complete(Ok(0))));
+    assert!(matches!(
+        source.resume(wait, &mut foreign),
+        IoAttempt::Complete(Ok(0))
+    ));
     assert_eq!(original.read_array::<1>(destination).unwrap(), [42]);
-    assert_eq!(foreign.read_array::<8>(0x1020).unwrap(), PAGE_SIZE.to_le_bytes());
+    assert_eq!(
+        foreign.read_array::<8>(0x1020).unwrap(),
+        PAGE_SIZE.to_le_bytes()
+    );
 }
 
 #[test]
@@ -97,20 +173,42 @@ fn concurrent_userfault_api_negotiation_clears_the_losing_response_after_copyout
     let vfs = Vfs::default();
     let mut original = Memory::default();
     let file = original.userfaultfd(false);
-    let fd = vfs.descriptor_factory().userfaultfd(file.clone(), trames_vfs::O_NONBLOCK).unwrap();
+    let fd = vfs
+        .descriptor_factory()
+        .userfaultfd(file.clone(), trames_vfs::O_NONBLOCK)
+        .unwrap();
     let source = source(&vfs);
-    let mut first = Gate::new(false,true);
-    let mut second = Gate::new(false,false);
-    let mut api = [0;24];api[0]=0xaa;
-    first.memory.write(0x3000,&api).unwrap();
-    second.memory.write(0x3000,&api).unwrap();
-    let wake: Arc<dyn IoWake> = Arc::new(Wake);let target=Arc::downgrade(&wake);
-    let pending = blocked(source.start(29,args(fd,0xc018aa3f,0x3000),&mut first,7,&target,None).unwrap());
+    let mut first = Gate::new(false, true);
+    let mut second = Gate::new(false, false);
+    let mut api = [0; 24];
+    api[0] = 0xaa;
+    first.memory.write(0x3000, &api).unwrap();
+    second.memory.write(0x3000, &api).unwrap();
+    let wake: Arc<dyn IoWake> = Arc::new(Wake);
+    let target = Arc::downgrade(&wake);
+    let pending = blocked(
+        source
+            .start(
+                29,
+                args(fd, 0xc018aa3f, 0x3000),
+                &mut first,
+                7,
+                &target,
+                None,
+            )
+            .unwrap(),
+    );
     assert!(!file.initialized());
-    assert_eq!(source.invoke(29,args(fd,0xc018aa3f,0x3000),&mut second),Some(Ok(0)));
+    assert_eq!(
+        source.invoke(29, args(fd, 0xc018aa3f, 0x3000), &mut second),
+        Some(Ok(0))
+    );
     first.write_wait.finish();
-    assert!(matches!(source.resume(pending,&mut first),IoAttempt::Complete(Err(Errno(22)))));
-    assert_eq!(first.memory.read_array::<24>(0x3000).unwrap(),[0;24]);
+    assert!(matches!(
+        source.resume(pending, &mut first),
+        IoAttempt::Complete(Err(Errno(22)))
+    ));
+    assert_eq!(first.memory.read_array::<24>(0x3000).unwrap(), [0; 24]);
     assert!(file.initialized());
 }
 

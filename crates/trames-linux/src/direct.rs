@@ -701,10 +701,16 @@ impl DirectSyscalls {
         Some(result)
     }
     fn userfault_ioctl(&self, args: [u64; 6]) -> bool {
-        self.resources.as_ref().and_then(|factory| factory.descriptor_control(args[0] as u32).ok())
+        self.resources
+            .as_ref()
+            .and_then(|factory| factory.descriptor_control(args[0] as u32).ok())
             .is_some_and(|control| control.shared_file().userfault_file().is_some())
-            || self.paths.as_ref().is_some_and(|paths| paths.control_factory().descriptor_control(args[0] as u32)
-                .is_ok_and(|control| control.shared_file().userfault_file().is_some()))
+            || self.paths.as_ref().is_some_and(|paths| {
+                paths
+                    .control_factory()
+                    .descriptor_control(args[0] as u32)
+                    .is_ok_and(|control| control.shared_file().userfault_file().is_some())
+            })
     }
     pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
         number == 29

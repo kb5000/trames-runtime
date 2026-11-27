@@ -1130,7 +1130,10 @@ impl View {
 impl CpuMemory for View {
     #[inline]
     fn userfaults_active(&self) -> bool {
-        self.snapshot.userfaults.as_ref().is_some_and(|faults| faults.active())
+        self.snapshot
+            .userfaults
+            .as_ref()
+            .is_some_and(|faults| faults.active())
     }
     fn mapped_at_or_after(&self, address: u64) -> bool {
         let address = address & 0x00ff_ffff_ffff_ffff;
@@ -1146,7 +1149,9 @@ impl CpuMemory for View {
             || self.snapshot.anonymous.mapped_at_or_after(address)
     }
     fn async_faults_possible(&self) -> bool {
-        self.snapshot.async_sources || self.snapshot.account.pressure_possible() || crate::CgroupMemoryTarget::active()
+        self.snapshot.async_sources
+            || self.snapshot.account.pressure_possible()
+            || crate::CgroupMemoryTarget::active()
     }
     fn numa_mode_at(&self, address: u64) -> u32 {
         self.nodes.at(address)

@@ -31,8 +31,8 @@ pub use parallel::page::MutablePage as SharedPage;
 mod pinned;
 pub use pinned::{PinnedBuffer, ReadBuffer};
 mod mm_control;
-mod process_release;
 pub mod pressure;
+mod process_release;
 pub use pressure::{MemoryPressure, PressureMemory, PressureSource, PressureTask};
 pub mod userfault;
 pub use mm_control::{ControlError, MmControl};
@@ -877,7 +877,8 @@ impl Memory {
         {
             self.check_userfault(address, access)?;
             if self.userfaults.is_some() {
-                self.translations[Translation::slot(address & !(PAGE_SIZE - 1))].set(Translation::EMPTY);
+                self.translations[Translation::slot(address & !(PAGE_SIZE - 1))]
+                    .set(Translation::EMPTY);
             }
         }
         let entry = self

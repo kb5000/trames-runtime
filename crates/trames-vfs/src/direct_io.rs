@@ -1409,7 +1409,9 @@ impl DirectFd {
         }
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
-        if let ByteResource::Pressure(file) = &self.resource { return file.poll(events); }
+        if let ByteResource::Pressure(file) = &self.resource {
+            return file.poll(events);
+        }
         if let ByteResource::Perf(event) = &self.resource {
             return event.poll(events);
         }
@@ -1539,7 +1541,9 @@ impl DirectFd {
         }
     }
     pub(super) fn acknowledge(&self, epoch: [u64; 2]) {
-        if let ByteResource::Pressure(file) = &self.resource { file.acknowledge(epoch); }
+        if let ByteResource::Pressure(file) = &self.resource {
+            file.acknowledge(epoch);
+        }
         if let ByteResource::ProcWatch(watch) = &self.resource {
             watch.acknowledge(epoch[0]);
         }
@@ -1588,7 +1592,10 @@ impl DirectFd {
             self.check_read_access()?;
             return Ok(q.status(offset, count));
         }
-        if let ByteResource::Pressure(file) = &self.resource { self.check_read_access()?; return Ok(file.read(offset,count)); }
+        if let ByteResource::Pressure(file) = &self.resource {
+            self.check_read_access()?;
+            return Ok(file.read(offset, count));
+        }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             self.check_read_access()?;
             return file.cgroup_read(caller, offset, count)?.ok_or(Errno(19));
@@ -1619,7 +1626,12 @@ impl DirectFd {
         if let ByteResource::MessageQueue(_) = &self.resource {
             return Err(Errno(if !fd_can_write(self.flags) { 9 } else { 22 }));
         }
-        if let ByteResource::Pressure(file) = &self.resource { if !fd_can_write(self.flags) {return Err(Errno(9));}return file.write(bytes); }
+        if let ByteResource::Pressure(file) = &self.resource {
+            if !fd_can_write(self.flags) {
+                return Err(Errno(9));
+            }
+            return file.write(bytes);
+        }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             if !fd_can_write(self.flags) {
                 return Err(Errno(9));
@@ -1670,7 +1682,9 @@ impl DirectFd {
             ByteResource::Userfault(_) => Ok(0),
             ByteResource::Kmsg(log) => log.seek(offset, whence),
             ByteResource::SimpleDevice(_) | ByteResource::Device(_) => Ok(0),
-            ByteResource::Pressure(_) | ByteResource::Cgroup(..) | ByteResource::MessageQueue(_) => {
+            ByteResource::Pressure(_)
+            | ByteResource::Cgroup(..)
+            | ByteResource::MessageQueue(_) => {
                 let mut position = self
                     ._file
                     .as_ref()
@@ -1707,9 +1721,7 @@ impl DirectFd {
     pub fn readv_records(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::Event(_)
-                | ByteResource::Inotify(_)
-                | ByteResource::Perf(_)
+            ByteResource::Event(_) | ByteResource::Inotify(_) | ByteResource::Perf(_)
         )
     }
     pub fn nonblocking(&self) -> bool {
@@ -1762,8 +1774,10 @@ impl DirectFd {
         Some(match &self.resource {
             ByteResource::Console(console) => console.read(count),
             ByteResource::Pressure(file) => {
-                let mut position=self._file.as_ref()?.open.file_position.lock().unwrap();
-                let bytes=file.read(position.value,count);position.value+=bytes.len() as u64;Ok(bytes)
+                let mut position = self._file.as_ref()?.open.file_position.lock().unwrap();
+                let bytes = file.read(position.value, count);
+                position.value += bytes.len() as u64;
+                Ok(bytes)
             }
             ByteResource::Cgroup(file, Some(caller)) => {
                 let mut position = self

@@ -5189,11 +5189,22 @@ pub(super) fn run<C: Cpu>(
     runtime
         .memory
         .set_total_limit(runtime.memory_limits.total)?;
-    let pressure_host: Option<trames_memory::PressureSource> = runtime.memory_limits.is_host_managed().then(|| {
-        let source = host_memory_source.as_ref().expect("validated host memory source").clone();
-        Arc::new(move || {let info=source();trames_memory::PressureMemory {total:info.total,free:info.free,available:info.available}}) as trames_memory::PressureSource
-    });
-    let pressure=runtime.memory.memory_pressure(pressure_host);
+    let pressure_host: Option<trames_memory::PressureSource> =
+        runtime.memory_limits.is_host_managed().then(|| {
+            let source = host_memory_source
+                .as_ref()
+                .expect("validated host memory source")
+                .clone();
+            Arc::new(move || {
+                let info = source();
+                trames_memory::PressureMemory {
+                    total: info.total,
+                    free: info.free,
+                    available: info.available,
+                }
+            }) as trames_memory::PressureSource
+        });
+    let pressure = runtime.memory.memory_pressure(pressure_host);
     runtime.linux.vfs.bind_memory_pressure(pressure.clone());
     io.bind_memory_pressure(pressure);
     let started = runtime

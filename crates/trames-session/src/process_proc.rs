@@ -139,7 +139,11 @@ impl<C: Cpu> Kernel<C> {
 
 impl<C: Cpu> Process<C> {
     pub(super) fn activate_memory_controls(&mut self) -> bool {
-        let _allocation = self.signals.io.cgroup().map(trames_vfs::CgroupTask::memory_scope);
+        let _allocation = self
+            .signals
+            .io
+            .cgroup()
+            .map(trames_vfs::CgroupTask::memory_scope);
         self.memory.activate_proc_reads()
     }
     #[allow(clippy::too_many_arguments)]

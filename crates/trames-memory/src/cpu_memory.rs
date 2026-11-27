@@ -211,7 +211,11 @@ impl CpuMemory for Memory {
     #[inline]
     fn userfaults_active(&self) -> bool {
         self.shared.as_ref().map_or_else(
-            || self.userfaults.as_ref().is_some_and(|faults| faults.active()),
+            || {
+                self.userfaults
+                    .as_ref()
+                    .is_some_and(|faults| faults.active())
+            },
             |shared| shared.borrow().userfaults_active(),
         )
     }
@@ -226,7 +230,8 @@ impl CpuMemory for Memory {
             .is_some_and(|&(_, end, _)| address < end)
     }
     fn async_faults_possible(&self) -> bool {
-        self.account.pressure_possible() || crate::CgroupMemoryTarget::active()
+        self.account.pressure_possible()
+            || crate::CgroupMemoryTarget::active()
             || self
                 .shared
                 .as_ref()

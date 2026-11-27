@@ -23,7 +23,9 @@ impl Budget {
         })
     }
     fn take(&self, bytes: usize) -> Result<(), MemoryError> {
-        if let Some(pressure) = self.pressure.get() { pressure.allocation(bytes)?; }
+        if let Some(pressure) = self.pressure.get() {
+            pressure.allocation(bytes)?;
+        }
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
@@ -54,7 +56,12 @@ pub(super) struct Account {
 impl Account {
     // HostManaged has no extra allocation admission. Its native pager already
     // retains its own waits; a PSI monitor alone must not stage every syscall.
-    pub(super) fn pressure_possible(&self)->bool { self.total.as_ref().and_then(|total|total.pressure.get()).is_some_and(|pressure|pressure.allocation_waits_possible()) }
+    pub(super) fn pressure_possible(&self) -> bool {
+        self.total
+            .as_ref()
+            .and_then(|total| total.pressure.get())
+            .is_some_and(|pressure| pressure.allocation_waits_possible())
+    }
 
     pub(super) fn reclaim_generation(&self) -> (u64, u64) {
         (
@@ -66,7 +73,7 @@ impl Account {
         let resource: Arc<dyn crate::CgroupReclaim> = report.clone();
         let mut index = self.reclaimer.lock();
         index.report = Some(Arc::downgrade(&resource));
-        if let Some(pressure) = self.total.as_ref().and_then(|total|total.pressure.get()) {
+        if let Some(pressure) = self.total.as_ref().and_then(|total| total.pressure.get()) {
             pressure.register_report(&MemoryReport(report.clone()));
         }
         index.groups.retain(|group| group.strong_count() != 0);
@@ -210,7 +217,9 @@ impl Account {
         self.record_peak(before);
         if let Some(total) = &self.total {
             total.used.fetch_sub(bytes, Ordering::Relaxed);
-            if let Some(pressure) = total.pressure.get() { pressure.released(); }
+            if let Some(pressure) = total.pressure.get() {
+                pressure.released();
+            }
         }
     }
 }
@@ -550,7 +559,14 @@ impl Memory {
             return shared.borrow_mut().set_total_limit(limit);
         }
         // A resumed session retains its original aggregate quota and PSI OFDs.
-        if self.account.total.as_ref().is_some_and(|total|total.limit.load(Ordering::Relaxed)==limit) {return Ok(());}
+        if self
+            .account
+            .total
+            .as_ref()
+            .is_some_and(|total| total.limit.load(Ordering::Relaxed) == limit)
+        {
+            return Ok(());
+        }
         self.bind_account(Arc::new(Account {
             peak: AtomicUsize::new(0),
             local: Budget::new(self.limit),
@@ -675,7 +691,11 @@ impl Memory {
         }
         self.revoke_native_storage(cgroup, userfault)
     }
-    pub(super) fn revoke_native_storage(&mut self, cgroup: Option<bool>, userfault: Option<bool>) -> Result<(), MemoryError> {
+    pub(super) fn revoke_native_storage(
+        &mut self,
+        cgroup: Option<bool>,
+        userfault: Option<bool>,
+    ) -> Result<(), MemoryError> {
         if self.has_parallel_users() {
             return Err(MemoryError::InvalidRange);
         }

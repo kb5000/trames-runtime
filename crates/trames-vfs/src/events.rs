@@ -392,7 +392,9 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> (u16, [u64; 2]) {
-        if let Some(SharedControl::Pressure(file)) = &o.control { return file.peek(events); }
+        if let Some(SharedControl::Pressure(file)) = &o.control {
+            return file.peek(events);
+        }
         if let Some(SharedControl::Perf(event)) = &o.control {
             return event.peek(events);
         }
@@ -438,7 +440,9 @@ impl Vfs {
                 )
                 .1;
         }
-        if let Some(SharedControl::Pressure(file)) = &o.control { return file.epoch(); }
+        if let Some(SharedControl::Pressure(file)) = &o.control {
+            return file.epoch();
+        }
         if let Some(SharedControl::Cgroup(file)) = &o.control {
             return file.poll(0).1;
         }
@@ -546,7 +550,9 @@ impl Vfs {
     ) -> Result<u16> {
         let open = OpenDescription::shared_projection(file.open.clone());
         let ready = self.peek_original(&open, events, pending, &mut special)?;
-        if let Some(SharedControl::Pressure(file)) = &open.control { file.acknowledge(ready.1); }
+        if let Some(SharedControl::Pressure(file)) = &open.control {
+            file.acknowledge(ready.1);
+        }
         if let Some(watch) = open.proc_watch() {
             watch.acknowledge(ready.1[0]);
         }
@@ -642,7 +648,9 @@ impl Vfs {
                 })?
             {
                 if let Some(open) = target.original_open() {
-                    if let Some(SharedControl::Pressure(file)) = &open.borrow().control { file.acknowledge(epoch); }
+                    if let Some(SharedControl::Pressure(file)) = &open.borrow().control {
+                        file.acknowledge(epoch);
+                    }
                     if let Some(watch) = open.borrow().proc_watch() {
                         watch.acknowledge(epoch[0]);
                     }
@@ -790,7 +798,10 @@ mod timer_index_tests {
 }
 
 pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) -> Descriptor {
-    let access = if matches!(anonymous, Anonymous::Userfault(_) | Anonymous::Inotify(_) | Anonymous::FsContext(_)) {
+    let access = if matches!(
+        anonymous,
+        Anonymous::Userfault(_) | Anonymous::Inotify(_) | Anonymous::FsContext(_)
+    ) {
         0
     } else {
         2

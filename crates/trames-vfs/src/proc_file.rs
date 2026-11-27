@@ -421,7 +421,13 @@ impl Vfs {
         self.pseudo.borrow().publication.clone()
     }
     pub(super) fn proc_runtime_file(&self, path: &ResolvedPath) -> Option<Arc<ProcFile>> {
-        if matches!(path.key.as_slice(),b"/proc/pressure/memory"|b"/proc/zoneinfo"|b"/proc/vmstat") && self.memory_pressure().is_some() {return None;}
+        if matches!(
+            path.key.as_slice(),
+            b"/proc/pressure/memory" | b"/proc/zoneinfo" | b"/proc/vmstat"
+        ) && self.memory_pressure().is_some()
+        {
+            return None;
+        }
         if !self.uses_pseudo(path) || !self.pseudo_readonly(path) {
             return None;
         }

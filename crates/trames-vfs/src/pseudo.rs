@@ -3200,7 +3200,13 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
-        if path==b"/proc" && self.memory_pressure().is_some() {names.extend([b"pressure".to_vec(),b"zoneinfo".to_vec(),b"vmstat".to_vec()]);}
+        if path == b"/proc" && self.memory_pressure().is_some() {
+            names.extend([
+                b"pressure".to_vec(),
+                b"zoneinfo".to_vec(),
+                b"vmstat".to_vec(),
+            ]);
+        }
 
         if path == b"/proc/sys/net/ipv4" && self.network.has_guest_transport() {
             names.push(b"tcp_sack".to_vec());
