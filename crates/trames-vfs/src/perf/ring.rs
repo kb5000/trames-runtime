@@ -93,7 +93,7 @@ impl Ring {
             at = at.wrapping_add(n as u64);
         }
     }
-    pub(super) fn userpage(&self, value: u64, time: u64) {
+    pub(super) fn userpage(&self, value: u64, enabled: u64, time: u64) {
         let page = &self.pages[0];
         let mut sequence = [0; 4];
         page.copy_read(8, &mut sequence);
@@ -103,7 +103,7 @@ impl Ring {
         // final even releases it. Ordinary guest memory accesses add no fence.
         std::sync::atomic::fence(Ordering::Release);
         page.copy_write(16, &value.to_le_bytes());
-        page.copy_write(24, &time.to_le_bytes());
+        page.copy_write(24, &enabled.to_le_bytes());
         page.copy_write(32, &time.to_le_bytes());
         unsafe {
             page.store_release_u32(8, sequence.wrapping_add(1));
@@ -209,7 +209,11 @@ impl Event {
         mm: u64,
     ) -> Result<Vec<Arc<dyn PageBacking>>> {
         let (offset, len) = range;
-        if self.attr.inherit || !shared || offset != 0 || len == 0 || !len.is_multiple_of(PAGE_SIZE)
+        if self.attr.inherit && self.clock.0.filter.is_none()
+            || !shared
+            || offset != 0
+            || len == 0
+            || !len.is_multiple_of(PAGE_SIZE)
         {
             return Err(Errno(22));
         }
@@ -221,6 +225,7 @@ impl Event {
             return Err(Errno(22));
         }
         let mut destination = self.output.ring.lock();
+        // Linux charges aliases to user locked_vm without a fresh limit check.
         let existing = match destination.upgrade() {
             Some(ring) if ring.alias(&self.output, count)? => Some(ring),
             _ => None,
@@ -268,7 +273,11 @@ impl Event {
         {
             let mut state = self.group.lock();
             state.settle(self.clock.read());
-            ring.userpage(state.members[&self.id].value, state.members[&self.id].time);
+            ring.userpage(
+                state.members[&self.id].value,
+                state.members[&self.id].enabled_time,
+                state.members[&self.id].time,
+            );
         }
         Ok((0..count)
             .map(|index| {
@@ -317,6 +326,15 @@ impl PageBacking for Page {
     }
     fn expandable(&self) -> bool {
         false
+    }
+    fn dumpable(&self) -> bool {
+        false
+    }
+    fn indivisible_mapping(&self) -> Option<(u64, u64)> {
+        Some((
+            self.index as u64 * PAGE_SIZE,
+            self.ring.pages.len() as u64 * PAGE_SIZE,
+        ))
     }
     fn retain_in_view(&self) -> bool {
         true

@@ -21,6 +21,54 @@ pub(crate) const POLL_INSTRUCTIONS: u64 = 16_384;
 
 pub(crate) use crate::execution_control::Control;
 
+/// Calibrated on this original interpreter worker, only during sampled runs.
+/// Cross the estimated deadline with bounded execution margin instead of
+/// polling tiny fragments or returning just before it. Otherwise descheduling
+/// bookkeeping can consume a user sampling point. Instruction limits win.
+#[derive(Default)]
+struct PerfPacing {
+    ns_per_instruction_q10: u64,
+}
+impl PerfPacing {
+    fn limit(&self, limit: u64, left: Duration) -> u64 {
+        if self.ns_per_instruction_q10 == 0 {
+            return limit.min(2048);
+        }
+        let estimate = (left.as_nanos().saturating_mul(1280)
+            / u128::from(self.ns_per_instruction_q10))
+        .clamp(64, u128::from(u64::MAX)) as u64;
+        limit.min(estimate)
+    }
+    fn observe(&mut self, instructions: u64, elapsed: Duration) {
+        if instructions < 64 || elapsed.is_zero() {
+            return;
+        }
+        let sample = (elapsed.as_nanos().saturating_mul(1024) / u128::from(instructions))
+            .clamp(1, u128::from(u64::MAX)) as u64;
+        self.ns_per_instruction_q10 = if self.ns_per_instruction_q10 == 0 {
+            sample
+        } else {
+            ((u128::from(self.ns_per_instruction_q10) * 3 + u128::from(sample)) / 4) as u64
+        };
+    }
+}
+#[cfg(test)]
+mod perf_pacing_tests {
+    use super::*;
+    #[test]
+    fn deadline_pacing_preserves_instruction_and_single_step_limits() {
+        let mut pacing = PerfPacing::default();
+        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
+        assert_eq!(pacing.limit(0, Duration::from_secs(1)), 0);
+        pacing.observe(0, Duration::ZERO);
+        pacing.observe(1000, Duration::from_millis(1));
+        let count = pacing.limit(10000, Duration::from_micros(100));
+        assert!((100..=125).contains(&count));
+        assert!(Duration::from_micros(count) <= Duration::from_micros(125));
+        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
+    }
+}
+
 pub(super) struct Work<C: Cpu> {
     /// Original task body, retained through every queue/checkpoint and return.
     /// Execution touches CPU/View without holding task-body custody.
@@ -535,6 +583,7 @@ impl<C: Cpu> Starter<C> {
             .name(format!("trames-cpu-{index}"))
             .spawn(move || {
                 let mut engine = C::Engine::default();
+                let mut perf_pacing = PerfPacing::default();
                 let mut registry = trames_accel::native::Registry::default();
                 let mut direct_scratch = Vec::new();
                 let mut file_cache = trames_vfs::DiskReadCache::default();
@@ -579,6 +628,7 @@ impl<C: Cpu> Starter<C> {
                         snapshot.io_signals.credentials().clone(), snapshot.io_signals.tid(), snapshot.direct.sync_executor()));
                     let began = Instant::now();
                     if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
+                    let mut perf_execution=work.syscalls.as_ref().and_then(|snapshot|snapshot.perf_execution(index,work.cpu.pc()));
                     let mut instructions = 0;
                     let mut pressure_progress = false;
                     let mut chunks = 0;
@@ -591,6 +641,12 @@ impl<C: Cpu> Starter<C> {
                     let mut resource_start = began;
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
+                            if let Some(perf)=&perf_execution {
+                                perf.kernel(job.io.is_some() || job.retry.is_some()
+                                    || job.waiting.as_ref().is_some_and(crate::run_queue::WaitState::copy_pending)
+                                    || job.work.syscalls.as_ref().is_some_and(|s|s.io_signals.has_pending_frame())
+                                    || matches!(job.pending_cpu,Some(SliceOutcome::Syscall {..})));
+                            }
                             job.restart_sleep_after_stop();
                             let work = &mut job.work;
                             if work.control.stopped() {
@@ -868,6 +924,7 @@ impl<C: Cpu> Starter<C> {
                             if let Some(epoch) = &epoch {
                                 if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                                 if let Some(ring) = &mut job.uring {
+                                    if let Some(perf)=&perf_execution {perf.kernel(true);}
                                     match ring.progress(work.memory.as_deref_mut().expect("source task View")) {
                                         Ok(true) => {},
                                         Ok(false) => {
@@ -882,6 +939,7 @@ impl<C: Cpu> Starter<C> {
                                         }
                                     }
                                     if !ring.active() { job.uring = None; }
+                                    if let Some(perf)=&perf_execution {perf.kernel(false);}
                                 }
                                 if job.hardware_wait.as_ref().is_some_and(|wait| !wait.ready())
                                     || job.waiting.is_some()
@@ -892,6 +950,7 @@ impl<C: Cpu> Starter<C> {
                                 job.hardware_wait = None;
                             }
                             if let Some(pending) = job.gpu_pending.take() {
+                                if let Some(perf)=&perf_execution {perf.kernel(false);}
                                 let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(work.memory.as_deref().expect("worker view"));
                                 let accepted = pending.compile.is_some();
                                 let call = pending.call;
@@ -1092,22 +1151,27 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                     interrupt_prepared = true;
                                 }
+                                let perf_budget=perf_execution.as_mut().and_then(trames_vfs::perf::Execution::budget);
+                                C::set_execution_deadline(&mut engine,perf_budget.and_then(|budget|Instant::now().checked_add(budget)));
+                                let budget=if C::EXACT_INSTRUCTIONS {perf_budget.map_or(budget,|left|perf_pacing.limit(budget,left))} else {budget};
+                                if let Some(perf)=&perf_execution {perf.kernel(false);}
                                 let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(work.memory.as_deref().expect("worker view"));
+                                let perf_run_at=(C::EXACT_INSTRUCTIONS && perf_budget.is_some()).then(Instant::now);
                                 let result = work.cpu.run_parallel(
                                     &mut engine,
                                     work.memory.as_deref_mut().expect("worker view"),
                                     budget,
                                 );
+                                if let (Some(at),SliceOutcome::Yield {instructions})=(perf_run_at,&result) {
+                                    perf_pacing.observe(*instructions,at.elapsed());
+                                }
                                 chunks += 1;
                                 result
                             };
-                            // A lone runnable task can retain this assignment indefinitely.
-                            if let Some(snapshot) = &work.syscalls {
-                                snapshot.io_signals.proc_view.sample_perf(|now| trames_vfs::perf::Sample {
-                                    ip: work.cpu.pc(), pid: snapshot.io_signals.tgid(), tid: snapshot.io_signals.tid(),
-                                    time: now.saturating_duration_since(snapshot.started).as_nanos().min(u64::MAX as u128) as u64,
-                                    cpu: index as u32,
-                                });
+                            if perf_execution.is_none() {perf_execution=work.syscalls.as_ref().and_then(|snapshot|snapshot.perf_execution(index,work.cpu.pc()));}
+                            if let (Some(snapshot),Some(perf))=(&work.syscalls,perf_execution.as_mut()) {
+                                perf.boundary(work.cpu.pc(),snapshot.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,false);
+                                perf.kernel(matches!(result,SliceOutcome::Syscall {..}));
                             }
                             // Inspect CPU timers and limits at quantum boundaries and amortize checks
                             // for workloads repeatedly entering the kernel before a quantum.
@@ -1162,7 +1226,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 // Transfer only the local Box pointer across the
                                 // borrow boundary; no View clone or message is made.
                                 let mut memory = job.work.memory.take().expect("syscall View");
+                                let perf_control=perf_execution.is_none() && matches!(job.work.cpu.x(8) as u32,241|29);
+                                if let Some(perf)=&perf_execution {perf.kernel(true);}
                                 let step = crate::syscall_dispatch::execute(&mut job, &mut *memory, epoch.as_deref(), index, resumed_policy, result);
+                                // Own open/enable must attach before the next run.
+                                // Remote attachment is discovered at CPU boundaries.
+                                if perf_control {perf_execution=job.work.syscalls.as_ref().and_then(|snapshot|snapshot.perf_execution(index,job.work.cpu.pc()));}
+                                if let (Some(snapshot),Some(perf))=(&job.work.syscalls,perf_execution.as_mut()) {perf.boundary(0,snapshot.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,true);perf.kernel(false);}
                                 job.work.memory = Some(memory);
                                 syscalls += step.syscalls;
                                 syscall_time += step.time;
@@ -1350,6 +1420,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                         }
                     }
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
+                    drop(perf_execution);
                     let elapsed = began.elapsed();
                     if let Some(share) = cpu_share { share.account(elapsed); }
                     let after = work.cpu.decode_stats();

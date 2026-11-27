@@ -233,6 +233,7 @@ pub(super) struct Charge {
     // consult only relaxed residency bits and the existing byte/region guards.
     state: AtomicU8,
     ownership: parking_lot::Mutex<Ownership>,
+    major: AtomicBool,
 }
 #[derive(Clone, Default)]
 struct Ownership {
@@ -257,6 +258,7 @@ impl Charge {
             account: account.clone(),
             state: AtomicU8::new(0),
             ownership: Default::default(),
+            major: AtomicBool::new(false),
         })
     }
     /// A fresh fork charge has no concurrent consumers until task publication.
@@ -291,6 +293,7 @@ impl Charge {
                 0
             }),
             ownership: parking_lot::Mutex::new(owner.clone()),
+            major: AtomicBool::new(false),
         }))
     }
     pub(super) fn fork_pending(&self) -> bool {
@@ -311,6 +314,7 @@ impl Charge {
             account: account.clone(),
             state: AtomicU8::new(3),
             ownership: Default::default(),
+            major: AtomicBool::new(false),
         })
     }
     pub(super) fn promote_native(&self) -> Result<(), MemoryError> {
@@ -350,11 +354,20 @@ impl Charge {
     pub(super) fn present(&self) -> bool {
         matches!(self.state.load(Ordering::Relaxed), 1 | 2 | 3 | 5 | 6)
     }
+    pub(super) fn major_fault(&self) {
+        self.major.store(true, Ordering::Relaxed);
+    }
+    fn record_fault(&self) {
+        crate::fault_accounting::fault(self.major.swap(false, Ordering::Relaxed));
+    }
     pub(super) fn note_zero_read(&self) {
-        if self.state.load(Ordering::Relaxed) == 0 {
-            let _ = self
+        if self.state.load(Ordering::Relaxed) == 0
+            && self
                 .state
-                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.record_fault();
         }
     }
     pub(super) fn resident(&self) -> bool {
@@ -407,6 +420,7 @@ impl Charge {
             account: account.clone(),
             state: AtomicU8::new(if state == 3 { 2 } else { state }),
             ownership: parking_lot::Mutex::new(owner.clone()),
+            major: AtomicBool::new(old.major.load(Ordering::Relaxed)),
         }))
     }
     /// Cold I/O preflight only. The final atomic ensure remains authoritative;
@@ -454,6 +468,7 @@ impl Charge {
                 }
                 self.state
                     .store(if private && !write { 5 } else { 2 }, Ordering::Relaxed);
+                self.record_fault();
                 Ok(())
             }
             Err(error) => {
@@ -491,6 +506,7 @@ impl Charge {
                 owner.physical = crate::cgroup_memory::PhysicalCharge::new()?;
             }
             self.state.store(2, Ordering::Relaxed);
+            self.record_fault();
             Ok(())
         } else if self.state.load(Ordering::Relaxed) == 5 {
             // The original file/shmem cache page keeps its first owner. COW
@@ -499,6 +515,7 @@ impl Charge {
             owner.physical = physical;
             owner.cache = None;
             self.state.store(2, Ordering::Relaxed);
+            self.record_fault();
             Ok(())
         } else {
             self.take(&mut owner, true)

@@ -7,7 +7,9 @@ mod backing;
 pub use attachments::SegmentAttachment;
 pub use backing::SharedAnonymousPages;
 mod cpu_memory;
+mod fault_accounting;
 mod page_fault;
+pub use fault_accounting::{FaultCounts, FaultScope};
 #[cfg(test)]
 mod page_fault_tests;
 pub use page_fault::{PageFault, PageWait};
@@ -1109,6 +1111,8 @@ impl Memory {
             return shared.borrow_mut().unmap(address, len);
         }
         let end = Self::mapping_end(address, len)?;
+        self.check_mapping_boundary(address)?;
+        self.check_mapping_boundary(end)?;
         self.remove_reservations(address, end)?;
         self.attachments.remove(address, end);
         self.vma_policy.remove(address, end);
@@ -1269,6 +1273,16 @@ impl Memory {
     ) -> Result<(), MemoryError> {
         let len = end - address;
         self.check_mapped_range(address, end)?;
+        // An unchanged protection does not split a Linux VMA. Changed perf
+        // boundaries must still pass its may_split policy before any effects.
+        for boundary in [address, end] {
+            if self
+                .page_for_access_unchecked(boundary)
+                .is_none_or(|page| page.permissions != permissions)
+            {
+                self.check_mapping_boundary(boundary)?;
+            }
+        }
         self.attachments.check_protect(address, end, permissions)?;
         for (&base, &frame) in self.pages.range(address..end) {
             let p = self.frames[frame].as_ref().expect("page");

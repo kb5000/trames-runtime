@@ -414,6 +414,7 @@ impl IoTask {
         debug_assert!(Arc::ptr_eq(original, parentage));
     }
     pub fn bind_cgroup(self: &Arc<Self>, task: trames_vfs::CgroupTask) {
+        self.proc_view.bind_perf_cgroup(task.clone());
         if self.cgroup.set(task).is_ok() {
             let target: Arc<dyn trames_vfs::TaskSignal> = self.clone();
             self.cgroup.get().unwrap().bind(&target);
@@ -847,6 +848,7 @@ impl trames_vfs::TaskSignal for IoTask {
 }
 #[derive(Default)]
 pub struct IoDirectory {
+    pub perf: trames_vfs::perf::Domain,
     pub parents: Arc<crate::task_parent::Parents>,
     groups: Mutex<BTreeMap<(u32, u32), Arc<Group>>>,
     updates: AtomicU32,
@@ -1019,6 +1021,7 @@ impl IoDirectory {
         uid: u32,
         euid: u32,
     ) {
+        task.proc_view.bind_perf_domain(self.perf.clone());
         task.parents.get_or_init(|| Arc::downgrade(&self.parents));
         task.lifecycle().register(task, pid);
         task.credentials().publish_signal_ids(uid, euid);

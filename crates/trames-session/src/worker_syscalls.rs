@@ -571,6 +571,38 @@ fn unknown_syscall<C: Cpu>(number: u32, args: [u64; 6]) -> bool {
 }
 
 impl Snapshot {
+    #[inline]
+    pub fn perf_execution(&self, cpu: usize, ip: u64) -> Option<trames_vfs::perf::Execution> {
+        if !self.io_routes.directory.perf.observed() {
+            return None;
+        }
+        self.observed_perf_execution(cpu, ip)
+    }
+
+    #[inline(never)]
+    fn observed_perf_execution(&self, cpu: usize, ip: u64) -> Option<trames_vfs::perf::Execution> {
+        if !self
+            .io_routes
+            .directory
+            .perf
+            .observing(&self.io_signals.proc_view, cpu as u32)
+        {
+            return None;
+        }
+        self.io_routes.directory.perf.bind_origin(self.started);
+        self.io_routes.directory.perf.enter(
+            &self.io_signals.proc_view,
+            self.io_signals.cgroup(),
+            trames_vfs::perf::Sample {
+                ip,
+                pid: self.io_signals.tgid(),
+                tid: self.io_signals.tid(),
+                time: self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                cpu: cpu as u32,
+            },
+        )
+    }
+
     fn unknown_entry<C: Cpu>(&self, cpu: &C) -> bool {
         self.diagnostics.is_some()
             && unknown_syscall::<C>(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))

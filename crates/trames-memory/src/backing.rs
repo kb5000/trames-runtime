@@ -29,6 +29,10 @@ pub(super) fn backing_revision() -> u64 {
 /// Thread-safe cold page-in capability. Namespace/OFD metadata stays in VFS;
 /// this handle retains only the byte resource needed by a reached CPU page.
 pub trait PageSource: Send + Sync {
+    /// A guest cache miss which actually needs file I/O, rather than a PTE-only fault.
+    fn requires_io(&self) -> bool {
+        false
+    }
     /// A missing asynchronous page returns MemoryError::Pending with its
     /// original PageWait. Never block a CPU worker or encode a guest errno.
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
@@ -184,6 +188,14 @@ pub trait PageBacking: Send + Sync {
     }
     /// Cold VMA growth policy (Linux VM_DONTEXPAND). Byte access is unaffected.
     fn expandable(&self) -> bool {
+        true
+    }
+    /// Optional immutable special VMA geometry: this page's byte offset and
+    /// whole mapping length. Only cold mapping operations consult the span.
+    fn indivisible_mapping(&self) -> Option<(u64, u64)> {
+        None
+    }
+    fn dumpable(&self) -> bool {
         true
     }
     fn mapping_remap(&self) -> Option<Arc<dyn MappingRemap>> {
@@ -649,6 +661,9 @@ impl Page {
             if !b.object.native_resident() {
                 if let Some(source) = b.object.page_source() {
                     self.access_charge().check_available()?;
+                    if source.requires_io() {
+                        self.access_charge().major_fault();
+                    }
                     source.load().map_err(|error| error.at_access(address))?;
                 }
             }
@@ -724,6 +739,31 @@ impl Memory {
                 .as_ref()
                 .is_none_or(|backing| backing.object.expandable())
         })
+    }
+    pub(super) fn check_mapping_boundary(&self, address: u64) -> Result<(), MemoryError> {
+        let base = address & !(PAGE_SIZE - 1);
+        if let Some(page) = self.page_for_access_unchecked(base) {
+            if let Some((offset, _)) = page
+                .backing
+                .as_ref()
+                .and_then(|b| b.object.indivisible_mapping())
+            {
+                if offset != 0 || address != base {
+                    return Err(MemoryError::InvalidRange);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn mapping_dumpable(&self, address: u64) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().mapping_dumpable(address);
+        }
+        !self.vma_policy.nodump.contains(address)
+            && self
+                .page_for_access_unchecked(address)
+                .and_then(|p| p.backing.as_ref())
+                .is_none_or(|b| b.object.dumpable())
     }
     pub fn map_backed(
         &mut self,
@@ -1040,6 +1080,15 @@ impl Memory {
         }
         Self::mapping_end(old, old_len)?;
         Self::mapping_end(new, new_len)?;
+        self.check_mapping_boundary(old)?;
+        self.check_mapping_boundary(old + old_len)?;
+        if new_len < old_len {
+            self.check_mapping_boundary(old + new_len)?;
+        }
+        if fixed && old != new {
+            self.check_mapping_boundary(new)?;
+            self.check_mapping_boundary(new + new_len)?;
+        }
         let origins = self.region_layout.origins.moved(old, old_len, new, new_len);
         let policy = self.vma_policy.moved(old, old_len, new, new_len);
         let moved_locks = self.locks.moved(old, old_len, new, new_len);

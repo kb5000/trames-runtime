@@ -12,6 +12,7 @@ fn memory() -> Memory {
 fn attr(config: u64, format: u64, disabled: bool) -> Attr {
     Attr {
         config,
+        metadata: 0,
         format,
         disabled,
         pinned: false,
@@ -35,6 +36,187 @@ fn words(bytes: Vec<u8>) -> Vec<u64> {
         .chunks_exact(8)
         .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
         .collect()
+}
+
+#[test]
+fn exec_and_inherited_enable_reactivate_real_fault_producers() {
+    let domain = Domain::default();
+    let parent = ProcessView::default();
+    let child = ProcessView::default();
+    let context = Sample {
+        ip: 0x1234,
+        pid: 1,
+        tid: 1,
+        time: 1,
+        cpu: 0,
+    };
+    let mut a = attr(2, 0, true);
+    a.enable_on_exec = true;
+    a.inherit = true;
+    let event = Event::new(a, parent.perf_clock(), None).unwrap();
+    drop(domain.enter(&parent, None, context));
+    assert!(!domain.observing(&parent, 0));
+    parent.exec_perf();
+    assert!(domain.observing(&parent, 0));
+    let mut m = memory();
+    let execution = domain.enter(&parent, None, context).unwrap();
+    m.write(BASE, &[1]).unwrap();
+    drop(execution);
+    assert_eq!(words(event.read(8).unwrap()), [1]);
+
+    event.ioctl(0x2401, 0, &mut m).unwrap();
+    child.inherit_perf(&parent, false);
+    drop(domain.enter(
+        &child,
+        None,
+        Sample {
+            pid: 2,
+            tid: 2,
+            ..context
+        },
+    ));
+    assert!(!domain.observing(&child, 0));
+    event.ioctl(0x2400, 0, &mut m).unwrap();
+    assert!(domain.observing(&child, 0));
+    let mut child_memory = memory();
+    let execution = domain
+        .enter(
+            &child,
+            None,
+            Sample {
+                pid: 2,
+                tid: 2,
+                ..context
+            },
+        )
+        .unwrap();
+    child_memory.write(BASE, &[2]).unwrap();
+    drop(execution);
+    assert_eq!(words(event.read(8).unwrap()), [2]);
+}
+
+#[test]
+fn cpu_filter_distinguishes_enabled_task_context_from_running_selected_cpu() {
+    let task = ProcessView::default();
+    let filtered = task.perf_clock().for_cpu(0);
+    let event = Event::new(attr(1, 3, false), filtered, None).unwrap();
+    task.account(Duration::from_nanos(17), 1);
+    assert_eq!(words(event.read(24).unwrap()), [0, 17, 0]);
+    let domain = Domain::default();
+    let began = std::time::Instant::now();
+    task.begin_accounting(began, 0);
+    let execution = domain
+        .enter(
+            &task,
+            None,
+            Sample {
+                ip: 1,
+                pid: 1,
+                tid: 1,
+                cpu: 0,
+                time: 1,
+            },
+        )
+        .unwrap();
+    drop(execution);
+    task.finish_accounting(began, began.elapsed(), 0);
+    let read = words(event.read(24).unwrap());
+    assert!(read[0] > 0 && read[1] >= read[2] + 17 && read[2] == read[0]);
+}
+
+#[test]
+fn a_new_filter_does_not_use_a_cpu_observed_before_collection_stopped() {
+    let task = ProcessView::default();
+    let domain = Domain::default();
+    let context = Sample {
+        ip: 1,
+        pid: 1,
+        tid: 1,
+        cpu: 0,
+        time: 1,
+    };
+    let previous = Event::new(attr(1, 0, false), task.perf_clock(), None).unwrap();
+    let began = std::time::Instant::now();
+    task.begin_accounting(began, 0);
+    let execution = domain.enter(&task, None, context).unwrap();
+    drop(previous);
+    drop(execution);
+    task.finish_accounting(began, began.elapsed(), 0);
+    assert!(!domain.observing(&task, 0));
+
+    let began = std::time::Instant::now();
+    task.begin_accounting(began, 1);
+    let event = Event::new(attr(1, 3, false), task.perf_clock().for_cpu(0), None).unwrap();
+    let execution = domain
+        .enter(&task, None, Sample { cpu: 1, ..context })
+        .unwrap();
+    let read = words(event.read(24).unwrap());
+    assert_eq!(read[0], 0);
+    assert_eq!(read[2], 0);
+    assert!(read[1] > 0);
+    drop(execution);
+    task.finish_accounting(began, began.elapsed(), 1);
+}
+
+#[test]
+fn a_new_cpu_filter_cannot_revive_a_retired_original_task() {
+    let task = ProcessView::default();
+    let original = task.perf_clock();
+    task.retire_perf();
+    assert!(matches!(
+        Event::new(attr(1, 0, false), original.for_cpu(0), None),
+        Err(Errno(3))
+    ));
+}
+
+#[test]
+fn the_session_hint_covers_original_and_inherited_observer_publication() {
+    let domain = Domain::default();
+    let task = ProcessView::default();
+    task.bind_perf_domain(domain.clone());
+    assert!(!domain.observed());
+    let _ = Event::new(attr(1, 0, true), task.perf_clock(), None).unwrap();
+    assert!(domain.observed());
+
+    let inherited_domain = Domain::default();
+    let child = ProcessView::default();
+    let _ = child.perf_clock();
+    assert!(!inherited_domain.observed());
+    child.bind_perf_domain(inherited_domain.clone());
+    assert!(inherited_domain.observed());
+}
+
+#[test]
+fn kernel_fault_sample_never_labels_a_guest_user_pc_as_kernel_text() {
+    let vfs = Vfs::default();
+    let task = ProcessView::default();
+    let mut memory = memory();
+    let mut a = attr(5, 0, false);
+    a.exclude_kernel = false;
+    a.exclude_user = true;
+    a.period = 1;
+    a.sample_type = 1;
+    let fd = vfs
+        .descriptor_factory()
+        .perf_event(a, task.perf_clock(), None, false)
+        .unwrap();
+    map_ring(&vfs, fd, &mut memory, 1, true);
+    task.perf_clock().record(
+        5,
+        1,
+        &Sample {
+            ip: 0x4455,
+            pid: 1,
+            tid: 1,
+            cpu: 0,
+            time: 1,
+        },
+        true,
+        0,
+    );
+    let mut record = vec![0; 16];
+    memory.read(MAP + PAGE_SIZE, &mut record).unwrap();
+    assert_eq!(words(record), [9 | (1u64 << 32) | (16u64 << 48), 0]);
 }
 
 #[test]
@@ -742,6 +924,12 @@ fn ring_mapping_growth_and_zero_size_remap_fail_without_losing_the_original_buff
         .unwrap();
     let event = v.perf_event(fd).unwrap().unwrap();
     map_ring(&v, fd, &mut m, 1, true);
+    m.protect(MAP + PAGE_SIZE, PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    assert_eq!(
+        m.protect(MAP + PAGE_SIZE, PAGE_SIZE, Permissions::R),
+        Err(MemoryError::InvalidRange)
+    );
     let len = 2 * PAGE_SIZE;
     assert_eq!(
         m.remap(MAP, len, MAP, len + PAGE_SIZE, false),

@@ -77,6 +77,7 @@ struct Source {
     domain: Arc<LoadDomain>,
 }
 impl PageSource for Source {
+    fn requires_io(&self)->bool {self.bytes.get().is_none()}
     fn load(&self) -> std::result::Result<Arc<SharedPage>, MemoryError> {
         if let Some(page) = self.bytes.get() {
             return Ok(page.clone());

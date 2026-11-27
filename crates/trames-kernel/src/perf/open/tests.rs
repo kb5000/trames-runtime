@@ -51,6 +51,20 @@ fn counter(vfs: &mut trames_vfs::Vfs, fd: u32) -> u64 {
     u64::from_le_bytes(vfs.read(fd, 8).unwrap().try_into().unwrap())
 }
 #[test]
+fn negative_task_pid_and_cgroup_fd_follow_their_original_resource_lookups() {
+    let (source, routes, vfs, mut memory) = fixture();
+    attr(&mut memory.memory, 0x1100, 136, 0);
+    for (pid, cpu, flags, error) in [(-2i32, -1i32, 0, 3), (-1, 0, 4, 22), (-2, 0, 4, 9)] {
+        let mut request = call(
+            &source,
+            &routes,
+            &vfs,
+            [0x1100, pid as u64, cpu as u64, u64::MAX, flags, 0],
+        );
+        assert_eq!(request.check(&mut memory), Some(Err(Errno(error))));
+    }
+}
+#[test]
 fn attr_body_retains_copied_prefix_and_creates_one_event_only_after_input_completes() {
     let (source, routes, mut vfs, mut memory) = fixture();
     let expected = next_fd(&mut vfs);

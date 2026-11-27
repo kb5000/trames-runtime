@@ -132,6 +132,8 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     /// parking, switching tasks, returning a fault, or completing a caught panic.
     /// Called even when entry/binding failed; default backends compile to a no-op.
     fn finish_execution(_: &mut Self::Engine) {}
+    /// Bound this CPU entry with its existing timer; no auxiliary timer actor.
+    fn set_execution_deadline(_: &mut Self::Engine, _: Option<std::time::Instant>) {}
     const FEATURES: Features;
     const FEATURE_NAMES: &'static str;
     /// A backend may query its actual execution configuration once at runtime.

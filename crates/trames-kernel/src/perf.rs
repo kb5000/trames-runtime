@@ -32,14 +32,17 @@ impl IoRoutes {
         attr: Attr,
     ) -> Result<u64, Errno> {
         factory.check_perf_attr(&attr)?;
+        self.directory.perf.observe_events();
         let pid = a[1] as i32;
         let cpu = a[2] as i32;
-        if cpu < -1 || cpu >= cpus as i32 || pid < -1 || pid == -1 && cpu == -1 {
+        if cpu < -1 || cpu >= cpus as i32 || pid == -1 && cpu == -1 {
             return Err(Errno(22));
         }
-        // CPU-wide and cgroup scopes need their original producers.
-        if cpu != -1 || pid == -1 || a[4] & 4 != 0 {
-            return Err(Errno(95));
+        if a[4] & 4 != 0 && (pid == -1 || cpu == -1) {
+            return Err(Errno(22));
+        }
+        if pid == -1 || a[4] & 4 != 0 {
+            factory.check_perf_cpu()?;
         }
         let slot = factory.reserve_perf()?;
         let group = a[3] as i32;
@@ -48,7 +51,12 @@ impl IoRoutes {
         } else {
             Some(files.perf_event(group as u32)?.ok_or(Errno(9))?)
         };
-        let retained = if pid == 0 {
+        let scope = if a[4] & 4 != 0 {
+            Some(factory.perf_cgroup(files, pid as u32)?)
+        } else {
+            None
+        };
+        let retained = if pid == 0 || pid == -1 || scope.is_some() {
             None
         } else {
             let global = self.namespace.global(pid as u32).ok_or(Errno(3))?;
@@ -65,14 +73,14 @@ impl IoRoutes {
             .check_perf(&caller.credentials().read(), target.tgid() == caller.tgid())?;
         let leader = if a[4] & 1 == 0 { named.as_ref() } else { None };
         let output = if a[4] & 2 != 0 { named.as_ref() } else { None };
-        slot.publish(
-            attr,
-            target.proc_view.perf_clock(),
-            leader,
-            output,
-            a[4] & 8 != 0,
-            cpus,
-        )
-        .map(u64::from)
+        let clock = if pid == -1 || scope.is_some() {
+            self.directory.perf.cpu(cpu as u32, scope)
+        } else if cpu >= 0 {
+            target.proc_view.perf_clock().for_cpu(cpu as u32)
+        } else {
+            target.proc_view.perf_clock()
+        };
+        slot.publish(attr, clock, leader, output, a[4] & 8 != 0, cpus)
+            .map(u64::from)
     }
 }

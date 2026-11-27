@@ -559,6 +559,14 @@ impl Birth {
             inherit_parent.then_some(&*p),
             target,
         )?;
+        p.signals.io.proc_view.perf_fork(
+            child.tgid,
+            id,
+            p.tgid,
+            pid,
+            p.last_cpu as u32,
+            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
         if let Some((slot, target)) = pidfd {
             target.bind_namespace(child.linux.vfs.pid_namespace());
             slot.publish()?;

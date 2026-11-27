@@ -4,24 +4,50 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
 mod accounting;
+mod context;
 mod inheritance;
+pub(crate) mod metadata;
 mod output;
+mod quota;
 mod ring;
 mod sample;
 mod settings;
 pub(super) use accounting::{Accounts, Policy};
+pub use context::{Domain, Execution, Scope};
 pub use sample::Sample;
 pub(super) use settings::{Setting, Settings};
 
+#[derive(Clone, Copy, Default)]
+struct Stamp {
+    cpu: u64,
+    enabled: u64,
+}
+impl Stamp {
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(other.cpu),
+            enabled: self.enabled.max(other.enabled),
+        }
+    }
+}
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct Clock(Arc<ClockData>);
 struct ClockData {
     time: Arc<crate::proc_time::Time>,
-    terminal: AtomicU64,
+    terminal: parking_lot::Mutex<Option<Stamp>>,
+    enabled_time: Option<Arc<crate::proc_time::Time>>,
     groups: parking_lot::Mutex<Registry>,
     sampling: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicBool,
+    metadata: std::sync::atomic::AtomicBool,
+    history: parking_lot::Mutex<BTreeMap<u64, metadata::Seen>>,
+    cpu: std::sync::atomic::AtomicU32,
+    filters: parking_lot::Mutex<BTreeMap<u32, Clock>>,
+    wall: Option<std::time::Instant>,
+    filter: Option<u32>,
+    wake_domain: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 #[derive(Default)]
 struct Registry {
@@ -33,26 +59,40 @@ impl Clock {
     pub(super) fn new(time: &Arc<crate::proc_time::Time>) -> Self {
         Self(Arc::new(ClockData {
             time: time.clone(),
-            terminal: AtomicU64::new(u64::MAX),
+            terminal: Default::default(),
+            enabled_time: None,
             groups: Default::default(),
             sampling: Default::default(),
+            active: Default::default(),
+            metadata: Default::default(),
+            history: Default::default(),
+            cpu: std::sync::atomic::AtomicU32::new(u32::MAX),
+            filters: Default::default(),
+            wall: None,
+            filter: None,
+            wake_domain: None,
         }))
     }
-    fn read(&self) -> u64 {
-        match self.0.terminal.load(Ordering::Relaxed) {
-            u64::MAX => self.0.time.read().as_nanos().min((u64::MAX - 1) as u128) as u64,
-            value => value,
-        }
+    fn read(&self) -> Stamp {
+        self.read_at(std::time::Instant::now())
     }
-    fn read_at(&self, at: std::time::Instant) -> u64 {
-        match self.0.terminal.load(Ordering::Relaxed) {
-            u64::MAX => self
+    fn read_at(&self, at: std::time::Instant) -> Stamp {
+        if let Some(terminal) = *self.0.terminal.lock() {
+            return terminal;
+        }
+        let cpu = self.0.wall.map_or_else(
+            || self.0.time.read_at(at),
+            |origin| at.saturating_duration_since(origin),
+        );
+        Stamp {
+            cpu: cpu.as_nanos().min((u64::MAX - 1) as u128) as u64,
+            enabled: self
                 .0
-                .time
-                .read_at(at)
+                .enabled_time
+                .as_ref()
+                .map_or(cpu, |time| time.read_at(at))
                 .as_nanos()
                 .min((u64::MAX - 1) as u128) as u64,
-            value => value,
         }
     }
     fn same(&self, other: &Self) -> bool {
@@ -60,12 +100,22 @@ impl Clock {
     }
     pub(super) fn retire(&self) {
         let final_time = self.read();
-        if self
-            .0
-            .terminal
-            .compare_exchange(u64::MAX, final_time, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
+        let fresh = {
+            let mut terminal = self.0.terminal.lock();
+            if terminal.is_some() {
+                false
+            } else {
+                *terminal = Some(final_time);
+                true
+            }
+        };
+        // Freeze the parent before collecting children: a concurrent/new
+        // filter inherits terminal state instead of reviving an exited task.
+        let filters: Vec<_> = self.0.filters.lock().values().cloned().collect();
+        for clock in filters {
+            clock.retire();
+        }
+        if fresh {
             let groups: Vec<_> = self
                 .0
                 .groups
@@ -93,9 +143,7 @@ impl Clock {
         }
     }
     pub(super) fn sample(&self, context: impl FnOnce(std::time::Instant) -> Sample) {
-        if !self.0.sampling.load(Ordering::Relaxed)
-            || self.0.terminal.load(Ordering::Relaxed) != u64::MAX
-        {
+        if !self.0.sampling.load(Ordering::Relaxed) || self.0.terminal.lock().is_some() {
             return;
         }
         let (groups, revision): (Vec<_>, _) = {
@@ -142,6 +190,11 @@ impl Clock {
         if new {
             registry.groups.push(Arc::downgrade(group));
         }
+        if !self.0.active.swap(true, Ordering::Relaxed) {
+            if let Some(domain) = &self.0.wake_domain {
+                domain.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if sample {
             self.0.sampling.store(true, Ordering::Relaxed);
         }
@@ -151,6 +204,7 @@ impl Clock {
 #[derive(Clone)]
 pub struct Attr {
     config: u64,
+    metadata: u64,
     format: u64,
     disabled: bool,
     pinned: bool,
@@ -234,7 +288,7 @@ impl Attr {
         if kind != 1 {
             return Err(Errno(2));
         }
-        if !matches!(config, 0 | 1 | 9) {
+        if !matches!(config, 0..=6 | 9) {
             return Err(Errno(2));
         }
         // Admit only sample fields with a real software producer. Inherited
@@ -253,7 +307,19 @@ impl Attr {
             | (1 << 18)
             | (1 << 20)
             | (1 << 35)
-            | (1 << 36);
+            | (1 << 36)
+            | (1 << 8)
+            | (1 << 9)
+            | (1 << 11)
+            | (1 << 13)
+            | (1 << 17)
+            | (1 << 23)
+            | (1 << 24)
+            | (1 << 25)
+            // These subscribe to guest dynamic kernel symbols/BPF programs.
+            // Neither resource can currently be created, so the streams are empty.
+            | (1 << 29)
+            | (1 << 30);
         let period = word(16);
         let sample_type = word(24);
         if period >> 63 != 0 || sample_type >> 25 != 0 {
@@ -261,24 +327,30 @@ impl Attr {
         }
         if flags & !SUPPORTED_FLAGS != 0
             || sample_type & !sample::SUPPORTED != 0
-            || bytes[52..expected].iter().any(|&b| b != 0)
+            || bytes[52..92]
+                .iter()
+                .chain(&bytes[96..expected])
+                .any(|&b| b != 0)
+            || if flags & (1 << 25) != 0 {
+                i32::from_le_bytes(bytes[92..96].try_into().unwrap()) != 1
+            } else {
+                bytes[92..96] != [0; 4]
+            }
         {
             return Err(Errno(95));
         }
         let frequency = flags & (1 << 10) != 0;
-        // CPU/task-clock count their time regardless of the sample filter.
-        // There is no compatibility-kernel IP producer yet.
-        if period != 0 && config != 9 && flags & (1 << 4) != 0 && flags & (1 << 5) == 0 {
-            return Err(Errno(95));
-        }
         let requested_frequency = frequency.then_some(period);
-        let period = if frequency && period != 0 {
+        let period = if frequency && period != 0 && matches!(config, 0 | 1) {
             (1_000_000_000 / period).max(1)
+        } else if frequency && period != 0 {
+            1
         } else {
             period
         };
         Ok(AttrInput::Value(Self {
             config,
+            metadata: flags & ((1 << 8) | (1 << 9) | (1 << 13) | (1 << 17) | (1 << 23) | (1 << 24)),
             format,
             disabled: flags & 1 != 0,
             pinned: flags & 4 != 0,
@@ -306,33 +378,37 @@ struct Counter {
     running: bool,
     value: u64,
     time: u64,
+    enabled_time: u64,
     attr: Attr,
     remaining: u64,
     refresh: Option<u64>,
     exhausted: bool,
+    throttled: bool,
+    sample_at: u64,
+    sample_value: u64,
     lost: Arc<AtomicU64>,
     output: Arc<output::Output>,
     namespace: PidNamespace,
     changed: Arc<Readiness>,
-    closed_at: Arc<AtomicU64>,
+    closed_at: Arc<parking_lot::Mutex<Option<Stamp>>>,
     connected: Arc<std::sync::atomic::AtomicBool>,
     family: Option<Arc<inheritance::Family>>,
     branch: Option<Arc<inheritance::Branch>>,
     settings: Arc<Settings>,
 }
 struct Group {
-    source: u64,
+    source: Stamp,
     members: BTreeMap<u64, Counter>,
 }
 impl Group {
-    fn settle(&mut self, source: u64) {
+    fn settle(&mut self, source: Stamp) {
         // A mapping can release the final Event while a sampler owns this
         // group. Drop only publishes its close timestamp; reap at this shared
         // resource boundary, including leader detachment at the actual time.
         let mut events = Vec::new();
         for (&id, counter) in &self.members {
-            let at = counter.closed_at.load(Ordering::Relaxed);
-            if at != u64::MAX {
+            let at = *counter.closed_at.lock();
+            if let Some(at) = at {
                 events.push((at, id, None));
             }
             if let Some(branch) = &counter.branch {
@@ -345,8 +421,8 @@ impl Group {
                 );
             }
         }
-        events.sort_by_key(|&(at, _, _)| at);
-        let source = source.max(events.last().map_or(0, |event| event.0));
+        events.sort_by_key(|&(at, _, _)| at.enabled);
+        let source = source.max(events.last().map_or(Stamp::default(), |event| event.0));
         for (at, id, request) in events {
             self.advance(at);
             if let Some(request) = request {
@@ -367,19 +443,21 @@ impl Group {
         }
         self.advance(source);
     }
-    fn advance(&mut self, source: u64) {
+    fn advance(&mut self, source: Stamp) {
         // A live assignment may finish after a reader observed its clock. The
         // completed projection must not move the baseline backward and count
         // the same execution interval again on the next read.
         let source = source.max(self.source);
-        let delta = source - self.source;
+        let delta = source.cpu - self.source.cpu;
+        let enabled_delta = source.enabled - self.source.enabled;
         for counter in self.members.values_mut() {
             if counter.running {
-                if counter.config != 9 {
+                if matches!(counter.config, 0 | 1) {
                     counter.value = counter.value.wrapping_add(delta);
                 }
                 counter.time = counter.time.saturating_add(delta);
-                if counter.config != 9 && counter.attr.period != 0 {
+                counter.enabled_time = counter.enabled_time.saturating_add(enabled_delta);
+                if matches!(counter.config, 0 | 1) && counter.attr.period != 0 {
                     counter.remaining = counter.remaining.saturating_sub(delta);
                 }
             }
@@ -411,20 +489,20 @@ impl Group {
             .members
             .iter()
             .filter(|(_, member)| member.leader == counter.leader);
-        let (value, time, _) = counter.totals();
+        let (value, enabled, time, _) = counter.totals();
         let mut words = vec![if grouped {
             members.clone().count() as u64
         } else {
             value
         }];
         if format & 1 != 0 {
-            words.push(time);
+            words.push(enabled);
         }
         if format & 2 != 0 {
             words.push(time);
         }
         let mut append = |id: u64, counter: &Counter| {
-            let (value, _, lost) = counter.totals();
+            let (value, _, _, lost) = counter.totals();
             if grouped {
                 words.push(value);
             }
@@ -454,7 +532,7 @@ pub struct Event {
     attr: Attr,
     changed: Arc<Readiness>,
     output: Arc<output::Output>,
-    closed_at: Arc<AtomicU64>,
+    closed_at: Arc<parking_lot::Mutex<Option<Stamp>>>,
     connected: Arc<std::sync::atomic::AtomicBool>,
     family: Option<Arc<inheritance::Family>>,
 }
@@ -480,18 +558,20 @@ impl Event {
         cpus: usize,
         settings: Arc<Settings>,
     ) -> Result<Arc<Self>> {
-        if clock.0.terminal.load(Ordering::Relaxed) != u64::MAX {
+        if clock.0.terminal.lock().is_some() {
             return Err(Errno(3));
         }
         // Linux software clocks convert frequency once in PMU init and clear
         // attr.freq. A later IOC_PERIOD therefore takes nanoseconds.
-        attr.frequency = None;
-        if output.is_some_and(|event| !clock.same(&event.clock)) {
+        if matches!(attr.config, 0 | 1) {
+            attr.frequency = None;
+        }
+        if output.is_some_and(|event| !clock.output_compatible(&event.clock)) {
             return Err(Errno(22));
         }
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let changed: Arc<Readiness> = Arc::default();
-        let closed_at = Arc::new(AtomicU64::new(u64::MAX));
+        let closed_at = Arc::new(parking_lot::Mutex::new(None));
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let family = attr.inherit.then(|| Arc::new(inheritance::Family::new(id)));
         let destination = output::Output::new(changed.clone());
@@ -545,9 +625,17 @@ impl Event {
                     running: false,
                     value: 0,
                     time: 0,
-                    remaining: attr.period.max(settings.minimum_period()),
+                    enabled_time: 0,
+                    remaining: attr.period.max(if matches!(attr.config, 0 | 1) {
+                        settings.minimum_period()
+                    } else {
+                        1
+                    }),
                     refresh: None,
                     exhausted: false,
+                    throttled: false,
+                    sample_at: 0,
+                    sample_value: 0,
                     attr: attr.clone(),
                     lost: Arc::new(AtomicU64::new(0)),
                     output: destination.clone(),
@@ -561,6 +649,9 @@ impl Event {
                 },
             );
             state.sync();
+        }
+        if attr.metadata != 0 {
+            clock.0.metadata.store(true, Ordering::Relaxed);
         }
         clock.register(&group, leader.is_none(), attr.period != 0);
         let event = Arc::new(Self {
@@ -576,7 +667,7 @@ impl Event {
             connected,
             family,
         });
-        if event.clock.0.terminal.load(Ordering::Relaxed) != u64::MAX {
+        if event.clock.0.terminal.lock().is_some() {
             return Err(Errno(3));
         }
         Ok(event)
@@ -654,8 +745,20 @@ impl Event {
                 if period == 0 || period >> 63 != 0 || counter.attr.period == 0 {
                     return Err(Errno(22));
                 }
-                counter.attr.period = period;
-                counter.remaining = period.max(counter.settings.minimum_period());
+                if counter.attr.frequency.is_some() {
+                    if period > counter.settings.get(Setting::MaxSampleRate) as u64 {
+                        return Err(Errno(22));
+                    }
+                    counter.attr.frequency = Some(period);
+                    counter.attr.period = 1;
+                } else {
+                    counter.attr.period = period;
+                }
+                counter.remaining = counter.attr.period.max(if matches!(counter.config, 0 | 1) {
+                    counter.settings.minimum_period()
+                } else {
+                    1
+                });
                 Ok(0)
             }
             0x40042409 => {
@@ -672,7 +775,7 @@ impl Event {
 }
 impl Drop for Event {
     fn drop(&mut self) {
-        self.closed_at.store(self.clock.read(), Ordering::Relaxed);
+        *self.closed_at.lock() = Some(self.clock.read());
         if let Some(family) = &self.family {
             family.close();
         }

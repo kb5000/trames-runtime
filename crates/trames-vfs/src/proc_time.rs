@@ -35,6 +35,9 @@ impl Time {
     fn ticks(&self, at: Instant) -> i128 {
         nanos(at.saturating_duration_since(self.origin))
     }
+    pub fn running(&self) -> bool {
+        self.value.load(Ordering::Relaxed) & 1 != 0
+    }
     pub fn begin(&self, at: Instant) {
         let tick = self.ticks(at);
         let _ = self

@@ -162,6 +162,16 @@ impl Memory {
                         ("me", mapping.is_none_or(|m| m.may_execute)),
                         ("ms", shared),
                         ("lo", locked),
+                        ("dd", !self.mapping_dumpable(start)),
+                        (
+                            "dc",
+                            self.vma_policy.nofork.contains(start)
+                                || self
+                                    .page_for_access_unchecked(start)
+                                    .and_then(|p| p.backing.as_ref())
+                                    .is_some_and(|b| !b.object.inherit_on_fork()),
+                        ),
+                        ("de", !self.mapping_expandable(start)),
                     ] {
                         if on {
                             write!(out, " {flag}").unwrap();

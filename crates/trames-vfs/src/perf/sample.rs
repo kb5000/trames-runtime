@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) const SUPPORTED: u64 =
     1 | 2 | 4 | 8 | 16 | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 16);
+#[derive(Clone, Copy)]
 pub struct Sample {
     pub ip: u64,
     pub pid: u32,
@@ -69,7 +70,14 @@ impl Identity<'_> {
             out.extend(self.id.to_le_bytes());
         }
     }
-    pub(super) fn sample_record(&self, sample: &Sample, period: u64, values: Vec<u64>) -> Vec<u8> {
+    pub(super) fn sample_record(
+        &self,
+        sample: &Sample,
+        period: u64,
+        values: Vec<u64>,
+        kernel: bool,
+        address: u64,
+    ) -> Vec<u8> {
         let kind = self.attr.sample_type;
         let mut out = vec![0; 8];
         if kind & (1 << 16) != 0 {
@@ -85,7 +93,7 @@ impl Identity<'_> {
             out.extend(sample.time.to_le_bytes());
         }
         if kind & 8 != 0 {
-            out.extend(0u64.to_le_bytes());
+            out.extend(address.to_le_bytes());
         }
         if kind & (1 << 6) != 0 {
             out.extend(self.id.to_le_bytes());
@@ -105,7 +113,7 @@ impl Identity<'_> {
                 out.extend(value.to_le_bytes());
             }
         }
-        header(&mut out, 9, 2); // PERF_RECORD_SAMPLE, PERF_RECORD_MISC_USER
+        header(&mut out, 9, if kernel { 1 } else { 2 }); // PERF_RECORD_SAMPLE, PERF_RECORD_MISC_USER
         out
     }
 }
@@ -114,12 +122,21 @@ impl Group {
         for counter in self.members.values() {
             if counter.branch.is_none() {
                 if let Some(ring) = counter.output.capture_owned() {
-                    ring.userpage(counter.value, counter.time);
+                    ring.userpage(counter.value, counter.enabled_time, counter.time);
                 }
             }
         }
     }
-    pub(super) fn sample(&mut self, source: u64, context: &Sample) -> Vec<Arc<Readiness>> {
+    pub(super) fn sample(&mut self, source: Stamp, context: &Sample) -> Vec<Arc<Readiness>> {
+        self.sample_mode(source, context, false, 0)
+    }
+    pub(super) fn sample_mode(
+        &mut self,
+        source: Stamp,
+        context: &Sample,
+        kernel: bool,
+        address: u64,
+    ) -> Vec<Arc<Readiness>> {
         self.settle(source);
         let due: Vec<_> = self
             .members
@@ -135,10 +152,37 @@ impl Group {
         let mut changes = Vec::new();
         for id in due {
             let counter = &self.members[&id];
-            if counter.attr.exclude_user {
+            if if kernel {
+                counter.attr.exclude_kernel
+            } else {
+                counter.attr.exclude_user
+            } {
                 let counter = self.members.get_mut(&id).unwrap();
-                counter.remaining = counter.attr.period.max(counter.settings.minimum_period());
+                counter.remaining = counter.attr.period.max(if matches!(counter.config, 0 | 1) {
+                    counter.settings.minimum_period()
+                } else {
+                    1
+                });
                 continue;
+            }
+            let permit = quota::enter(&counter.settings);
+            if permit.is_err() {
+                let first = !counter.throttled;
+                if first {
+                    changes.extend(metadata::throttle(counter, id, context, 5));
+                }
+                let counter = self.members.get_mut(&id).unwrap();
+                counter.throttled = true;
+                counter.remaining = counter.attr.period.max(if matches!(counter.config, 0 | 1) {
+                    100_000_000
+                } else {
+                    1
+                });
+                continue;
+            }
+            let _permit = permit.ok();
+            if counter.throttled {
+                changes.extend(metadata::throttle(counter, id, context, 6));
             }
             if let Some(ring) = counter.output.capture() {
                 let values = if counter.attr.sample_type & 16 != 0 {
@@ -152,15 +196,33 @@ impl Group {
                     namespace: &counter.namespace,
                     attr: &counter.attr,
                 };
-                let record = source.sample_record(context, counter.attr.period, values);
+                let record =
+                    source.sample_record(context, counter.attr.period, values, kernel, address);
                 if ring.output(&record, context, true, &source, &counter.lost) {
                     changes.extend(ring.waiters());
                 }
             }
             let counter = self.members.get_mut(&id).unwrap();
+            counter.throttled = false;
+            if let Some(frequency) = counter.attr.frequency {
+                let elapsed = source.cpu.saturating_sub(counter.sample_at);
+                let count = counter.value.saturating_sub(counter.sample_value);
+                if elapsed != 0 {
+                    counter.attr.period = ((count as u128 * 1_000_000_000)
+                        / (elapsed as u128 * frequency.max(1) as u128))
+                        .clamp(1, i64::MAX as u128)
+                        as u64;
+                }
+                counter.sample_at = source.cpu;
+                counter.sample_value = counter.value;
+            }
             // A delayed software timer has one real sampled IP. Re-arm from
             // this actual boundary rather than fabricating past samples.
-            counter.remaining = counter.attr.period.max(counter.settings.minimum_period());
+            counter.remaining = counter.attr.period.max(if matches!(counter.config, 0 | 1) {
+                counter.settings.minimum_period()
+            } else {
+                1
+            });
             if let Some(remaining) = &mut counter.refresh {
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 {

@@ -3117,6 +3117,7 @@ impl Vfs {
                 "perf_event_paranoid",
                 "perf_event_mlock_kb",
                 "perf_event_max_sample_rate",
+                "perf_cpu_time_max_percent",
                 "randomize_va_space",
                 "random",
             ]

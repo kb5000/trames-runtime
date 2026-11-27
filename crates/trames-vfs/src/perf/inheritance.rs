@@ -7,12 +7,14 @@ use std::sync::{atomic::AtomicBool, Weak};
 struct Totals {
     value: u64,
     time: u64,
+    enabled: u64,
     lost: u64,
 }
 impl Totals {
     fn add(&mut self, other: Self) {
         self.value = self.value.wrapping_add(other.value);
         self.time = self.time.saturating_add(other.time);
+        self.enabled = self.enabled.saturating_add(other.enabled);
         self.lost = self.lost.saturating_add(other.lost);
     }
 }
@@ -29,10 +31,10 @@ struct FamilyState {
 pub(super) struct Branch {
     clock: Weak<ClockData>,
     group: Weak<parking_lot::Mutex<Group>>,
-    closed_at: Arc<AtomicU64>,
+    closed_at: Arc<parking_lot::Mutex<Option<Stamp>>>,
     connected: Arc<AtomicBool>,
     totals: parking_lot::Mutex<Totals>,
-    pub(super) commands: parking_lot::Mutex<Vec<(u64, u32)>>,
+    pub(super) commands: parking_lot::Mutex<Vec<(Stamp, u32)>>,
 }
 impl Family {
     pub(super) fn new(id: u64) -> Self {
@@ -92,9 +94,7 @@ impl Family {
         for branch in &state.branches {
             if let Some(clock) = branch.clock.upgrade() {
                 clocks.push(Clock(clock));
-                branch
-                    .closed_at
-                    .store(clocks.last().unwrap().read(), Ordering::Relaxed);
+                *branch.closed_at.lock() = Some(clocks.last().unwrap().read());
             }
         }
         // A retained clock's final release can aggregate its children. Release
@@ -131,10 +131,11 @@ impl Counter {
         }
         self.publish_branch();
     }
-    pub(super) fn totals(&self) -> (u64, u64, u64) {
+    pub(super) fn totals(&self) -> (u64, u64, u64, u64) {
         let mut totals = Totals {
             value: self.value,
             time: self.time,
+            enabled: self.enabled_time,
             lost: self.lost.load(Ordering::Relaxed),
         };
         if self.branch.is_none() {
@@ -142,13 +143,14 @@ impl Counter {
                 totals.add(family.totals());
             }
         }
-        (totals.value, totals.time, totals.lost)
+        (totals.value, totals.enabled, totals.time, totals.lost)
     }
     pub(super) fn publish_branch(&self) {
         if let Some(branch) = &self.branch {
             *branch.totals.lock() = Totals {
                 value: self.value,
                 time: self.time,
+                enabled: self.enabled_time,
                 lost: self.lost.load(Ordering::Relaxed),
             };
         }
@@ -197,7 +199,37 @@ impl Group {
     }
 }
 impl Clock {
+    pub(crate) fn revoke(&self) {
+        let filters: Vec<_> = self.0.filters.lock().values().cloned().collect();
+        for clock in filters {
+            clock.revoke();
+        }
+        let source = self.read();
+        let mut changes = Vec::new();
+        let groups = self.groups();
+        for group in groups {
+            let mut group = group.lock();
+            group.settle(source);
+            group.detach_all();
+            group.publish_userpages();
+            changes.extend(
+                group
+                    .members
+                    .values()
+                    .map(|counter| counter.changed.clone()),
+            );
+        }
+        self.0.sampling.store(false, Ordering::Relaxed);
+        self.deactivate();
+        for changed in changes {
+            changed.notify_atomic();
+        }
+    }
     pub(crate) fn exec(&self) {
+        let filters: Vec<_> = self.0.filters.lock().values().cloned().collect();
+        for clock in filters {
+            clock.exec();
+        }
         let groups: Vec<_> = self
             .0
             .groups
@@ -208,7 +240,7 @@ impl Clock {
             .collect();
         let source = self.read();
         let mut changes = Vec::new();
-        let mut sampling = false;
+        let mut active = false;
         for group in groups {
             let mut group = group.lock();
             group.settle(source);
@@ -233,12 +265,9 @@ impl Clock {
             }
             group.sync();
             group.publish_userpages();
-            sampling |= group
-                .members
-                .values()
-                .any(|counter| counter.running && counter.attr.period != 0);
+            active |= group.members.values().any(|counter| counter.running);
         }
-        if sampling {
+        if active {
             self.register_empty_sampling();
         }
         for changed in changes {
@@ -248,9 +277,18 @@ impl Clock {
     fn register_empty_sampling(&self) {
         let mut registry = self.0.groups.lock();
         registry.revision = registry.revision.wrapping_add(1);
+        if !self.0.active.swap(true, Ordering::Relaxed) {
+            if let Some(domain) = &self.0.wake_domain {
+                domain.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.0.sampling.store(true, Ordering::Relaxed);
     }
     pub(crate) fn inherit(&self, parent: &Self, threaded: bool) {
+        let filters = parent.0.filters.lock().clone();
+        for (cpu, clock) in filters {
+            self.for_cpu(cpu).inherit(&clock, threaded);
+        }
         let groups: Vec<_> = parent
             .0
             .groups
@@ -281,6 +319,7 @@ impl Clock {
                 let mut children = BTreeMap::new();
                 let mut new_leader = None;
                 let mut sampling = false;
+                let mut metadata = false;
                 let ids: Vec<_> = source
                     .members
                     .iter()
@@ -320,7 +359,7 @@ impl Clock {
                     } else {
                         new_leader.unwrap_or(id)
                     };
-                    let closed_at = Arc::new(AtomicU64::new(u64::MAX));
+                    let closed_at = Arc::new(parking_lot::Mutex::new(None));
                     let connected = Arc::new(AtomicBool::new(true));
                     let branch = Arc::new(Branch {
                         clock: Arc::downgrade(&self.0),
@@ -332,6 +371,7 @@ impl Clock {
                     });
                     state.branches.push(branch.clone());
                     sampling |= counter.attr.period != 0 && counter.enabled;
+                    metadata |= counter.attr.metadata != 0;
                     children.insert(
                         id,
                         Counter {
@@ -341,10 +381,20 @@ impl Clock {
                             running: false,
                             value: 0,
                             time: 0,
+                            enabled_time: 0,
                             attr: counter.attr.clone(),
-                            remaining: counter.attr.period.max(counter.settings.minimum_period()),
+                            remaining: counter.attr.period.max(
+                                if matches!(counter.config, 0 | 1) {
+                                    counter.settings.minimum_period()
+                                } else {
+                                    1
+                                },
+                            ),
                             refresh: None,
                             exhausted: false,
+                            throttled: false,
+                            sample_at: 0,
+                            sample_value: 0,
                             lost: Arc::new(AtomicU64::new(0)),
                             output: counter.output.clone(),
                             namespace: counter.namespace.clone(),
@@ -371,6 +421,10 @@ impl Clock {
                 registry.revision = registry.revision.wrapping_add(1);
                 registry.groups.push(Arc::downgrade(&group));
                 registry.inherited.push(group);
+                self.0.active.store(true, Ordering::Relaxed);
+                if metadata {
+                    self.0.metadata.store(true, Ordering::Relaxed);
+                }
                 if sampling {
                     self.0.sampling.store(true, Ordering::Relaxed);
                 }
@@ -380,9 +434,32 @@ impl Clock {
 }
 impl Drop for ClockData {
     fn drop(&mut self) {
+        if self.active.load(Ordering::Relaxed) {
+            if let Some(domain) = &self.wake_domain {
+                domain.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         // Also covers a failed, never-published birth. No worker or task body
         // is retained merely to finish a child's accounting.
-        let source = self.time.read().as_nanos().min((u64::MAX - 1) as u128) as u64;
+        let source = Stamp {
+            cpu: self
+                .wall
+                .map_or_else(|| self.time.read(), |origin| origin.elapsed())
+                .as_nanos()
+                .min((u64::MAX - 1) as u128) as u64,
+            enabled: self
+                .enabled_time
+                .as_ref()
+                .map_or_else(
+                    || {
+                        self.wall
+                            .map_or_else(|| self.time.read(), |origin| origin.elapsed())
+                    },
+                    |time| time.read(),
+                )
+                .as_nanos()
+                .min((u64::MAX - 1) as u128) as u64,
+        };
         for group in &self.groups.get_mut().inherited {
             let mut group = group.lock();
             group.settle(source);

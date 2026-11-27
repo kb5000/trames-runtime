@@ -123,6 +123,13 @@ pub(super) struct Cache {
     pages: RwLock<BTreeMap<u64, Arc<Page>>>,
 }
 impl Cache {
+    pub fn resident(&self, offset: u64) -> bool {
+        self.pages
+            .read()
+            .unwrap()
+            .get(&(offset & !(PAGE_SIZE - 1)))
+            .is_some_and(|page| page.contents.lock().unwrap().is_some())
+    }
     /// Called under this inode's original layout exclusion after writeback.
     /// Old executor/native byte pins keep their physical leases independently.
     pub fn discard_mapped(

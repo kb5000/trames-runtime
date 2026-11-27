@@ -310,6 +310,18 @@ impl FilePage {
     }
 }
 impl trames_memory::PageSource for FilePage {
+    fn requires_io(&self) -> bool {
+        let bytes = self.bytes.read().unwrap();
+        let source = if self.external_version() != self.loaded_generation.load(Ordering::Relaxed) {
+            self.shared_reload.as_ref().unwrap_or(&bytes)
+        } else {
+            &bytes
+        };
+        match source {
+            PageStorage::Deferred { source, offset, .. } => source.fault_requires_io(*offset),
+            _ => false,
+        }
+    }
     fn generation(&self) -> u64 {
         self.source_generation
             .load(Ordering::Relaxed)

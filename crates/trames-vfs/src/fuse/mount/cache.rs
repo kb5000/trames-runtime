@@ -1113,6 +1113,7 @@ struct Source {
     read: Mutex<BTreeMap<u32, Read>>,
 }
 impl PageSource for Source {
+    fn requires_io(&self)->bool {self.page.as_ref().is_some_and(|page|!page.valid())}
     fn generation(&self) -> u64 {
         self.page
             .as_ref()

@@ -205,6 +205,9 @@ impl<C: Cpu> Kernel<C> {
         p.family.mark_exec();
         p.wait_event.exec();
         p.signals.exec();
+        if p.linux.vfs.dumpable() != 1 {
+            p.signals.io.proc_view.revoke_perf();
+        }
 
         p.membarrier_registered = Arc::new(std::sync::atomic::AtomicU32::new(0));
         p.state = State::Ready;

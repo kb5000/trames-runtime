@@ -506,6 +506,13 @@ impl PlainFile {
             .as_ref()
             .is_some_and(|cache| cache.discard_mapped(offset, owners, bytes))
     }
+    pub(super) fn fault_requires_io(&self, offset: u64) -> bool {
+        self.disk_backed()
+            && !self
+                .cache
+                .as_ref()
+                .is_some_and(|cache| cache.resident(offset))
+    }
     pub(super) fn cached_fault(
         &self,
         offset: u64,

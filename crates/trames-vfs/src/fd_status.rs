@@ -66,7 +66,7 @@ struct MutableStatus {
 const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// One accepted original descriptor for controls needing inode/credential data.
 /// This has no Files root and never resolves a numeric FD after acceptance.
-pub struct DescriptorControl(Descriptor);
+pub struct DescriptorControl(pub(crate) Descriptor);
 impl DescriptorControl {
     pub fn shared_file(&self) -> SharedFd {
         SharedFd::new(self.0.open.borrow().shared.clone())

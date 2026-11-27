@@ -88,7 +88,7 @@ fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>
         Ok(len) => len,
         Err(error) => return Some(Err(error)),
     };
-    if matches!(a[2] as u32, 10 | 11 | 18 | 19) {
+    if matches!(a[2] as u32, 10 | 11 | 16 | 17 | 18 | 19) {
         return Some(
             memory
                 .advise_fork(start, len, a[2] as u32)?
@@ -166,7 +166,7 @@ mod tests {
             (233, [0x4000, 0, 0, 0, 0, 0], 0),
             (233, [0x6000, 3 * PAGE_SIZE, 0, 0, 0, 0], 12),
         ];
-        for advice in [0, 1, 2, 3, 14, 15, 16, 17, 1u64 << 32 | 3] {
+        for advice in [0, 1, 2, 3, 14, 15, 1u64 << 32 | 3] {
             cases.push((233, [0x8000, 2 * PAGE_SIZE, advice, 0, 0, 0], 0));
         }
         for (number, args, error) in cases {
@@ -195,6 +195,18 @@ mod tests {
             if error != 0 {
                 assert_eq!(owner.read_array::<256>(0x1000).unwrap(), [0xa5; 256]);
             }
+        }
+    }
+    #[test]
+    fn dump_policy_defers_to_the_original_mm_before_mutating_the_view() {
+        let mut owner = memory();
+        for advice in [16, 17] {
+            let args = [0x4000, PAGE_SIZE, advice, 0, 0, 0];
+            let mut view = owner.parallel_view(&mut Default::default()).unwrap();
+            assert_eq!(memory_query(&mut view, 233, args), None);
+            drop(view);
+            assert_eq!(memory_query(&mut owner, 233, args), Some(Ok(0)));
+            assert_eq!(owner.mapping_dumpable(0x4000), advice == 17);
         }
     }
     #[test]

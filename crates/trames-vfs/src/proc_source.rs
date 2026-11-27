@@ -479,7 +479,7 @@ impl Vfs {
 
 #[derive(Clone)]
 pub struct ProcResources {
-    name: Option<TaskName>,
+    pub(crate) name: Option<TaskName>,
     dumpable: Dumpable,
     fs: FsHandle,
     paths: fs_context::PathSource,
@@ -699,7 +699,7 @@ impl Vfs {
 macro_rules! process_metadata {
     ($($name:ident: $ty:ty,)*) => {
         #[derive(Clone)]
-        struct ProcessMetadata { $( $name: $ty, )* }
+        pub(crate) struct ProcessMetadata { $( pub(crate) $name: $ty, )* }
         impl ProcessMetadata {
             fn capture(info: &ProcessInfo) -> Self {
                 Self { $( $name: info.$name.clone(), )* }
@@ -747,15 +747,16 @@ process_metadata! {
     caught: u64,
 }
 #[derive(Clone)]
-struct ProcessImage {
-    metadata: ProcessMetadata,
-    legacy_command: Vec<u8>,
-    resources: ProcResources,
+pub(crate) struct ProcessImage {
+    pub(crate) identity: u64,
+    pub(crate) metadata: ProcessMetadata,
+    pub(crate) legacy_command: Vec<u8>,
+    pub(crate) resources: ProcResources,
     arguments: Vec<Vec<u8>>,
     environment: Vec<Vec<u8>>,
     auxiliary: Vec<u8>,
-    maps: Vec<u8>,
-    memory: Option<trames_memory::MemoryReport>,
+    pub(crate) maps: Vec<u8>,
+    pub(crate) memory: Option<trames_memory::MemoryReport>,
 }
 /// Live original task policy; observations never borrow its CPU or task body.
 pub trait SeccompView: Send + Sync {
@@ -766,12 +767,15 @@ pub trait SeccompView: Send + Sync {
 pub struct ProcessView {
     pressure: std::sync::OnceLock<Arc<trames_memory::PressureTask>>,
     seccomp: std::sync::OnceLock<Arc<dyn SeccompView>>,
-    image: std::sync::RwLock<Option<Arc<ProcessImage>>>,
+    image: Arc<std::sync::RwLock<Option<Arc<ProcessImage>>>>,
     identity: u64,
     cpu: AtomicU32,
     time: Arc<Time>,
     perf: std::sync::OnceLock<crate::perf::Clock>,
+    perf_domain: std::sync::OnceLock<crate::perf::Domain>,
+    perf_cgroup: std::sync::OnceLock<CgroupTask>,
     perf_retired: parking_lot::Mutex<bool>,
+    perf_exec: Arc<std::sync::atomic::AtomicU64>,
     state: AtomicU32,
     counters: std::sync::OnceLock<Arc<ProcCounters>>,
 }
@@ -785,7 +789,10 @@ impl Default for ProcessView {
             cpu: Default::default(),
             time: Default::default(),
             perf: Default::default(),
+            perf_domain: Default::default(),
+            perf_cgroup: Default::default(),
             perf_retired: Default::default(),
+            perf_exec: Default::default(),
             state: Default::default(),
             counters: Default::default(),
         }
@@ -797,7 +804,19 @@ impl ProcessView {
     }
 
     /// The counting resource retains neither the process image nor its Files.
+    pub(crate) fn perf_existing(&self) -> Option<crate::perf::Clock> {
+        self.perf.get().cloned()
+    }
+    pub(crate) fn perf_image_source(&self) -> crate::perf::metadata::ImageSource {
+        crate::perf::metadata::ImageSource(self.image.clone(), self.perf_exec.clone())
+    }
     pub fn perf_clock(&self) -> crate::perf::Clock {
+        if let Some(domain) = self.perf_domain.get() {
+            domain.observe_events();
+        }
+        if let Some(clock) = self.perf.get() {
+            return clock.clone();
+        }
         let clock = self
             .perf
             .get_or_init(|| crate::perf::Clock::new(&self.time))
@@ -807,7 +826,62 @@ impl ProcessView {
         }
         clock
     }
+    pub fn bind_perf_domain(&self, domain: crate::perf::Domain) {
+        if self.perf.get().is_some() {
+            domain.observe_events();
+        }
+        self.perf_domain.get_or_init(|| domain);
+    }
+    pub fn bind_perf_cgroup(&self, group: CgroupTask) {
+        self.perf_cgroup.get_or_init(|| group);
+    }
+    pub fn perf_fork(&self, pid: u32, tid: u32, parent: u32, parent_tid: u32, cpu: u32, time: u64) {
+        let context = crate::perf::Sample {
+            ip: 0,
+            pid,
+            tid,
+            time,
+            cpu,
+        };
+        if let Some(clock) = self.perf.get() {
+            clock.family_record(7, &context, parent, parent_tid);
+        }
+        if let Some(domain) = self.perf_domain.get() {
+            domain.task_record(7, &context, parent, parent_tid, self.perf_cgroup.get());
+        }
+    }
     pub fn retire_perf(&self) {
+        let cpu = self.cpu.load(Ordering::Relaxed);
+        let observed = self.perf_observing()
+            || self
+                .perf_domain
+                .get()
+                .is_some_and(|domain| domain.observing(self, cpu));
+        if let Some(image) = observed
+            .then(|| self.perf_image_source().current())
+            .flatten()
+        {
+            let time = self.perf_domain.get().map_or(0, crate::perf::Domain::time);
+            let context = crate::perf::Sample {
+                ip: 0,
+                pid: image.pid,
+                tid: image.tid,
+                time,
+                cpu,
+            };
+            if let Some(clock) = self.perf.get() {
+                clock.family_record(4, &context, image.parent, image.parent);
+            }
+            if let Some(domain) = self.perf_domain.get() {
+                domain.task_record(
+                    4,
+                    &context,
+                    image.parent,
+                    image.parent,
+                    self.perf_cgroup.get(),
+                );
+            }
+        }
         if let Some(pressure) = self.pressure.get() {
             pressure.retire();
         }
@@ -821,7 +895,26 @@ impl ProcessView {
             clock.sample(context);
         }
     }
+    /// A non-user-dumpable exec detaches the old perf task context, while the
+    /// living task may subsequently open an independent new context.
+    pub fn revoke_perf(&self) {
+        if let (Some(clock), Some(image)) = (self.perf.get(), self.perf_image_source().current()) {
+            let context = crate::perf::Sample {
+                ip: 0,
+                pid: image.pid,
+                tid: image.tid,
+                time: self.perf_domain.get().map_or(0, crate::perf::Domain::time),
+                cpu: self.cpu.load(Ordering::Relaxed),
+            };
+            clock.family_record(4, &context, image.parent, image.parent);
+            clock.revoke();
+        }
+    }
+    pub fn perf_observing(&self) -> bool {
+        self.perf.get().is_some_and(crate::perf::Clock::observing)
+    }
     pub fn exec_perf(&self) {
+        self.perf_exec.fetch_add(1, Ordering::Relaxed);
         if let Some(clock) = self.perf.get() {
             clock.exec();
         }
@@ -936,6 +1029,7 @@ impl ProcessView {
         memory: Option<trames_memory::MemoryReport>,
     ) {
         let image = Arc::new(ProcessImage {
+            identity: self.identity,
             metadata: ProcessMetadata::capture(info),
             legacy_command: if resources.name.is_none() {
                 info.command.clone()

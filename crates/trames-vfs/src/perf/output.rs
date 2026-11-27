@@ -90,7 +90,9 @@ impl Output {
 }
 impl Event {
     pub fn set_output(&self, target: Option<&Arc<Event>>) -> Result<u64> {
-        if target.is_some_and(|target| self.id == target.id || !self.clock.same(&target.clock)) {
+        if target.is_some_and(|target| {
+            self.id == target.id || !self.clock.output_compatible(&target.clock)
+        }) {
             return Err(Errno(22));
         }
         self.output.redirect(target.map(|target| &target.output))?;

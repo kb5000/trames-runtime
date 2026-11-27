@@ -99,16 +99,22 @@ pub(super) struct Policy {
     pub nodes: NodePolicies,
     pub nofork: Ranges,
     pub wipe: Ranges,
+    pub nodump: Ranges,
 }
 impl Policy {
     pub fn remove(&mut self, start: u64, end: u64) {
         self.nodes.remove(start, end);
         self.nofork.remove(start, end);
         self.wipe.remove(start, end);
+        self.nodump.remove(start, end);
     }
     pub fn moved(&self, old: u64, old_len: u64, new: u64, new_len: u64) -> Self {
         let mut out = Self::default();
-        for (source, target) in [(&self.nofork, &mut out.nofork), (&self.wipe, &mut out.wipe)] {
+        for (source, target) in [
+            (&self.nofork, &mut out.nofork),
+            (&self.wipe, &mut out.wipe),
+            (&self.nodump, &mut out.nodump),
+        ] {
             for (&a, &b) in source.0.range(..old + old_len) {
                 let start = a.max(old);
                 let end = b.min(old + old_len.min(new_len));
@@ -141,6 +147,9 @@ impl Policy {
         }
         for (a, b) in other.wipe.0 {
             self.wipe.insert(a, b);
+        }
+        for (a, b) in other.nodump.0 {
+            self.nodump.insert(a, b);
         }
     }
 }
@@ -187,7 +196,21 @@ impl Memory {
         {
             return Err(MemoryError::InvalidRange);
         }
+        if advice == 17
+            && self.pages.range(address..end).any(|(_, i)| {
+                self.frames[*i]
+                    .as_ref()
+                    .unwrap()
+                    .backing
+                    .as_ref()
+                    .is_some_and(|b| !b.object.dumpable())
+            })
+        {
+            return Err(MemoryError::InvalidRange);
+        }
         match advice {
+            16 => self.vma_policy.nodump.insert(address, end),
+            17 => self.vma_policy.nodump.remove(address, end),
             10 => self.vma_policy.nofork.insert(address, end),
             11 => self.vma_policy.nofork.remove(address, end),
             18 => self.vma_policy.wipe.insert(address, end),
