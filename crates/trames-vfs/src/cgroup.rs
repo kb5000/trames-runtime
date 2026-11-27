@@ -2212,7 +2212,6 @@ impl DescriptorFactory {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
