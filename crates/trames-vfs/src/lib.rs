@@ -3974,7 +3974,10 @@ impl Vfs {
                         };
                     let controlling_tty = matches!(n.content, Content::Terminal)
                         && self.terminal_task.get().is_some();
+                    // O_PATH retains inode/mount identity without opening the
+                    // device or rendering volatile bytes (including devpts).
                     if !query.original
+                        && flags & O_PATH == 0
                         && !pty
                         && !controlling_tty
                         && !matches!(n.content, Content::Fifo(_) | Content::MessageQueue(_))
@@ -3991,7 +3994,14 @@ impl Vfs {
                         && !(node.proc_node.get().is_some()
                             && (flags & O_PATH != 0 || matches!(n.content, Content::Directory)))
                         && (n.volatile
-                            || n.seals.is_some() && magic.as_ref().is_none_or(|m| m.file.is_none())
+                            // A live executable retains the same anonymous inode
+                            // capability as a proc fd, even after CLOEXEC closes
+                            // its last descriptor. Reopen through normal shared
+                            // open/permission handling instead of owner fallback.
+                            || n.seals.is_some()
+                                && magic
+                                    .as_ref()
+                                    .is_none_or(|m| m.file.is_none() && m._image.is_none())
                             || !matches!(
                                 n.content,
                                 Content::File(_) | Content::Directory | Content::Socket(_)
