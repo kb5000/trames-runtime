@@ -837,6 +837,7 @@ pub(super) struct Job<C: Cpu> {
     /// Guest code reached this exit during a bounded exclusive-mm window.
     /// Its syscall/native/fault handling still belongs to normal dispatch.
     pub pending_cpu: Option<SliceOutcome>,
+    pub futex2: Option<Box<crate::futex2::Call>>,
     pub pending_accounted: bool,
     /// A filtered syscall entry may defer before effects. Carry its
     /// decision to the owner instead of evaluating the same BPF entry twice.
@@ -876,6 +877,7 @@ impl<C: Cpu> Job<C> {
             checkpoint: None,
             maintenance_scope: false,
             pending_cpu: None,
+            futex2: None,
             pending_accounted: false,
             seccomp_entry: None,
             stats: Stats {
@@ -1174,6 +1176,7 @@ impl<C: Cpu> Job<C> {
         done.task = work.task;
         done.trace = work.trace;
         done.seccomp_entry = self.seccomp_entry;
+        done.futex2 = self.futex2;
         done
     }
     pub fn finish_retired(
@@ -1218,6 +1221,7 @@ impl Stats {
         Done::<C> {
             task: None,
             thread_exit: None,
+            futex2: None,
             trace: Default::default(),
             fatal_fault: None,
             exit_groups: Vec::new(),

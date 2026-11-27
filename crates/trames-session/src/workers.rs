@@ -81,6 +81,7 @@ impl GpuStats {
 pub(super) struct Done<C: Cpu> {
     pub task: Option<crate::process::tasks::Handle<C>>,
     pub thread_exit: Option<i32>,
+    pub futex2: Option<Box<crate::futex2::Call>>,
     pub trace: crate::syscall_trace::Trace,
     pub fatal_fault: Option<trames_engine::CpuFault>,
     pub exit_groups: Vec<Arc<trames_kernel::task_control::Group>>,
@@ -3140,6 +3141,194 @@ mod tests {
         assert_eq!(done.serviced_syscalls, 0);
         memory.commit_parallel().unwrap();
         assert_eq!(memory.read_array::<7>(0x3000).unwrap(), *b"payload");
+    }
+
+    #[test]
+    fn futex2_page_wait_releases_the_only_slot_and_retains_input_through_source_return() {
+        struct Backing {
+            wait: Arc<trames_memory::PageWait>,
+            page: Arc<trames_memory::SharedPage>,
+        }
+        impl trames_memory::PageSource for Backing {
+            fn load(&self) -> Result<Arc<trames_memory::SharedPage>, MemoryError> {
+                if self.wait.ready() {
+                    Ok(self.page.clone())
+                } else {
+                    Err(self.wait.fault(0))
+                }
+            }
+        }
+        struct Page(Arc<Backing>);
+        impl PageBacking for Page {
+            fn check(&self, _: u64) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn cpu_borrow_safe(&self) -> bool {
+                true
+            }
+            fn native_resident(&self) -> bool {
+                self.0.wait.ready()
+            }
+            fn page_source(&self) -> Option<Arc<dyn trames_memory::PageSource>> {
+                Some(self.0.clone())
+            }
+            fn parallel_key(&self) -> Option<(u64, u64)> {
+                Some((1234, 0))
+            }
+            fn read(&self, offset: usize, bytes: &mut [u8]) -> Result<(), MemoryError> {
+                use trames_memory::PageSource;
+                self.0.load()?.copy_read(offset, bytes);
+                Ok(())
+            }
+            fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
+                use trames_memory::PageSource;
+                self.0.load()?.copy_write(offset, bytes);
+                Ok(())
+            }
+            fn sync(&self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn version(&self) -> u64 {
+                0
+            }
+            fn writable(&self) -> bool {
+                true
+            }
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
+                Err(MemoryError::InvalidRange)
+            }
+        }
+        let page = Arc::new(Backing {
+            wait: Arc::default(),
+            page: Arc::new(trames_memory::SharedPage::new([0; PAGE_SIZE as usize])),
+        });
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory
+            .map_backed(
+                0x3000,
+                vec![Arc::new(Page(page.clone()))],
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        for (i, op) in [0xaa0003f3u32, 0xd2800ba8, 0xd4000001]
+            .into_iter()
+            .enumerate()
+        {
+            memory
+                .write_array(0x1000 + i as u64 * 4, op.to_le_bytes())
+                .unwrap();
+        }
+        memory.write_array(0x2008, 0x3000u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2010, 130u32.to_le_bytes()).unwrap();
+        let mut snapshot = syscall_snapshot();
+        snapshot.futex.vm = 7;
+        let table = snapshot.futex.table.clone();
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let mut cpu = Cpu::new(0x1000, 0);
+        cpu.set_x(8, 449);
+        cpu.set_x(0, 0x2000);
+        cpu.set_x(1, 1);
+        let source = Work {
+            task: None,
+            pid: 1,
+            cpu,
+            memory: Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            )),
+            control: control.clone(),
+            trace: Default::default(),
+            syscalls: Some(snapshot),
+            gpu: None,
+            audio: None,
+        };
+        let mut source = crate::run_queue::Job::new(source, 1, 0, None);
+        source.pending_cpu = Some(SliceOutcome::Syscall { instructions: 0 });
+        epoch.add(source);
+        epoch.add(crate::run_queue::Job::new(
+            work(2, &[0xd4000001], 0, control),
+            1,
+            0,
+            None,
+        ));
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let mut results = epoch.drain();
+        let source = results.remove(results.iter().position(|d| d.pid == 1).unwrap());
+        assert_eq!(
+            results[0].instructions, 1,
+            "peer must use the sole slot during the page wait"
+        );
+        assert!(source.futex2.is_some());
+        assert_eq!(source.syscalls, 0);
+        assert_eq!(table.wake((0, 7, 0x3000), 1, 1), 0);
+        memory.commit_parallel().unwrap();
+        // The original vector was accepted before page-in; replacing it must
+        // not redirect the resumed call to another (resident) word.
+        memory.write_array(0x2008, 0x2000u64.to_le_bytes()).unwrap();
+        page.wait.finish();
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let mut snapshot = syscall_snapshot();
+        snapshot.futex.vm = 7;
+        snapshot.futex.table = table.clone();
+        let source_work = Work {
+            task: None,
+            pid: 1,
+            cpu: source.cpu,
+            memory: Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            )),
+            control: control.clone(),
+            trace: source.trace,
+            syscalls: Some(snapshot),
+            gpu: None,
+            audio: None,
+        };
+        let mut job = crate::run_queue::Job::new(source_work, 1, 0, None);
+        job.pending_cpu = source.outcome;
+        job.futex2 = source.futex2;
+        epoch.add(job);
+        let mov = |r: u32, v: u32| 0xd2800000 | (v << 5) | r;
+        let mut peer = work(
+            2,
+            &[
+                mov(0, 0x3000),
+                mov(1, 1),
+                mov(2, 1),
+                mov(3, 130),
+                mov(8, 454),
+                0xd4000001,
+                mov(8, 93),
+                0xd4000001,
+            ],
+            0,
+            control,
+        );
+        let mut snapshot = syscall_snapshot();
+        snapshot.futex.vm = 7;
+        snapshot.futex.table = table;
+        peer.syscalls = Some(snapshot);
+        epoch.add(crate::run_queue::Job::new(peer, 1, 0, None));
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let results = epoch.drain();
+        let source = results.iter().find(|d| d.pid == 1).unwrap();
+        assert_eq!(source.cpu.x(19), 0);
+        assert_eq!(source.syscalls, 1);
+        assert!(source.futex2.is_none());
+        memory.commit_parallel().unwrap();
     }
 
     #[test]

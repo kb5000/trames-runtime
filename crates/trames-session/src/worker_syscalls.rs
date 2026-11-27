@@ -445,170 +445,37 @@ pub(super) fn futex_parameters(
     futex_key(memory, vm, a[0], a[1] & 128 != 0)
 }
 
-// Linux futex2 currently accepts only U32 words. Flags and values are
-// validated before obtaining any queue key or publishing a registration.
-fn futex2_flags(flags: u32, value: u64) -> Result<(), Errno> {
-    if flags & !0x83 != 0 || flags & 3 != 2 || value > u32::MAX as u64 {
-        return Err(Errno(22));
-    }
-    Ok(())
-}
-struct Futex2Word {
-    address: u64,
-    value: u32,
-    flags: u32,
-}
-fn futex2_words(
-    memory: &impl CpuMemory,
-    address: u64,
-    count: usize,
-) -> Result<Vec<Futex2Word>, Errno> {
-    let mut words = Vec::with_capacity(count);
-    for index in 0..count {
-        let at = address.checked_add(index as u64 * 24).ok_or(Errno(14))?;
-        let bytes = memory.read_array::<24>(at).map_err(|_| Errno(14))?;
-        let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        if bytes[20..24] != [0; 4] {
-            return Err(Errno(22));
-        }
-        futex2_flags(flags, value)?;
-        words.push(Futex2Word {
-            address: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            value: value as u32,
-            flags,
-        });
-    }
-    Ok(words)
-}
-fn futex2_key(
-    memory: &impl CpuMemory,
-    vm: u64,
-    address: u64,
-    flags: u32,
-) -> Result<crate::futex::Key, Errno> {
-    if address & 3 != 0 {
-        return Err(Errno(22));
-    }
-    futex_key(memory, vm, address, flags & 128 != 0)
-}
-fn futex2_deadline(
-    memory: &impl CpuMemory,
-    address: u64,
-    clock: u32,
-    started: Instant,
-) -> Result<Option<Instant>, Errno> {
-    if address == 0 {
-        return Ok(None);
-    }
-    if !matches!(clock, 0 | 1) {
-        return Err(Errno(22));
-    }
-    futex_wait_parameters(
-        memory,
-        [
-            0,
-            9 | if clock == 0 { 256 } else { 0 },
-            0,
-            address,
-            0,
-            u32::MAX as u64,
-        ],
-        started,
-    )
-    .map(|(_, deadline)| deadline)
-}
+// Resident legacy/conformance entry points share the production ABI parser.
 pub(super) fn futex2_wait(
     table: &crate::futex::Futexes,
     memory: &impl CpuMemory,
     caller: (u64, u32),
     number: u32,
-    a: [u64; 6],
+    args: [u64; 6],
     started: Instant,
     target: Option<std::sync::Weak<dyn crate::futex::Wake>>,
 ) -> Result<crate::run_queue::WaitState, Errno> {
-    let (vm, pid) = caller;
-    let (wait, deadline) = if number == 449 {
-        let count = a[1] as u32;
-        if a[2] as u32 != 0 || !(1..=128).contains(&count) || a[0] == 0 {
-            return Err(Errno(22));
-        }
-        let deadline = futex2_deadline(memory, a[3], a[4] as u32, started)?;
-        let words = futex2_words(memory, a[0], count as usize)?;
-        let mut keys = Vec::with_capacity(words.len());
-        for word in &words {
-            keys.push(futex2_key(memory, vm, word.address, word.flags)?);
-        }
-        let wait = table.wait_vector(&keys, pid, target, || {
-            for word in &words {
-                let value = u32::from_le_bytes(
-                    memory
-                        .read_array::<4>(word.address)
-                        .map_err(|_| Errno(14))?,
-                );
-                if value != word.value {
-                    return Err(Errno(11));
-                }
-            }
-            Ok(())
-        })?;
-        (wait, deadline)
-    } else {
-        let flags = a[3] as u32;
-        futex2_flags(flags, a[1])?;
-        futex2_flags(flags, a[2])?;
-        let deadline = futex2_deadline(memory, a[4], a[5] as u32, started)?;
-        if a[2] == 0 {
-            return Err(Errno(22));
-        }
-        let key = futex2_key(memory, vm, a[0], flags)?;
-        let wait = table.wait_target(key, pid, a[2] as u32, target, || {
-            let value = u32::from_le_bytes(memory.read_array::<4>(a[0]).map_err(|_| Errno(14))?);
-            if value != a[1] as u32 {
-                return Err(Errno(11));
-            }
-            Ok(())
-        })?;
-        (wait, deadline)
-    };
-    Ok(crate::run_queue::WaitState::Futex { wait, deadline })
+    match crate::futex2::Call::new(number, args)
+        .progress(table, memory, caller, started, target)
+        .map_err(crate::futex2::Error::errno)?
+    {
+        crate::futex2::Ready::Wait(wait) => Ok(wait),
+        _ => unreachable!("futex2 wait"),
+    }
 }
 pub(super) fn futex2_queue(
     table: &crate::futex::Futexes,
     memory: &impl CpuMemory,
     vm: u64,
     number: u32,
-    a: [u64; 6],
+    args: [u64; 6],
 ) -> Result<crate::futex::Effect, Errno> {
-    if number == 454 {
-        let flags = a[3] as u32;
-        futex2_flags(flags, a[1])?;
-        if a[1] == 0 || (a[2] as i32) < 0 {
-            return Err(Errno(22));
-        }
-        let key = futex2_key(memory, vm, a[0], flags)?;
-        table.wake_regular(key, a[2] as u32, a[1] as u32)
-    } else {
-        if a[1] as u32 != 0 || a[0] == 0 {
-            return Err(Errno(22));
-        }
-        let words = futex2_words(memory, a[0], 2)?;
-        if words[0].flags != words[1].flags || (a[2] as i32) < 0 || (a[3] as i32) < 0 {
-            return Err(Errno(22));
-        }
-        let old = futex2_key(memory, vm, words[0].address, words[0].flags)?;
-        let new = futex2_key(memory, vm, words[1].address, words[1].flags)?;
-        table.requeue_regular(old, new, a[2] as u32, a[3] as u32, || {
-            let value = u32::from_le_bytes(
-                memory
-                    .read_array::<4>(words[0].address)
-                    .map_err(|_| Errno(14))?,
-            );
-            if value != words[0].value {
-                return Err(Errno(11));
-            }
-            Ok(())
-        })
+    match crate::futex2::Call::new(number, args)
+        .progress(table, memory, (vm, 0), Instant::now(), None)
+        .map_err(crate::futex2::Error::errno)?
+    {
+        crate::futex2::Ready::Queue(effect) => Ok(effect),
+        _ => unreachable!("futex2 queue operation"),
     }
 }
 /// One ABI/validation implementation for owner and worker queue operations.
@@ -906,9 +773,21 @@ impl Snapshot {
         delivered: crate::run_queue::Delivered,
     ) -> Result<Option<trames_memory::PageFault>, Errno> {
         if let Some(completion) = delivered.completion {
-            if completion.restart {
+            // Futex2 returns ERESTARTSYS even with an absolute timeout. The
+            // queued wait has left x0..x5 intact; a handler restart is a fresh
+            // SVC entry and therefore imports the vector again, like Linux.
+            let futex2_restart = completion.number.is_none()
+                && completion.result == Err(Errno(4))
+                && delivered.action.flags & 0x1000_0000 != 0
+                && matches!(cpu.x(8) as u32, 449 | 455);
+            if completion.restart || futex2_restart {
                 trace.restart();
-                for (index, value) in completion.args.into_iter().enumerate() {
+                let args = if futex2_restart {
+                    std::array::from_fn(|i| cpu.x(i))
+                } else {
+                    completion.args
+                };
+                for (index, value) in args.into_iter().enumerate() {
                     cpu.set_x(index, value);
                 }
                 cpu.set_pc(cpu.pc().wrapping_sub(4));

@@ -708,15 +708,22 @@ impl Futexes {
     ) -> Result<Effect, E> {
         self.requeue_impl(old, new, wake, count, compare, None)
     }
-    pub fn requeue_regular(
+    pub fn requeue_regular<E: From<trames_vfs::Errno>>(
         &self,
         old: Key,
         new: Key,
         wake: u32,
         count: u32,
-        compare: impl FnOnce() -> Result<(), trames_vfs::Errno>,
-    ) -> Result<Effect, trames_vfs::Errno> {
-        self.requeue_impl(old, new, wake, count, compare, Some(trames_vfs::Errno(22)))
+        compare: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Effect, E> {
+        self.requeue_impl(
+            old,
+            new,
+            wake,
+            count,
+            compare,
+            Some(trames_vfs::Errno(22).into()),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn requeue_impl<E>(
@@ -961,7 +968,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             table
-                .requeue_regular(keys[0], destination, 0, 1, || Ok(()))
+                .requeue_regular(
+                    keys[0],
+                    destination,
+                    0,
+                    1,
+                    || Ok::<_, trames_vfs::Errno>(())
+                )
                 .unwrap()
                 .moved,
             1

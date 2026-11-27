@@ -120,6 +120,53 @@ pub(crate) fn execute<C: Cpu>(
             parked = Some(wait);
             break 'entry Some(SliceOutcome::Yield { instructions: 0 });
         }
+        if job.futex2.is_some() || matches!(work.cpu.x(8) as u32, 449 | 454..=456) {
+            if let (Some(snapshot), Some(epoch)) = (work.syscalls.as_ref(), epoch) {
+                // The normal resident entry stays on the stack. Only a real
+                // backing fault allocates a retained call, never a coordinator.
+                let mut call = job.futex2.take().map_or_else(
+                    || {
+                        crate::futex2::Call::new(
+                            work.cpu.x(8) as u32,
+                            std::array::from_fn(|i| work.cpu.x(i)),
+                        )
+                    },
+                    |call| *call,
+                );
+                match call.progress(
+                    &snapshot.futex.table,
+                    &*memory,
+                    (snapshot.futex.vm, work.pid),
+                    snapshot.started,
+                    Some(epoch.futex_target()),
+                ) {
+                    Ok(crate::futex2::Ready::Wait(wait)) => {
+                        syscalls += 1;
+                        parked = Some(wait);
+                        break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                    }
+                    Ok(crate::futex2::Ready::Queue(effect)) => {
+                        snapshot.futex.record(&effect, call.number == 456);
+                        work.trace.finish(&mut work.cpu, effect.total());
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    Err(crate::futex2::Error::Errno(error)) => {
+                        work.trace
+                            .finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64));
+                        syscalls += 1;
+                        break 'entry None;
+                    }
+                    Err(crate::futex2::Error::Page(fault)) => {
+                        job.futex2 = Some(Box::new(call));
+                        job.pending_cpu = Some(result);
+                        job.pending_accounted = true;
+                        parked = Some(WaitState::Page(crate::run_queue::PageWait::new(fault.wait)));
+                        break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                    }
+                }
+            }
+        }
         if work.cpu.x(8) as u32 == 283 {
             if let (Some(snapshot), Some(epoch), Some(domain)) =
                 (work.syscalls.as_ref(), epoch.as_ref(), domain.as_ref())

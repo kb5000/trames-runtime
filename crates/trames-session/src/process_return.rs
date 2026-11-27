@@ -15,6 +15,7 @@ pub(super) fn publish<C: Cpu>(
     p.linux.vfs.sync_task_namespaces();
     p.cpu = std::mem::take(&mut done.cpu);
     p.trace = std::mem::take(&mut done.trace);
+    p.futex2 = done.futex2.take();
     p.signals.finish_io();
     if let Some(entry) = done.seccomp_entry.take() {
         p.seccomp_entry = Some(entry);

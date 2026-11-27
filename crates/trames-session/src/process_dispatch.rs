@@ -282,6 +282,7 @@ impl Dispatch {
             waiting,
         );
         job.pending_cpu = p.pending_cpu.take();
+        job.futex2 = p.futex2.take();
         job.pending_accounted = job.pending_cpu.is_some();
         if matches!(job.pending_cpu, Some(SliceOutcome::Syscall { .. })) {
             if let Some(entry) = p.seccomp_entry.take() {

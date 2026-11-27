@@ -150,12 +150,14 @@ enum State {
 }
 pub(super) struct Continuation {
     outcome: Option<SliceOutcome>,
+    futex2: Option<Box<crate::futex2::Call>>,
     policy: seccomp::Seccomp,
     entry: Option<seccomp::EntryDecision>,
 }
 pub(crate) struct Process<C: Cpu> {
     cpu: C,
     pending_cpu: Option<SliceOutcome>,
+    futex2: Option<Box<crate::futex2::Call>>,
     last_cpu: usize,
     memory: Memory,
     linux: Linux,
@@ -628,6 +630,7 @@ impl<C: Cpu> Process<C> {
         Box::new(Self {
             trace: Default::default(),
             pending_cpu: None,
+            futex2: None,
             cpu: self.cpu.fork_cpu(shared_vm),
             last_cpu: self.last_cpu,
             memory,
@@ -1448,6 +1451,7 @@ impl<C: Cpu> Kernel<C> {
         self.collect_exit_projection(pid, p, status);
     }
     fn clear_exit_resources(p: &mut Process<C>) {
+        p.futex2 = None;
         Self::cancel_task_waits(p);
         p.linux.cancel_pending_mmap();
         p.layout_wait = None;
@@ -5226,14 +5230,16 @@ pub(super) fn run<C: Cpu>(
             .expect("initial task slot")
             .into_presence(),
     );
-    let (pending_cpu, policy, entry) = if let Some(continuation) = runtime.continuation.take() {
-        let (policy, entry) = continuation.policy.resume_binding(continuation.entry);
-        (continuation.outcome, policy, entry)
-    } else {
-        (None, seccomp::Seccomp::default(), None)
-    };
+    let (pending_cpu, futex2, policy, entry) =
+        if let Some(continuation) = runtime.continuation.take() {
+            let (policy, entry) = continuation.policy.resume_binding(continuation.entry);
+            (continuation.outcome, continuation.futex2, policy, entry)
+        } else {
+            (None, None, seccomp::Seccomp::default(), None)
+        };
     let mut root = Process::<C> {
         pending_cpu,
+        futex2,
         trace: Default::default(),
         cpu: std::mem::take(&mut runtime.cpu),
         last_cpu: 0,
@@ -5488,6 +5494,7 @@ pub(super) fn run<C: Cpu>(
         runtime.cpu = p.cpu;
         runtime.continuation = Some(Continuation {
             outcome: p.pending_cpu,
+            futex2: p.futex2,
             policy: p.seccomp,
             entry: p.seccomp_entry,
         });
@@ -6991,6 +6998,7 @@ mod tests {
         let process = Box::new(Process {
             trace: Default::default(),
             pending_cpu: None,
+            futex2: None,
             cpu: Cpu::new(0x4000, 0x9000),
             last_cpu: 0,
             memory,

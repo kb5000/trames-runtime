@@ -13,6 +13,7 @@ mod devices;
 mod execution_control;
 mod exit_groups;
 mod futex;
+mod futex2;
 mod gpu;
 mod proc_views;
 mod process;

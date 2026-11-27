@@ -1,0 +1,5202 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-27",
+  "base_runtime": "167b66acad47872db699f9009bc27fc9533ae765",
+  "source_sha256": {
+    "crates/trames-session/src/futex.rs": "31deaa7c711ee2c67e46224317889fc3551eadf4220f38d6a29e0189baca0523",
+    "crates/trames-session/src/lib.rs": "e8535df95c6ed9a554b90bdd0178493541931b0e169eee40406c7b66d2f5ea55",
+    "crates/trames-session/src/process.rs": "35af7c51d3f5ece187803fab0ad5c3acf1cf2f329f7f5caab9205cd4f42eee69",
+    "crates/trames-session/src/process_dispatch.rs": "8a9e7cac046fc8c8b800dba3bc9855b1db5a9bcc1bd0780c915634af8fc57256",
+    "crates/trames-session/src/process_return.rs": "dbda6e52bb44379e586943874be191421b965b1ec7dde3bd1d4db8de3df33f2d",
+    "crates/trames-session/src/run_queue.rs": "23054265bd0cb9b0bb9dbc0884c7ccb3a29bdbd48e29599164beecf0f7c9d176",
+    "crates/trames-session/src/syscall_dispatch.rs": "d167ceb4f44f2e82b388e04a37a960c8c9b935a3cf5ed53bddf40c0b543d1e9d",
+    "crates/trames-session/src/worker_syscalls.rs": "0e9089d21317f3866e0bf2d5449a3e0e967f608713965814ae2424fabb92355f",
+    "crates/trames-session/src/workers.rs": "4c2e39e9e44123a9ccc71d8fd1a0d6e38aff3e50c3f354b22e80d95ef8bde3ee",
+    "crates/trames-session/src/futex2.rs": "9bfa97183d6484824f70f82b3d98fafe13cea2162e89a5f141de2d8d341c9078",
+    "tests/fixtures/synchronization.c": "11ac1a972551f5bcedf0991e4660171aa9cd139a9fe3a39a5fcab049dee68a9c"
+  },
+  "gvisor_source": {
+    "revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+    "url": "https://codeload.github.com/google/gvisor/tar.gz/89cacadae21eca4270a8f7c79281d0426d33ac5f",
+    "sha256": "23276c6ca194c4818be1544be13c1def23a492fd8f96d261e0ef9b64a0b444aa"
+  },
+  "linux_source": {
+    "version": "v6.12",
+    "files": [
+      {
+        "path": "include/uapi/linux/futex.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/include/uapi/linux/futex.h?format=TEXT",
+        "sha256": "8482b5e9522268e617e155fd85e1fad3137eb4c0e6672ebb34c07c4c322d5438"
+      },
+      {
+        "path": "include/uapi/linux/rseq.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/include/uapi/linux/rseq.h?format=TEXT",
+        "sha256": "aea8d4292268ef48f76423f78aaf60591620a1b76d70a78dfacdc1d290d56099"
+      },
+      {
+        "path": "kernel/futex/core.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/kernel/futex/core.c?format=TEXT",
+        "sha256": "cf4b088c8b18e5d3cc9d33d52cd38326f5ff7ca1d23a979c6a0e3b5261b8e40e"
+      },
+      {
+        "path": "kernel/futex/requeue.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/kernel/futex/requeue.c?format=TEXT",
+        "sha256": "b2639b9af9ebe809fd9b49c8dfc703f29d05900887cf5350ec0dc53299d24bf1"
+      },
+      {
+        "path": "kernel/futex/syscalls.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/kernel/futex/syscalls.c?format=TEXT",
+        "sha256": "e06a96ec7d945a2afbbc2d71af0c39ca27a84030f9d1377b4f33aec3af2c36b9"
+      },
+      {
+        "path": "kernel/futex/waitwake.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/kernel/futex/waitwake.c?format=TEXT",
+        "sha256": "f756076b20c0ad996a9c6f86702de05ffa3f942a7ff20ec8ef73ec213ef156f7"
+      },
+      {
+        "path": "kernel/rseq.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/kernel/rseq.c?format=TEXT",
+        "sha256": "264ee15b37ddc70bb832b47a90ab5493a80d251dbf9213df575b740cb7cc03f2"
+      },
+      {
+        "path": "tools/include/linux/bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/bits.h?format=TEXT",
+        "sha256": "7972176e1b115c9b0c0b2b1af7b0a8139c1cbfae65c3516a4be6d05aa8462ad6"
+      },
+      {
+        "path": "tools/include/linux/compiler-gcc.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/compiler-gcc.h?format=TEXT",
+        "sha256": "bc221ec8ef2408dffad064bf508fba413cb1380d5f348c6c19076a606f4a8966"
+      },
+      {
+        "path": "tools/include/linux/compiler.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/compiler.h?format=TEXT",
+        "sha256": "0ab5050529801b4e2ad9c2157246a1f3767d132743628412b0bf81e410944f29"
+      },
+      {
+        "path": "tools/include/linux/compiler_types.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/compiler_types.h?format=TEXT",
+        "sha256": "23d173c055a965e3763d6b275fd9d212cf34622d6e79e17bbda145c52bc13120"
+      },
+      {
+        "path": "tools/include/linux/const.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/const.h?format=TEXT",
+        "sha256": "17aaf8663019f1988881952a031fa12aefa9127af9ea1d546202af632b2f0adf"
+      },
+      {
+        "path": "tools/include/linux/kernel.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/kernel.h?format=TEXT",
+        "sha256": "079930c8b58cbab6074f37beb809138d2d744df632299b9aad4cf98fb38aff85"
+      },
+      {
+        "path": "tools/include/linux/poison.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/poison.h?format=TEXT",
+        "sha256": "62b05add7f4b2985c8aec48cd93b26d57b7cf651a0db1a2afdf8dbb6a2b54836"
+      },
+      {
+        "path": "tools/include/linux/stringify.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/stringify.h?format=TEXT",
+        "sha256": "15e3ce94ce1897da94cfd848b17e0ea58ee5cacd199d183847a61f0bda7f1888"
+      },
+      {
+        "path": "tools/include/linux/types.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/linux/types.h?format=TEXT",
+        "sha256": "fb469a378c8d1ebe1a721e05430874b49ea3cf2df39d9acbec493ce500321e8f"
+      },
+      {
+        "path": "tools/include/uapi/linux/const.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/include/uapi/linux/const.h?format=TEXT",
+        "sha256": "0828c9a43d421b39c97c72ca7c14cf6f8b02572b006367fb833d2763aa816af0"
+      },
+      {
+        "path": "tools/testing/selftests/futex/functional/futex_requeue.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/functional/futex_requeue.c?format=TEXT",
+        "sha256": "f017fc203cc4618f1a4b669883064984e0a9431176a5fb236e91c7d4f4d51f5d"
+      },
+      {
+        "path": "tools/testing/selftests/futex/functional/futex_wait.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/functional/futex_wait.c?format=TEXT",
+        "sha256": "c9cbc5c18902f1c2de1c6b1a16a3b4107959c1ac75e402d60b3b1f68a5e7cb49"
+      },
+      {
+        "path": "tools/testing/selftests/futex/functional/futex_waitv.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/functional/futex_waitv.c?format=TEXT",
+        "sha256": "66c68d9a627c617de0684426eaaf97aeeddd32547c158d8144535ab1a1bcbb4b"
+      },
+      {
+        "path": "tools/testing/selftests/futex/include/futex2test.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/include/futex2test.h?format=TEXT",
+        "sha256": "20f630900cd515e60a94d578e2a3a37b975fdddc3f88e122557aef6aa55ec432"
+      },
+      {
+        "path": "tools/testing/selftests/futex/include/futextest.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/include/futextest.h?format=TEXT",
+        "sha256": "eb231e2382406eeb2d3bfa2b81622c6e078ee852f4173f51cd72fff2872b10e7"
+      },
+      {
+        "path": "tools/testing/selftests/futex/include/logging.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/futex/include/logging.h?format=TEXT",
+        "sha256": "48c5dca5a678298c1c0a0fcdb33acc51d144f501b80ceb5cd7665e62c2a53763"
+      },
+      {
+        "path": "tools/testing/selftests/kselftest.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/kselftest.h?format=TEXT",
+        "sha256": "5d5720da5593490c7260d867904531b48230a4868798dcb4b34df8039a7be609"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/.gitignore",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/.gitignore?format=TEXT",
+        "sha256": "f0e25dc8d25f8130530613e13bc4288a6833d9e0b397b81060149dc518718708"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/Makefile",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/Makefile?format=TEXT",
+        "sha256": "9f0ef25e5c23964652957d0a2476c274652e5c635d38367024e5d7e9f8b72e03"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/basic_percpu_ops_test.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/basic_percpu_ops_test.c?format=TEXT",
+        "sha256": "f11b383112bca03998d0beb46056b502772cf245ea2156366b5ecddd056f4eca"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/basic_test.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/basic_test.c?format=TEXT",
+        "sha256": "15527a7e0dacbb30d569e615a0af69990739789b696df01fe9243c59580fa54e"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/compiler.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/compiler.h?format=TEXT",
+        "sha256": "9aa9753d1c6536d1f1f049bacea87e875adedb4eea963e6e7c3a831bf5245c3b"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/param_test.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/param_test.c?format=TEXT",
+        "sha256": "a610b221a3a9fa6bcf7bea734ba467d6d9a786d77262faa6f08493d82ae99573"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-abi.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-abi.h?format=TEXT",
+        "sha256": "a432661ac1a9f07bc5aa5c7f45eaf8e15881e1b97aa772fce57db533652c903b"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-arm-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-arm-bits.h?format=TEXT",
+        "sha256": "de388ef359eee0b66cae3d535875f060a1135699d268e6d3ccd45ae8cc9f200f"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-arm.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-arm.h?format=TEXT",
+        "sha256": "8c128983bad507dfc92b2d72c3f5c21617f248d7d1df8369d31183f39631249a"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-arm64-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-arm64-bits.h?format=TEXT",
+        "sha256": "831c7027c8bdb888c921e55db0b8c1ccf162e84ca9d75825464cedab5c47c8b2"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-arm64.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-arm64.h?format=TEXT",
+        "sha256": "efba594b63183abe03b9d42271ad5283984e5971310ecce8b71266392996f93d"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-bits-reset.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-bits-reset.h?format=TEXT",
+        "sha256": "01261a509965d37dc68d64cfb448430dc40e372aca0c91e2baa94e7af1d5b674"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-bits-template.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-bits-template.h?format=TEXT",
+        "sha256": "878127eba03de897a8ac47f0a903a0bc1fc6b2c982fc27575a916470d485ace6"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-generic-thread-pointer.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-generic-thread-pointer.h?format=TEXT",
+        "sha256": "e4975d9e89fefb89d5ada97e0063e283ccd039a9ad0fa506ab49ea3407f4da65"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-mips-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-mips-bits.h?format=TEXT",
+        "sha256": "5e49055debf6ace7ddb365d8656264942b4a8f1cfbfe2b0978fe652f6715d0d2"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-mips.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-mips.h?format=TEXT",
+        "sha256": "81f8af38c16c728a2f217c4149db1b783fdfc232cf23dd808e5a8458eb20f6ca"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-ppc-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-ppc-bits.h?format=TEXT",
+        "sha256": "b24b616594d35bfe6a27de1d8816c9178fc02ddb0ee60afbfff3f52122e45710"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-ppc-thread-pointer.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-ppc-thread-pointer.h?format=TEXT",
+        "sha256": "633bf9e8a801c4205e65caf3b66dd48df12f6fe5a866c7fe810fa779e5d98800"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-ppc.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-ppc.h?format=TEXT",
+        "sha256": "a504b4bc2209ea589c195871bced08ea545f0beff5f1dce57d7f63f73925ed88"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-riscv-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-riscv-bits.h?format=TEXT",
+        "sha256": "afbc4b13206812726028437cd06cd1d4e3d3462823f40a474f6a48fa2d5b4dab"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-riscv.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-riscv.h?format=TEXT",
+        "sha256": "1c913a4fc368e3dff4df7787b58cae902d70621dbb45ec474e58027e3c94dc34"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-s390-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-s390-bits.h?format=TEXT",
+        "sha256": "718d57908662b8f8df589500a931dbf9ba5025e7a0d0b83f536096a6c683f8cf"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-s390.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-s390.h?format=TEXT",
+        "sha256": "95d769b97a79978c3271fef95b156e01392103fed555b542ada091c016ea47ad"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-thread-pointer.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-thread-pointer.h?format=TEXT",
+        "sha256": "1943fa0b5bb70ae4a736527305d2aa6ca0d697ee3b93b5f89656f108b5503309"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-x86-bits.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-x86-bits.h?format=TEXT",
+        "sha256": "5ba7dd43739422d069caa9418bbf3685ab68f401f5e9d0d5d986f76c6afd08f7"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-x86-thread-pointer.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-x86-thread-pointer.h?format=TEXT",
+        "sha256": "ff16aae4c486b00b1114162caf4a35e4101b79b8570b105d817d12254bbde1fc"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq-x86.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq-x86.h?format=TEXT",
+        "sha256": "58d6b8e681cc0932780bbc91ec1de2241138681d740fa6b73027bdd844fcb2c8"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq.c",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq.c?format=TEXT",
+        "sha256": "5d74106229d1aebb101f0f6e9865f2b70dc2e467dbb9b23dcf1ccdfcaa0cdd75"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/rseq.h",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/rseq.h?format=TEXT",
+        "sha256": "117d18a743e7a65e19c21563ad3607808931c63209fade34643d15dbd5a70b81"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/run_param_test.sh",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/run_param_test.sh?format=TEXT",
+        "sha256": "a209f3f597105f0c95202fc197b9512f01a0ec97b86879143b67965282c4fb56"
+      },
+      {
+        "path": "tools/testing/selftests/rseq/settings",
+        "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/v6.12/tools/testing/selftests/rseq/settings?format=TEXT",
+        "sha256": "c8a2526b9efc0c01394b08464332cf414e7f97243ac2d468e314def67c807bb4"
+      }
+    ]
+  },
+  "native_environment": {
+    "gcc": [
+      "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "Copyright (C) 2023 Free Software Foundation, Inc."
+    ],
+    "glibc": [
+      "ldd (Ubuntu GLIBC 2.39-0ubuntu8.12) 2.39",
+      "Copyright (C) 2024 Free Software Foundation, Inc."
+    ],
+    "kernel": [
+      "Linux lima-linux 7.0.0-44-generic #44~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Nov 10 21:06:24 UTC 2 aarch64 aarch64 aarch64 GNU/Linux"
+    ]
+  },
+  "binaries": [
+    {
+      "path": "bin/futex_test",
+      "sha256": "f27b5d779199c5b0fd21c816b575739f2ff69b905f3b1db0f22d550aeb57e361",
+      "bytes": 3987152
+    },
+    {
+      "path": "bin/rseq_test",
+      "sha256": "8512f4b215c9802b4581c1ff35abcfa869053d6f81366962a33879ccab9f0875",
+      "bytes": 3636232
+    },
+    {
+      "path": "bin/runfiles/_main/test/syscalls/linux/rseq/rseq",
+      "sha256": "d79f36497498f323fa65b441ec11fa16c9029f537c0ff49299862ee93806de93",
+      "bytes": 9656
+    },
+    {
+      "path": "bin/runfiles/test/syscalls/linux/rseq/rseq",
+      "sha256": "d79f36497498f323fa65b441ec11fa16c9029f537c0ff49299862ee93806de93",
+      "bytes": 9656
+    },
+    {
+      "path": "bin/test/syscalls/linux/rseq/rseq",
+      "sha256": "d79f36497498f323fa65b441ec11fa16c9029f537c0ff49299862ee93806de93",
+      "bytes": 9656
+    },
+    {
+      "path": "selftests/basic_percpu_ops_mm_cid_test",
+      "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da",
+      "bytes": 795728
+    },
+    {
+      "path": "selftests/basic_percpu_ops_test",
+      "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b",
+      "bytes": 795776
+    },
+    {
+      "path": "selftests/basic_test",
+      "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a",
+      "bytes": 712200
+    },
+    {
+      "path": "selftests/futex_requeue",
+      "sha256": "958a448909c99099f8d6116ce43e75c4a3941d4dbda11cbcb349f858df4c7166",
+      "bytes": 794184
+    },
+    {
+      "path": "selftests/futex_wait",
+      "sha256": "ff60a659faaed4107ed38eb9f73da8f500da0fa51d19767a673dc66a076256c4",
+      "bytes": 795600
+    },
+    {
+      "path": "selftests/futex_waitv",
+      "sha256": "5931e774b969a91f274f25084007ecf1feb6466062cc3c728065cd1d0e5ab34b",
+      "bytes": 795048
+    },
+    {
+      "path": "selftests/param_test",
+      "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546",
+      "bytes": 798160
+    },
+    {
+      "path": "selftests/param_test_mm_cid",
+      "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b",
+      "bytes": 798184
+    },
+    {
+      "path": "selftests/synchronization",
+      "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b",
+      "bytes": 795576
+    }
+  ],
+  "runners": {
+    "interpreter": {
+      "path": "/Users/main/dev/trames/target/validation-synchronization-20261127/trames-run-synchronization",
+      "sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb",
+      "runtime_source_manifest": "/Users/main/dev/trames/target/validation-synchronization-20261127/runtime-source-final.json",
+      "source": "/Users/main/dev/trames"
+    },
+    "hvf": {
+      "path": "/Users/main/dev/trames/target/validation-synchronization-20261127/trames-hvf-synchronization",
+      "sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a",
+      "runtime_source_manifest": "/Users/main/dev/trames/target/validation-synchronization-20261127/runtime-source-final.json",
+      "source": "/Users/main/dev/trames/target/validation-cgroup-20261127/mac-source"
+    }
+  },
+  "gvisor": {
+    "plan": {
+      "schema_version": 1,
+      "kernel": "7.0.0-44-generic",
+      "machine": "aarch64",
+      "uid": 0,
+      "nofile": [
+        1048576,
+        1048576
+      ],
+      "max_cases_per_suite": 0,
+      "network": "none",
+      "process_context": "pid2",
+      "suites": [
+        {
+          "name": "futex",
+          "sha256": "f27b5d779199c5b0fd21c816b575739f2ff69b905f3b1db0f22d550aeb57e361",
+          "available": 67,
+          "cases": [
+            "PrivateFutexTest.WakeOp0Set",
+            "PrivateFutexTest.WakeOp0Add",
+            "PrivateFutexTest.WakeOp0Or",
+            "PrivateFutexTest.WakeOp0Andn",
+            "PrivateFutexTest.WakeOp0Xor",
+            "PrivateFutexTest.WakeOpNegativeOparg",
+            "PrivateFutexTest.WakeOpShiftMasked",
+            "SharedFutexTest.WakeInterprocessSharedAnon",
+            "SharedFutexTest.WakeInterprocessFile",
+            "RobustFutexTest.BasicSetGet",
+            "RobustFutexTest.GetFromOtherTid",
+            "RobustFutexTest.InvalidSize",
+            "RobustFutexTest.PthreadMutexAttr",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroTimeout/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroTimeout/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_Timeout/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_Timeout/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_BitsetTimeout/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_BitsetTimeout/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_NegativeTimeout/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_NegativeTimeout/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_WrongVal/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_WrongVal/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroBitset/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroBitset/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wake1/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wake1/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wake0/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wake0/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeAll/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeAll/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeSome/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeSome/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_Wake/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_Wake/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_WakeBitset/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.Wait_WakeBitset/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetMatch/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetMatch/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetNoMatch/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetNoMatch/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSuccess/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSuccess/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondFailure/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondFailure/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondNegativeCmparg/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondNegativeCmparg/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSignedCompare/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSignedCompare/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.NoWakeInterprocessPrivateAnon/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.NoWakeInterprocessPrivateAnon/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeAfterCOWBreak/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeAfterCOWBreak/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeWrongKind/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.WakeWrongKind/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIBasic/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIBasic/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PITryLock/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PITryLock/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIWithOrdinaryWaiter/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PIWithOrdinaryWaiter/1",
+            "SharedPrivate/PrivateAndSharedFutexTest.PITryLockConcurrency/0",
+            "SharedPrivate/PrivateAndSharedFutexTest.PITryLockConcurrency/1"
+          ]
+        },
+        {
+          "name": "rseq",
+          "sha256": "8512f4b215c9802b4581c1ff35abcfa869053d6f81366962a33879ccab9f0875",
+          "available": 13,
+          "cases": [
+            "RseqTest.Unaligned",
+            "RseqTest.Register",
+            "RseqTest.DoubleRegister",
+            "RseqTest.RegisterUnregister",
+            "RseqTest.UnregisterDifferentPtr",
+            "RseqTest.UnregisterDifferentSignature",
+            "RseqTest.CPU",
+            "RseqTest.Abort",
+            "RseqTest.AbortBefore",
+            "RseqTest.AbortSignature",
+            "RseqTest.AbortPreCommit",
+            "RseqTest.AbortClearsCS",
+            "RseqTest.InvalidAbortClearsCS"
+          ]
+        }
+      ],
+      "case_execution": {
+        "timeout_base": 30.0,
+        "suite_timeouts": {},
+        "upstream_wait_timeouts": {
+          "inotify": {
+            "Inotify.EpollNoDeadlock": 60
+          },
+          "mmap_eternal": {
+            "MmapEternalTest.PageTableLeak": 90
+          },
+          "flock": {
+            "FlockTest.BlockingLockNoBlockingForSharedLocks": 45
+          },
+          "ppoll": {
+            "PpollTest.SignalMaskBlocksSignal": 45
+          },
+          "vfork": {
+            "VforkTest.ParentStopsUntilChildExits": 20,
+            "VforkTest.ParentStopsUntilChildExecves": 40,
+            "VforkTest.ExecedChildExitDoesntUnstopParent": 30,
+            "VforkTest.SigchldReceivedDuringVforkIsDelivered": 20
+          },
+          "sigstop": {
+            "SigstopTest.Correctness": 45
+          },
+          "itimer": {
+            "ItimerTest.DeliversSIGALRMToMainThread": 45,
+            "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive": 100,
+            "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle": 220
+          },
+          "pselect": {
+            "PselectTest.SignalMaskBlocksSignal": 45
+          }
+        }
+      },
+      "native_init_sha256": "0dfc5f216287ec9bba22c01f3223e425431ae3cc29a34c92f6f0cf0dc0929b29"
+    },
+    "native": {
+      "futex": 67,
+      "rseq": 13,
+      "all_passed": true,
+      "rseq_result_override": "gvisor-native-rseq/results.json"
+    },
+    "interpreter": {
+      "platform": "interpreter",
+      "cases": 80,
+      "counts": {
+        "passed": 80
+      }
+    },
+    "hvf": {
+      "platform": "trames",
+      "groups": 2,
+      "cases": 80,
+      "counts": {
+        "passed": 80
+      },
+      "discovery_errors": [],
+      "worker_errors": [],
+      "reference_discovery_errors": []
+    },
+    "interpreter_single": {
+      "platform": "interpreter",
+      "cases": 13,
+      "counts": {
+        "passed": 13
+      }
+    },
+    "hvf_single": {
+      "platform": "trames",
+      "groups": 1,
+      "cases": 13,
+      "counts": {
+        "passed": 13
+      },
+      "discovery_errors": [],
+      "worker_errors": [],
+      "reference_discovery_errors": []
+    }
+  },
+  "native_selftests": {
+    "original_programs": [
+      {
+        "args": [
+          "futex_waitv"
+        ],
+        "exit_code": 0,
+        "seconds": 0.024,
+        "sha256": "5931e774b969a91f274f25084007ecf1feb6466062cc3c728065cd1d0e5ab34b"
+      },
+      {
+        "args": [
+          "futex_wait"
+        ],
+        "exit_code": 0,
+        "seconds": 0.035,
+        "sha256": "ff60a659faaed4107ed38eb9f73da8f500da0fa51d19767a673dc66a076256c4"
+      },
+      {
+        "args": [
+          "futex_requeue"
+        ],
+        "exit_code": 0,
+        "seconds": 0.024,
+        "sha256": "958a448909c99099f8d6116ce43e75c4a3941d4dbda11cbcb349f858df4c7166"
+      },
+      {
+        "args": [
+          "basic_test"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a"
+      },
+      {
+        "args": [
+          "basic_percpu_ops_test"
+        ],
+        "exit_code": 0,
+        "seconds": 15.631,
+        "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b"
+      },
+      {
+        "args": [
+          "basic_percpu_ops_mm_cid_test"
+        ],
+        "exit_code": 0,
+        "seconds": 15.822,
+        "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "s"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "l"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "b"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "m"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "i"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test_mm_cid",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "s"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+      },
+      {
+        "args": [
+          "param_test_mm_cid",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "l"
+        ],
+        "exit_code": 0,
+        "seconds": 0.005,
+        "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+      },
+      {
+        "args": [
+          "param_test_mm_cid",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "b"
+        ],
+        "exit_code": 0,
+        "seconds": 0.009,
+        "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+      },
+      {
+        "args": [
+          "param_test_mm_cid",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "m"
+        ],
+        "exit_code": 0,
+        "seconds": 0.008,
+        "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+      },
+      {
+        "args": [
+          "param_test_mm_cid",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "i"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "i",
+          "-m",
+          "10",
+          "-y"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      },
+      {
+        "args": [
+          "param_test",
+          "-t",
+          "4",
+          "-r",
+          "1000",
+          "-T",
+          "i",
+          "-m",
+          "10",
+          "-k"
+        ],
+        "exit_code": 0,
+        "seconds": 0.003,
+        "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+      }
+    ],
+    "fixture": [
+      {
+        "mode": "default",
+        "exit_code": 0,
+        "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+      },
+      {
+        "mode": "fallback",
+        "exit_code": 0,
+        "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+      }
+    ]
+  },
+  "guest_selftests": {
+    "interpreter": {
+      "original_batch": [
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 2,
+          "index": 0,
+          "exit_code": 0,
+          "seconds": 1.079,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "futex_waitv"
+          ],
+          "cpus": 2,
+          "index": 1,
+          "exit_code": 0,
+          "seconds": 0.179,
+          "sha256": "5931e774b969a91f274f25084007ecf1feb6466062cc3c728065cd1d0e5ab34b"
+        },
+        {
+          "args": [
+            "futex_wait"
+          ],
+          "cpus": 2,
+          "index": 2,
+          "exit_code": 0,
+          "seconds": 0.128,
+          "sha256": "ff60a659faaed4107ed38eb9f73da8f500da0fa51d19767a673dc66a076256c4"
+        },
+        {
+          "args": [
+            "futex_requeue"
+          ],
+          "cpus": 2,
+          "index": 3,
+          "exit_code": 0,
+          "seconds": 0.09,
+          "sha256": "958a448909c99099f8d6116ce43e75c4a3941d4dbda11cbcb349f858df4c7166"
+        },
+        {
+          "args": [
+            "basic_test"
+          ],
+          "cpus": 2,
+          "index": 4,
+          "exit_code": 0,
+          "seconds": 0.063,
+          "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_test"
+          ],
+          "cpus": 2,
+          "index": 5,
+          "exit_code": 124,
+          "seconds": 65.024,
+          "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_mm_cid_test"
+          ],
+          "cpus": 2,
+          "index": 6,
+          "exit_code": 124,
+          "seconds": 65.014,
+          "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "s"
+          ],
+          "cpus": 2,
+          "index": 7,
+          "exit_code": 0,
+          "seconds": 0.069,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "l"
+          ],
+          "cpus": 2,
+          "index": 8,
+          "exit_code": 0,
+          "seconds": 0.082,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "b"
+          ],
+          "cpus": 2,
+          "index": 9,
+          "exit_code": 0,
+          "seconds": 0.265,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "m"
+          ],
+          "cpus": 2,
+          "index": 10,
+          "exit_code": 0,
+          "seconds": 0.366,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i"
+          ],
+          "cpus": 2,
+          "index": 11,
+          "exit_code": 0,
+          "seconds": 0.309,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "s"
+          ],
+          "cpus": 2,
+          "index": 12,
+          "exit_code": 0,
+          "seconds": 0.126,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "l"
+          ],
+          "cpus": 2,
+          "index": 13,
+          "exit_code": 0,
+          "seconds": 0.457,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "b"
+          ],
+          "cpus": 2,
+          "index": 14,
+          "exit_code": 0,
+          "seconds": 0.412,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "m"
+          ],
+          "cpus": 2,
+          "index": 15,
+          "exit_code": 0,
+          "seconds": 0.143,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i"
+          ],
+          "cpus": 2,
+          "index": 16,
+          "exit_code": 0,
+          "seconds": 0.18,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i",
+            "-m",
+            "10",
+            "-y"
+          ],
+          "cpus": 2,
+          "index": 17,
+          "exit_code": 0,
+          "seconds": 0.163,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i",
+            "-m",
+            "10",
+            "-k"
+          ],
+          "cpus": 2,
+          "index": 18,
+          "exit_code": 0,
+          "seconds": 0.21,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 2,
+          "fallback": true,
+          "index": 19,
+          "exit_code": 0,
+          "seconds": 1.091,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 1,
+          "index": 20,
+          "exit_code": 0,
+          "seconds": 1.179,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 4,
+          "index": 21,
+          "exit_code": 0,
+          "seconds": 1.063,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "basic_test"
+          ],
+          "cpus": 1,
+          "index": 22,
+          "exit_code": 0,
+          "seconds": 0.066,
+          "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a"
+        }
+      ],
+      "stress_completed": [
+        {
+          "args": [
+            "basic_percpu_ops_test"
+          ],
+          "cpus": 2,
+          "index": 0,
+          "exit_code": 0,
+          "seconds": 150.04,
+          "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_mm_cid_test"
+          ],
+          "cpus": 2,
+          "index": 1,
+          "exit_code": 0,
+          "seconds": 150.87,
+          "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da"
+        }
+      ],
+      "effective_all_23_passed": true,
+      "stress_hard_limit_seconds": 240
+    },
+    "hvf": {
+      "original_batch": [
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 2,
+          "index": 0,
+          "exit_code": 0,
+          "seconds": 1.074,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "futex_waitv"
+          ],
+          "cpus": 2,
+          "index": 1,
+          "exit_code": 0,
+          "seconds": 0.108,
+          "sha256": "5931e774b969a91f274f25084007ecf1feb6466062cc3c728065cd1d0e5ab34b"
+        },
+        {
+          "args": [
+            "futex_wait"
+          ],
+          "cpus": 2,
+          "index": 2,
+          "exit_code": 0,
+          "seconds": 0.138,
+          "sha256": "ff60a659faaed4107ed38eb9f73da8f500da0fa51d19767a673dc66a076256c4"
+        },
+        {
+          "args": [
+            "futex_requeue"
+          ],
+          "cpus": 2,
+          "index": 3,
+          "exit_code": 0,
+          "seconds": 0.093,
+          "sha256": "958a448909c99099f8d6116ce43e75c4a3941d4dbda11cbcb349f858df4c7166"
+        },
+        {
+          "args": [
+            "basic_test"
+          ],
+          "cpus": 2,
+          "index": 4,
+          "exit_code": 0,
+          "seconds": 0.063,
+          "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_test"
+          ],
+          "cpus": 2,
+          "index": 5,
+          "exit_code": 1,
+          "seconds": 60.058,
+          "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_mm_cid_test"
+          ],
+          "cpus": 2,
+          "index": 6,
+          "exit_code": 1,
+          "seconds": 60.261,
+          "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "s"
+          ],
+          "cpus": 2,
+          "index": 7,
+          "exit_code": 0,
+          "seconds": 0.069,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "l"
+          ],
+          "cpus": 2,
+          "index": 8,
+          "exit_code": 0,
+          "seconds": 0.09,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "b"
+          ],
+          "cpus": 2,
+          "index": 9,
+          "exit_code": 0,
+          "seconds": 0.065,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "m"
+          ],
+          "cpus": 2,
+          "index": 10,
+          "exit_code": 0,
+          "seconds": 0.062,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i"
+          ],
+          "cpus": 2,
+          "index": 11,
+          "exit_code": 0,
+          "seconds": 0.063,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "s"
+          ],
+          "cpus": 2,
+          "index": 12,
+          "exit_code": 0,
+          "seconds": 0.064,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "l"
+          ],
+          "cpus": 2,
+          "index": 13,
+          "exit_code": 0,
+          "seconds": 0.12,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "b"
+          ],
+          "cpus": 2,
+          "index": 14,
+          "exit_code": 0,
+          "seconds": 0.112,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "m"
+          ],
+          "cpus": 2,
+          "index": 15,
+          "exit_code": 0,
+          "seconds": 0.19,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test_mm_cid",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i"
+          ],
+          "cpus": 2,
+          "index": 16,
+          "exit_code": 0,
+          "seconds": 0.303,
+          "sha256": "a9f86d56d9fe2a102f7c69f46d4461e942177a92fcf2f60ed5376c3410a9ee7b"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i",
+            "-m",
+            "10",
+            "-y"
+          ],
+          "cpus": 2,
+          "index": 17,
+          "exit_code": 0,
+          "seconds": 0.126,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "param_test",
+            "-t",
+            "4",
+            "-r",
+            "1000",
+            "-T",
+            "i",
+            "-m",
+            "10",
+            "-k"
+          ],
+          "cpus": 2,
+          "index": 18,
+          "exit_code": 0,
+          "seconds": 0.414,
+          "sha256": "dbcc62b6320a53400597a9afc24f861545718b9cd3eaaded4bd4d3fb74e1f546"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 2,
+          "fallback": true,
+          "index": 19,
+          "exit_code": 0,
+          "seconds": 1.105,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 1,
+          "index": 20,
+          "exit_code": 0,
+          "seconds": 1.171,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "synchronization"
+          ],
+          "cpus": 4,
+          "index": 21,
+          "exit_code": 0,
+          "seconds": 1.165,
+          "sha256": "9c11f8286b5347c5d25d35c02718f5d409ce143f8ce012b4caa8dc958a42626b"
+        },
+        {
+          "args": [
+            "basic_test"
+          ],
+          "cpus": 1,
+          "index": 22,
+          "exit_code": 0,
+          "seconds": 0.099,
+          "sha256": "f254e16be178ea225e183f9a231710d95bf081fbc4376e4baf498f7abdbdf69a"
+        }
+      ],
+      "stress_completed": [
+        {
+          "args": [
+            "basic_percpu_ops_test"
+          ],
+          "cpus": 2,
+          "index": 0,
+          "exit_code": 0,
+          "seconds": 148.754,
+          "sha256": "79e139695e1a8877528220010fc4e6157427d7bd96c1ffaf223b8f9b8601453b"
+        },
+        {
+          "args": [
+            "basic_percpu_ops_mm_cid_test"
+          ],
+          "cpus": 2,
+          "index": 1,
+          "exit_code": 0,
+          "seconds": 149.717,
+          "sha256": "9e217c148b91043a43ed98dde9b76282e672e3f5c92595e6932bd8475e3bf5da"
+        }
+      ],
+      "effective_all_23_passed": true,
+      "stress_hard_limit_seconds": 240
+    }
+  },
+  "checks": {
+    "product": {
+      "passed": 553,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 3,
+      "total": 556,
+      "seconds": 7.01
+    },
+    "session_apple": {
+      "passed": 16,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 0,
+      "total": 16,
+      "seconds": 0.573
+    },
+    "session_linux": {
+      "passed": 16,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 0,
+      "total": 16,
+      "seconds": 0.088
+    },
+    "apple-clippy": {
+      "exit_code": 0,
+      "seconds": 46.41,
+      "command": [
+        "env",
+        "CARGO_INCREMENTAL=0",
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "runtime/Cargo.toml",
+        "-p",
+        "trames-session",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "linux-checks-driver": {
+      "exit_code": 0,
+      "seconds": 30.36,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "env",
+        "CARGO_TARGET_DIR=/mnt/trames-output/fuse-runtime-target-20261125",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "clippy",
+        "-p",
+        "trames-session",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "ios-arm64": {
+      "exit_code": 0,
+      "seconds": 81.16,
+      "command": [
+        "env",
+        "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
+        "CARGO_NET_OFFLINE=true",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_RELEASE_DEBUG=0",
+        "CARGO_BUILD_JOBS=2",
+        "python3",
+        "scripts/stage-ios-rust.py",
+        "aarch64-apple-ios",
+        "/Users/main/dev/trames/target/moltenvk-patched/ios-arm64-d63d9672b06094154f4f"
+      ]
+    },
+    "completion_and_host_boundaries": {
+      "passed": true,
+      "new_production_threads": 0
+    }
+  },
+  "artifact_roots": [
+    "target/validation-synchronization-20261127",
+    "target/local-ci/io/synchronization-20261127"
+  ],
+  "performance_short": {
+    "results": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.22,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 2961417.0,
+            "ns_per_op": 296.14
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 2975458.0,
+            "ns_per_op": 297.55,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 40083875.0,
+            "ops_per_sec": 997907.51
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.086,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1709042.0,
+            "ns_per_op": 170.9
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3705666.0,
+            "ns_per_op": 370.57,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 31659792.0,
+            "ops_per_sec": 1263432.18
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.362,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3700000.0,
+            "ns_per_op": 370.0
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3760625.0,
+            "ns_per_op": 376.06,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 42577167.0,
+            "ops_per_sec": 939470.68
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.085,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1733917.0,
+            "ns_per_op": 173.39
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3591333.0,
+            "ns_per_op": 359.13,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 30395542.0,
+            "ops_per_sec": 1315982.46
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.262,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 4519000.0,
+            "ns_per_op": 451.9
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3975041.0,
+            "ns_per_op": 397.5,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 46225875.0,
+            "ops_per_sec": 865316.23
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.079,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1680167.0,
+            "ns_per_op": 168.02
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3520709.0,
+            "ns_per_op": 352.07,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 30614875.0,
+            "ops_per_sec": 1306554.41
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.391,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 4338416.0,
+            "ns_per_op": 433.84
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3457166.0,
+            "ns_per_op": 345.72,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 42712500.0,
+            "ops_per_sec": 936494.0
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.074,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1667750.0,
+            "ns_per_op": 166.78
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3554833.0,
+            "ns_per_op": 355.48,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 30723625.0,
+            "ops_per_sec": 1301929.7
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 8.179,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3823375.0,
+            "ns_per_op": 382.34
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3328833.0,
+            "ns_per_op": 332.88,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 44189583.0,
+            "ops_per_sec": 905190.71
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.074,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1666125.0,
+            "ns_per_op": 166.61
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3508625.0,
+            "ns_per_op": 350.86,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 31119917.0,
+            "ops_per_sec": 1285350.47
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 8.157,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3604917.0,
+            "ns_per_op": 360.49
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3483792.0,
+            "ns_per_op": 348.38,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 41849959.0,
+            "ops_per_sec": 955795.44
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.069,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1717791.0,
+            "ns_per_op": 171.78
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3561833.0,
+            "ns_per_op": 356.18,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 30688000.0,
+            "ops_per_sec": 1303441.08
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.313,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 4482833.0,
+            "ns_per_op": 448.28
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3913750.0,
+            "ns_per_op": 391.38,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 93125958.0,
+            "ops_per_sec": 429525.78
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.125,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1727500.0,
+            "ns_per_op": 172.75
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3339292.0,
+            "ns_per_op": 333.93,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 80236583.0,
+            "ops_per_sec": 498525.72
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 8.905,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3886667.0,
+            "ns_per_op": 388.67
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3830916.0,
+            "ns_per_op": 383.09,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 92252584.0,
+            "ops_per_sec": 433592.19
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.125,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1698417.0,
+            "ns_per_op": 169.84
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3511792.0,
+            "ns_per_op": 351.18,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 81616666.0,
+            "ops_per_sec": 490095.98
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 8.739,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3415666.0,
+            "ns_per_op": 341.57
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3137875.0,
+            "ns_per_op": 313.79,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 87296250.0,
+            "ops_per_sec": 458209.83
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.12,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1666459.0,
+            "ns_per_op": 166.65
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3565375.0,
+            "ns_per_op": 356.54,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 80542000.0,
+            "ops_per_sec": 496635.3
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 9.406,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 2293125.0,
+            "ns_per_op": 229.31
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 2456250.0,
+            "ns_per_op": 245.62,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 75885334.0,
+            "ops_per_sec": 527111.08
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.131,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1841041.0,
+            "ns_per_op": 184.1
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3671958.0,
+            "ns_per_op": 367.2,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 79411125.0,
+            "ops_per_sec": 503707.76
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 10.017,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 3470709.0,
+            "ns_per_op": 347.07
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3402750.0,
+            "ns_per_op": 340.27,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 88861792.0,
+            "ops_per_sec": 450137.22
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.117,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1838875.0,
+            "ns_per_op": 183.89
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3593792.0,
+            "ns_per_op": 359.38,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 80553458.0,
+            "ops_per_sec": 496564.65
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 9.901,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 4549375.0,
+            "ns_per_op": 454.94
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 4085084.0,
+            "ns_per_op": 408.51,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 92595208.0,
+            "ops_per_sec": 431987.8
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.122,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 1696792.0,
+            "ns_per_op": 169.68
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 3610041.0,
+            "ns_per_op": 361.0,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 81178584.0,
+            "ops_per_sec": 492740.79
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.57,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 15356125.0,
+            "ns_per_op": 1535.61
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10916.0,
+            "ns_per_op": 1.09,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1693333.0,
+            "ops_per_sec": 23622051.89
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.068,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10668792.0,
+            "ns_per_op": 1066.88
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10863542.0,
+            "ns_per_op": 1086.35,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 684750.0,
+            "ops_per_sec": 58415480.1
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.543,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 21140042.0,
+            "ns_per_op": 2114.0
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 13750.0,
+            "ns_per_op": 1.38,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1026666.0,
+            "ops_per_sec": 38961064.26
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.064,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10748667.0,
+            "ns_per_op": 1074.87
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10764625.0,
+            "ns_per_op": 1076.46,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 526666.0,
+            "ops_per_sec": 75949463.23
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.583,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 18454458.0,
+            "ns_per_op": 1845.45
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 9417.0,
+            "ns_per_op": 0.94,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 834708.0,
+            "ops_per_sec": 47920949.6
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.065,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10342916.0,
+            "ns_per_op": 1034.29
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10920000.0,
+            "ns_per_op": 1092.0,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 513875.0,
+            "ops_per_sec": 77839941.62
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.512,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 17277417.0,
+            "ns_per_op": 1727.74
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 8833.0,
+            "ns_per_op": 0.88,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 797250.0,
+            "ops_per_sec": 50172467.86
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.061,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10470917.0,
+            "ns_per_op": 1047.09
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 11084667.0,
+            "ns_per_op": 1108.47,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 616084.0,
+            "ops_per_sec": 64926211.36
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.507,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 20994875.0,
+            "ns_per_op": 2099.49
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 14125.0,
+            "ns_per_op": 1.41,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 936000.0,
+            "ops_per_sec": 42735042.74
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.062,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10766792.0,
+            "ns_per_op": 1076.68
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10951958.0,
+            "ns_per_op": 1095.2,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 562583.0,
+            "ops_per_sec": 71100619.82
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.495,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 19027250.0,
+            "ns_per_op": 1902.72
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10333.0,
+            "ns_per_op": 1.03,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 947000.0,
+            "ops_per_sec": 42238648.36
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.055,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10478125.0,
+            "ns_per_op": 1047.81
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10620417.0,
+            "ns_per_op": 1062.04,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 507500.0,
+            "ops_per_sec": 78817733.99
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.463,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 15923500.0,
+            "ns_per_op": 1592.35
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 11792.0,
+            "ns_per_op": 1.18,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1175333.0,
+            "ops_per_sec": 34032908.12
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.061,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10800083.0,
+            "ns_per_op": 1080.01
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10763042.0,
+            "ns_per_op": 1076.3,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 851542.0,
+            "ops_per_sec": 46973607.88
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.507,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 18887625.0,
+            "ns_per_op": 1888.76
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 14125.0,
+            "ns_per_op": 1.41,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1512542.0,
+            "ops_per_sec": 26445546.64
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.061,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10492291.0,
+            "ns_per_op": 1049.23
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10779041.0,
+            "ns_per_op": 1077.9,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1084792.0,
+            "ops_per_sec": 36873428.27
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.481,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 17220417.0,
+            "ns_per_op": 1722.04
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 9417.0,
+            "ns_per_op": 0.94,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1387250.0,
+            "ops_per_sec": 28834024.15
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.066,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10686083.0,
+            "ns_per_op": 1068.61
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 11078250.0,
+            "ns_per_op": 1107.83,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1081959.0,
+            "ops_per_sec": 36969977.61
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.435,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 17408875.0,
+            "ns_per_op": 1740.89
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 12666.0,
+            "ns_per_op": 1.27,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1240416.0,
+            "ops_per_sec": 32247246.09
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.058,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10471000.0,
+            "ns_per_op": 1047.1
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10732500.0,
+            "ns_per_op": 1073.25,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 890792.0,
+            "ops_per_sec": 44903860.83
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.533,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 18118458.0,
+            "ns_per_op": 1811.85
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 12709.0,
+            "ns_per_op": 1.27,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1276375.0,
+            "ops_per_sec": 31338752.33
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.065,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10491750.0,
+            "ns_per_op": 1049.17
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10752667.0,
+            "ns_per_op": 1075.27,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 921125.0,
+            "ops_per_sec": 43425159.45
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.61,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 20464500.0,
+            "ns_per_op": 2046.45
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 13708.0,
+            "ns_per_op": 1.37,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1485958.0,
+            "ops_per_sec": 26918661.23
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.086,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 10000.0,
+            "elapsed_ns": 10778500.0,
+            "ns_per_op": 1077.85
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 10000.0,
+            "elapsed_ns": 10777291.0,
+            "ns_per_op": 1077.73,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 40000.0,
+            "elapsed_ns": 1063833.0,
+            "ops_per_sec": 37599886.45
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      }
+    ],
+    "medians": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 382.34,
+          "glibc_sched_getcpu": 332.88,
+          "glibc_mutex": 936494.0
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 166.78,
+          "glibc_sched_getcpu": 355.48,
+          "glibc_mutex": 1285350.47
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 370.0,
+          "glibc_sched_getcpu": 376.06,
+          "glibc_mutex": 939470.68
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 171.78,
+          "glibc_sched_getcpu": 356.18,
+          "glibc_mutex": 1306554.41
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 347.07,
+          "glibc_sched_getcpu": 340.27,
+          "glibc_mutex": 450137.22
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 183.89,
+          "glibc_sched_getcpu": 359.38,
+          "glibc_mutex": 498525.72
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 388.67,
+          "glibc_sched_getcpu": 383.09,
+          "glibc_mutex": 433592.19
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 169.68,
+          "glibc_sched_getcpu": 356.54,
+          "glibc_mutex": 492740.79
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1727.74,
+          "glibc_sched_getcpu": 1.09,
+          "glibc_mutex": 42735042.74
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1066.88,
+          "glibc_sched_getcpu": 1095.2,
+          "glibc_mutex": 64926211.36
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1902.72,
+          "glibc_sched_getcpu": 1.03,
+          "glibc_mutex": 42238648.36
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1047.81,
+          "glibc_sched_getcpu": 1076.46,
+          "glibc_mutex": 77839941.62
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1740.89,
+          "glibc_sched_getcpu": 1.27,
+          "glibc_mutex": 32247246.09
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1049.17,
+          "glibc_sched_getcpu": 1075.27,
+          "glibc_mutex": 44903860.83
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1888.76,
+          "glibc_sched_getcpu": 1.37,
+          "glibc_mutex": 26918661.23
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1068.61,
+          "glibc_sched_getcpu": 1077.9,
+          "glibc_mutex": 36969977.61
+        }
+      }
+    ],
+    "note": "short durations; steady-state follow-up required for legacy wake and mutex variability"
+  },
+  "performance_steady": {
+    "warmup_iterations": 10000,
+    "measured_iterations": 200000,
+    "repetitions": 5,
+    "results": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.768,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 34352875.0,
+            "ns_per_op": 171.76
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34555084.0,
+            "ns_per_op": 172.78,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 614580625.0,
+            "ops_per_sec": 1301700.65
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.758,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35155334.0,
+            "ns_per_op": 175.78
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35043875.0,
+            "ns_per_op": 175.22,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 604969291.0,
+            "ops_per_sec": 1322381.17
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.764,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35458500.0,
+            "ns_per_op": 177.29
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35267583.0,
+            "ns_per_op": 176.34,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 608462375.0,
+            "ops_per_sec": 1314789.6
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.758,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35487250.0,
+            "ns_per_op": 177.44
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34679625.0,
+            "ns_per_op": 173.4,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 603050250.0,
+            "ops_per_sec": 1326589.29
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.759,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35320292.0,
+            "ns_per_op": 176.6
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34998959.0,
+            "ns_per_op": 174.99,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 605276708.0,
+            "ops_per_sec": 1321709.54
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.757,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 34799583.0,
+            "ns_per_op": 174.0
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34985625.0,
+            "ns_per_op": 174.93,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 602048458.0,
+            "ops_per_sec": 1328796.69
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.776,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35141167.0,
+            "ns_per_op": 175.71
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35302375.0,
+            "ns_per_op": 176.51,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 620072125.0,
+            "ops_per_sec": 1290172.49
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.762,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 34710750.0,
+            "ns_per_op": 173.55
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35008667.0,
+            "ns_per_op": 175.04,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 607197750.0,
+            "ops_per_sec": 1317527.94
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.762,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 34944583.0,
+            "ns_per_op": 174.72
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34800916.0,
+            "ns_per_op": 174.0,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 609032291.0,
+            "ops_per_sec": 1313559.25
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.762,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 35215375.0,
+            "ns_per_op": 176.08
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35115375.0,
+            "ns_per_op": 175.58,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 606025042.0,
+            "ops_per_sec": 1320077.46
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.786,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37488834.0,
+            "ns_per_op": 187.44
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34765708.0,
+            "ns_per_op": 173.83,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1577708334.0,
+            "ops_per_sec": 507064.57
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.781,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37267167.0,
+            "ns_per_op": 186.34
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34739833.0,
+            "ns_per_op": 173.7,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1574542000.0,
+            "ops_per_sec": 508084.26
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.789,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37724583.0,
+            "ns_per_op": 188.62
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35133916.0,
+            "ns_per_op": 175.67,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1584969333.0,
+            "ops_per_sec": 504741.63
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.793,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37347167.0,
+            "ns_per_op": 186.74
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35082208.0,
+            "ns_per_op": 175.41,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1585832000.0,
+            "ops_per_sec": 504467.06
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.781,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37833792.0,
+            "ns_per_op": 189.17
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34942500.0,
+            "ns_per_op": 174.71,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1577680625.0,
+            "ops_per_sec": 507073.48
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.786,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37631875.0,
+            "ns_per_op": 188.16
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35004125.0,
+            "ns_per_op": 175.02,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1580442084.0,
+            "ops_per_sec": 506187.48
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.779,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37891625.0,
+            "ns_per_op": 189.46
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35320459.0,
+            "ns_per_op": 176.6,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1571064625.0,
+            "ops_per_sec": 509208.84
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.789,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37787291.0,
+            "ns_per_op": 188.94
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34589750.0,
+            "ns_per_op": 172.95,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1584259792.0,
+            "ops_per_sec": 504967.69
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.787,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37799167.0,
+            "ns_per_op": 189.0
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 34575250.0,
+            "ns_per_op": 172.88,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1582446250.0,
+            "ops_per_sec": 505546.4
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 1.782,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 38310458.0,
+            "ns_per_op": 191.55
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 35137334.0,
+            "ns_per_op": 175.69,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1575623750.0,
+            "ops_per_sec": 507735.43
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.281,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 207546709.0,
+            "ns_per_op": 1037.73
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168417.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 3017459.0,
+            "ops_per_sec": 265123734.9
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.267,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 207271041.0,
+            "ns_per_op": 1036.36
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168750.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2998250.0,
+            "ops_per_sec": 266822313.02
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.271,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 206704209.0,
+            "ns_per_op": 1033.52
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168792.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2904875.0,
+            "ops_per_sec": 275399113.56
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.269,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 207699458.0,
+            "ns_per_op": 1038.5
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167458.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2914791.0,
+            "ops_per_sec": 274462217.02
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.272,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208987458.0,
+            "ns_per_op": 1044.94
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168625.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 3028000.0,
+            "ops_per_sec": 264200792.6
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.267,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 206670375.0,
+            "ns_per_op": 1033.35
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168625.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2922125.0,
+            "ops_per_sec": 273773366.98
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.266,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 206932708.0,
+            "ns_per_op": 1034.66
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168625.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2969541.0,
+            "ops_per_sec": 269401904.2
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.268,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 207523750.0,
+            "ns_per_op": 1037.62
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 168750.0,
+            "ns_per_op": 0.84,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 3002917.0,
+            "ops_per_sec": 266407629.65
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.268,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208309667.0,
+            "ns_per_op": 1041.55
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 197875.0,
+            "ns_per_op": 0.99,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2994042.0,
+            "ops_per_sec": 267197320.55
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.266,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 207976625.0,
+            "ns_per_op": 1039.88
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 195458.0,
+            "ns_per_op": 0.98,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 2922375.0,
+            "ops_per_sec": 273749946.53
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.28,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 210012792.0,
+            "ns_per_op": 1050.06
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167250.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 10553875.0,
+            "ops_per_sec": 75801542.09
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.277,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208347958.0,
+            "ns_per_op": 1041.74
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167208.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11722834.0,
+            "ops_per_sec": 68242883.93
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.277,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209938042.0,
+            "ns_per_op": 1049.69
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 175958.0,
+            "ns_per_op": 0.88,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11013792.0,
+            "ops_per_sec": 72636200.14
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.279,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209466708.0,
+            "ns_per_op": 1047.33
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 196750.0,
+            "ns_per_op": 0.98,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 10604375.0,
+            "ops_per_sec": 75440561.09
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.28,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209580625.0,
+            "ns_per_op": 1047.9
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167250.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11572959.0,
+            "ops_per_sec": 69126659.83
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.28,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209396417.0,
+            "ns_per_op": 1046.98
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 169500.0,
+            "ns_per_op": 0.85,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11546958.0,
+            "ops_per_sec": 69282316.61
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.277,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208137750.0,
+            "ns_per_op": 1040.69
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 170833.0,
+            "ns_per_op": 0.85,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 10976417.0,
+            "ops_per_sec": 72883528.39
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.28,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209352666.0,
+            "ns_per_op": 1046.76
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167166.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11429250.0,
+            "ops_per_sec": 69995844.0
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.278,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209607625.0,
+            "ns_per_op": 1048.04
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167250.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11453208.0,
+            "ops_per_sec": 69849425.59
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": false,
+        "exit_code": 0,
+        "seconds": 0.276,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209176000.0,
+            "ns_per_op": 1045.88
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 32.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 167250.0,
+            "ns_per_op": 0.84,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 10698875.0,
+            "ops_per_sec": 74774216.92
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.508,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 210526125.0,
+            "ns_per_op": 1052.63
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 217488833.0,
+            "ns_per_op": 1087.44,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11512958.0,
+            "ops_per_sec": 69486920.74
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.533,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 214306333.0,
+            "ns_per_op": 1071.53
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 216896625.0,
+            "ns_per_op": 1084.48,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11014375.0,
+            "ops_per_sec": 72632355.44
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.504,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209241917.0,
+            "ns_per_op": 1046.21
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 216159750.0,
+            "ns_per_op": 1080.8,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 10115250.0,
+            "ops_per_sec": 79088504.98
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.506,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209905042.0,
+            "ns_per_op": 1049.53
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 217634208.0,
+            "ns_per_op": 1088.17,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11410833.0,
+            "ops_per_sec": 70108816.77
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.505,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208867292.0,
+            "ns_per_op": 1044.34
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 215394958.0,
+            "ns_per_op": 1076.97,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11522292.0,
+            "ops_per_sec": 69430630.64
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.506,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 208629208.0,
+            "ns_per_op": 1043.15
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 215826834.0,
+            "ns_per_op": 1079.13,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11280542.0,
+            "ops_per_sec": 70918578.2
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.504,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209237875.0,
+            "ns_per_op": 1046.19
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 215870541.0,
+            "ns_per_op": 1079.35,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11272583.0,
+            "ops_per_sec": 70968650.22
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.507,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209595750.0,
+            "ns_per_op": 1047.98
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 217466583.0,
+            "ns_per_op": 1087.33,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11180834.0,
+            "ops_per_sec": 71551013.1
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.51,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 210606875.0,
+            "ns_per_op": 1053.03
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 216870458.0,
+            "ns_per_op": 1084.35,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11468709.0,
+            "ops_per_sec": 69755017.76
+          }
+        },
+        "runner_sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625"
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 0.508,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 209804083.0,
+            "ns_per_op": 1049.02
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 217086000.0,
+            "ns_per_op": 1085.43,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 11049625.0,
+            "ops_per_sec": 72400647.08
+          }
+        },
+        "runner_sha256": "998c63f63095fe27a78c50f7a55e2ffc949ecc64758432ede12e3ef4f0dafb6a"
+      }
+    ],
+    "medians": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 174.72,
+          "glibc_sched_getcpu": 174.0,
+          "glibc_mutex": 1317527.94
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 175.78,
+          "glibc_sched_getcpu": 175.58,
+          "glibc_mutex": 1320077.46
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 188.94,
+          "glibc_sched_getcpu": 173.83,
+          "glibc_mutex": 505546.4
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 188.62,
+          "glibc_sched_getcpu": 175.67,
+          "glibc_mutex": 507735.43
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1038.5,
+          "glibc_sched_getcpu": 0.84,
+          "glibc_mutex": 266407629.65
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 1,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1034.66,
+          "glibc_sched_getcpu": 0.84,
+          "glibc_mutex": 273749946.53
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1047.9,
+          "glibc_sched_getcpu": 0.84,
+          "glibc_mutex": 69995844.0
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": false,
+        "median": {
+          "legacy_wake": 1045.88,
+          "glibc_sched_getcpu": 0.85,
+          "glibc_mutex": 72636200.14
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1049.53,
+          "glibc_sched_getcpu": 1087.33,
+          "glibc_mutex": 69755017.76
+        }
+      },
+      {
+        "mode": "hvf",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 1046.21,
+          "glibc_sched_getcpu": 1080.8,
+          "glibc_mutex": 72400647.08
+        }
+      }
+    ]
+  },
+  "performance_interpreter_fallback": {
+    "warmup_iterations": 10000,
+    "measured_iterations": 200000,
+    "repetitions": 5,
+    "results": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.858,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 38742417.0,
+            "ns_per_op": 193.71
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 74829667.0,
+            "ns_per_op": 374.15,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1591798750.0,
+            "ops_per_sec": 502576.1
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 0,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.824,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37200916.0,
+            "ns_per_op": 186.0
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73144417.0,
+            "ns_per_op": 365.72,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1578864334.0,
+            "ops_per_sec": 506693.31
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.837,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 36612291.0,
+            "ns_per_op": 183.06
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73384167.0,
+            "ns_per_op": 366.92,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1591987875.0,
+            "ops_per_sec": 502516.39
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 1,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.852,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37436084.0,
+            "ns_per_op": 187.18
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73694083.0,
+            "ns_per_op": 368.47,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1601442750.0,
+            "ops_per_sec": 499549.55
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.861,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 38004458.0,
+            "ns_per_op": 190.02
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73197416.0,
+            "ns_per_op": 365.99,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1612843125.0,
+            "ops_per_sec": 496018.48
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 2,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.855,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37966000.0,
+            "ns_per_op": 189.83
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73189833.0,
+            "ns_per_op": 365.95,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1608471125.0,
+            "ops_per_sec": 497366.72
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.861,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37720583.0,
+            "ns_per_op": 188.6
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 72960708.0,
+            "ns_per_op": 364.8,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1612617584.0,
+            "ops_per_sec": 496087.86
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 3,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.838,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37217958.0,
+            "ns_per_op": 186.09
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73069750.0,
+            "ns_per_op": 365.35,
+            "checksum": 0.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1598876375.0,
+            "ops_per_sec": 500351.38
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.82,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37150875.0,
+            "ns_per_op": 185.75
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73897042.0,
+            "ns_per_op": 369.49,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1575597708.0,
+            "ops_per_sec": 507743.82
+          }
+        },
+        "runner_sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336"
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "repeat": 4,
+        "fallback": true,
+        "exit_code": 0,
+        "seconds": 1.844,
+        "metrics": {
+          "legacy_wake": {
+            "iterations": 200000.0,
+            "elapsed_ns": 37767542.0,
+            "ns_per_op": 188.84
+          },
+          "glibc_sched_getcpu": {
+            "rseq_size": 0.0,
+            "iterations": 200000.0,
+            "elapsed_ns": 73644250.0,
+            "ns_per_op": 368.22,
+            "checksum": 200000.0
+          },
+          "glibc_mutex": {
+            "threads": 4.0,
+            "operations": 800000.0,
+            "elapsed_ns": 1595555416.0,
+            "ops_per_sec": 501392.8
+          }
+        },
+        "runner_sha256": "a295d1c91170aa4eea829fa7aa32242493fcb596c1a2b9f786036ee87d4841cb"
+      }
+    ],
+    "medians": [
+      {
+        "mode": "interpreter",
+        "version": "baseline",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 187.18,
+          "glibc_sched_getcpu": 368.47,
+          "glibc_mutex": 500351.38
+        }
+      },
+      {
+        "mode": "interpreter",
+        "version": "candidate",
+        "cpus": 4,
+        "fallback": true,
+        "median": {
+          "legacy_wake": 188.6,
+          "glibc_sched_getcpu": 365.95,
+          "glibc_mutex": 501392.8
+        }
+      }
+    ]
+  },
+  "performance_conclusion": {
+    "legacy_wake_default_median_change_percent": {
+      "interpreter_1": 0.61,
+      "interpreter_4": -0.17,
+      "hvf_1": -0.37,
+      "hvf_4": -0.19
+    },
+    "mutex_default_median_throughput_change_percent": {
+      "interpreter_1": 0.19,
+      "interpreter_4": 0.43,
+      "hvf_1": 2.76,
+      "hvf_4": 3.77
+    },
+    "selected_glibc_sched_getcpu_4cpu_ns": {
+      "interpreter_rseq": 175.67,
+      "interpreter_fallback": 365.95,
+      "hvf_rseq": 0.85,
+      "hvf_fallback": 1080.8
+    },
+    "limits": "batch averages for this micro-workload, not single-call latency accuracy or application-wide speedups; no unrelated validation workloads ran concurrently"
+  }
+}
