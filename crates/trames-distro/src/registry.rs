@@ -282,6 +282,11 @@ impl Registry {
         if i.uuid != c.environment.uuid || i.name != c.environment.name {
             return Err("use env rename/clone to change registered identity".into());
         }
+        if i.distribution != c.image.distribution || i.sha256 != c.image.sha256 {
+            return Err(
+                "registered image provenance is immutable; create a new environment".into(),
+            );
+        }
         self.register(dir, c, true)
     }
 }
@@ -415,6 +420,11 @@ mod tests {
                 c
             })
             .is_err());
+        let before = fs::read(dir.join("instance.toml")).unwrap();
+        let mut replaced = c.clone();
+        replaced.image.distribution = "debian".into();
+        assert!(r.save(&dir, &replaced).is_err());
+        assert_eq!(fs::read(dir.join("instance.toml")).unwrap(), before);
         assert!(!r.directory("work").unwrap().exists());
         drop(_metadata);
         fs::remove_dir_all(temp).unwrap();
