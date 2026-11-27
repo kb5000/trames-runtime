@@ -67,7 +67,7 @@ pub use backing::{
     backing_changed, backing_invalidated, external_memory_changed, MappingRemap, PageBacking,
     PageSource, SyncCompletion, SyncExecutor, SyncRange, SyncResource,
 };
-pub use cpu_memory::{CpuMemory, CpuSlice};
+pub use cpu_memory::{CpuMemory, CpuSlice, InstructionEpochs};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use residency::{Account, Charge};

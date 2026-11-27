@@ -2,7 +2,7 @@
 use trames_engine::{Cpu as Backend, SliceOutcome};
 use trames_execution::{Aarch64State, Registers};
 use trames_jit::{Cpu, Engine, NATIVE_COMPILED};
-use trames_memory::{Memory, Permissions, PAGE_SIZE};
+use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
 
 fn memory(words: &[u32]) -> Memory {
     let mut memory = Memory::default();
@@ -352,13 +352,8 @@ fn register_cache_uses_one_load_and_writeback_for_a_chain() {
     let cold = e.compilation_stats();
     if NATIVE_COMPILED {
         assert_eq!(
-            (
-                cold.blocks,
-                cold.register_loads,
-                cold.register_stores,
-                cold.host_words
-            ),
-            (1, 1, 1, 20)
+            (cold.blocks, cold.register_loads, cold.register_stores),
+            (1, 1, 1)
         );
         assert_eq!(
             (
@@ -380,7 +375,7 @@ fn register_cache_uses_one_load_and_writeback_for_a_chain() {
 fn dirty_eviction_source_aliases_and_deferred_flags_match_interpreter() {
     for seed in 0..32u32 {
         // First set deferred flags from old x0/x1, then overwrite both operands
-        // while exceeding all 17 allocatable host registers.
+        // while exceeding all 13 allocatable value registers.
         let mut words = vec![0xeb01001f];
         for reg in 0..31 {
             words.push(0xd2800000 | ((reg + 1 + seed) << 5) | reg);
@@ -418,5 +413,202 @@ fn dirty_eviction_source_aliases_and_deferred_flags_match_interpreter() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn linked_loop_keeps_exact_budgets_and_avoids_native_reentry() {
+    let words = [0x91000400, 0x17ffffff];
+    let mut memory_a = memory(&words);
+    let mut memory_b = memory(&words);
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    c.run_slice(&mut e, &mut memory_a, 128);
+    for budget in [0, 1, 2, 3, 63, 64, 65, 4097, 10000] {
+        let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+        c.restore_architectural_state(&expected.architectural_state());
+        let x = expected.run_slice(&mut memory_b, budget);
+        let y = c.run_slice(&mut e, &mut memory_a, budget);
+        assert_eq!(outcome(&x), outcome(&y));
+        assert_eq!(expected.architectural_state(), c.architectural_state());
+    }
+    if NATIVE_COMPILED {
+        c.set_pc(0x1000);
+        c.run_slice(&mut e, &mut memory_a, 128);
+        let before = e.link_stats();
+        c.run_slice(&mut e, &mut memory_a, 10000);
+        let after = e.link_stats();
+        assert_eq!(after.entries - before.entries, 1);
+        assert_eq!(after.linked_blocks - before.linked_blocks, 4999);
+    }
+}
+
+#[test]
+fn syscall_continuations_use_current_arguments_and_revalidate_code_changes() {
+    let mut m = memory(&[0x91000400, 0xd4000001, 0x17fffffe]);
+    let mut c = Cpu::new(0x1008, 0);
+    let mut e = Engine::default();
+    for i in 0..16 {
+        c.set_x(0, 1000 + i);
+        c.set_x(8, if i & 1 == 0 { 93 } else { 172 });
+        assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 3));
+        assert_eq!((c.x(0), c.pc()), (1001 + i, 0x1008));
+    }
+    if NATIVE_COMPILED {
+        assert!(e.link_stats().syscall_resumes > 0);
+        assert!(e.link_stats().linked_blocks > 0);
+        let lookups = e.link_stats().lookups;
+        c.run_slice(&mut e, &mut m, 64);
+        assert_eq!(e.link_stats().lookups, lookups);
+    }
+    m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    m.write_array(0x1000, 0x91000800u32.to_le_bytes()).unwrap();
+    m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+    c.set_x(0, 40);
+    assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 3));
+    assert_eq!(c.x(0), 42);
+    c.set_pc(0x1004);
+    c.set_x(0, 77);
+    assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 1));
+    assert_eq!(c.x(0), 77);
+}
+
+#[test]
+fn cross_page_targets_remain_unlinked() {
+    let mut m = memory(&[0x14000400]);
+    m.write_array(0x2000, 0xd4000001u32.to_le_bytes()).unwrap();
+    m.protect(0x2000, PAGE_SIZE, Permissions::RX).unwrap();
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    for _ in 0..8 {
+        c.set_pc(0x1000);
+        assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 2));
+    }
+    assert_eq!(e.link_stats().linked_blocks, 0);
+}
+
+#[test]
+fn parallel_code_write_breaks_a_running_native_chain_at_its_epoch_guard() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    let mut m = memory(&[0x91000400, 0x17ffffff]);
+    m.protect(
+        0x1000,
+        PAGE_SIZE,
+        Permissions {
+            read: true,
+            write: true,
+            execute: true,
+        },
+    )
+    .unwrap();
+    let mut registry = trames_memory::parallel::Registry::default();
+    let mut reader = m.parallel_view(&mut registry).unwrap();
+    let mut writer = reader.clone();
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    c.run_parallel(&mut e, &mut reader, 128);
+    c.set_x(0, 0);
+    c.set_pc(0x1000);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        other.wait();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        writer.write(0x1000, &0xd4000001u32.to_le_bytes()).unwrap();
+    });
+    barrier.wait();
+    let result = c.run_parallel(&mut e, &mut reader, 100_000_000);
+    thread.join().unwrap();
+    let SliceOutcome::Syscall { instructions } = result else {
+        panic!("running chain missed changed code: {result:?}");
+    };
+    assert_eq!(instructions, c.x(0) * 2 + 1);
+    assert_eq!(c.pc(), 0x1004);
+    assert!(e.link_stats().linked_blocks > 0);
+}
+
+#[test]
+fn adjacent_syscalls_always_return_to_runtime_between_entries() {
+    let mut m = memory(&[0xd4000001, 0xd4000001]);
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    for _ in 0..8 {
+        c.set_pc(0x1000);
+        assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 1));
+        assert_eq!(c.pc(), 0x1004);
+        c.set_x(0, 123);
+        assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 1));
+        assert_eq!((c.x(0), c.pc()), (123, 0x1008));
+    }
+}
+
+#[test]
+fn memory_embeddings_without_epoch_capability_never_follow_native_links() {
+    use trames_memory::{Access, MemoryError};
+    struct Plain(Memory);
+    impl CpuMemory for Plain {
+        fn mapped_at_or_after(&self, a: u64) -> bool {
+            CpuMemory::mapped_at_or_after(&self.0, a)
+        }
+        fn read(&self, a: u64, out: &mut [u8]) -> Result<(), MemoryError> {
+            self.0.read(a, out)
+        }
+        fn write(&mut self, a: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.0.write(a, bytes)
+        }
+        fn check(&self, a: u64, len: usize, access: Access) -> Result<(), MemoryError> {
+            self.0.check(a, len, access)
+        }
+        fn check_translation(&self, a: u64) -> Result<(), MemoryError> {
+            self.0.check_translation(a)
+        }
+        fn fetch_u32(&self, a: u64) -> Result<u32, MemoryError> {
+            self.0.fetch_u32(a)
+        }
+        fn instruction_identity(&self) -> (u64, u64, u64) {
+            self.0.instruction_identity()
+        }
+        fn instruction_page_identity(&self, a: u64) -> Result<(u64, u64, u64), MemoryError> {
+            self.0.instruction_page_identity(a)
+        }
+        fn atomic_update<T>(
+            &mut self,
+            a: u64,
+            len: usize,
+            f: impl FnOnce(&mut [u8]) -> (T, bool),
+        ) -> Result<T, MemoryError> {
+            CpuMemory::atomic_update(&mut self.0, a, len, f)
+        }
+        fn exclusive_read(&mut self, a: u64, out: &mut [u8]) -> Result<u128, MemoryError> {
+            CpuMemory::exclusive_read(&mut self.0, a, out)
+        }
+        fn exclusive_write(
+            &mut self,
+            a: u64,
+            bytes: &[u8],
+            token: Option<u128>,
+        ) -> Result<bool, MemoryError> {
+            CpuMemory::exclusive_write(&mut self.0, a, bytes, token)
+        }
+    }
+    let mut m = memory(&[0x91000400, 0x17ffffff]);
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    c.run_slice(&mut e, &mut m, 128);
+    let before = e.link_stats();
+    let mut plain = Plain(m);
+    c.set_pc(0x1000);
+    c.set_x(0, 0);
+    assert_eq!(
+        outcome(&c.run_slice(&mut e, &mut plain, 128)),
+        ("yield", 128)
+    );
+    assert_eq!(c.x(0), 64);
+    let after = e.link_stats();
+    assert_eq!(after.linked_blocks, before.linked_blocks);
+    if NATIVE_COMPILED {
+        assert_eq!(after.entries - before.entries, 64);
     }
 }

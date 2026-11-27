@@ -1586,6 +1586,13 @@ impl Memory {
     }
 }
 
+pub(super) fn revision_epoch() -> &'static AtomicU64 {
+    &BACKING_REVISION
+}
+pub(super) fn external_epoch() -> &'static AtomicU64 {
+    &EXTERNAL_REVISION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

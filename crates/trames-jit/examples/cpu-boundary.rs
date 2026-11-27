@@ -16,9 +16,9 @@ fn memory(words: &[u32]) -> Memory {
     memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
     memory
 }
-fn measure<C: Backend>(words: &[u32], syscalls: bool) -> (u128, u64) {
+fn measure<C: Backend>(words: &[u32], syscalls: bool, continuation: bool) -> (u128, u64) {
     let mut memory = memory(words);
-    let mut cpu = C::new(0x1000, 0);
+    let mut cpu = C::new(if continuation { 0x1008 } else { 0x1000 }, 0);
     let mut engine = C::Engine::default();
     let rounds = if syscalls { 100_000 } else { 16 };
     let budget = if syscalls { 64 } else { 1_048_576 };
@@ -27,7 +27,7 @@ fn measure<C: Backend>(words: &[u32], syscalls: bool) -> (u128, u64) {
     for sample in 0..6 {
         let start = Instant::now();
         for _ in 0..rounds {
-            if syscalls {
+            if syscalls && !continuation {
                 cpu.set_pc(0x1000);
             }
             let outcome = cpu.run(&mut engine, &mut memory, budget);
@@ -61,13 +61,19 @@ fn main() {
     arithmetic.push(0x17ffffe1); // b -124, 32-instruction loop
     let mut syscall = vec![0x91000400; 16];
     syscall.push(0xd4000001);
-    for (name, words, svc) in [
-        ("integer-loop", arithmetic, false),
-        ("svc-round-trip", syscall, true),
-        ("svc-only", vec![0xd4000001], true),
+    for (name, words, svc, continuation) in [
+        ("integer-loop", arithmetic, false, false),
+        ("svc-round-trip", syscall, true, false),
+        ("svc-only", vec![0xd4000001], true, false),
+        (
+            "svc-continuation",
+            vec![0x91000400, 0xd4000001, 0x17fffffe],
+            true,
+            true,
+        ),
     ] {
-        let (interpreter, a) = measure::<trames_interpreter::Cpu>(&words, svc);
-        let (jit, b) = measure::<trames_jit::Cpu>(&words, svc);
+        let (interpreter, a) = measure::<trames_interpreter::Cpu>(&words, svc, continuation);
+        let (jit, b) = measure::<trames_jit::Cpu>(&words, svc, continuation);
         assert_eq!(a, b);
         println!("{{\"workload\":\"{name}\",\"interpreter_ns\":{interpreter},\"jit_ns\":{jit},\"speedup\":{:.3}}}", interpreter as f64 / jit as f64);
     }

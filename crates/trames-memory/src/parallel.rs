@@ -677,6 +677,12 @@ pub(super) struct SnapshotCache {
     source_backing_revision: u64,
 }
 impl SnapshotCache {
+    pub(super) fn instruction_epoch(&self) -> Option<&AtomicU64> {
+        self.snapshot
+            .dynamic_code
+            .then_some(&*self.snapshot.code_epoch)
+    }
+
     pub(super) fn has_uncommitted(&self) -> bool {
         self.snapshot
             .dirty_pages
@@ -1349,6 +1355,15 @@ impl CpuMemory for View {
         let mut bytes = [0; 4];
         self.read_fragment(frame, offset, &mut bytes);
         Ok(u32::from_le_bytes(bytes))
+    }
+    fn instruction_epochs(&self) -> Option<crate::InstructionEpochs<'_>> {
+        Some(crate::InstructionEpochs([
+            self.snapshot
+                .dynamic_code
+                .then_some(&*self.snapshot.code_epoch),
+            None, // backing_revision is immutable in this borrowed snapshot
+            self.snapshot.external_code.then(backing::external_epoch),
+        ]))
     }
     fn instruction_identity(&self) -> (u64, u64, u64) {
         (

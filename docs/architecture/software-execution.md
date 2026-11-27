@@ -24,8 +24,9 @@ Original guest instructions are never changed. Derived code is private to each
 worker, bounded, and published RW -> RX, never RWX. Guest page identities drive
 invalidation at block entry, using the existing decoder invalidation model.
 Blocks do not cross 4 KiB guest pages; host allocations use the actual host page
-size, including 16 KiB Android hosts. x0 retains the register-frame pointer; x1-x17 hold block-local guest values.
-Dirty evictions and block exits write values back. Host x18, TLS, FP state and
+size, including 16 KiB Android hosts. x0 retains the register-frame pointer; x1-x13 hold block-local guest values.
+x14/x15/x16 carry linked-block count, remaining budget and execution context;
+x17 is the jump scratch. Dirty evictions and block exits write values back. Host x18, TLS, FP state and
 callee-saved registers remain intact. Allocation runs only during compilation;
 ordinary translated instructions perform no dynamic register/feature checks.
 
@@ -38,3 +39,40 @@ exit only; its full shared Session integration is a separate milestone.
 
 Register choices follow [AAPCS64](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst)
 and [Android's reserved-x18 requirement](https://developer.android.com/ndk/guides/abis#arm64-v8a).
+
+
+## Same-page links and syscall continuation cache
+
+Each worker owns 128 stable RW jump slots alongside bounded RX code mappings.
+A cold lookup resolves a fixed, same-guest-page edge; later entries branch
+through its slot without returning to the Rust block-dispatch loop. Natural
+blocks use canonical cache keys. Exact-budget prefixes remain available for
+stepping but cannot replace full-block hot edges.
+
+A 96-byte native entry frame supplies GPR storage, budget and borrowed existing
+instruction epochs. Budget and block counts stay in caller-saved registers while
+chained; every exit publishes the actual guest PC and retirement count. No full
+architectural-state copy occurs. Ordinary translated accesses acquire no new
+checks or barriers. Entry guards use acquire only for the existing parallel-code
+publication counter and relaxed loads for backing/external notifications.
+
+`CpuMemory::instruction_epochs` is an optional cold observation capability.
+Memory/View expose only counters already used by instruction identities, for the
+current borrow. Unknown embeddings default to no chaining. Native code retains
+no memory/epoch pointers after returning. An epoch change unwinds the chain and
+invalidates links before revalidation. Mapping/permission changes between
+entries use the existing checked memory identities.
+
+A terminal SVC preserves its lightweight scalar entry. For stable same-page code,
+a fixed ordinary block followed by an SVC block can tail-jump directly into the
+latter's scalar entry when the complete pair fits the budget. Mutable code keeps
+per-block epoch guards. Every SVC still returns to the ordinary Runtime syscall
+dispatcher; no pair can execute two SVCs without that return.
+
+After syscall handling, the next entry can use a generation-checked cached
+continuation if guest PC, memory identity and budget match. Registers and syscall
+numbers remain current; results and policy decisions are not cached. Blocking,
+signal redirection, restart and worker migration retain the existing scheduler
+path, with cache misses falling back to lookup. Incoming links are cleared before
+RX eviction; generation handles reject slot/address reuse. Only RW link data is
+updated after publication; guest bytes and RX instructions remain unchanged.

@@ -25,7 +25,21 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
     }
 }
 
+/// Existing live instruction-change counters, borrowed for one CPU entry.
+/// Counter 0 uses acquire ordering (parallel code publication); counters 1/2
+/// retain relaxed backing/external notifications. Mapping custody and immutable
+/// address-space identity stay with the borrowed Memory/View, not these counters.
+pub struct InstructionEpochs<'a>(pub [Option<&'a std::sync::atomic::AtomicU64>; 3]);
+
 pub trait CpuMemory {
+    /// Optional cold capability for chaining derived executable code. Every
+    /// instruction-identity change possible during this borrow must be covered
+    /// by these counters. None keeps the ordinary per-block interpreter/cache
+    /// boundary. This adds no checks to guest memory reads/writes.
+    fn instruction_epochs(&self) -> Option<InstructionEpochs<'_>> {
+        None
+    }
+
     /// User-only missing faults need an execution-origin scope. Ordinary mm's
     /// do not touch thread-local origin state on each CPU/native entry.
     fn userfaults_active(&self) -> bool {
@@ -359,6 +373,19 @@ impl CpuMemory for Memory {
     fn instruction_identity(&self) -> (u64, u64, u64) {
         Memory::instruction_identity(self)
     }
+    fn instruction_epochs(&self) -> Option<InstructionEpochs<'_>> {
+        if self.shared.is_some() {
+            return None;
+        }
+        Some(InstructionEpochs([
+            self.parallel_cache
+                .as_ref()
+                .and_then(|cache| cache.instruction_epoch()),
+            self.has_backings.then(crate::backing::revision_epoch),
+            self.has_external_code.then(crate::backing::external_epoch),
+        ]))
+    }
+
     #[inline]
     fn instruction_page_identity(&self, a: u64) -> Result<(u64, u64, u64), MemoryError> {
         Memory::instruction_page_identity(self, a)

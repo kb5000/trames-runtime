@@ -50,7 +50,34 @@ pub struct CompilationStats {
     pub register_loads: u64,
     pub register_stores: u64,
 }
+/// Execution/link counters; per-instruction guest memory accesses are unchanged.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LinkStats {
+    pub entries: u64,
+    pub linked_blocks: u64,
+    pub syscall_resumes: u64,
+    pub lookups: u64,
+}
 impl Engine {
+    pub fn link_stats(&self) -> LinkStats {
+        #[cfg(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            self.native.links_stats
+        }
+        #[cfg(not(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )))]
+        {
+            LinkStats::default()
+        }
+    }
+
     pub fn compilation_stats(&self) -> CompilationStats {
         #[cfg(all(
             feature = "native-aarch64",
@@ -103,7 +130,7 @@ impl Cpu {
             {
                 Ok(Some(exit)) => {
                     retired += exit.instructions;
-                    engine.stats.native_blocks += 1;
+                    engine.stats.native_blocks += exit.blocks;
                     // SVC is a translated control exit, separate from native
                     // guest ALU/branch instructions and fallback execution.
                     engine.stats.native_instructions += exit.instructions - u64::from(exit.syscall);
