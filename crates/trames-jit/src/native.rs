@@ -833,9 +833,11 @@ struct Binding {
     dirty: bool,
     used: u32,
 }
-/// Compile-time allocation only. x0 retains the register-frame argument; x1-x13
-/// are caller-saved; x14/x15/x16 hold block count, budget and entry context.
-/// x18/TLS, x19-x30, host SP and FP/SIMD are never modified.
+/// Compile-time allocation only. Between helpers, x0 holds the register-frame
+/// argument; x1-x13 are caller-saved and x14/x15/x16 hold count/budget/context.
+/// Scalar bodies use no host stack or FP/SIMD state. Memory calls balance the
+/// host stack/LR and obey AAPCS64; no live guest vector binding crosses a helper.
+/// Host x18/TLS and callee-saved state remain preserved on return.
 /// Bindings do not survive block exit, so worker/task migration needs no flush.
 struct Assembler {
     words: Vec<u32>,
