@@ -89,6 +89,7 @@ impl Gateway {
         for address in [
             SocketAddr::new(v4(1).into(), 53),
             SocketAddr::new(v6(1).into(), 53),
+            crate::direct_dns::ROUTABLE_ADDRESS,
         ] {
             let mut u = udp_socket();
             u.bind(endpoint(address)).unwrap();
@@ -203,7 +204,7 @@ impl Gateway {
         let tuple = h.tuple;
         let dest = tuple.destination;
 
-        let local_gateway = dest.ip() == IpAddr::V4(v4(1)) || dest.ip() == IpAddr::V6(v6(1));
+        let local_gateway = gateway_ip(dest.ip());
         // Managed IP links use this gateway's existing DNS service even though
         // their policy route is recorded for reply delivery. Routed container
         // destinations otherwise keep their normal native forwarding meaning.
@@ -346,11 +347,17 @@ impl Gateway {
         if ![1, 2].contains(&kind) || host.is_ipv4() != guest.is_ipv4() {
             return Err(NetError(22));
         }
-        let native = self.native.socket(
+        // This endpoint is explicitly authorized by the host embedder. Its
+        // requested bind address follows host policy; ordinary guest egress
+        // continues using the separate outbound-only network above.
+        let native = native::Network::new(NetworkMode::Full).socket(
             if host.is_ipv4() { 2 } else { 10 },
             kind,
             if kind == 1 { 6 } else { 17 },
         )?;
+        if kind == 1 {
+            native.set_option(1, 2, 1)?;
+        } // SO_REUSEADDR: restart after accepted TCP flows.
         native.bind(host)?;
         if kind == 1 {
             native.listen(128)?;

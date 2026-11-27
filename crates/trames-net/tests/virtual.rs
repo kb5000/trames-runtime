@@ -249,6 +249,42 @@ fn native_gateway_tcp_and_udp_both_families() {
     }
 }
 #[test]
+fn managed_resolver_address_is_available_over_udp_and_tcp_in_virtual_networks() {
+    let f = Fabric::new().unwrap();
+    let dir = std::path::Path::new("/tmp").join(format!(
+        "trames-dns-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    f.attach(&dir, 2, false).unwrap();
+    let n = net(&f, 2);
+    let _peer = net(&f, 3);
+    for tcp in [false, true] {
+        let c = socket(&n, false, tcp);
+        let address = parse("169.254.0.53:53");
+        if tcp {
+            connect(&c, address);
+        } else {
+            c.connect(address).unwrap();
+        }
+        let query = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x04env3\x06trames\0\0\x01\0\x01";
+        let bytes = if tcp {
+            [&(query.len() as u16).to_be_bytes()[..], query].concat()
+        } else {
+            query.to_vec()
+        };
+        c.send(&bytes, 0, None).unwrap();
+        let answer = until(&c, || c.recv(512, 0));
+        assert!(answer.data.ends_with(&[10, 0, 0, 3]));
+        assert_eq!(c.peer_addr().unwrap(), address);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn dns_internal_a_aaaa_and_refused_connect_error_consumption() {
     let f = Fabric::new().unwrap();
     let n = net(&f, 2);

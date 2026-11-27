@@ -6,6 +6,7 @@ pub mod bionic;
 pub mod boot;
 pub mod environment;
 pub mod glibc;
+pub mod networks;
 pub mod packages;
 pub mod progress;
 pub mod registry;

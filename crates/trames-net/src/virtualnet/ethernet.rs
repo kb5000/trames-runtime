@@ -142,11 +142,7 @@ impl Inner {
                 .get(&source)
                 .and_then(|n| n.owner.upgrade())
                 .is_some_and(|o| matches!(o.mode, NetworkMode::Full | NetworkMode::Outbound));
-            if !allowed
-                || self.external.as_ref().is_some_and(|e| !e.nat)
-                    && dst != IpAddr::V4(v4(1))
-                    && dst != IpAddr::V6(v6(1))
-            {
+            if !allowed || self.external.as_ref().is_some_and(|e| !e.nat) && !gateway_ip(dst) {
                 return;
             }
             let Some(tuple) = crate::conntrack::key(&packet) else {
