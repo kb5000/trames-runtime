@@ -75,7 +75,10 @@ extern "C" fn handle(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             let address = (*info).si_addr() as usize;
             let pc = context_pc(context);
             if !pc.is_null() {
-                if let Some(recovery) = super::access::recovery(*pc) {
+                let recovery = super::access::recovery(*pc);
+                #[cfg(feature = "native-code")]
+                let recovery = recovery.or_else(|| crate::native_code::recovery(*pc));
+                if let Some(recovery) = recovery {
                     if WINDOWS.iter().any(|slot| {
                         let base = slot.load(Ordering::Acquire);
                         base != 0 && address.wrapping_sub(base) < WINDOW

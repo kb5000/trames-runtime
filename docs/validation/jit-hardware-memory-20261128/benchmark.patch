@@ -1,0 +1,45 @@
+--- a/tools/cpu-backends/src/main.rs
++++ b/tools/cpu-backends/src/main.rs
+@@ -30,7 +30,7 @@
+             "native_instructions":engine.stats.native_instructions,
+             "direct_syscall_exits":engine.stats.direct_syscall_exits,
+             "memory_instructions":memory.instructions,"staged":memory.staged,
+-            "fused_entries":memory.fused_entries,"fused_blocks":memory.fused_blocks})
++            "hardware":memory.hardware,"fused_entries":memory.fused_entries,"fused_blocks":memory.fused_blocks})
+     }
+ }
+ impl Bench for trames_kvm::kernel::Cpu {
+@@ -104,6 +104,7 @@
+     let mut memory = Memory::default();
+     memory.map(CODE, PAGE_SIZE, Permissions::RW).unwrap();
+     memory.map(DATA, PAGE_SIZE, Permissions::RW).unwrap();
++    memory.write_array(DATA, 0u64.to_le_bytes()).unwrap();
+     for (i, word) in work.words.iter().enumerate() {
+         memory
+             .write_array(CODE + i as u64 * 4, word.to_le_bytes())
+@@ -114,10 +115,15 @@
+     cpu.set_x(1, DATA);
+     let mut engine = C::Engine::default();
+     let mut registry = Registry::default();
+-    let mut view = if mode == "worker" {
++    let mut view = if mode != "direct" {
+         C::prepare_hardware_memory(&mut memory, &mut registry).unwrap();
+         let mut view = memory.parallel_view(&mut registry).unwrap();
+         C::prepare_hardware_view(&mut view);
++        if mode == "worker-private" && backend != "kvm" {
++            // Sole actor and all mm roots remain here, no clone/fork/host bytes
++            // or mapping access until the view is dropped after all samples.
++            assert!(unsafe { trames_memory::parallel::View::try_private_epoch(&mut [&mut view]) });
++        }
+         Some(view)
+     } else {
+         None
+@@ -245,7 +251,7 @@
+     let backend = args.first().map(String::as_str).unwrap_or("jit");
+     let mode = args.get(1).map(String::as_str).unwrap_or("worker");
+     let quick = args.iter().any(|a| a == "--quick");
+-    assert!(matches!(mode, "worker" | "direct"));
++    assert!(matches!(mode, "worker" | "worker-private" | "direct"));
+     assert!(matches!(backend, "interpreter" | "jit" | "kvm"));
+     if backend == "kvm" {
+         assert_eq!(

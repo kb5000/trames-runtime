@@ -32,6 +32,35 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 pub struct InstructionEpochs<'a>(pub [Option<&'a std::sync::atomic::AtomicU64>; 3]);
 
 pub trait CpuMemory {
+    /// Cold entry capability, separate from CPU instruction support. A false
+    /// result keeps the existing checked lowering without inline cache probes.
+    #[cfg(feature = "native-code")]
+    fn cpu_native_available(&self) -> bool {
+        false
+    }
+    /// Whether exported aliases/ownership survive further checked scalar
+    /// reads/stores on this same frozen View. Never permits mapping operations,
+    /// atomics, native callbacks or retaining exports beyond this CPU entry.
+    #[cfg(feature = "native-code")]
+    fn cpu_native_stable(&self) -> bool {
+        false
+    }
+    /// Export an existing, resident protected alias after a successful checked
+    /// access. `write` admits further stores and publishes private-page dirty
+    /// and reservation metadata once for this entry, never for a read alone.
+    ///
+    /// # Safety
+    /// All earlier exports must be discarded before ANY other CpuMemory call,
+    /// except further exports and checked scalar reads/stores when
+    /// cpu_native_stable() admits them.
+    /// The caller may access only this guest page through the returned alias,
+    /// with the admitted read/write rights, until its next CpuMemory call. No
+    /// guest exclusive operation or native callback may overlap that interval.
+    /// Never retain an export across CPU entries, mapping edits or a syscall.
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_page(&mut self, _address: u64, _write: bool) -> Option<crate::NativePage> {
+        None
+    }
     /// Optional cold capability for chaining derived executable code. Every
     /// instruction-identity change possible during this borrow must be covered
     /// by these counters. None keeps the ordinary per-block interpreter/cache
@@ -239,6 +268,43 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    #[cfg(feature = "native-code")]
+    fn cpu_native_available(&self) -> bool {
+        self.shared.is_none() && !self.async_faults_possible() && !self.userfaults_active()
+    }
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_page(&mut self, address: u64, write: bool) -> Option<crate::NativePage> {
+        if !self.cpu_native_available() {
+            return None;
+        }
+        let base = (address & 0x00ff_ffff_ffff_ffff) & !(PAGE_SIZE - 1);
+        let entry = self.translation(base)?;
+        let page = self.translated_page(entry);
+        // No fork owner, concurrent/native borrower, provider, executable store,
+        // unpaid zero page, userfault or software-only 16K permission group.
+        if entry.cpu == 0
+            || page.backing.is_some()
+            || page.permissions.execute
+            || !page.charge.write_ready()
+            || std::sync::Arc::strong_count(&page.bytes) != 1
+            || page.bytes.shared().is_some()
+        {
+            return None;
+        }
+        let read = if page.permissions.read { entry.cpu } else { 0 };
+        let writable = write && page.permissions.write;
+        if writable {
+            let page = self.translated_page_mut(entry);
+            page.data_revision = page.data_revision.wrapping_add(1);
+            self.revision = self.revision.wrapping_add(1);
+            self.note_parallel_write(entry.frame);
+        }
+        Some(crate::NativePage {
+            base,
+            read,
+            write: if writable { entry.cpu } else { 0 },
+        })
+    }
     #[inline]
     fn userfaults_active(&self) -> bool {
         self.shared.as_ref().map_or_else(

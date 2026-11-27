@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Only native code producers need dynamic signal fixups and entry-scoped aliases.
+native-code = []
+
 [dependencies]
 libc = "=0.2.190"
 parking_lot = "=0.12.5"

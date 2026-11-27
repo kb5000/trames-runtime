@@ -97,6 +97,8 @@ pub struct MemoryStats {
     pub staged: u64,
     pub fused_entries: u64,
     pub fused_blocks: u64,
+    /// Inline LDR/STR through an entry-scoped hardware-protected CPU alias.
+    pub hardware: u64,
 }
 impl Engine {
     pub fn memory_stats(&self) -> MemoryStats {

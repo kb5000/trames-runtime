@@ -36,6 +36,7 @@ impl Node {
 struct Block {
     code: Code,
     has_memory: bool,
+    has_hardware: bool,
     instructions: u64,
     next_pc: u64,
     syscall: bool,
@@ -150,20 +151,43 @@ struct MemoryFrame<M> {
     cpu: *mut Cpu,
     memory: *mut M,
     registers: *mut u64,
+    hits: u64,
+    pages: [OperandPage; 64],
+    stable: bool,
     checked: Identity,
     fault: Option<CpuFault>,
     stats: crate::MemoryStats,
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OperandPage {
+    tag: u64,
+    read: usize,
+    write: usize,
+    reserved: usize,
+}
+impl OperandPage {
+    const EMPTY: Self = Self {
+        tag: u64::MAX,
+        read: 0,
+        write: 0,
+        reserved: 0,
+    };
+}
 const _: () = {
     assert!(std::mem::offset_of!(MemoryFrame<()>, helper) == 120);
     assert!(std::mem::offset_of!(MemoryFrame<()>, registers) == 144);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, hits) == 152);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, pages) == 160);
+    assert!(std::mem::size_of::<OperandPage>() == 32);
 };
 struct MemorySite {
     adjust: usize,
     stop: usize,
     before: u64,
+    fixup: Option<(usize, usize)>,
 }
-unsafe extern "C" fn memory_access<M: CpuMemory>(
+unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
     pointer: *mut MemoryFrame<M>,
     operation: *const crate::memory_ops::Operation,
     remaining: u64,
@@ -176,6 +200,17 @@ unsafe extern "C" fn memory_access<M: CpuMemory>(
     let (cpu, memory) = unsafe { (&mut *frame.cpu, &mut *frame.memory) };
     cpu.pc = op.pc();
     cpu.sp = frame.frame.sp;
+    // Any checked call can prepare COW/storage or replace CPU aliases. Discard
+    // all earlier loans before reborrowing Memory; only this call's final export
+    // survives. Stores also populate the read slot after actual write admission.
+    if HARDWARE && !frame.stable {
+        frame.pages.fill(OperandPage::EMPTY);
+    }
+    let address = if HARDWARE {
+        op.operand(cpu).0 & 0x00ff_ffff_ffff_ffff
+    } else {
+        0
+    };
     let result = op.execute(cpu, memory);
     frame.frame.sp = cpu.sp;
     let next = match result {
@@ -183,6 +218,21 @@ unsafe extern "C" fn memory_access<M: CpuMemory>(
             frame.stats.instructions += 1;
             frame.stats.staged += u64::from(!direct);
             if memory.instruction_identity() == frame.checked {
+                if HARDWARE
+                    && op.opcode.is_some()
+                    && op.size as u64 <= PAGE_SIZE - address % PAGE_SIZE
+                {
+                    // SAFETY: prior loans are gone; native execution performs
+                    // only bounded scalar accesses until the next helper/return.
+                    if let Some(page) = unsafe { memory.cpu_native_page(address, !op.load) } {
+                        frame.pages[(page.base / PAGE_SIZE) as usize & 63] = OperandPage {
+                            tag: page.base,
+                            read: page.read,
+                            write: page.write,
+                            reserved: 0,
+                        };
+                    }
+                }
                 1
             } else {
                 frame.frame.remaining = remaining - 1;
@@ -452,7 +502,7 @@ impl Cache {
             return;
         }
         let entry = to.entry();
-        let tail = if a.key.2 == 8
+        let tail = if a.key.2 & !16 == 8
             && !from.syscall
             && to.syscall
             && !from.context
@@ -513,7 +563,7 @@ impl Cache {
         let pc = cpu.pc;
         if let Some(handle) = self.hot {
             if let Some(node) = self.node(handle) {
-                if node.key.0 == pc && node.key.2 == 8 && self.tails[handle.slot] != 0 {
+                if node.key.0 == pc && node.key.2 & !16 == 8 && self.tails[handle.slot] != 0 {
                     if let (Some(block), Some(target)) = (&node.block, node.next) {
                         if let Some(to) = self.node(target).and_then(|n| n.block.as_ref()) {
                             let instructions = block.instructions + to.instructions;
@@ -626,6 +676,9 @@ impl Cache {
             nzcv: (cpu.nzcv() as u64) << 28,
         };
         let mut mode = if epochs.is_some() { 8 } else { 0 };
+        if epochs.is_some() && memory.cpu_native_available() {
+            mode |= 16;
+        }
         if let Some(epochs) = &epochs {
             for (i, counter) in epochs.0.iter().enumerate() {
                 if let Some(counter) = counter {
@@ -784,10 +837,17 @@ impl Cache {
         let block_length = block.instructions;
         let mut fused = MemoryFrame {
             frame,
-            helper: memory_access::<M> as *const () as usize,
+            helper: if block.has_hardware {
+                memory_access::<M, true> as *const () as usize
+            } else {
+                memory_access::<M, false> as *const () as usize
+            },
             cpu: cpu_pointer,
             memory: memory as *mut _,
             registers,
+            hits: 0,
+            pages: [OperandPage::EMPTY; 64],
+            stable: memory.cpu_native_stable(),
             checked,
             fault: None,
             stats: crate::MemoryStats::default(),
@@ -795,7 +855,8 @@ impl Cache {
         // All Rust register references end before entry. The helper temporarily
         // reborrows this same CPU/mm; no guest lease survives the callback.
         unsafe { block.code.call_memory_block(registers, &mut fused) };
-        self.cold.memory.instructions += fused.stats.instructions;
+        self.cold.memory.instructions += fused.stats.instructions + fused.hits;
+        self.cold.memory.hardware += fused.hits;
         self.cold.memory.staged += fused.stats.staged;
         self.cold.memory.fused_entries += 1;
         self.cold.memory.fused_blocks += fused.frame.blocks;
@@ -839,6 +900,7 @@ struct Binding {
 /// host stack/LR and obey AAPCS64; no live guest vector binding crosses a helper.
 /// Host x18/TLS and callee-saved state remain preserved on return.
 /// Bindings do not survive block exit, so worker/task migration needs no flush.
+#[derive(Clone)]
 struct Assembler {
     words: Vec<u32>,
     bindings: [Option<Binding>; 13],
@@ -999,7 +1061,124 @@ impl Assembler {
             adjust,
             stop,
             before,
+            fixup: None,
         }
+    }
+    fn hardware_memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
+        use crate::memory_ops::Address;
+        const SCRATCH: u32 = (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13);
+        // Evict just four scratch registers, retaining other guest bindings and
+        // flags across every successful access. No helper ABI on a cache hit.
+        for slot in 9..13 {
+            if let Some(binding) = self.bindings[slot].take() {
+                self.store(slot, binding);
+                self.hosts[binding.guest as usize] = u8::MAX;
+            }
+        }
+        self.context = true;
+        let base = if matches!(op.address, Address::Literal(_)) {
+            31
+        } else {
+            self.read(sp_register(op.rn as u32), SCRATCH)
+        };
+        let source = if op.load {
+            31
+        } else {
+            self.read(op.rt as u32, SCRATCH | (1 << base))
+        };
+        match op.address {
+            Address::Literal(address) => constant(&mut self.words, 17, address),
+            Address::Register { reg, option, shift } => {
+                let index = self.read(reg as u32, SCRATCH | (1 << base) | (1 << source));
+                self.words.push(
+                    0x8b200000 | (index << 16) | (option << 13) | (shift << 10) | (base << 5) | 17,
+                );
+            }
+            Address::Offset(offset) | Address::Pre(offset) => {
+                constant(&mut self.words, 10, offset);
+                self.words.push(0x8b0a0000 | (base << 5) | 17);
+            }
+            Address::Post(_) => self.words.push(0xaa0003f1 | (base << 16)),
+        }
+        let prior = self.clone();
+        let prior_stores = self.traffic.register_stores;
+        if self.flags_live {
+            self.words.push(0xd53b420c);
+        } // save guest NZCV
+        self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17); // guest TBI
+        self.words.push(0xd3400000 | (11 << 10) | (17 << 5) | 10); // offset
+        self.words
+            .push(0xf100001f | (((4096 - op.size) as u32) << 10) | (10 << 5));
+        let mut misses = vec![self.words.len()];
+        self.words.push(0x54000008); // b.hi cross-page slow path
+        self.words.push(0xcb0a022a); // x10 = guest page base
+        self.words
+            .push(0xd3400000 | (12 << 16) | (17 << 10) | (17 << 5) | 11); // ubfx index,#12,#6
+        self.words.push(0x8b0b160b); // add x11,x16,x11,lsl #5
+        self.words.push(0x9102816b); // add x11,x11,#160
+        load(&mut self.words, 13, 11, 0);
+        self.words.push(0xeb0a01bf); // cmp x13,x10 (full guest tag, no address masking)
+        misses.push(self.words.len());
+        self.words.push(0x54000001);
+        load(&mut self.words, 13, 11, if op.load { 8 } else { 16 });
+        misses.push(self.words.len());
+        self.words.push(0xb400000d);
+        self.words.push(0xcb0a0231); // x17 = offset
+        self.words.push(0x8b1101b1); // x17 = protected CPU alias + offset
+        if self.flags_live {
+            self.words.push(0xd51b420c);
+        }
+        let target = if op.load {
+            self.output(op.rt as u32, SCRATCH | (1 << base))
+        } else {
+            source
+        };
+        let fault = self.words.len();
+        self.words
+            .push((op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target);
+        if let Address::Pre(offset) | Address::Post(offset) = op.address {
+            constant(&mut self.words, 10, offset);
+            let target = self.output(sp_register(op.rn as u32), SCRATCH | (1 << base));
+            self.words.push(0x8b0a0000 | (base << 5) | target);
+        }
+        load(&mut self.words, 10, 16, 152);
+        self.words.push(0x9100054a); // diagnostic hit, no atomics/fence
+        store(&mut self.words, 10, 152);
+        let done = self.words.len();
+        self.words.push(0x14000000);
+        let slow_start = self.words.len();
+        let mut slow = prior;
+        slow.words.clear();
+        if slow.flags_live {
+            slow.words.push(0xd51b420c);
+        }
+        let mut site = slow.memory(op, before);
+        site.adjust += slow_start;
+        site.stop += slow_start;
+        site.fixup = Some((fault, slow_start));
+        self.words.extend(slow.words);
+        self.traffic.register_stores += slow.traffic.register_stores - prior_stores;
+        // The helper publishes a new register-array borrow. Rebuild precisely
+        // the bindings expected by the hot continuation, without replaying it.
+        for (slot, binding) in self.bindings.iter().enumerate() {
+            if let Some(binding) = binding {
+                if binding.guest == 32 {
+                    load(&mut self.words, slot as u32 + 1, 16, 104);
+                } else {
+                    load(&mut self.words, slot as u32 + 1, 0, binding.guest * 8);
+                }
+            }
+        }
+        if self.flags_live {
+            load(&mut self.words, 12, 16, 112);
+            self.words.push(0xd51b420c);
+        }
+        let end = self.words.len();
+        self.words[done] |= (end - done) as u32;
+        for at in misses {
+            branch(&mut self.words, at, slow_start);
+        }
+        site
     }
     fn finish(mut self) -> (Vec<u32>, CompilationStats, bool) {
         self.flush();
@@ -1047,7 +1226,7 @@ fn render(
     mask: u8,
     flow: Flow,
     memory: &[MemorySite],
-) -> Vec<u32> {
+) -> (Vec<u32>, usize) {
     let syscall = matches!(flow, Flow::Syscall);
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
     let mut words = vec![0xd503245f, 0xaa0103f0, 0xf940020f, 0xaa1f03ee, 0xd50324df]; // BTI c; ctx=x1; budget; blocks=0; BTI jc
@@ -1139,7 +1318,7 @@ fn render(
             branch(&mut words, body_start + site.stop, stopped);
         }
     }
-    words
+    (words, body_start)
 }
 
 fn signed(value: u64, bits: u32) -> u64 {
@@ -1502,7 +1681,11 @@ fn compile_with_features(
                 break;
             };
             let op = Box::new(op);
-            memory_sites.push(code.memory(&op, count));
+            memory_sites.push(if mode & 16 != 0 && op.opcode.is_some() {
+                code.hardware_memory(&op, count)
+            } else {
+                code.memory(&op, count)
+            });
             memory_ops.push(op);
         } else {
             break;
@@ -1521,7 +1704,7 @@ fn compile_with_features(
         code.words[site.adjust] |= ((count - site.before) as u32) << 10;
     }
     let (body, mut traffic, context) = code.finish();
-    let mut words = render(
+    let (mut words, body_start) = render(
         &body,
         (start, next),
         slot,
@@ -1551,12 +1734,18 @@ fn compile_with_features(
         tail_offset = 0;
     }
     traffic.host_words = words.len() as u64;
+    let fixups: Vec<_> = memory_sites
+        .iter()
+        .filter_map(|site| site.fixup)
+        .map(|(pc, recovery)| ((body_start + pc) * 4, (body_start + recovery) * 4))
+        .collect();
     Ok(Some(Compiled {
         memory: (!memory_ops.is_empty()).then(|| Box::new(MemoryOps::Fused(memory_ops))),
         block: Block {
-            code: Code::publish(&words)
+            code: Code::publish_fixups(&words, &fixups)
                 .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
             has_memory: !memory_sites.is_empty(),
+            has_hardware: mode & 16 != 0,
             instructions: count,
             next_pc: next,
             syscall,
@@ -1574,10 +1763,14 @@ fn compile_with_features(
 pub(super) struct Code {
     pointer: *mut libc::c_void,
     length: usize,
+    fixups: Option<trames_memory::NativeCodeFixups>,
     _thread: PhantomData<Rc<()>>,
 }
 impl Code {
     pub(super) fn publish(words: &[u32]) -> std::io::Result<Self> {
+        Self::publish_fixups(words, &[])
+    }
+    fn publish_fixups(words: &[u32], fixups: &[(usize, usize)]) -> std::io::Result<Self> {
         // SAFETY: sysconf has no memory arguments; host page size is cold-path.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page <= 0 {
@@ -1598,9 +1791,10 @@ impl Code {
         if pointer == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        let mapping = Self {
+        let mut mapping = Self {
             pointer,
             length,
+            fixups: None,
             _thread: PhantomData,
         };
         // SAFETY: this fresh RW mapping has capacity for all words. No execution
@@ -1611,6 +1805,15 @@ impl Code {
             if libc::mprotect(pointer, length, libc::PROT_READ | libc::PROT_EXEC) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+        }
+        if !fixups.is_empty() {
+            let pairs: Vec<_> = fixups
+                .iter()
+                .map(|&(pc, recovery)| (pointer as usize + pc, pointer as usize + recovery))
+                .collect();
+            // SAFETY: exact emitted scalar sites and local slow continuations;
+            // mapping is thread-affine and token retires before its RX storage.
+            mapping.fixups = Some(unsafe { trames_memory::NativeCodeFixups::register(&pairs) }?);
         }
         Ok(mapping)
     }
@@ -1668,6 +1871,7 @@ impl Code {
 }
 impl Drop for Code {
     fn drop(&mut self) {
+        drop(self.fixups.take());
         unsafe {
             libc::munmap(self.pointer, self.length);
         }
@@ -1700,6 +1904,27 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_admission_preserves_scalar_syscall_tail_cells() {
+        let mut m = memory(&[0x91000400, 0xd4000001, 0x17fffffe]);
+        assert!(m.cpu_native_available());
+        let mut cpu = Cpu::new(0x1008, 0);
+        let mut cache = Cache::default();
+        for _ in 0..8 {
+            let mut retired = 0;
+            loop {
+                let result = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
+                retired += result.instructions;
+                if result.syscall {
+                    break;
+                }
+            }
+            assert_eq!(retired, 3);
+        }
+        assert!(cache.tails.iter().any(|&entry| entry != 0));
+        assert!(cache.active.is_some_and(|(_, mode)| mode & 16 != 0));
+    }
     use std::sync::atomic::AtomicU64;
     use trames_memory::{Memory, Permissions};
     fn memory(words: &[u32]) -> Memory {

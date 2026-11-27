@@ -126,8 +126,9 @@ Integer LDR/STR byte/halfword/word/doubleword, signed loads, immediate/unscaled,
 pre/post-index, extended register offsets, literal loads and optional PRFM hints
 have cached native fragments. Cold decode selects the exact baseline host LDR/STR
 opcode. The helper computes the decoded guest address and commits result/base
-writeback only after success. Each real same-page access stays inside the existing
-`CpuMemory` read/full-write callback; no host data pointer or lease is cached.
+writeback only after success. The checked slow path uses the existing `CpuMemory` read/full-write
+callback. The hardware-alias path below retains bounded, entry-scoped operands
+without placing data pointers in the compiled-code cache.
 
 `cpu_store_chunk` is a full-overwrite contract. Memory/View reuse existing write
 borrowing and dirty/code/exclusive publication. Staging-only providers need not
@@ -158,11 +159,57 @@ the published scalar/SVC machine-entry ABI and existing Stats fields are retaine
 counts; these are updated only by memory execution. No extension register model,
 algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is added.
 
-Fusion removes repeated main-dispatch returns but still calls the checked helper
-and a tiny native fragment for each access. The cached interpreter's scalar path
-already uses decoded tail handlers and its canonical fixed-width memory access;
-executing a host LDR/STR alone does not make the surrounding JIT machinery faster.
-Further memory-helper/translation integration remains necessary. Pairs, SIMD,
-acquire/release and atomics keep their existing path until separately lowered.
+Pairs, SIMD, acquire/release and atomics keep their existing path until separately
+lowered.
+
+### Entry-scoped hardware aliases
+
+Native scalar memory blocks can inline guest-address computation, a bounded
+64-slot guest-page tag lookup, guest-page containment, and LDR/STR through the
+existing protected CPU alias. The final translation and page protection use the
+host MMU. Cache hits keep guest registers bound in host registers, skip the Rust
+helper and do not acquire a region lock or add a memory fence. Guest TBI follows
+the shared memory model; the remaining guest address is compared in full, never
+masked into a host arena or a different guest page.
+
+Cold entry admission selects this lowering. Direct Memory exports only unique,
+resident, anonymous, non-executable pages with a protected alias, and discards
+all operands before the next checked helper. Frozen worker Views retain operands
+across scalar helpers only under existing private-epoch admission: one actor can
+read/write eligible private pages; multiple actors may read immutable pages.
+Shared writable/COW pages, backing providers, unpaid pages, userfault/async policy
+and software-only host-page groups decline. The existing checked lowering stays
+available, including its permissions, independent read/store borrows and staging.
+
+A successful checked store admits further writes and publishes private-page dirty
+fragments/reservation invalidation once before returning the alias. No write
+admission is inferred from a read. All potentially writable fragments of that
+private page are marked; there are no concurrent private actors or backing
+writeback providers to overwrite. Atomic/exclusive instructions, syscalls and
+native callbacks end the generated block/operand loan. Native stores therefore
+cannot hide a write from a later guest exclusive operation. Direct Memory also
+advances its existing data/revision and parallel-write metadata. Alias pointers
+never outlive their canonical owner, entry, frozen mapping or permissions.
+
+Each generated faulting instruction registers its exact native PC and local slow
+continuation using the opt-in memory `native-code` feature. The existing handler
+recovers only hardware faults inside a registered CPU alias; unrelated signals
+continue through the existing handler chain. The dynamic registry is bounded,
+uses only lock-free atomics in signal context and is retired by the thread-affine
+code owner before RX unmap. Recovery flushes the pre-instruction bindings, runs
+the checked access, reloads the helper's fresh register-array borrow, and rejoins
+without replaying the prefix. SP/writeback/results retire only after success.
+No Rust stack frame or destructor is skipped.
+
+A 16/64 KiB host page is used directly only when the existing alias layer can
+represent its entire group without guest permission leaks. Mixed 4 KiB groups,
+holes and cross-guest-page operands use the established slow path. The guest
+page size remains 4 KiB. iPad/interpreter builds do not enable `native-code` or
+compile the JIT/executable allocator. The scalar/SVC frame and tail fast path
+remain separate from the larger helper frame.
+
+`MemoryStats::hardware` counts actual inline accesses; other public instruction,
+staging and fused-entry counts retain their meanings. See
+[hardware-memory validation](../validation/jit-hardware-memory-20261128.md).
 
 See [fusion validation and complete measurements](../validation/jit-memory-fusion-20261127.md).

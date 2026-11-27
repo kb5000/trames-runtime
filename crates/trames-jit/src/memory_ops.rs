@@ -7,7 +7,7 @@ use trames_interpreter::Cpu;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
 #[derive(Clone, Copy)]
-enum Address {
+pub(super) enum Address {
     Offset(u64),
     Pre(u64),
     Post(u64),
@@ -16,11 +16,12 @@ enum Address {
 }
 pub(super) struct Operation {
     pc: u64,
-    address: Address,
-    rn: usize,
-    rt: usize,
-    size: usize,
-    load: bool,
+    pub(super) address: Address,
+    pub(super) rn: usize,
+    pub(super) rt: usize,
+    pub(super) size: usize,
+    pub(super) load: bool,
+    pub(super) opcode: Option<u32>,
     code: Option<Code>, // PRFM is an architecturally optional hint, no read.
 }
 fn signed(value: u64, bits: u32) -> u64 {
@@ -108,6 +109,7 @@ impl Operation {
             rt,
             size,
             load,
+            opcode,
             code,
         }))
     }
@@ -121,18 +123,13 @@ impl Operation {
             0
         }
     }
-    pub fn execute(&self, cpu: &mut Cpu, memory: &mut impl CpuMemory) -> Result<bool, CpuFault> {
-        let pc = cpu.pc;
-        let Some(code) = &self.code else {
-            cpu.pc = pc.wrapping_add(4);
-            return Ok(true);
-        };
+    pub(super) fn operand(&self, cpu: &Cpu) -> (u64, Option<u64>) {
         let base = if self.rn == 31 {
             cpu.sp
         } else {
             cpu.x(self.rn)
         };
-        let (address, writeback) = match self.address {
+        match self.address {
             Address::Offset(offset) => (base.wrapping_add(offset), None),
             Address::Pre(offset) => {
                 let next = base.wrapping_add(offset);
@@ -149,7 +146,15 @@ impl Operation {
                 };
                 (base.wrapping_add(index.wrapping_shl(shift)), None)
             }
+        }
+    }
+    pub fn execute(&self, cpu: &mut Cpu, memory: &mut impl CpuMemory) -> Result<bool, CpuFault> {
+        let pc = cpu.pc;
+        let Some(code) = &self.code else {
+            cpu.pc = pc.wrapping_add(4);
+            return Ok(true);
         };
+        let (address, writeback) = self.operand(cpu);
         let fault = |error| CpuFault::Memory { pc, error };
         let crosses = self.size as u64 > PAGE_SIZE - (address & (PAGE_SIZE - 1));
         let direct = if self.load {

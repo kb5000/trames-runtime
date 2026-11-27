@@ -1134,6 +1134,53 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    #[cfg(feature = "native-code")]
+    fn cpu_native_available(&self) -> bool {
+        self.private_mode != PrivateMode::Guarded
+            && !self.hardware_mode
+            && !self.async_faults_possible()
+            && !self.userfaults_active()
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_native_stable(&self) -> bool {
+        self.cpu_native_available()
+    }
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_page(&mut self, address: u64, write: bool) -> Option<crate::NativePage> {
+        if !self.cpu_native_available() {
+            return None;
+        }
+        let base = (address & 0x00ff_ffff_ffff_ffff) & !(PAGE_SIZE - 1);
+        let entry = self
+            .operand_translation(base, if write { Access::Write } else { Access::Read })
+            .ok()?;
+        let frame = self.snapshot.frame_token(entry.frame);
+        if entry.cpu == 0
+            || frame.permissions.execute
+            || self.snapshot.backed_pages.contains(&base)
+            || frame.error.is_some()
+            || !frame.charge.write_ready()
+            || (frame.bytes.constant.is_none()
+                && self.private_mode as u8 & frame.private_access == 0)
+        {
+            return None;
+        }
+        let writable =
+            write && frame.permissions.write && self.private_mode == PrivateMode::Exclusive;
+        if writable {
+            // Only one actor owns this anonymous page for the frozen epoch.
+            // Publish all potentially touched private fragments and invalidate
+            // reservations before unguarded scalar stores. An exclusive guest
+            // instruction ends this native block/loan before it can reserve.
+            let mut guard = self.frame_guard(frame, 0, PAGE_SIZE as usize);
+            self.changed(frame, &mut guard, 0, PAGE_SIZE as usize);
+        }
+        Some(crate::NativePage {
+            base,
+            read: if frame.permissions.read { entry.cpu } else { 0 },
+            write: if writable { entry.cpu } else { 0 },
+        })
+    }
     #[inline]
     fn userfaults_active(&self) -> bool {
         self.snapshot

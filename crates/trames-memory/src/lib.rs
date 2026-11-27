@@ -26,7 +26,11 @@ mod locking;
 mod mapping_cleanup;
 pub use mapping_cleanup::{MappingCleanup, MappingCleanupStatus, MappingLease};
 mod mmu;
+#[cfg(feature = "native-code")]
+mod native_code;
 use mmu::PageBytes;
+#[cfg(feature = "native-code")]
+pub use native_code::{NativeCodeFixups, NativePage};
 mod native_access;
 pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;

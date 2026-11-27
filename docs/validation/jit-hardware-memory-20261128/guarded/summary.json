@@ -1,0 +1,26 @@
+{
+  "integer-loop": {
+    "new": 1793384,
+    "old": 1796301
+  },
+  "memory-64k": {
+    "new": 1924468,
+    "old": 2636138
+  },
+  "memory-1m": {
+    "new": 30750528,
+    "old": 30189775
+  },
+  "svc-only": {
+    "new": 72042,
+    "old": 78542
+  },
+  "svc-continuation": {
+    "new": 72042,
+    "old": 78625
+  },
+  "svc-16-add": {
+    "new": 74209,
+    "old": 80542
+  }
+}
