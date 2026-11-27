@@ -635,6 +635,7 @@ fn prepare_frame(
 }
 
 pub(super) struct Snapshot {
+    userfaults: Option<Arc<userfault::Faults>>,
     account: Arc<Account>,
     locks: locking::Locks,
     pub(super) anonymous: anonymous::Anonymous,
@@ -904,6 +905,9 @@ impl View {
                 return Err(MemoryError::Permission { address, access });
             }
             if let Some(frame) = self.snapshot.anonymous.get(address, access)? {
+                if let Some(faults) = &self.snapshot.userfaults {
+                    faults.check(address, access)?;
+                }
                 let pointer = frame as *const Frame as usize;
                 assert_eq!(pointer & crate::anonymous::TOKEN, 0);
                 let mut entry = Translation::new(
@@ -935,6 +939,9 @@ impl View {
             if let Some(error) = &frame.write_error {
                 return Err(error.clone().at_access(address));
             }
+        }
+        if let Some(faults) = &self.snapshot.userfaults {
+            faults.check(address, access)?;
         }
         let mut permissions = frame.permissions;
         if frame.write_error.is_some() {
@@ -973,6 +980,9 @@ impl View {
         self.load_frame(frame, address)?;
         if frame.backed {
             frame.charge.ensure()?;
+        }
+        if access != Access::Write {
+            frame.charge.note_zero_read();
         }
         Ok((frame, offset))
     }
@@ -1048,6 +1058,7 @@ impl View {
             let offset = (address % PAGE_SIZE) as usize;
             let len = (out.len() - done).min(PAGE_SIZE as usize - offset);
             self.read_fragment(frame, offset, &mut out[done..done + len]);
+            frame.charge.note_zero_read();
             done += len;
             address += len as u64;
         }
@@ -1117,6 +1128,10 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    #[inline]
+    fn userfaults_active(&self) -> bool {
+        self.snapshot.userfaults.as_ref().is_some_and(|faults| faults.active())
+    }
     fn mapped_at_or_after(&self, address: u64) -> bool {
         let address = address & 0x00ff_ffff_ffff_ffff;
         self.snapshot
@@ -1131,7 +1146,7 @@ impl CpuMemory for View {
             || self.snapshot.anonymous.mapped_at_or_after(address)
     }
     fn async_faults_possible(&self) -> bool {
-        self.snapshot.async_sources || crate::CgroupMemoryTarget::active()
+        self.snapshot.async_sources || self.snapshot.account.pressure_possible() || crate::CgroupMemoryTarget::active()
     }
     fn numa_mode_at(&self, address: u64) -> u32 {
         self.nodes.at(address)
@@ -1739,6 +1754,7 @@ impl Memory {
             dynamic_code: dynamic_code_pages != 0 || anonymous_executable,
             dynamic_code_pages,
             external_code: self.has_external_code,
+            userfaults: self.userfaults.clone(),
             async_sources: self.has_async_sources,
             identities,
             alias_count,

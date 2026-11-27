@@ -36,9 +36,11 @@ mod local_message;
 mod locks;
 mod memory_sync;
 pub(crate) mod message;
+mod mm_control;
 mod posix_queue;
 mod process_vm;
 mod semaphore;
+pub(crate) mod userfault;
 pub use message::RetainedMessage;
 pub(crate) mod namespace;
 #[cfg(test)]
@@ -697,6 +699,12 @@ impl DirectSyscalls {
         let result = crate::descriptor_create::call(self.resources.as_ref()?, number, a, memory)?;
         self.record_fd_control();
         Some(result)
+    }
+    fn userfault_ioctl(&self, args: [u64; 6]) -> bool {
+        self.resources.as_ref().and_then(|factory| factory.descriptor_control(args[0] as u32).ok())
+            .is_some_and(|control| control.shared_file().userfault_file().is_some())
+            || self.paths.as_ref().is_some_and(|paths| paths.control_factory().descriptor_control(args[0] as u32)
+                .is_ok_and(|control| control.shared_file().userfault_file().is_some()))
     }
     pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
         number == 29
@@ -2018,7 +2026,7 @@ impl DirectSyscalls {
         if number == 29 && self.file_prepared(number, args) {
             return self.start_prepared_file(number, args, memory, pid, target);
         }
-        if number == 29 && memory.async_faults_possible() {
+        if number == 29 && (memory.async_faults_possible() || self.userfault_ioctl(args)) {
             if let Some(attempt) = self.start_ioctl_control(args, memory, pid, target) {
                 return Some(attempt);
             }
@@ -3108,7 +3116,7 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if number == 29 && memory.async_faults_possible() {
+        if number == 29 && (memory.async_faults_possible() || self.userfault_ioctl(args)) {
             if let Some(value) = self.invoke_ioctl_control(args, memory) {
                 return value;
             }

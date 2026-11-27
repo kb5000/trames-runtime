@@ -87,6 +87,62 @@ impl IoTask {
     }
 }
 impl IoRoutes {
+    /// pidfd is an original task capability. Reaping needs no ptrace permission,
+    /// but every process still using this mm must already be dying.
+    pub fn process_mrelease(
+        &self,
+        files: &trames_vfs::FdFlags,
+        a: [u64; 6],
+    ) -> Result<Arc<trames_memory::MmControl>, Errno> {
+        if a[1] as u32 != 0 {
+            return Err(Errno(22));
+        }
+        let (pidfd, flags) = files.pidfd_flags(a[0] as u32)?;
+        if flags & trames_vfs::PIDFD_THREAD == 0 && pidfd.exited() {
+            return Err(Errno(3));
+        }
+        let task = self.directory.proc_task(pidfd.pid()).ok_or(Errno(3))?;
+        if !Self::task_pidfd(&task, pidfd.pid()).is_some_and(|p| Arc::ptr_eq(&p, &pidfd)) {
+            return Err(Errno(3));
+        }
+        let report = std::iter::once(task.clone())
+            .chain(task.lifecycle().members().into_iter().map(|(_, t)| t))
+            .find_map(|t| t.proc_view.memory_report().filter(|mm| mm.alive()))
+            .ok_or(Errno(3))?;
+        let directory = self.directory.clone();
+        let original = report.clone();
+        let dying = move || {
+            directory.proc_tasks().iter().all(|t| {
+                !t.proc_view
+                    .memory_report()
+                    .is_some_and(|mm| mm.same_resource(&original))
+                    || !t.live()
+                    || t.lifecycle().termination().is_some()
+                    || !t.lifecycle().has_live_members()
+                    // Linux marks SIGNAL_GROUP_EXIT while accepting SIGKILL.
+                    // Our inbox can precede executor delivery, but the same
+                    // irrevocable group kill already makes this mm reapable.
+                    || t.process().bits() & (1 << 8) != 0
+                    || t.inbox.bits() & (1 << 8) != 0
+                    || t.lifecycle().tasks().iter().any(|member| {
+                        member.inbox.bits() & (1 << 8) != 0
+                    })
+            })
+        };
+        if !report.process_reaped() && !dying() {
+            return Err(Errno(22));
+        }
+        report
+            .submit_release_control(move |memory| {
+                if !memory.memory_report().process_reaped() && !dying() {
+                    return Err(22);
+                }
+                memory.release_process_memory().map_err(|_| 11u32)?;
+                Ok(Vec::new())
+            })
+            .map_err(Errno)
+    }
+
     /// Guest and resource senders use the same original queues and group control.
     pub fn send(&self, source: &IoTask, number: u32, a: [u64; 6]) -> Option<Result<u64, Errno>> {
         self.send_info(source, number, a, None)

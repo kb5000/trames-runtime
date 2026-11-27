@@ -36,10 +36,13 @@ pub(super) struct Report {
     identity: u64,
     pub(super) owner: std::sync::Weak<ReportOwner>,
     retired: std::sync::atomic::AtomicBool,
+    pub(super) process_reaped: std::sync::atomic::AtomicBool,
     image: RwLock<Option<ImageRanges>>,
     state: RwLock<Arc<Layout>>,
     pub(super) smaps: OnceLock<smaps::Requests>,
     pub(super) transfers: OnceLock<process_transfer::Transfers>,
+    pub(super) controls: OnceLock<mm_control::Controls>,
+    pub(super) userfaults: OnceLock<std::sync::Weak<userfault::Faults>>,
     pub(super) reads: OnceLock<read_export::Reads>,
     pub(super) reclaims: OnceLock<cgroup_memory::reclaim::Requests>,
     pub(super) read_waker: RwLock<Option<read_export::ReadWaker>>,
@@ -210,10 +213,13 @@ impl Memory {
                 identity: self.original_identity,
                 owner: Arc::downgrade(&owner),
                 retired: std::sync::atomic::AtomicBool::new(false),
+                process_reaped: std::sync::atomic::AtomicBool::new(false),
                 image: RwLock::new(self.image_ranges),
                 state: RwLock::new(layout),
                 smaps: OnceLock::new(),
                 transfers: OnceLock::new(),
+                controls: OnceLock::new(),
+                userfaults: OnceLock::new(),
                 reads: OnceLock::new(),
                 reclaims: OnceLock::new(),
                 read_waker: RwLock::new(None),
@@ -251,9 +257,13 @@ impl MemoryReport {
     }
     pub(super) fn retire(&self) {
         self.0.retired.store(true, Ordering::Relaxed);
+        if let Some(faults) = self.0.userfaults.get().and_then(std::sync::Weak::upgrade) {
+            faults.remove(0, ADDRESS_LIMIT, true, None);
+        }
         self.retire_reads();
         self.finish_smaps(None);
         self.finish_transfers(None);
+        self.finish_controls(None);
         self.finish_reclaims(None);
     }
     pub fn image_ranges(&self) -> Option<ImageRanges> {

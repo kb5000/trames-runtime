@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Hierarchical resident-page accounting on the original page lease.
-use crate::{MemoryError, PAGE_SIZE};
+use crate::{MemoryError, MemoryPressure, PressureTask, PAGE_SIZE};
 use parking_lot::RwLock;
 use std::{
     cell::RefCell,
@@ -231,20 +231,21 @@ impl MemoryCgroup {
     /// by their original owners, including failures. No quota lock is held
     /// while providers run, and no ready completion is mistaken for free bytes.
     pub fn pressure(self: &Arc<Self>, bytes: usize) -> Option<Arc<crate::PageWait>> {
+        let _pressure=CgroupMemoryTarget::pressure_task().map(|task|task.stall());
         let goal = self.current().saturating_sub(bytes);
         self.reclaim(bytes);
         if self.current() <= goal {
             return None;
         }
         if let Some(wait) = self.writeback(bytes).filter(|wait| !wait.ready()) {
-            return Some(wait);
+            return Some(CgroupMemoryTarget::pressure_task().map_or(wait.clone(),|task|crate::PageWait::resource(task.reclaim_wait(wait))));
         }
         self.reclaim(bytes);
         if self.current() <= goal {
             return None;
         }
         if let Some(wait) = self.release_mappings(bytes).filter(|wait| !wait.ready()) {
-            return Some(wait);
+            return Some(CgroupMemoryTarget::pressure_task().map_or(wait.clone(),|task|crate::PageWait::resource(task.reclaim_wait(wait))));
         }
         self.reclaim(bytes);
         None
@@ -487,6 +488,8 @@ impl trames_shared::ResourceWait for QuotaWait {
 
 #[derive(Default)]
 pub struct CgroupMemoryTarget {
+    pressure: std::sync::OnceLock<Arc<PressureTask>>,
+    pressure_delay: parking_lot::Mutex<Option<crate::pressure::PressureStall>>,
     current: RwLock<Option<Arc<MemoryCgroup>>>,
     oom: parking_lot::Mutex<Option<(Arc<MemoryCgroup>, Arc<MemoryCgroup>)>>,
     high_pages: AtomicUsize,
@@ -523,6 +526,15 @@ impl Default for CgroupMemoryContext {
     }
 }
 impl CgroupMemoryContext {
+    /// An mm provider follows its original task's current allocation target.
+    /// Individual faults freeze this binding when they are actually accepted.
+    pub(crate) fn capture_live() -> Self {
+        Self(SOURCE.with(|slot| match slot.borrow().as_ref() {
+            Some(Binding::Live(target) | Binding::Frozen { target, .. }) => Binding::Live(target.clone()),
+            _ => Binding::Root,
+        }))
+    }
+
     pub fn capture() -> Self {
         Self(SOURCE.with(|slot| {
             slot.borrow().as_ref().and_then(Binding::resolve).map_or(
@@ -558,6 +570,28 @@ impl Drop for CgroupMemoryScope {
 }
 
 impl CgroupMemoryTarget {
+    pub fn finish_pressure_execution(&self) {
+        if let Some(pressure) = self.pressure.get() { pressure.execution_finished(); }
+    }
+    pub fn bind_pressure(&self, domain: &Arc<MemoryPressure>) -> Arc<PressureTask> { self.pressure.get_or_init(||domain.task()).clone() }
+    pub fn memory_pressure_task(&self) -> Option<Arc<PressureTask>> { self.pressure.get().cloned() }
+    pub fn pressure_delay_until(&self,deadline:std::time::Instant) {
+        if let Some(task)=self.pressure.get() {*self.pressure_delay.lock()=Some(task.stall_until(Some(deadline)));}
+    }
+    pub(crate) fn pressure_task() -> Option<Arc<PressureTask>> {
+        SOURCE.with(|source| match source.borrow().as_ref() {
+            Some(Binding::Live(target) | Binding::Frozen { target, .. }) => target.pressure.get().cloned(),
+            _ => None,
+        })
+    }
+    pub(crate) fn pressure_admitted() {
+        SOURCE.with(|source| {
+            if let Some(Binding::Live(target) | Binding::Frozen { target, .. }) = source.borrow().as_ref() {
+                if let Some(task) = target.pressure.get() { task.admitted(); }
+            }
+        });
+    }
+
     /// Available whole-page allocation in the current resource actor. This is
     /// an admission hint; the hierarchical atomic take remains authoritative.
     pub fn allocation_capacity() -> usize {

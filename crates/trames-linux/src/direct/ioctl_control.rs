@@ -8,6 +8,7 @@ use trames_vfs::{DescriptorFactory, PathQueries, SharedFd, TerminalIo, TerminalT
 mod tests;
 
 enum Backend {
+    Userfault(super::userfault::Control),
     Direct,
     Binder {
         _file: Arc<trames_vfs::binder::Connection>,
@@ -120,7 +121,13 @@ impl IoctlControl {
             }
             self.entry_checked = true;
         }
-        if let Some(file) = self.file.as_ref().and_then(SharedFd::binder_file) {
+        if let Some(file) = self.file.as_ref().and_then(SharedFd::userfault_file) {
+            self.backend = Some(Backend::Userfault(super::userfault::Control::new(
+                file,
+                request,
+                self.args[2],
+            )));
+        } else if let Some(file) = self.file.as_ref().and_then(SharedFd::binder_file) {
             let Some(factory) = &self.factory else {
                 return Ok(false);
             };
@@ -182,6 +189,15 @@ impl IoctlControl {
         }
         if matches!(self.backend, Some(Backend::Binder { .. })) {
             return Step::Binder;
+        }
+        if self.value.is_none() {
+            if let Some(Backend::Userfault(control)) = self.backend.as_mut() {
+                match control.progress(memory, &self.input, &mut self.output) {
+                    Ok(value) => self.value = Some(value),
+                    Err(MemoryError::Pending(fault)) => return Step::Page(fault),
+                    Err(_) => return Step::Reply(Err(Errno(14))),
+                }
+            }
         }
         if self.value.is_none() {
             if matches!(self.backend, Some(Backend::Direct)) {
@@ -267,6 +283,7 @@ impl IoctlControl {
                     scalar_address: (self.args[1] as u32 == 0x8912).then_some(self.args[2]),
                 };
                 let result = match self.backend.as_mut().unwrap() {
+                    Backend::Userfault(_) => unreachable!("typed userfault control"),
                     Backend::Binder { .. } => unreachable!("typed original Binder ioctl"),
                     Backend::Status(status) => status.ioctl_accepted(
                         self.args[0] as u32,
@@ -358,8 +375,19 @@ impl IoctlControl {
         }
         let value = self.value.take().unwrap();
         if value.is_ok() {
-            if let Some(Backend::Sync { control, .. }) = self.backend.take() {
-                return Step::Reply(control.finish());
+            match self.backend.take() {
+                Some(Backend::Sync { control, .. }) => return Step::Reply(control.finish()),
+                Some(Backend::Userfault(control)) => {
+                    let value = control.finish();
+                    if value.is_err() {
+                        self.output.push_slice(self.args[2], &[0; 24]);
+                        self.value = Some(value);
+                        self.backend = Some(Backend::Userfault(control));
+                        return self.progress(memory);
+                    }
+                    return Step::Reply(value);
+                }
+                _ => {}
             }
         }
         Step::Reply(value)

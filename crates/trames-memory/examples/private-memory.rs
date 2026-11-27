@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Fixed-work A/B of the same CPU/native paths, excluding prepare/join costs.
 //! Independent VMs: this does not measure shared-VM threads or whole-app speed.
+#![recursion_limit = "512"]
 use std::{
     hint::black_box,
     sync::{Arc, Barrier},

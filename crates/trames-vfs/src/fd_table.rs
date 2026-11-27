@@ -698,6 +698,12 @@ impl SharedFd {
         }
         self.open.check_device_ioctl(request)
     }
+    pub fn userfault_file(&self) -> Option<Arc<trames_memory::userfault::UserfaultFile>> {
+        match &self.open.control {
+            Some(events::SharedControl::Userfault(file)) => Some(file.clone()),
+            _ => None,
+        }
+    }
     pub fn sync_file(&self) -> Option<Arc<sync_file::File>> {
         match &self.open.control {
             Some(events::SharedControl::Sync(file)) => Some(file.clone()),

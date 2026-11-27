@@ -10,6 +10,12 @@ pub(crate) struct Bytes {
     fragments: RefCell<BTreeMap<(u64, usize), Vec<u8>>>,
     checked: RefCell<BTreeSet<(u64, usize, u8)>>,
 }
+impl Bytes {
+    pub(super) fn clear(&self) {
+        self.fragments.borrow_mut().clear();
+        self.checked.borrow_mut().clear();
+    }
+}
 pub(crate) struct Reader<'a, M> {
     memory: &'a M,
     bytes: &'a Bytes,
@@ -232,6 +238,7 @@ pub(super) struct Input {
     pub(super) bytes: Bytes,
 }
 pub(super) enum Accepted {
+    MmControl(Box<super::mm_control::Control>),
     File(Input),
     Path(PathInput),
     Byte(RetainedByte),
@@ -269,6 +276,7 @@ impl Accepted {
             | Self::AioSetup(_)
             | Self::Uts(_)
             | Self::TimerFd(_)
+            | Self::MmControl(_)
             | Self::Ioctl(_) => None,
         }
     }

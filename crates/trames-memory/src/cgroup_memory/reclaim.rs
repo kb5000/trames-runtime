@@ -158,6 +158,7 @@ impl MemoryReport {
 }
 impl Memory {
     fn reclaim_clean_mappings(&mut self, group: &MemoryCgroup, bytes: usize) {
+        self.scan_pressure_pages();
         if bytes == 0 {
             return;
         }

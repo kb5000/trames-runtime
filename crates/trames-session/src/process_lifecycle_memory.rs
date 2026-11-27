@@ -56,7 +56,7 @@ impl<C: Cpu> Lifecycle<C> {
                     epoch.fail();
                     return;
                 }
-                assert!(p.memory.activate_proc_reads());
+                assert!(p.activate_memory_controls());
                 break;
             }
         }
@@ -70,6 +70,51 @@ mod tests {
     struct Wake;
     impl trames_shared::IoWake for Wake {
         fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {}
+    }
+
+    #[test]
+    fn pidfd_release_runs_on_the_original_dying_mm_and_drops_real_private_storage() {
+        let mut k = super::super::super::tests::kernel();
+        let mut caller = super::super::super::tests::admitted_process(&k);
+        k.install_proc_source(&caller,None);
+        let mut io = trames_linux::CapturedOutput::default();
+        let child = k.syscall(1,&mut caller,220,[17,0,0,0,0,0],&mut io).unwrap().unwrap() as u32;
+        k.publish_task(1,&caller);
+        let group = trames_memory::MemoryCgroup::new(None);
+        let actor = Arc::new(trames_memory::CgroupMemoryTarget::default());
+        actor.set(Some(group.clone()));
+        {
+            let _allocation = actor.scope();
+            let mut target = k.processes.get_mut(&child).unwrap();
+            target.memory.map(0x1000000,16*1024*1024,trames_memory::Permissions::RW).unwrap();
+            for page in (0x1000000..0x2000000).step_by(4096) { target.memory.write(page,&[42]).unwrap(); }
+            assert!(target.memory.resident_bytes() >= 16*1024*1024);
+            assert_eq!(group.current(),16*1024*1024);
+        }
+        k.publish_io_tasks(Some((1,&caller)));
+        let routes = trames_kernel::signal::IoRoutes {
+            directory: caller.signals.io_directory.clone(),
+            namespace: caller.linux.vfs.pid_namespace().clone(),
+            uid: caller.linux.vfs.credentials.uid,
+            euid: caller.linux.vfs.credentials.euid,
+        };
+        let fd = u64::from(routes.pidfd_open(&caller.linux.vfs.descriptor_factory(),child as i32,0).unwrap());
+        assert_eq!(k.syscall(1,&mut caller,448,[fd,0,0,0,0,0],&mut io),Err(trames_vfs::Errno(22)));
+        k.processes.get(&child).unwrap().signals.io.host_signal(9);
+        assert_eq!(k.processes.get(&child).unwrap().signals.io.lifecycle().termination(),None,
+            "SIGKILL admission must work before the target executor delivers it");
+        assert_eq!(k.syscall(1,&mut caller,448,[fd,0,0,0,0,0],&mut io).unwrap(),None);
+        {
+            let mut target = k.processes.get_mut(&child).unwrap();
+            assert!(target.memory.activate_proc_reads());
+            assert_eq!(target.memory.resident_bytes(),0);
+            assert!(target.memory.memory_report().process_reaped());
+            assert_eq!(group.current(),0,"original physical page leases have been released");
+        }
+        // The accepted operation retains its original mm after the numeric fd
+        // is closed; resumption cannot resolve a replacement file or process.
+        caller.linux.vfs.close(fd as u32).unwrap();
+        assert_eq!(k.syscall(1,&mut caller,448,[fd,0,0,0,0,0],&mut io).unwrap(),Some(0));
     }
 
     #[test]

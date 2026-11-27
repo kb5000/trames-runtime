@@ -293,17 +293,14 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
     if !properties.ends_with(b"\n") {
         properties.push(b'\n');
     }
-    // There is no Linux PSI/vmpressure source in the host-managed memory mode.
-    // Upstream LMKD explicitly skips zero-threshold monitors. Keep its original
-    // control socket, process priorities and replies alive; otherwise every OOM
-    // adjustment waits 3 seconds while holding ActivityManager locks. This does
-    // not advertise PSI support or perform pressure-based Android app killing.
+    // Original LMKD uses session-wide PSI from actual allocation/reclaim waits.
+    // Its existing guest reaper pool retains normal pidfd/SIGKILL/mrelease.
     // The original HWC can also put its cursor on a native-image subsurface.
     // Use that same retained GPU transport instead of its unaccepted EGL-to-SHM
     // cursor readback path. Explicit caller settings still win over defaults.
     // No camera device is forwarded. Android's own no-camera mode makes camera
     // enumeration return zero instead of waiting forever for an absent HAL.
-    let defaults = b"ro.lmk.use_new_strategy=true\nro.lmk.psi_partial_stall_ms=0\nro.lmk.psi_complete_stall_ms=0\nro.cold_boot_done=true\nro.zygote=zygote64\ndalvik.vm.dex2oat64.enabled=true\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nconfig.disable_cameraservice=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
+    let defaults = b"ro.lmk.use_new_strategy=true\nro.cold_boot_done=true\nro.zygote=zygote64\ndalvik.vm.dex2oat64.enabled=true\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nconfig.disable_cameraservice=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
     for line in defaults
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
@@ -404,8 +401,8 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
             configured.as_bytes(),
         )?;
     }
-    // An explicit pressure configuration can still be unsupported. This
-    // experimental profile must report that failure without reboot-looping.
+    // Retain this experimental profile's existing service restart policy for
+    // invalid caller-supplied monitor settings or an unrelated daemon failure.
     if let Some(bytes) = optional_file(vfs, b"/system/etc/init/lmkd.rc")? {
         let text = String::from_utf8(bytes)?;
         let configured = text
@@ -585,7 +582,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let properties = String::from_utf8(properties).unwrap();
-        assert!(properties.contains("ro.lmk.psi_partial_stall_ms=0\n"));
+        assert!(!properties.contains("ro.lmk.psi_partial_stall_ms=0\n"));
+        assert!(!properties.contains("ro.lmk.psi_complete_stall_ms=0\n"));
         assert!(properties.contains("dalvik.vm.dex2oat64.enabled=true\n"));
         assert!(properties.contains("persist.waydroid.cursor_on_subsurface=false\n"));
         assert!(!properties.contains("persist.waydroid.cursor_on_subsurface=true"));

@@ -9,18 +9,21 @@ use std::sync::{
 };
 
 pub(super) struct Budget {
-    used: AtomicUsize,
-    limit: AtomicUsize,
+    pub(super) used: AtomicUsize,
+    pub(super) limit: AtomicUsize,
+    pub(super) pressure: std::sync::OnceLock<Arc<MemoryPressure>>,
 }
 
 impl Budget {
     fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
+            pressure: Default::default(),
             used: AtomicUsize::new(0),
             limit: AtomicUsize::new(limit),
         })
     }
     fn take(&self, bytes: usize) -> Result<(), MemoryError> {
+        if let Some(pressure) = self.pressure.get() { pressure.allocation(bytes)?; }
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
@@ -39,15 +42,20 @@ type NativeRanges = std::sync::Mutex<BTreeMap<usize, std::sync::Weak<dyn crate::
 pub(super) struct Account {
     local: Arc<Budget>,
     peak: AtomicUsize,
-    total: Option<Arc<Budget>>,
+    pub(super) total: Option<Arc<Budget>>,
     native: std::sync::OnceLock<NativeRanges>,
     cow_epoch: AtomicU64,
     cgroup_controlled: AtomicBool,
+    userfault_controlled: AtomicBool,
     reclaimer: parking_lot::Mutex<Reclaimers>,
     reclaim_identity: u64,
     reclaim_epoch: AtomicU64,
 }
 impl Account {
+    // HostManaged has no extra allocation admission. Its native pager already
+    // retains its own waits; a PSI monitor alone must not stage every syscall.
+    pub(super) fn pressure_possible(&self)->bool { self.total.as_ref().and_then(|total|total.pressure.get()).is_some_and(|pressure|pressure.allocation_waits_possible()) }
+
     pub(super) fn reclaim_generation(&self) -> (u64, u64) {
         (
             self.reclaim_identity,
@@ -58,6 +66,9 @@ impl Account {
         let resource: Arc<dyn crate::CgroupReclaim> = report.clone();
         let mut index = self.reclaimer.lock();
         index.report = Some(Arc::downgrade(&resource));
+        if let Some(pressure) = self.total.as_ref().and_then(|total|total.pressure.get()) {
+            pressure.register_report(&MemoryReport(report.clone()));
+        }
         index.groups.retain(|group| group.strong_count() != 0);
         for group in index.groups.iter().filter_map(std::sync::Weak::upgrade) {
             group.register_reclaimer(&resource);
@@ -101,6 +112,7 @@ impl Account {
     pub(super) fn native_allowed(&self) -> bool {
         !CgroupMemoryTarget::active()
             && !self.cgroup_controlled.load(Ordering::Relaxed)
+            && !self.userfault_controlled.load(Ordering::Relaxed)
             && self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
             && self
                 .total
@@ -160,6 +172,7 @@ impl Account {
             total: None,
             native: Default::default(),
             cow_epoch: AtomicU64::new(0),
+            userfault_controlled: AtomicBool::new(false),
             cgroup_controlled: AtomicBool::new(false),
             reclaimer: Default::default(),
             reclaim_identity: crate::new_backing_identity(),
@@ -173,6 +186,7 @@ impl Account {
             total: self.total.clone(),
             native: Default::default(),
             cow_epoch: AtomicU64::new(0),
+            userfault_controlled: AtomicBool::new(false),
             cgroup_controlled: AtomicBool::new(self.cgroup_controlled.load(Ordering::Relaxed)),
             reclaimer: Default::default(),
             reclaim_identity: crate::new_backing_identity(),
@@ -196,12 +210,13 @@ impl Account {
         self.record_peak(before);
         if let Some(total) = &self.total {
             total.used.fetch_sub(bytes, Ordering::Relaxed);
+            if let Some(pressure) = total.pressure.get() { pressure.released(); }
         }
     }
 }
 pub(super) struct Charge {
     account: Arc<Account>,
-    // 0 = untouched, 2 = resident, 3 = native extent, 5 = resident private
+    // 0 = untouched, 1 = zero-page PTE (no RSS), 2 = resident, 3 = native extent, 5 = resident private
     // mapping of the original cache page, 6 = fork-shared private page.
     // The last two states need COW admission on first write. State 8 retains
     // only obsolete byte pins after a private PTE was invalidated by truncate.
@@ -261,6 +276,8 @@ impl Charge {
                 5
             } else if resident {
                 2
+            } else if state == 1 {
+                1
             } else {
                 0
             }),
@@ -307,11 +324,28 @@ impl Charge {
         }
         Ok(())
     }
+    pub(super) fn pte_present(&self, bytes: Option<&SharedPage>) -> Result<u8, MemoryError> {
+        if self.state.load(Ordering::Relaxed) == 1 {
+            Ok(1)
+        } else {
+            self.page_resident(bytes)
+        }
+    }
     pub(super) fn page_resident(&self, bytes: Option<&SharedPage>) -> Result<u8, MemoryError> {
         match self.state.load(Ordering::Relaxed) {
             3 => bytes.map_or(Ok(1), SharedPage::native_page_resident),
             2 | 5 | 6 => Ok(1),
             _ => Ok(0),
+        }
+    }
+    pub(super) fn present(&self) -> bool {
+        matches!(self.state.load(Ordering::Relaxed), 1 | 2 | 3 | 5 | 6)
+    }
+    pub(super) fn note_zero_read(&self) {
+        if self.state.load(Ordering::Relaxed) == 0 {
+            let _ = self
+                .state
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
     pub(super) fn resident(&self) -> bool {
@@ -369,9 +403,9 @@ impl Charge {
     /// Cold I/O preflight only. The final atomic ensure remains authoritative;
     /// a peer already reserving this same page must not get a false quota error.
     pub(super) fn check_available(&self) -> Result<(), MemoryError> {
-        if self.state.load(Ordering::Relaxed) != 0
+        if !matches!(self.state.load(Ordering::Relaxed), 0 | 1)
             || self.account.available() >= PAGE_SIZE as usize
-            || self.state.load(Ordering::Relaxed) != 0
+            || !matches!(self.state.load(Ordering::Relaxed), 0 | 1)
         {
             Ok(())
         } else {
@@ -512,12 +546,20 @@ impl Memory {
     }
     /// Bind a fresh runtime to one aggregate guest budget before workers start.
     pub fn set_total_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().set_total_limit(limit);
+        }
+        // A resumed session retains its original aggregate quota and PSI OFDs.
+        if self.account.total.as_ref().is_some_and(|total|total.limit.load(Ordering::Relaxed)==limit) {return Ok(());}
         self.bind_account(Arc::new(Account {
             peak: AtomicUsize::new(0),
             local: Budget::new(self.limit),
             total: Some(Budget::new(limit)),
             native: Default::default(),
             cow_epoch: AtomicU64::new(0),
+            userfault_controlled: AtomicBool::new(
+                self.account.userfault_controlled.load(Ordering::Relaxed),
+            ),
             cgroup_controlled: AtomicBool::new(
                 self.account.cgroup_controlled.load(Ordering::Relaxed),
             ),
@@ -537,6 +579,9 @@ impl Memory {
             total: old.account.total.clone(),
             native: Default::default(),
             cow_epoch: AtomicU64::new(0),
+            userfault_controlled: AtomicBool::new(
+                self.account.userfault_controlled.load(Ordering::Relaxed),
+            ),
             cgroup_controlled: AtomicBool::new(
                 self.account.cgroup_controlled.load(Ordering::Relaxed),
             ),
@@ -585,6 +630,9 @@ impl Memory {
             total: self.account.total.clone(),
             native: Default::default(),
             cow_epoch: AtomicU64::new(0),
+            userfault_controlled: AtomicBool::new(
+                self.account.userfault_controlled.load(Ordering::Relaxed),
+            ),
             cgroup_controlled: AtomicBool::new(
                 self.account.cgroup_controlled.load(Ordering::Relaxed),
             ),
@@ -610,9 +658,24 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().set_cgroup_controlled(controlled);
         }
-        if self.cgroup_controlled() == controlled {
+        self.set_native_control(Some(controlled), None)
+    }
+    pub(super) fn set_native_control(
+        &mut self,
+        cgroup: Option<bool>,
+        userfault: Option<bool>,
+    ) -> Result<(), MemoryError> {
+        if cgroup
+            .is_none_or(|value| self.account.cgroup_controlled.load(Ordering::Relaxed) == value)
+            && userfault.is_none_or(|value| {
+                self.account.userfault_controlled.load(Ordering::Relaxed) == value
+            })
+        {
             return Ok(());
         }
+        self.revoke_native_storage(cgroup, userfault)
+    }
+    pub(super) fn revoke_native_storage(&mut self, cgroup: Option<bool>, userfault: Option<bool>) -> Result<(), MemoryError> {
         if self.has_parallel_users() {
             return Err(MemoryError::InvalidRange);
         }
@@ -636,9 +699,16 @@ impl Memory {
         if let Some(native) = self.account.native.get() {
             native.lock().unwrap().clear();
         }
-        self.account
-            .cgroup_controlled
-            .store(controlled, Ordering::Relaxed);
+        if let Some(value) = cgroup {
+            self.account
+                .cgroup_controlled
+                .store(value, Ordering::Relaxed);
+        }
+        if let Some(value) = userfault {
+            self.account
+                .userfault_controlled
+                .store(value, Ordering::Relaxed);
+        }
         // Preserve ordinary resident tickets and COW ownership. This is not a
         // second RSS-budget admission and cannot temporarily double total usage.
         self.anonymous = self.anonymous.fork(&self.account);

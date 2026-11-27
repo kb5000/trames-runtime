@@ -140,7 +140,8 @@ impl DescriptorControl {
                 || matches!(
                     &open.control,
                     Some(
-                        events::SharedControl::Pid(_)
+                        events::SharedControl::Userfault(_)
+                            | events::SharedControl::Pid(_)
                             | events::SharedControl::Perf(_)
                             | events::SharedControl::Signal(_)
                             | events::SharedControl::Timer(_)

@@ -946,6 +946,7 @@ impl<C: Cpu> Kernel<C> {
         function: u64,
         a: [u64; 3],
     ) -> Result<Option<trames_accel::native::Return>, trames_accel::native::Error> {
+        let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(&p.memory);
         if module == trames_audio::PROFILE {
             if !accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE) {
                 return Err(trames_accel::native::Error::InvalidEntry);
@@ -2556,12 +2557,20 @@ impl<C: Cpu> Kernel<C> {
                     }
                 }
             },
-            number @ (270 | 271 | 117) if number != 117 || matches!(a[0],1|2|4|5) => {
+            number @ (270 | 271 | 117 | 448) if number != 117 || matches!(a[0],1|2|4|5) => {
                 let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors());
                 let attempt = if let Some(wait) = p.byte_wait.take() {
                     direct.resume(wait, &mut p.memory)
                 } else {
-                    direct.start_process_vm(number, a, &mut p.memory, pid, &Arc::downgrade(&self.byte_target), || {
+                    if number == 448 {
+                        let routes = trames_kernel::signal::IoRoutes {
+                            directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(),
+                            uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid,
+                        };
+                        direct.start_mm_control(number, a, pid, &Arc::downgrade(&self.byte_target), || {
+                            routes.process_mrelease(&p.linux.vfs.fd_flags_snapshot(), a)
+                        })
+                    } else { direct.start_process_vm(number, a, &mut p.memory, pid, &Arc::downgrade(&self.byte_target), || {
                         if number == 117 {
                             let routes = trames_kernel::signal::IoRoutes {
                                 directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(),
@@ -2570,7 +2579,7 @@ impl<C: Cpu> Kernel<C> {
                             return routes.trace_read_target(&p.signals.io,a[1] as u32);
                         }
                         p.signals.io_directory.process_memory_target(p.linux.vfs.pid_namespace(), &p.signals.io, a[0] as u32)
-                    })
+                    }) }
                 };
                 match attempt {
                     trames_linux::IoAttempt::Complete(result) => result.map(Some),
@@ -5180,6 +5189,13 @@ pub(super) fn run<C: Cpu>(
     runtime
         .memory
         .set_total_limit(runtime.memory_limits.total)?;
+    let pressure_host: Option<trames_memory::PressureSource> = runtime.memory_limits.is_host_managed().then(|| {
+        let source = host_memory_source.as_ref().expect("validated host memory source").clone();
+        Arc::new(move || {let info=source();trames_memory::PressureMemory {total:info.total,free:info.free,available:info.available}}) as trames_memory::PressureSource
+    });
+    let pressure=runtime.memory.memory_pressure(pressure_host);
+    runtime.linux.vfs.bind_memory_pressure(pressure.clone());
+    io.bind_memory_pressure(pressure);
     let started = runtime
         .linux
         .vfs

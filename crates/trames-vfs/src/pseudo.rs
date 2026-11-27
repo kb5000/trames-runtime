@@ -1018,6 +1018,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) memory_pressure: Arc<std::sync::RwLock<Option<Arc<trames_memory::MemoryPressure>>>>,
     pub(super) special_supers: Arc<fs_data::SpecialSupers>,
     pub(super) debug_fs: Arc<std::sync::Mutex<Option<FsHandle>>>,
     pub(super) fuse_control: Arc<fuse::Controller>,
@@ -1221,6 +1222,9 @@ impl PseudoFs {
             path,
             b"/proc/stat"
                 | b"/proc/meminfo"
+                | b"/proc/pressure/memory"
+                | b"/proc/zoneinfo"
+                | b"/proc/vmstat"
                 | b"/proc/uptime"
                 | b"/proc/cpuinfo"
                 | b"/proc/swaps"
@@ -2205,6 +2209,9 @@ impl Vfs {
             b"/sys/dev/block/253:1" => return Ok(link(b"../../devices/virtual/block/vda/vda1".to_vec())),
             b"/dev/ptmx" => return Ok(Some((Content::Device(Device::Ptmx),0o20666))),
             b"/proc/uptime" => return Ok(regular(format!("{:.2} {:.2}\n", r.uptime.as_secs_f64(), r.idle.as_secs_f64()).into_bytes())),
+            b"/proc/pressure" if pseudo.memory_pressure.read().unwrap().is_some() => return Ok(Some((Content::Directory,0o40555))),
+            b"/proc/pressure/memory" if pseudo.memory_pressure.read().unwrap().is_some() => return Ok(Some((file(Vec::new()),0o100666))),
+            b"/proc/zoneinfo" | b"/proc/vmstat" if pseudo.memory_pressure.read().unwrap().is_some() => return Ok(regular(Vec::new())),
             b"/proc/meminfo" => {
                 let total = r.memory_limit as u64 / 1024;
                 let used: u64 = r.used_memory as u64 / 1024;
@@ -2556,7 +2563,7 @@ impl Vfs {
                                 .unwrap_or(0)
                                 .max(64)
                                 .next_power_of_two();
-                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{text} kB\nVmLib:\t{library} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent, p.tracer,
+                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{text} kB\nVmLib:\t{library} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nVmSwap:\t0 kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent, p.tracer,
                                 self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.vm_sizes.data/1024,p.vm_sizes.stack/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => p.limit_text(task_limit as u64),
@@ -2942,6 +2949,7 @@ impl Vfs {
         }
         let mut names: Vec<Vec<u8>> = match path {
             b"/" => vec![b"proc".to_vec(), b"sys".to_vec()],
+            b"/proc/pressure" if self.memory_pressure().is_some() => vec![b"memory".to_vec()],
             b"/proc" => [
                 "self",
                 "thread-self",
@@ -3192,6 +3200,8 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
+        if path==b"/proc" && self.memory_pressure().is_some() {names.extend([b"pressure".to_vec(),b"zoneinfo".to_vec(),b"vmstat".to_vec()]);}
+
         if path == b"/proc/sys/net/ipv4" && self.network.has_guest_transport() {
             names.push(b"tcp_sack".to_vec());
         }

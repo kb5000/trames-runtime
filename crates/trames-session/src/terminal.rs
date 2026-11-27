@@ -220,6 +220,7 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
             .clone()
             .unwrap_or_else(|| self.inner.source_console())
     }
+    fn bind_memory_pressure(&mut self,pressure:Arc<trames_memory::MemoryPressure>) {self.inner.bind_memory_pressure(pressure);}
     fn host_memory_source(&self) -> Option<Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
         self.inner.host_memory_source()
     }

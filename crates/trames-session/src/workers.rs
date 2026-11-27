@@ -579,6 +579,7 @@ impl<C: Cpu> Starter<C> {
                     let began = Instant::now();
                     if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
                     let mut instructions = 0;
+                    let mut pressure_progress = false;
                     let mut chunks = 0;
                     let mut running = false;
                     let mut rejected_native = None;
@@ -890,6 +891,7 @@ impl<C: Cpu> Starter<C> {
                                 job.hardware_wait = None;
                             }
                             if let Some(pending) = job.gpu_pending.take() {
+                                let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(work.memory.as_deref().expect("worker view"));
                                 let accepted = pending.compile.is_some();
                                 let call = pending.call;
                                 if !accepted && credit == 0 {
@@ -1086,6 +1088,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                     interrupt_prepared = true;
                                 }
+                                let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(work.memory.as_deref().expect("worker view"));
                                 let result = work.cpu.run_parallel(
                                     &mut engine,
                                     work.memory.as_deref_mut().expect("worker view"),
@@ -1108,6 +1111,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 if let Some(snapshot) = &work.syscalls { snapshot.io_signals.check_cpu_timers(); }
                             }
                             if let Some(wait) = C::take_hardware_wait(&mut engine) {
+                                let wait=work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()).and_then(|task|task.memory_pressure_task()).map_or_else(||wait.clone(),|task|task.hardware_wait(wait.clone()));
                                 parked_hardware = Some(wait);
                                 break result;
                             }
@@ -1117,6 +1121,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 | SliceOutcome::Syscall { instructions }
                                 | SliceOutcome::NativeCall { instructions, .. } => *instructions,
                             };
+                            pressure_progress |= retired != 0;
                             let retired = if already_accounted { 0 } else { retired };
                             instructions += retired;
                             credit -= retired;
@@ -1173,6 +1178,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 ..
                             } = &result
                             {
+                                let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(work.memory.as_deref().expect("worker view"));
                                 work.cpu.clear_exclusive();
                                 let args = [work.cpu.x(0), work.cpu.x(1), work.cpu.x(2)];
                                 let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
@@ -1383,7 +1389,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                         let held=job.stop_hold().map(|held|held || vm_checkpoint || (!maintenance && !yielded && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && matches!(outcome,Some(SliceOutcome::Syscall{..}|SliceOutcome::NativeCall{..}|SliceOutcome::Fault(_)))));
                         lease.finish(held);
                     }
-                    if let Some(task)=job.work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()) {task.acknowledge();}
+                    if let Some(task)=job.work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()) {
+                        task.acknowledge();
+                        if pressure_progress { task.finish_pressure_execution(); }
+                    }
                     if thread_exit.is_some() { job.work.trace.replaced(); }
                     job.work.trace.suspend();
                     // The same allocation retains CPU, translations and View;

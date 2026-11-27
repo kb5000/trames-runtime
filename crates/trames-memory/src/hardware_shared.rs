@@ -3,7 +3,7 @@
 //! to ordinary guest loads; only host byte borrows revoke hardware access.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex, Weak,
 };
 
 /// Retained host resource mapping. Geometry is explicit: an executor may
@@ -287,20 +287,56 @@ pub unsafe trait HardwareRange: HardwareStorage {
 #[derive(Default)]
 pub struct HardwareWait {
     ready: AtomicBool,
-    wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    wake: Mutex<Option<HardwareWake>>,
+    completion: Mutex<Option<Box<dyn Send + Sync>>>,
+}
+struct HardwareWake {
+    callback: Box<dyn FnOnce() + Send>,
+    wrapper: Option<Weak<HardwareWait>>,
 }
 impl HardwareWait {
+    /// Keep a completion lease while this original resource is awaited. The
+    /// source retains only a weak wrapper, so cancellation releases the lease.
+    pub fn retaining(self: &Arc<Self>, lease: impl Send + Sync + 'static) -> Arc<Self> {
+        let wrapper = Arc::new(Self {
+            completion: Mutex::new(Some(Box::new(lease))),
+            ..Self::default()
+        });
+        let weak = Arc::downgrade(&wrapper);
+        let target = weak.clone();
+        self.subscribe_inner(
+            Box::new(move || {
+                if let Some(wrapper) = target.upgrade() {
+                    wrapper.fire();
+                }
+            }),
+            Some(weak),
+        );
+        wrapper
+    }
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
     pub fn subscribe(&self, wake: impl FnOnce() + Send + 'static) {
+        self.subscribe_inner(Box::new(wake), None);
+    }
+    fn subscribe_inner(&self, wake: Box<dyn FnOnce() + Send>, wrapper: Option<Weak<Self>>) {
         let mut slot = self.wake.lock().unwrap();
         if self.ready() {
             drop(slot);
             wake();
         } else {
+            if slot
+                .as_ref()
+                .is_some_and(|wake| wake.wrapper.as_ref().is_some_and(|w| w.strong_count() == 0))
+            {
+                *slot = None;
+            }
             assert!(slot.is_none());
-            *slot = Some(Box::new(wake));
+            *slot = Some(HardwareWake {
+                callback: wake,
+                wrapper,
+            });
         }
     }
     pub fn fire(&self) {
@@ -308,8 +344,10 @@ impl HardwareWait {
         self.ready.store(true, Ordering::Release);
         let wake = slot.take();
         drop(slot);
+        let lease = self.completion.lock().unwrap().take();
+        drop(lease);
         if let Some(wake) = wake {
-            wake();
+            (wake.callback)();
         }
     }
 }

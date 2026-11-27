@@ -306,6 +306,8 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Userfault(Arc<trames_memory::userfault::UserfaultFile>),
+    Pressure(Arc<pressure::PressureFile>),
     Perf(Arc<perf::Event>),
     Fuse(Arc<fuse::Device>),
     MessageQueue(Arc<posix_mq::Queue>),
@@ -649,6 +651,9 @@ impl DirectFd {
                 Some(events::SharedControl::FuseFile(_)) => return None,
                 Some(events::SharedControl::Fuse(file)) => ByteResource::Fuse(file.clone()),
                 Some(events::SharedControl::Tun(file, _)) => ByteResource::Tun(file.clone()),
+                Some(events::SharedControl::Userfault(file)) => {
+                    ByteResource::Userfault(file.clone())
+                }
                 Some(events::SharedControl::Pid(pid)) => ByteResource::PollOnly(pid.clone()),
                 Some(events::SharedControl::Sync(file)) => {
                     ByteResource::PollOnly(file.poll_handle())
@@ -666,6 +671,7 @@ impl DirectFd {
                     | events::SharedControl::Landlock(_)
                     | events::SharedControl::Bpf(_),
                 ) => return None,
+                Some(events::SharedControl::Pressure(file)) => ByteResource::Pressure(file.clone()),
                 Some(events::SharedControl::Cgroup(file)) => {
                     ByteResource::Cgroup(file.clone(), None)
                 }
@@ -823,6 +829,8 @@ impl DirectFd {
             }
             (ByteResource::Signal(a, _), ByteResource::Signal(b, _)) => Arc::ptr_eq(a, b),
             (ByteResource::Perf(a), ByteResource::Perf(b)) => Arc::ptr_eq(a, b),
+            (ByteResource::Userfault(a), ByteResource::Userfault(b)) => Arc::ptr_eq(a, b),
+            (ByteResource::Pressure(a), ByteResource::Pressure(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Event(a), ByteResource::Event(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Timer(a), ByteResource::Timer(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Inotify(a), ByteResource::Inotify(b)) => Arc::ptr_eq(&a.queue, &b.queue),
@@ -912,6 +920,7 @@ impl DirectFd {
             ByteResource::Tun(file) => file.subscribe(signal).into_iter().collect(),
             ByteResource::ProcWatch(watch) => vec![watch.subscribe(signal)],
             ByteResource::MessageQueue(q) => vec![q.subscribe(signal)],
+            ByteResource::Pressure(file) => vec![file.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
             ByteResource::Bpf
             | ByteResource::Regular
@@ -930,6 +939,7 @@ impl DirectFd {
                 .collect(),
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Perf(event) => vec![event.subscribe(signal)],
+            ByteResource::Userfault(file) => vec![file.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => timer.subscribe(signal),
             ByteResource::Signal(mask, reader) => {
@@ -999,6 +1009,10 @@ impl DirectFd {
             ByteResource::Kmsg(log.clone())
         } else if let Some(bridge) = &open.bridge {
             ByteResource::Bridge(Arc::downgrade(bridge))
+        } else if let Some(events::SharedControl::Pressure(file)) = &open.control {
+            ByteResource::Pressure(file.clone())
+        } else if let Some(events::Anonymous::Userfault(file)) = &open.anonymous {
+            ByteResource::Userfault(file.clone())
         } else if let Some(events::Anonymous::Perf(event)) = &open.anonymous {
             ByteResource::Perf(event.clone())
         } else if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
@@ -1342,6 +1356,7 @@ impl DirectFd {
             ByteResource::Tun(file) => file
                 .wait_delay()
                 .and_then(|d| std::time::Instant::now().checked_add(d)),
+            ByteResource::Pressure(file) => file.deadline(),
             ByteResource::Timer(timer) => timer.deadline(),
             ByteResource::SocketPoll(socket) => socket
                 .upgrade()
@@ -1394,6 +1409,7 @@ impl DirectFd {
         }
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
+        if let ByteResource::Pressure(file) = &self.resource { return file.poll(events); }
         if let ByteResource::Perf(event) = &self.resource {
             return event.poll(events);
         }
@@ -1421,6 +1437,7 @@ impl DirectFd {
                 events & (poll_mask::READ_NORMAL | poll_mask::WRITE_NORMAL),
                 [0; 2],
             ),
+            ByteResource::Pressure(file) => file.peek(events),
             ByteResource::Cgroup(file, _) => {
                 if self.flags & O_PATH != 0 {
                     (32, [0; 2])
@@ -1437,6 +1454,7 @@ impl DirectFd {
             }
             ByteResource::PollOnly(poll) => poll.poll(events),
             ByteResource::Perf(event) => event.peek(events),
+            ByteResource::Userfault(file) => file.poll(events, self.nonblocking()),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
             ByteResource::Timer(timer) => timer.poll(events),
             ByteResource::Signal(mask, reader) => {
@@ -1521,6 +1539,7 @@ impl DirectFd {
         }
     }
     pub(super) fn acknowledge(&self, epoch: [u64; 2]) {
+        if let ByteResource::Pressure(file) = &self.resource { file.acknowledge(epoch); }
         if let ByteResource::ProcWatch(watch) = &self.resource {
             watch.acknowledge(epoch[0]);
         }
@@ -1569,6 +1588,7 @@ impl DirectFd {
             self.check_read_access()?;
             return Ok(q.status(offset, count));
         }
+        if let ByteResource::Pressure(file) = &self.resource { self.check_read_access()?; return Ok(file.read(offset,count)); }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             self.check_read_access()?;
             return file.cgroup_read(caller, offset, count)?.ok_or(Errno(19));
@@ -1599,6 +1619,7 @@ impl DirectFd {
         if let ByteResource::MessageQueue(_) = &self.resource {
             return Err(Errno(if !fd_can_write(self.flags) { 9 } else { 22 }));
         }
+        if let ByteResource::Pressure(file) = &self.resource { if !fd_can_write(self.flags) {return Err(Errno(9));}return file.write(bytes); }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             if !fd_can_write(self.flags) {
                 return Err(Errno(9));
@@ -1636,6 +1657,7 @@ impl DirectFd {
             ByteResource::SimpleDevice(_)
                 | ByteResource::Device(_)
                 | ByteResource::Bridge(_)
+                | ByteResource::Pressure(_)
                 | ByteResource::Cgroup(..)
                 | ByteResource::MessageQueue(_)
         )
@@ -1645,9 +1667,10 @@ impl DirectFd {
             return Err(Errno(9));
         }
         match &self.resource {
+            ByteResource::Userfault(_) => Ok(0),
             ByteResource::Kmsg(log) => log.seek(offset, whence),
             ByteResource::SimpleDevice(_) | ByteResource::Device(_) => Ok(0),
-            ByteResource::Cgroup(..) | ByteResource::MessageQueue(_) => {
+            ByteResource::Pressure(_) | ByteResource::Cgroup(..) | ByteResource::MessageQueue(_) => {
                 let mut position = self
                     ._file
                     .as_ref()
@@ -1684,7 +1707,9 @@ impl DirectFd {
     pub fn readv_records(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::Event(_) | ByteResource::Inotify(_) | ByteResource::Perf(_)
+            ByteResource::Event(_)
+                | ByteResource::Inotify(_)
+                | ByteResource::Perf(_)
         )
     }
     pub fn nonblocking(&self) -> bool {
@@ -1736,6 +1761,10 @@ impl DirectFd {
         }
         Some(match &self.resource {
             ByteResource::Console(console) => console.read(count),
+            ByteResource::Pressure(file) => {
+                let mut position=self._file.as_ref()?.open.file_position.lock().unwrap();
+                let bytes=file.read(position.value,count);position.value+=bytes.len() as u64;Ok(bytes)
+            }
             ByteResource::Cgroup(file, Some(caller)) => {
                 let mut position = self
                     ._file
@@ -1776,6 +1805,7 @@ impl DirectFd {
                 .upgrade()
                 .map_or(Err(Errno(9)), |b| b.read(count).map_err(Errno)),
             ByteResource::SimpleDevice(_) => unreachable!("typed device read"),
+            ByteResource::Userfault(file) => file.read(count).map_err(Errno),
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Perf(event) => event.read(count),
             ByteResource::Timer(timer) => timer.read(count),
@@ -1876,6 +1906,7 @@ impl DirectFd {
             return Err(Errno(9));
         }
         match &self.resource {
+            ByteResource::Pressure(file) => file.write(bytes),
             ByteResource::Console(console) => console.write(bytes),
             ByteResource::Cgroup(file, Some(caller)) => {
                 if file.memory_write() {
@@ -1903,7 +1934,7 @@ impl DirectFd {
                 Ok(count)
             }
             ByteResource::Cgroup(_, None) => Err(Errno(95)),
-            ByteResource::MessageQueue(_) => Err(Errno(22)),
+            ByteResource::Userfault(_) | ByteResource::MessageQueue(_) => Err(Errno(22)),
             ByteResource::Fuse(file) => file.connection().and_then(|c| c.write(bytes)),
             ByteResource::Tun(file) => file.write(bytes).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.write(bytes),

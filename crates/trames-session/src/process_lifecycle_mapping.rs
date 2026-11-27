@@ -265,9 +265,11 @@ impl<C: Cpu> Lifecycle<C> {
                 }
                 let began = Instant::now();
                 p.signals.io.proc_view.begin_accounting(began, slot);
-                let outcome = p
-                    .cpu
-                    .run_quiesced(engine, &mut p.memory, registry, remaining);
+                let outcome = {
+                    let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(&p.memory);
+                    p.cpu
+                        .run_quiesced(engine, &mut p.memory, registry, remaining)
+                };
                 let elapsed = outcome.as_ref().map_or(Duration::ZERO, |_| began.elapsed());
                 p.signals.io.finish_accounting(began, elapsed, slot);
                 let Some(outcome) = outcome else {

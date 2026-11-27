@@ -176,6 +176,7 @@ pub use network_io::{DirectNetwork, DirectTcpFd, NetworkEpoch};
 mod oom;
 mod overlay;
 mod proc_file;
+mod pressure;
 mod proc_image;
 mod proc_inet;
 pub use proc_image::ProcImage;
@@ -400,6 +401,7 @@ impl SharedOpenDescription {
             || self.sysctl_control.is_some()
             || self.mount_file.is_some()
             || self.runtime_file.is_some()
+            || matches!(self.control, Some(events::SharedControl::Pressure(_)))
     }
 }
 impl std::ops::Deref for OpenDescription {
@@ -1586,6 +1588,7 @@ impl Vfs {
         if let Some(log) = &o.kernel_log {
             return log.poll(events).0;
         }
+        if let Some(events::SharedControl::Pressure(file)) = &o.control { return file.poll(events).0; }
         if let Some(events::SharedControl::Cgroup(file)) = &o.control {
             return if o.flags.get() & O_PATH != 0 {
                 32
@@ -1600,7 +1603,7 @@ impl Vfs {
             return local.poll(events);
         }
         if let Some(anonymous) = &o.anonymous {
-            return anonymous.poll(events, pending, reader);
+            return anonymous.poll(events, pending, reader, o.flags.get() & O_NONBLOCK != 0);
         }
         if let Some(bridge) = &o.bridge {
             return bridge.poll(events);
@@ -4063,6 +4066,7 @@ impl Vfs {
             query.prepared.borrow_mut().fuse = Some(Box::new(pending));
             return query.defer();
         }
+        let pressure_control = self.pressure_file(&p, flags).map(events::SharedControl::Pressure);
         let mut runtime_file = None;
         let mut existed = match forced_node.clone().map_or_else(|| self.node(&p), Ok) {
             Ok(node) => {
@@ -4126,6 +4130,7 @@ impl Vfs {
                         && oom.is_none()
                         && network_control.is_none()
                         && mount_file.is_none()
+                        && pressure_control.is_none()
                         && runtime_file.is_none()
                         && !(Self::cgroup_mount(&p)
                             && matches!(n.content, Content::Directory | Content::File(_)))
@@ -4519,7 +4524,7 @@ impl Vfs {
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
-                    control: binder_control.or(cgroup_control),
+                    control: binder_control.or(cgroup_control).or(pressure_control),
                     read_node,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -4961,6 +4966,10 @@ impl Vfs {
                 return Ok(data);
             }
         }
+        if let Some(events::SharedControl::Pressure(file)) = &o.control {
+            let mut position=o.file_position.lock().unwrap();
+            let data=file.read(position.value,count);position.value+=data.len() as u64;return Ok(data);
+        }
         if let Some(events::SharedControl::Cgroup(file)) = &o.control {
             let mut position = o.file_position.lock().unwrap();
             if position.pending != 0 {
@@ -5262,6 +5271,7 @@ impl Vfs {
                 return Ok(count);
             }
         }
+        if let Some(events::SharedControl::Pressure(file)) = &o.control { return file.write(bytes); }
         if let Some(events::SharedControl::Cgroup(file)) = &o.control {
             if offset.is_some() {
                 return file
@@ -5623,7 +5633,7 @@ impl Vfs {
                 _ => Err(Errno(22)),
             };
         }
-        if matches!(o.anonymous, Some(events::Anonymous::Signal(_))) {
+        if matches!(o.anonymous, Some(events::Anonymous::Userfault(_) | events::Anonymous::Signal(_))) {
             return Ok(o.file_position.lock().unwrap().value);
         }
         if o.kind == FdKind::Terminal {

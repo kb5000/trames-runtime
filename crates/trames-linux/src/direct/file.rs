@@ -1330,6 +1330,9 @@ impl DirectSyscalls {
                 super::file_input::Accepted::TimerFd(call) => {
                     return call.resume(self, memory, signal.pid, target)
                 }
+                super::file_input::Accepted::MmControl(call) => {
+                    return call.resume(self, signal.pid, target);
+                }
                 super::file_input::Accepted::Ioctl(call) => {
                     return call.resume(self, memory, signal.pid, target)
                 }

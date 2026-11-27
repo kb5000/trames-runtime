@@ -49,7 +49,8 @@ impl MemoryReport {
         }
     }
     pub fn has_requested_reads(&self) -> bool {
-        self.has_reclaims()
+        self.has_controls()
+            || self.has_reclaims()
             || self.has_transfers()
             || self.requested_smaps()
             || self.read_ranges(0, u64::MAX).iter().any(|read| {
@@ -228,6 +229,7 @@ impl Memory {
             .as_ref()
             .map(|(_, r, _)| r.clone());
         let Some(report) = report else { return true };
+        report.finish_controls(Some(self));
         report.finish_transfers(Some(self));
         report.finish_smaps(Some(self));
         report.finish_reclaims(Some(self));

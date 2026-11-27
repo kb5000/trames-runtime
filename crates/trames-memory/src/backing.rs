@@ -701,6 +701,7 @@ impl Page {
             }
         }
         self.bytes.copy_read(offset, out);
+        self.charge.note_zero_read();
         Ok(())
     }
     #[inline]
@@ -909,7 +910,7 @@ impl Memory {
             let page = self.frames[frame].as_ref().expect("page");
             pages[((base - address) / PAGE_SIZE) as usize] = if page.check_backing(base).is_ok() {
                 page.charge
-                    .page_resident(page.bytes.shared().map(Arc::as_ref))?
+                    .pte_present(page.bytes.shared().map(Arc::as_ref))?
             } else {
                 0
             };
@@ -920,10 +921,19 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().discard(address, len);
         }
+        self.discard_inner(address, len, false)
+    }
+    pub(crate) fn discard_for_reaper(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
+        self.discard_inner(address, len, true)
+    }
+    fn discard_inner(&mut self, address: u64, len: u64, reaper: bool) -> Result<(), MemoryError> {
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
-        if self.locks.overlaps(address, end) {
+        if !reaper && self.locks.overlaps(address, end) {
             return Err(MemoryError::InvalidRange);
+        }
+        if let Some(faults) = &self.userfaults {
+            faults.remove(address, end, false, None);
         }
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
@@ -1049,7 +1059,17 @@ impl Memory {
                 self.locks.moved(old, old_len, old, new_len),
             )
         });
+        let userfault = (old == new)
+            .then(|| {
+                self.userfaults
+                    .as_ref()
+                    .map(|faults| faults.in_place(old, old + old_len, old + new_len))
+            })
+            .flatten();
         self.remap_inner(old, old_len, new, new_len, fixed)?;
+        if let Some(saved) = userfault {
+            self.userfaults.as_ref().unwrap().restore_in_place(saved);
+        }
         if let Some(callback) = callback {
             if let Err(error) = callback.remapped(self.original_identity, new) {
                 // Linux has already discarded a fixed destination and any

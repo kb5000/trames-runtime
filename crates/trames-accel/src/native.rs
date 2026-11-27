@@ -365,6 +365,7 @@ impl Registry {
         // Live/reentrant backings keep cpu_slice's original conservative path.
         // Neither this borrow nor the tracking scope survives a guest callback
         // or a scheduler/mapping checkpoint.
+        let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(memory);
         let mut slice = memory.cpu_slice();
         let memory = &mut *slice;
         let valid = match self.valid(memory, pc, module, function) {

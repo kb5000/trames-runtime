@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
+#![recursion_limit = "512"]
 mod anonymous;
 mod attachments;
 mod backing;
@@ -29,6 +30,12 @@ pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;
 mod pinned;
 pub use pinned::{PinnedBuffer, ReadBuffer};
+mod mm_control;
+mod process_release;
+pub mod pressure;
+pub use pressure::{MemoryPressure, PressureMemory, PressureSource, PressureTask};
+pub mod userfault;
+pub use mm_control::{ControlError, MmControl};
 mod process_transfer;
 mod raw;
 pub use process_transfer::{TransferError, TransferRequest, TransferTarget, TRANSFER_WINDOW};
@@ -278,6 +285,7 @@ impl Translation {
 }
 
 pub struct Memory {
+    userfaults: Option<Arc<userfault::Faults>>,
     mmu: mmu::Arena,
     // Ordered mappings serve mmap and procfs; stable frame indices serve the
     // interpreter. The translation cache owns no bytes, so it cannot trigger
@@ -422,6 +430,7 @@ impl Memory {
             frames.push(Some(page));
         }
         let mut cloned = Self {
+            userfaults: None,
             mmu: self.mmu.empty_like(),
             pages: if excluded.is_empty() {
                 self.pages.clone()
@@ -650,6 +659,7 @@ impl Memory {
     pub fn new(limit: usize) -> Self {
         let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         Self {
+            userfaults: None,
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
@@ -798,6 +808,13 @@ impl Memory {
             (anonymous::TOKEN | (base / PAGE_SIZE) as usize, page)
         };
         let mut permissions = page.permissions;
+        if self
+            .userfaults
+            .as_ref()
+            .is_some_and(|faults| faults.missing(base))
+        {
+            permissions = Permissions::NONE;
+        }
         if page.write_fault(base).is_some() {
             permissions.write = false;
         }
@@ -843,6 +860,26 @@ impl Memory {
         access: Access,
     ) -> Result<Translation, MemoryError> {
         Self::end(address, len as u64)?;
+        if self
+            .report_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, mm, _)| mm.process_reaped())
+            && self
+                .page_for_access_unchecked(address)
+                .is_some_and(|p| p.backing.as_ref().is_none_or(|b| !b.shared))
+        {
+            return Err(MemoryError::Bus(address));
+        }
+        if self
+            .page_for_access_unchecked(address)
+            .is_some_and(|p| p.permissions.allows(access))
+        {
+            self.check_userfault(address, access)?;
+            if self.userfaults.is_some() {
+                self.translations[Translation::slot(address & !(PAGE_SIZE - 1))].set(Translation::EMPTY);
+            }
+        }
         let entry = self
             .translation(address & !(PAGE_SIZE - 1))
             .ok_or_else(|| self.missing_page(address, access))?;
@@ -1115,6 +1152,9 @@ impl Memory {
             }
             self.frames[frame] = None;
             self.free_frames.push(frame);
+        }
+        if let Some(faults) = &self.userfaults {
+            faults.remove(address, end, true, None);
         }
         self.revision = self.revision.wrapping_add(1);
         self.advance_mapping_revision(address, end, None);
@@ -1518,12 +1558,7 @@ impl Memory {
         }
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if N <= PAGE_SIZE as usize - offset {
-            let base = address & !(PAGE_SIZE - 1);
-            let entry = self.translation(base).ok_or_else(|| {
-                Self::end(address, N as u64)
-                    .err()
-                    .unwrap_or_else(|| self.missing_page(address, Access::Read))
-            })?;
+            let entry = self.access_translation(address, N, Access::Read)?;
             if entry.cpu != 0 && matches!(N, 1 | 2 | 4 | 8 | 16) {
                 // SAFETY: live owning TLB, page-contained operand, no callbacks
                 // or mutation before the guarded CPU load.
@@ -1561,12 +1596,7 @@ impl Memory {
         if N > PAGE_SIZE as usize - offset {
             return self.write(address, &bytes);
         }
-        let base = address & !(PAGE_SIZE - 1);
-        let entry = self.translation(base).ok_or_else(|| {
-            Self::end(address, N as u64)
-                .err()
-                .unwrap_or_else(|| self.missing_page(address, Access::Write))
-        })?;
+        let entry = self.access_translation(address, N, Access::Write)?;
         // SAFETY: same owning-TLB/lifetime bound as read, exclusive coordinator
         // access and one guest page. Failed protected stores have no effects.
         let stored = if entry.cpu != 0 && matches!(N, 1 | 2 | 4 | 8 | 16) {

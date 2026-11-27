@@ -2029,6 +2029,12 @@ impl Linux {
                 Ok(0)
             },
             214 => Ok(self.brk(a[0], memory)),
+            282 => {
+                let flags = a[0] as u32;
+                if flags & 1 == 0 && !self.vfs.credentials.has_cap(trames_vfs::capabilities::SYS_PTRACE) { return Err(Errno(1)); }
+                if flags & !(1 | trames_vfs::O_NONBLOCK | trames_vfs::O_CLOEXEC) != 0 { return Err(Errno(22)); }
+                self.vfs.descriptor_factory().userfaultfd(memory.userfaultfd(flags & 1 != 0), flags).map(u64::from)
+            },
             222 => self.mmap(a, memory),
             215 => {
                 let len = Self::page_length(a[1])?;

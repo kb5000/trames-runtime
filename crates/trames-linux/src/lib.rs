@@ -256,6 +256,9 @@ pub trait GuestOutput {
     fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo>;
     /// Read-only host accounting can run on the querying executor. Adapters
     /// retain their actual provider, not a periodically copied memory hint.
+    /// Shared pressure accounting accepts native notifications and real pager
+    /// progress; the adapter retains no guest CPU or mutable Vfs authority.
+    fn bind_memory_pressure(&mut self, _pressure: std::sync::Arc<trames_memory::MemoryPressure>) {}
     fn host_memory_source(
         &self,
     ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
@@ -352,6 +355,7 @@ pub mod execution_io {
         fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo>;
         /// Read-only host accounting can run on the querying executor. Adapters
         /// retain their actual provider, not a periodically copied memory hint.
+        fn bind_memory_pressure(&mut self, _pressure: std::sync::Arc<trames_memory::MemoryPressure>) {}
         fn host_memory_source(
             &self,
         ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
@@ -431,6 +435,7 @@ pub mod execution_io {
         fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
             super::GuestOutput::source_console(self)
         }
+        fn bind_memory_pressure(&mut self, pressure: std::sync::Arc<trames_memory::MemoryPressure>) {super::GuestOutput::bind_memory_pressure(self,pressure)}
         fn host_memory_source(
             &self,
         ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {

@@ -283,6 +283,7 @@ impl EpollDelivery {
             match &event.target {
                 Target::Direct(fd) => fd.acknowledge(event.epoch),
                 Target::Original(file) => {
+                    if let Some(events::SharedControl::Pressure(pressure)) = &file.open.control { pressure.acknowledge(event.epoch); }
                     if let Some(watch) = file.open.proc_watch() {
                         watch.acknowledge(event.epoch[0]);
                     }

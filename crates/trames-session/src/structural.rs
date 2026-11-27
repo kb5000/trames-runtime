@@ -13,6 +13,7 @@ pub(crate) enum Call {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Memory {
+    Userfault,
     AioSetup,
     AioDestroy,
     Attach,
@@ -33,6 +34,7 @@ pub(crate) enum Memory {
 impl Call {
     pub fn decode(number: u32, args: [u64; 6]) -> Option<Self> {
         Some(match number {
+            282 => Self::Memory(Memory::Userfault),
             0 => Self::Memory(Memory::AioSetup),
             1 => Self::Memory(Memory::AioDestroy),
             167 if args[0] == trames_linux::PR_SET_VMA => Self::Memory(Memory::NameVma),
@@ -94,6 +96,7 @@ impl Call {
 impl Memory {
     pub fn number(self) -> u32 {
         match self {
+            Self::Userfault => 282,
             Self::AioSetup => 0,
             Self::AioDestroy => 1,
             Self::Attach => 196,
@@ -117,7 +120,7 @@ impl Memory {
             Self::Break => 0,
             Self::AioDestroy | Self::Detach | Self::Unmap => 1,
             Self::Remap => 2,
-            Self::AioSetup | Self::Attach | Self::Map => 3,
+            Self::Userfault | Self::AioSetup | Self::Attach | Self::Map => 3,
             Self::Protect => 4,
             Self::Lock { .. } => 9,
             Self::Residency => 5,

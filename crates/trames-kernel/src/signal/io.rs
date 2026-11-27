@@ -418,6 +418,9 @@ impl IoTask {
             let target: Arc<dyn trames_vfs::TaskSignal> = self.clone();
             self.cgroup.get().unwrap().bind(&target);
         }
+        if let Some(pressure) = self.cgroup.get().unwrap().memory_pressure_task() {
+            self.proc_view.bind_pressure(pressure);
+        }
     }
     pub fn session(&self) -> u32 {
         self.lifecycle().job_ids().1

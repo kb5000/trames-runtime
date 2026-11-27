@@ -26,6 +26,11 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// User-only missing faults need an execution-origin scope. Ordinary mm's
+    /// do not touch thread-local origin state on each CPU/native entry.
+    fn userfaults_active(&self) -> bool {
+        false
+    }
     /// Cold VMA observation for exception classification: whether a mapping
     /// covers or follows this address, irrespective of permissions/residency.
     /// It must not fault in bytes, allocate pages or edit mapping ownership.
@@ -203,6 +208,13 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    #[inline]
+    fn userfaults_active(&self) -> bool {
+        self.shared.as_ref().map_or_else(
+            || self.userfaults.as_ref().is_some_and(|faults| faults.active()),
+            |shared| shared.borrow().userfaults_active(),
+        )
+    }
     fn mapped_at_or_after(&self, address: u64) -> bool {
         if let Some(shared) = &self.shared {
             return shared.borrow().mapped_at_or_after(address);
@@ -214,7 +226,7 @@ impl CpuMemory for Memory {
             .is_some_and(|&(_, end, _)| address < end)
     }
     fn async_faults_possible(&self) -> bool {
-        crate::CgroupMemoryTarget::active()
+        self.account.pressure_possible() || crate::CgroupMemoryTarget::active()
             || self
                 .shared
                 .as_ref()

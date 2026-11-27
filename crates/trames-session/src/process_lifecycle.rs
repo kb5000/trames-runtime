@@ -461,7 +461,7 @@ impl<C: Cpu> Lifecycle<C> {
                 if p.memory.parallel_views_quiescent() {
                     p.memory.commit_parallel()?;
                     if checkpoint.proc_reads {
-                        assert!(p.memory.activate_proc_reads());
+                        assert!(p.activate_memory_controls());
                     }
                 } else {
                     p.memory.commit_retired_parallel()?;

@@ -421,6 +421,7 @@ impl Vfs {
         self.pseudo.borrow().publication.clone()
     }
     pub(super) fn proc_runtime_file(&self, path: &ResolvedPath) -> Option<Arc<ProcFile>> {
+        if matches!(path.key.as_slice(),b"/proc/pressure/memory"|b"/proc/zoneinfo"|b"/proc/vmstat") && self.memory_pressure().is_some() {return None;}
         if !self.uses_pseudo(path) || !self.pseudo_readonly(path) {
             return None;
         }
@@ -537,6 +538,7 @@ impl Vfs {
             let original = self.pseudo.borrow();
             let mut pseudo = view.pseudo.borrow_mut();
             pseudo.enabled = true;
+            pseudo.memory_pressure = original.memory_pressure.clone();
             pseudo.source = source.clone();
             pseudo.boot_id = original.boot_id.clone();
             pseudo.video_device = original.video_device.clone();

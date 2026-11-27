@@ -26,6 +26,10 @@ impl PidFd {
         self.pid
     }
 
+    pub fn exited(&self) -> bool {
+        self.state.load(Ordering::Relaxed) != 0
+    }
+
     /// Retain only original PID translations, never the target's task or Files.
     /// CLONE_PIDFD binds after successful birth; pidfd_open binds the live target.
     pub fn bind_namespace(&self, namespace: &PidNamespace) {

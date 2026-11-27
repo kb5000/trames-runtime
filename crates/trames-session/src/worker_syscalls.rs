@@ -1265,6 +1265,11 @@ impl Snapshot {
         tid: u32,
         wake: &std::sync::Weak<dyn trames_vfs::IoWake>,
     ) -> Option<trames_linux::IoAttempt> {
+        if number == 448 {
+            return Some(self.direct.start_mm_control(number, args, tid, wake, || {
+                self.io_routes.process_mrelease(&self.fd_flags, args)
+            }));
+        }
         let peek = number == 117 && matches!(args[0], 1 | 2 | 4 | 5);
         (peek || matches!(number, 270 | 271) && args[0] as u32 != self.io_signals.local_tid()).then(
             || {

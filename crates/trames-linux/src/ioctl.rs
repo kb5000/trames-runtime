@@ -21,6 +21,14 @@ pub(crate) fn call_accepted(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
+    if let Some(file) = vfs
+        .fd_flags_snapshot()
+        .descriptor_control(a[0] as u32)?
+        .shared_file()
+        .userfault_file()
+    {
+        return crate::direct::userfault::solo(file, a[1] as u32, a[2], memory);
+    }
     if let Some(event) = vfs.perf_event(a[0] as u32)? {
         if a[1] as u32 == 0x2405 {
             let target = if a[2] == u64::MAX {

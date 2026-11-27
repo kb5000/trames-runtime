@@ -39,6 +39,7 @@ impl<C: Cpu> Lifecycle<C> {
                 .expect("original native task")
                 .clone();
             let p = &mut *original.write();
+            let _guest_access = trames_memory::userfault::UserAccessScope::for_memory(&p.memory);
             if p.signals.io.lifecycle().termination().is_some() {
                 job.work.control.refund(1);
                 continue;

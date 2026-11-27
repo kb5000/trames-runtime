@@ -73,6 +73,7 @@ impl Memory {
     }
     fn forced_page(&self, address: u64, write: bool) -> Result<Translation, MemoryError> {
         Self::end(address, 1)?;
+        self.check_userfault(address, if write { Access::Write } else { Access::Read })?;
         let entry = self
             .translation(address & !(PAGE_SIZE - 1))
             .ok_or(MemoryError::Unmapped(address))?;
@@ -92,7 +93,7 @@ impl Memory {
         }
         Ok(entry)
     }
-    fn forced_bytes(
+    pub(super) fn forced_bytes(
         &mut self,
         address: u64,
         data: &mut [u8],

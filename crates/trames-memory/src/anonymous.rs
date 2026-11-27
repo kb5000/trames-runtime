@@ -99,7 +99,7 @@ impl Store {
                     .lock()
                     .unwrap()
                     .range(start..end)
-                    .filter_map(|(&base, p)| p.charge.resident().then_some(base)),
+                    .filter_map(|(&base, p)| p.charge.present().then_some(base)),
             );
         }
         if let Some(native) = &self.native {
@@ -124,12 +124,12 @@ impl Store {
     pub(super) fn residency(&self, start: u64, pages: &mut [u8]) -> Result<(), MemoryError> {
         let end = start + pages.len() as u64 * PAGE_SIZE;
         if pages.len() == 1 {
-            pages[0] = u8::from(self.lookup(start).is_some_and(|p| p.charge.resident()));
+            pages[0] = u8::from(self.lookup(start).is_some_and(|p| p.charge.present()));
         } else {
             pages.fill(0);
             for shard in &self.pages {
                 for (&at, p) in shard.lock().unwrap().range(start..end) {
-                    pages[((at - start) / PAGE_SIZE) as usize] = u8::from(p.charge.resident());
+                    pages[((at - start) / PAGE_SIZE) as usize] = u8::from(p.charge.present());
                 }
             }
         }

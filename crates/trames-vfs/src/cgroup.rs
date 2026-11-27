@@ -288,6 +288,8 @@ impl CgroupResourceContext {
     }
 }
 impl CgroupTask {
+    pub fn memory_pressure_task(&self)->Option<Arc<trames_memory::PressureTask>> { self.member.memory.memory_pressure_task() }
+
     pub fn bind_oom(&self, oom: &Arc<OomTask>) {
         let _ = self.member.oom.set(Arc::downgrade(oom));
     }
@@ -313,6 +315,9 @@ impl CgroupTask {
             _io: self.member.io.scope(),
         }
     }
+    pub fn finish_pressure_execution(&self) {
+        self.member.memory.finish_pressure_execution();
+    }
     pub fn resource_context(&self) -> CgroupResourceContext {
         // Acceptance snapshots the same membership update for both resources.
         // Ordinary live CPU scopes keep their existing per-target access.
@@ -337,6 +342,7 @@ impl CgroupTask {
     ) -> Option<std::time::Instant> {
         let high = self.member.memory.high_delay();
         let deadline = (!high.is_zero()).then(|| now + high);
+        if let Some(deadline)=deadline {self.member.memory.pressure_delay_until(deadline);}
         if !self.member.cpu_limited.load(Ordering::Relaxed) {
             return deadline;
         }
@@ -1570,6 +1576,11 @@ impl Vfs {
     }
     pub fn cgroup_task(&self, pid: u32) -> Option<CgroupTask> {
         let member = self.cgroups.borrow().tasks.get(&pid)?.clone();
+        if let Some(domain)=self.memory_pressure() {
+            let task=member.memory.bind_pressure(&domain);
+            let weak=Arc::downgrade(&member);
+            task.set_protected(Arc::new(move || weak.upgrade().is_some_and(|member|member.oom_protected())));
+        }
         Some(CgroupTask {
             groups: self.cgroups.clone(),
             member,

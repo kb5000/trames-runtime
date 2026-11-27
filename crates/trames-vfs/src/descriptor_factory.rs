@@ -454,6 +454,13 @@ impl DescriptorFactory {
         let descriptor = events::anonymous_descriptor(self.open_id(), flags, resource);
         reservation.publish(descriptor, None)
     }
+    pub fn userfaultfd(
+        &self,
+        file: Arc<trames_memory::userfault::UserfaultFile>,
+        flags: u32,
+    ) -> Result<u32> {
+        self.anonymous(flags, events::Anonymous::Userfault(file))
+    }
     pub fn eventfd(&self, initial: u32, flags: u32) -> Result<u32> {
         if flags & !(O_CLOEXEC | O_NONBLOCK | 1) != 0 {
             return Err(Errno(22));

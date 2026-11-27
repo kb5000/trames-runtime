@@ -230,6 +230,7 @@ impl Vfs {
             let source = self.pseudo.borrow();
             let mut pseudo = view.pseudo.borrow_mut();
             pseudo.enabled = source.enabled;
+            pseudo.memory_pressure = source.memory_pressure.clone();
             pseudo.fuse_control = source.fuse_control.clone();
             pseudo.nodes = source.nodes.clone();
             pseudo.source = source.source.clone();
@@ -307,6 +308,7 @@ impl Vfs {
         let pseudo = {
             let root = publication.borrow();
             Arc::new(SharedCell::new(pseudo::PseudoFs {
+                memory_pressure: root.memory_pressure.clone(),
                 debug_fs: root.debug_fs.clone(),
                 special_supers: root.special_supers.clone(),
                 fuse_control: root.fuse_control.clone(),

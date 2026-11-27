@@ -54,7 +54,7 @@ impl View {
         for (&base, &index) in self.snapshot.pages.range(address..address + len) {
             let frame = &self.snapshot.frames[index];
             pages[((base - address) / PAGE_SIZE) as usize] = if frame.error.is_none() {
-                frame.charge.page_resident(
+                frame.charge.pte_present(
                     frame
                         .bytes
                         .bytes

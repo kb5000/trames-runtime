@@ -155,6 +155,7 @@ impl NativeMemory for Memory {
         if page.bytes.shared().is_some() {
             return Ok(None);
         }
+        page.charge.note_zero_read();
         Ok(Some(&page.bytes))
     }
     #[inline]
@@ -307,6 +308,7 @@ impl Memory {
             .as_ref()
             .is_none_or(|b| !b.shared && b.private_current())
         {
+            page.charge.note_zero_read();
             return Ok((page.bytes.with_read(offset, len, operation), true));
         }
         if page

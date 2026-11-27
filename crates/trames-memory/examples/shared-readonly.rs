@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared-VM immutable reads, plus a disjoint-RW control of the guarded fallback.
+#![recursion_limit = "512"]
 use std::{
     hint::black_box,
     sync::{Arc, Barrier},

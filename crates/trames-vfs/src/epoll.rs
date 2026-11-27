@@ -317,10 +317,11 @@ pub(super) fn prepare_control(
     let resource_control = matches!(
         t.control,
         Some(
-            events::SharedControl::MessageQueue(_)
+            events::SharedControl::Userfault(_)
+                | events::SharedControl::MessageQueue(_)
                 | events::SharedControl::Fuse(_)
                 | events::SharedControl::Tun(..)
-                | events::SharedControl::Cgroup(_)
+                | events::SharedControl::Pressure(_) | events::SharedControl::Cgroup(_)
                 | events::SharedControl::Binder(_)
                 | events::SharedControl::Sync(_)
         )
