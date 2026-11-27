@@ -106,11 +106,9 @@ mod tests {
             uid: caller.linux.vfs.credentials.uid,
             euid: caller.linux.vfs.credentials.euid,
         };
-        let fd = u64::from(
-            routes
-                .pidfd_open(&caller.linux.vfs.descriptor_factory(), child as i32, 0)
-                .unwrap(),
-        );
+        let fd = routes
+            .pidfd_open(&caller.linux.vfs.descriptor_factory(), child as i32, 0)
+            .unwrap();
         assert_eq!(
             k.syscall(1, &mut caller, 448, [fd, 0, 0, 0, 0, 0], &mut io),
             Err(trames_vfs::Errno(22))
