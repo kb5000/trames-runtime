@@ -1135,6 +1135,39 @@ impl View {
 }
 impl CpuMemory for View {
     #[cfg(feature = "native-code")]
+    fn cpu_hardware_ordering(&self) -> bool {
+        true
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_acquire_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) {
+            return Err(MemoryError::InvalidRange);
+        }
+        let ((result, aligned), direct) =
+            self.cpu_read_chunk(address, len, |bytes| crate::ordered::read(bytes, operation))?;
+        Ok((result, direct && aligned))
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_release_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) {
+            return Err(MemoryError::InvalidRange);
+        }
+        let ((result, aligned), direct) = self.cpu_store_chunk(address, len, |bytes| {
+            crate::ordered::write(bytes, operation)
+        })?;
+        Ok((result, direct && aligned))
+    }
+    #[cfg(feature = "native-code")]
     fn cpu_native_available(&self) -> bool {
         self.private_mode != PrivateMode::Guarded
             && !self.hardware_mode

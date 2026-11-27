@@ -185,7 +185,7 @@ A successful checked store admits further writes and publishes private-page dirt
 fragments/reservation invalidation once before returning the alias. No write
 admission is inferred from a read. All potentially writable fragments of that
 private page are marked; there are no concurrent private actors or backing
-writeback providers to overwrite. Atomic/exclusive instructions, syscalls and
+writeback providers to overwrite. RMW/exclusive instructions, syscalls and
 native callbacks end the generated block/operand loan. Native stores therefore
 cannot hide a write from a later guest exclusive operation. Direct Memory also
 advances its existing data/revision and parallel-write metadata. Alias pointers
@@ -228,7 +228,7 @@ Region hits replace indexed page-cache lookup with register subtraction/range
 comparison and fixed-bias addition. The existing page cache and checked helper
 remain the fallback. Every non-reused access retains one-guest-page containment,
 including unaligned operands, so a faulting cross-page store cannot partially
-retire through this optimization. The block's widest scalar width supplies a
+retire through this optimization. The block's widest memory operand supplies a
 conservative region bound; narrower boundary operands can use the fallback.
 
 Cold compiler register-definition versions identify unchanged effective addresses
@@ -257,3 +257,40 @@ subset of `hardware`. Its selected counter replaces the page-path increment,
 without adding another increment per access. `CompilationStats::address_reuses`
 counts emitted reuse sites, not dynamic executions. The original counters and
 JNI layout remain unchanged. See [affine validation and full measurements](../validation/jit-affine-memory-20261128.md).
+
+### Paired and ordered native memory
+
+Integer LDP/STP (W/X), LDPSW and LDNP/STNP share the scalar page/affine/address
+reuse path. Total operand width is 8 or 16 bytes, covering both registers. The
+emitter remaps both registers into **one original host pair instruction**; it
+does not synthesize two singles, stronger atomicity or a software extension state.
+Offset/pre/post-index, sign extension, non-temporal hints and architectural
+zero-register behavior remain native. Cold decoding excludes reserved and
+constrained-unpredictable forms. Cross-page and non-borrowable operands retain
+the existing checked whole-operand transfer and fault publication boundaries.
+
+LDAR/STLR B/H/W/X execute their actual host instruction against canonical shared
+bytes. Native hits add no software alignment preflight, stronger fence or new
+lock. The original page-custody bound remains shared with ordinary accesses;
+same-address width proofs still skip it. Hardware controls alignment behavior
+on native hits, including the host's LSE2 rules; there is no new strict software
+alignment model for buggy guest programs. Checked recovery keeps the existing
+interpreter fault boundary. Acquire/release does not terminate a private alias
+loan; RMW/exclusive operations still do.
+
+The cold embedding capability `cpu_hardware_ordering` admits Memory/View, while
+unknown CpuMemory implementations retain their abstract interpreter/fence hooks.
+Scoped ordered borrows use actual aligned RAM directly. Providers that cannot
+lend storage or whose host pointer cannot represent the operand use the existing
+staging transport: acquire follows the canonical read, release precedes canonical
+writeback. An ordered access on a temporary alone cannot publish real bytes.
+Those exceptional transports use no new algorithm/global lock. Const-generic
+ordinary access paths retain their old behavior and emit no additional fence.
+All ordered hooks/storage helpers are opt-in through `native-code`.
+
+Valid DMB/DSB domain/type options and ISB SY are emitted unchanged. They preserve
+GPR/NZCV bindings and do not invoke a catch-all SeqCst Rust helper. No ISA-support
+probe is added to execution. The pair helper uses AAPCS64 x0/x1/x2 arguments and
+a two-u64 x0/x1 result, without touching host x18/TLS or callee-saved registers.
+The existing exact-site native fault recovery covers pair/ordered instructions.
+See [paired/ordered validation and matched measurement](../validation/jit-pairs-ordering-20261128.md).

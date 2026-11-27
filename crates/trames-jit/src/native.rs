@@ -1230,6 +1230,12 @@ impl Assembler {
         } else {
             self.read(op.rt as u32, SCRATCH | (1 << base))
         };
+        let source2 = if !op.load {
+            op.second
+                .map(|reg| self.read(reg as u32, SCRATCH | (1 << base) | (1 << source)))
+        } else {
+            None
+        };
         let index = if let Address::Register { reg, .. } = op.address {
             self.read(reg as u32, SCRATCH | (1 << base) | (1 << source))
         } else {
@@ -1280,9 +1286,10 @@ impl Assembler {
             }
             Address::Post(_) => self.words.push(0xaa0003f1 | (base << 16)),
         }
-        self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17); // shared guest TBI
-                                                                   // Retain exact one-guest-page fault atomicity even for a larger affine
-                                                                   // run. Only a proof of the same address and sufficient width skips this.
+        // Shared guest TBI, followed by the existing one-page custody bound.
+        self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17);
+        // The native LDAR/STLR itself enforces the host's alignment rules; no
+        // software preflight or stricter guest-bug emulation on the hot path.
         self.words.push(0xd3400000 | (11 << 10) | (17 << 5) | 10);
         self.words
             .push(0xf100001f | (((4096 - op.size) as u32) << 10) | (10 << 5));
@@ -1329,9 +1336,18 @@ impl Assembler {
         } else {
             source
         };
+        let target2 = if op.load {
+            op.second
+                .map(|reg| self.output(reg as u32, SCRATCH | (1 << base) | (1 << target)))
+        } else {
+            source2
+        };
         let fault = self.words.len();
-        self.words
-            .push((op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target);
+        self.words.push(if let Some(second) = target2 {
+            (op.opcode.expect("pair operand") & !0x7fff) | (second << 10) | (17 << 5) | target
+        } else {
+            (op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target
+        });
         if let Address::Pre(offset) | Address::Post(offset) = op.address {
             constant(&mut self.words, 10, offset);
             let target = self.output(sp_register(op.rn as u32), SCRATCH | (1 << base));
@@ -1633,7 +1649,20 @@ fn compile_with_features(
         let sf = word >> 31;
         let flags = word & (1 << 29) != 0;
         let mut terminal = false;
-        if word & 0xffe0001f == 0xd4000001 {
+        if (matches!(word & 0xfffff0ff, 0xd503309f | 0xd50330bf)
+            && matches!(
+                (word >> 8) & 15,
+                1 | 2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 | 13 | 14 | 15
+            ))
+            || word == 0xd5033fdf
+        {
+            if !memory.cpu_hardware_ordering() {
+                break;
+            }
+            // Preserve the guest's barrier domain/type exactly. No helper,
+            // catch-all SeqCst fence, flag clobber or ordinary-access barrier.
+            code.words.push(word);
+        } else if word & 0xffe0001f == 0xd4000001 {
             syscall = true;
             flow = Flow::Syscall;
             next = pc.wrapping_add(4);
@@ -2014,6 +2043,11 @@ pub(super) struct Code {
     fixups: Option<trames_memory::NativeCodeFixups>,
     _thread: PhantomData<Rc<()>>,
 }
+#[repr(C)]
+pub(super) struct PairValues {
+    pub first: u64,
+    pub second: u64,
+}
 impl Code {
     pub(super) fn publish(words: &[u32]) -> std::io::Result<Self> {
         Self::publish_fixups(words, &[])
@@ -2080,6 +2114,14 @@ impl Code {
         let function: unsafe extern "C" fn(*mut u8, u64) -> u64 =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(pointer, value) }
+    }
+    pub(super) unsafe fn call_pair(&self, pointer: *mut u8, first: u64, second: u64) -> PairValues {
+        // SAFETY: AAPCS64 passes three scalar arguments in x0/x1/x2 and the
+        // two-u64 aggregate result in x0/x1. The exact-width LDP/STP owns only
+        // the complete borrowed operand; SP and host callee-saved state stay live.
+        let function: unsafe extern "C" fn(*mut u8, u64, u64) -> PairValues =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(pointer, first, second) }
     }
     unsafe fn call_tail(&self, offset: usize, registers: &mut [u64; 31], links: *const usize) {
         // SAFETY: the caller validated the bounded two-block edge and owns both
@@ -2152,6 +2194,55 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_ordered_and_barrier_lowerings_preserve_hardware_opcodes() {
+        for word in [
+            0xa9400820, 0xa9000820, 0x69400820, 0x28400820, 0xa8000820, 0x08dffc20, 0x489ffc20,
+            0x88dffc20, 0xc89ffc20,
+        ] {
+            let m = memory(&[word, 0xd4000001]);
+            let op = crate::memory_ops::Operation::compile(&m, 0x1000)
+                .unwrap()
+                .unwrap();
+            let compiled = compile(&m, 0x1000, 64, 0, 8 | 16 | 1).unwrap().unwrap();
+            assert_eq!(compiled.block.instructions, 2);
+            let words = unsafe {
+                std::slice::from_raw_parts(
+                    compiled.block.code.pointer.cast::<u32>(),
+                    compiled.block.traffic.host_words as usize,
+                )
+            };
+            let mask = if op.second.is_some() { !0x7fff } else { !0x3ff };
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&w| w & mask == op.opcode.unwrap() & mask)
+                    .count(),
+                1,
+                "{word:08x}"
+            );
+        }
+        for base in [0xd50330bf, 0xd503309f] {
+            for option in [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15] {
+                let barrier = base | (option << 8);
+                let m = memory(&[barrier, 0xd5033fdf, 0xd4000001]);
+                let compiled = compile(&m, 0x1000, 64, 0, 8 | 1).unwrap().unwrap();
+                assert_eq!(compiled.block.instructions, 3);
+                let words = unsafe {
+                    std::slice::from_raw_parts(
+                        compiled.block.code.pointer.cast::<u32>(),
+                        compiled.block.traffic.host_words as usize,
+                    )
+                };
+                assert!(words.contains(&barrier));
+                assert_eq!(
+                    words.iter().filter(|&&w| w == barrier).count(),
+                    words.iter().filter(|&&w| w == 0xd5033fdf).count()
+                );
+            }
+        }
+    }
 
     #[test]
     fn direct_entries_preserve_native_callee_registers_on_every_return() {

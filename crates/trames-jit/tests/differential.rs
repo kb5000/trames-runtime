@@ -44,6 +44,265 @@ fn hardware_span() -> u64 {
     (4 * PAGE_SIZE).max(trames_memory::host_mapping_granule() as u64)
 }
 
+// Compare whole architectural state, canonical bytes and precise retirement on
+// both sides of every slice, including faults after a dirty native prefix.
+fn compare_memory_sequence(
+    words: &[u32],
+    state: &Aarch64State,
+    budget: u64,
+    parallel: bool,
+) -> Engine {
+    let mut a = memory(words);
+    let mut b = memory(words);
+    for m in [&mut a, &mut b] {
+        m.map(0x10000, hardware_span(), Permissions::RW).unwrap();
+        let bytes: Vec<_> = (0..hardware_span())
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(0x85))
+            .collect();
+        m.write(0x10000, &bytes).unwrap();
+    }
+    let mut expected = trames_interpreter::Cpu::new(0, 0);
+    let mut actual = Cpu::new(0, 0);
+    expected.restore_architectural_state(state);
+    actual.restore_architectural_state(state);
+    let mut engine = Engine::default();
+    let mut ra = trames_memory::parallel::Registry::default();
+    let mut rb = trames_memory::parallel::Registry::default();
+    let mut va = parallel.then(|| a.parallel_view(&mut ra).unwrap());
+    let mut vb = parallel.then(|| b.parallel_view(&mut rb).unwrap());
+    if parallel {
+        assert!(unsafe {
+            trames_memory::parallel::View::try_private_epoch(&mut [va.as_mut().unwrap()])
+        });
+        assert!(unsafe {
+            trames_memory::parallel::View::try_private_epoch(&mut [vb.as_mut().unwrap()])
+        });
+    }
+    let mut reference_engine = trames_interpreter::Engine::default();
+    for _ in 0..64 {
+        let x = if parallel {
+            expected.run_parallel(&mut reference_engine, va.as_mut().unwrap(), budget)
+        } else {
+            expected.run_slice(&mut a, budget)
+        };
+        let y = if parallel {
+            actual.run_parallel(&mut engine, vb.as_mut().unwrap(), budget)
+        } else {
+            actual.run_slice(&mut engine, &mut b, budget)
+        };
+        assert_eq!(format!("{x:?}"), format!("{y:?}"), "words={words:x?}");
+        assert_eq!(
+            actual.architectural_state(),
+            expected.architectural_state(),
+            "words={words:x?}"
+        );
+        assert_eq!(actual.fault_retired(), expected.fault_retired());
+        let mut left = vec![0; hardware_span() as usize];
+        let mut right = left.clone();
+        if parallel {
+            va.as_ref().unwrap().read(0x10000, &mut left).unwrap();
+            vb.as_ref().unwrap().read(0x10000, &mut right).unwrap();
+        } else {
+            a.read(0x10000, &mut left).unwrap();
+            b.read(0x10000, &mut right).unwrap();
+        }
+        assert_eq!(left, right, "words={words:x?}");
+        if !matches!(x, SliceOutcome::Yield { .. }) {
+            return engine;
+        }
+    }
+    panic!("sequence did not terminate");
+}
+
+#[test]
+fn paired_integer_transfers_match_reference_including_aliases_and_writeback() {
+    for (opc, load) in [(0, false), (0, true), (1, true), (2, false), (2, true)] {
+        for mode in 0..4 {
+            if opc == 1 && mode == 0 {
+                continue;
+            } // reserved LDNP sign-extending form
+            for offset in [-4i32, 0, 3] {
+                for (rn, rt, rt2) in [
+                    (1, 0, 2),
+                    (31, 0, 31),
+                    (1, 31, 2),
+                    (1, 2, 1),
+                    (1, 1, 2),
+                    (1, 0, 0),
+                ] {
+                    if ((mode == 1 || mode == 3) && rn != 31 && (rn == rt || rn == rt2))
+                        || (load && rt == rt2)
+                    {
+                        continue;
+                    }
+                    let word = (opc << 30)
+                        | 0x28000000
+                        | (mode << 23)
+                        | (u32::from(load) << 22)
+                        | (((offset as u32) & 127) << 15)
+                        | (rt2 << 10)
+                        | (rn << 5)
+                        | rt;
+                    for cross in [false, true] {
+                        let mut state = initial();
+                        state.registers[1] = if cross {
+                            0xab00_0000_0001_0ffd
+                        } else {
+                            0xab00_0000_0001_0100
+                        };
+                        state.sp = state.registers[1];
+                        // Three copies warm the alias path; writeback and load/base
+                        // overlap may intentionally leave the mapping and fault.
+                        for budget in [1, 64] {
+                            let engine = compare_memory_sequence(
+                                &[0xb1000463, word, word, word, 0xd4000001],
+                                &state,
+                                budget,
+                                budget == 64,
+                            );
+                            if NATIVE_COMPILED {
+                                assert_eq!(engine.stats.fallback_instructions, 0, "{word:08x}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_transfers_barriers_and_checked_faults_match_reference() {
+    for size in 0..4 {
+        for load in [false, true] {
+            for (rn, rt) in [(1, 0), (31, 31), (1, 1)] {
+                let word =
+                    (size << 30) | if load { 0x08dffc00 } else { 0x089ffc00 } | (rn << 5) | rt;
+                for offset in [0, 1, 2, 4, 8] {
+                    let mut state = initial();
+                    state.registers[1] = 0xab00_0000_0001_0100 + offset;
+                    state.sp = state.registers[1];
+                    for budget in [1, 64] {
+                        let engine = compare_memory_sequence(
+                            &[0xb1000463, word, word, 0xd4000001],
+                            &state,
+                            budget,
+                            budget == 64,
+                        );
+                        if NATIVE_COMPILED {
+                            assert_eq!(engine.stats.fallback_instructions, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for base in [0xd50330bf, 0xd503309f] {
+        for option in [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15] {
+            let engine = compare_memory_sequence(
+                &[
+                    0xb1000463,
+                    base | (option << 8),
+                    0xd5033fdf,
+                    0x9a9f37e4,
+                    0xd4000001,
+                ],
+                &initial(),
+                64,
+                false,
+            );
+            if NATIVE_COMPILED {
+                assert_eq!(engine.stats.fallback_instructions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn pairs_and_ordered_loops_use_hardware_aliases_with_exact_budgets() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    for words in [
+        vec![
+            0xa9400820, 0x91000400, 0xa9000820, 0xf1000463, 0x54ffff81, 0xd4000001,
+        ],
+        vec![
+            0xc8dffc20, 0x91000400, 0xc89ffc20, 0xf1000463, 0x54ffff81, 0xd4000001,
+        ],
+    ] {
+        for parallel in [false, true] {
+            let mut state = initial();
+            state.registers[1] = 0x10000;
+            state.registers[3] = 16;
+            let engine = compare_memory_sequence(&words, &state, 128, parallel);
+            assert_eq!(engine.stats.fallback_instructions, 0);
+            assert_eq!(engine.memory_stats().instructions, 32);
+            assert!(
+                engine.memory_stats().hardware >= 28,
+                "{:?}",
+                engine.memory_stats()
+            );
+            assert!(engine.memory_stats().direct >= 28);
+            assert!(engine.compilation_stats().address_reuses > 0);
+        }
+    }
+}
+
+#[test]
+fn guest_release_acquire_publishes_canonical_data_between_workers() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    // Guest handshakes deliberately use no Rust synchronization for guest data.
+    // The ack prevents the producer from replacing data before it is consumed.
+    let producer = [
+        0xc8dffc65, 0xeb0000bf, 0x54ffffc1, 0x91000400, 0xf9000020, 0xc89ffc40, 0xf1000484,
+        0x54ffff21, 0xd4000001,
+    ];
+    let consumer: [u32; 14] = [
+        0xc8dffc45, 0x91000406, 0xeb0600bf, 0x54ffffa1, 0xf9400027, 0xeb0600ff, 0x540000c1,
+        0xaa0603e0, 0xc89ffc60, 0xf1000484, 0x54fffec1, 0xd4000001, 0xd2800029, 0xd4000001,
+    ];
+    let mut m = memory(&producer);
+    m.write(0x2000, &vec![0; PAGE_SIZE as usize]).unwrap();
+    m.map(0x4000, PAGE_SIZE, Permissions::RW).unwrap();
+    for (i, word) in consumer.into_iter().enumerate() {
+        m.write_array(0x4000 + 4 * i as u64, word.to_le_bytes())
+            .unwrap();
+    }
+    m.protect(0x4000, PAGE_SIZE, Permissions::RX).unwrap();
+    let mut registry = trames_memory::parallel::Registry::default();
+    let writer = m.parallel_view(&mut registry).unwrap();
+    let reader = writer.clone();
+    let run = |mut view: trames_memory::parallel::View, pc| {
+        let mut cpu = Cpu::new(pc, 0);
+        for (reg, value) in [(1, 0x2000), (2, 0x2008), (3, 0x2010), (4, 256)] {
+            cpu.set_x(reg, value);
+        }
+        let mut engine = Engine::default();
+        let start = std::time::Instant::now();
+        loop {
+            let exit = cpu.run_parallel(&mut engine, &mut view, 4096);
+            if matches!(exit, SliceOutcome::Syscall { .. }) {
+                break;
+            }
+            assert!(matches!(exit, SliceOutcome::Yield { .. }), "{exit:?}");
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "guest handshake timed out"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!((cpu.x(0), cpu.x(4), cpu.x(9)), (256, 0, 0));
+        assert_eq!(engine.stats.fallback_instructions, 0);
+        assert_eq!(engine.memory_stats().staged, 0);
+    };
+    let thread = std::thread::spawn(move || run(writer, 0x1000));
+    run(reader, 0x4000);
+    thread.join().unwrap();
+}
+
 #[test]
 fn hardware_alias_loop_preserves_state_and_canonical_bytes() {
     if !NATIVE_COMPILED {
@@ -1154,6 +1413,7 @@ fn scalar_memory_address_modes_widths_signs_and_register_aliases_match_reference
 fn memory_faults_cross_page_and_writeback_are_precise() {
     for word in [
         0xf8408420, 0xf8008420, 0xf8408c20, 0xf8008c20, 0xb9800020, 0xf9400020, 0xf9000020,
+        0xa8c10820, 0xa8810820, 0xa9c10820, 0xa9810820, 0x69400820, 0xc8dffc20, 0xc89ffc20,
     ] {
         for address in [0x2800, 0x2ffd, 0xab00000000002ffd, 0x3ffd] {
             for access in [
@@ -1202,7 +1462,7 @@ fn memory_faults_cross_page_and_writeback_are_precise() {
         }
     }
     // Successful cross-page transfers remain native, with explicit staging.
-    for word in [0xf9400020, 0xf9000020] {
+    for word in [0xf9400020, 0xf9000020, 0xa9400820, 0xa9000820, 0x69400820] {
         let mut m = data_memory(word);
         let mut c = Cpu::new(0x1000, 0);
         let mut e = Engine::default();
@@ -1396,43 +1656,45 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
             Err(MemoryError::BackingIo(5))
         }
     }
-    let output = Arc::new(Output::default());
-    let mut m = memory(&[0xf9000020]);
-    m.unmap(0x2000, PAGE_SIZE).unwrap();
-    m.map_backed(
-        0x2000,
-        vec![output.clone()],
-        true,
-        Permissions {
-            read: false,
-            write: true,
-            execute: false,
-        },
-        false,
-    )
-    .unwrap();
-    let mut cpu = Cpu::new(0x1000, 0);
-    cpu.set_x(0, 0x8877665544332211);
-    cpu.set_x(1, 0x2000);
-    let mut engine = Engine::default();
-    assert_eq!(
-        outcome(&cpu.run_slice(&mut engine, &mut m, 1)),
-        ("yield", 1)
-    );
-    assert_eq!(output.reads.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        &output.bytes.lock().unwrap()[..8],
-        &0x8877665544332211u64.to_le_bytes()
-    );
-    if NATIVE_COMPILED {
+    for word in [0xf9000020, 0xa9000820, 0xc89ffc20] {
+        let output = Arc::new(Output::default());
+        let mut m = memory(&[word]);
+        m.unmap(0x2000, PAGE_SIZE).unwrap();
+        m.map_backed(
+            0x2000,
+            vec![output.clone()],
+            true,
+            Permissions {
+                read: false,
+                write: true,
+                execute: false,
+            },
+            false,
+        )
+        .unwrap();
+        let mut cpu = Cpu::new(0x1000, 0);
+        cpu.set_x(0, 0x8877665544332211);
+        cpu.set_x(1, 0x2000);
+        let mut engine = Engine::default();
         assert_eq!(
-            (
-                engine.memory_stats().instructions,
-                engine.memory_stats().staged,
-                engine.stats.fallback_instructions
-            ),
-            (1, 1, 0)
+            outcome(&cpu.run_slice(&mut engine, &mut m, 1)),
+            ("yield", 1)
         );
+        assert_eq!(output.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            &output.bytes.lock().unwrap()[..8],
+            &0x8877665544332211u64.to_le_bytes()
+        );
+        if NATIVE_COMPILED {
+            assert_eq!(
+                (
+                    engine.memory_stats().instructions,
+                    engine.memory_stats().staged,
+                    engine.stats.fallback_instructions
+                ),
+                (1, 1, 0)
+            );
+        }
     }
 }
 
@@ -1769,6 +2031,9 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
         ) -> Result<bool, MemoryError> {
             self.memory.exclusive_write(a, bytes, token)
         }
+        fn cpu_hardware_ordering(&self) -> bool {
+            true
+        }
         fn cpu_native_available(&self) -> bool {
             self.memory.cpu_native_available()
         }
@@ -1838,14 +2103,20 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
             self.memory.instruction_page_identity(a)
         }
     }
-    for store in [false, true] {
-        let word = if store { 0xf8008420 } else { 0xf8408420 }; // post-index #8
+    for (store, word) in [
+        (false, 0xf8408420),
+        (true, 0xf80087a0),
+        (false, 0xa8c10820),
+        (true, 0xa8810ba0),
+        (false, 0xc8dffc20),
+        (true, 0xc89fffa0),
+    ] {
         let words = if store {
             // The read succeeds with host PROT_READ, then the following store
             // reuses that exact translated address and faults. Its recovery
             // must also preserve newer flags and post-index writeback.
             [
-                0xf94003bc, 0xf90003bc, 0xf94003a0, 0x910004a5, 0xb1000463, 0xf80087a0, 0x9a9f37e4,
+                0xf94003bc, 0xf90003bc, 0xf94003a0, 0x910004a5, 0xb1000463, word, 0x9a9f37e4,
                 0xd4000001,
             ]
         } else {

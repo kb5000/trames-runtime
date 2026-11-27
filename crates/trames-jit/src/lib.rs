@@ -99,7 +99,7 @@ pub struct MemoryStats {
     pub staged: u64,
     pub fused_entries: u64,
     pub fused_blocks: u64,
-    /// Inline LDR/STR through an entry-scoped hardware-protected CPU alias.
+    /// Inline scalar/paired/ordered access through a protected CPU alias.
     pub hardware: u64,
     /// Hardware accesses using the register-held affine region/address path.
     pub direct: u64,

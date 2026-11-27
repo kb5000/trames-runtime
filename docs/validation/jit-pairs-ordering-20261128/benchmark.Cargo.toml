@@ -1,0 +1,15 @@
+[package]
+name="jit-pairs-new"
+version="0.1.0"
+edition="2024"
+[workspace]
+[dependencies]
+trames-engine = {path="../jit-pair-order-source/crates/trames-engine"}
+trames-execution = {path="../jit-pair-order-source/crates/trames-execution"}
+trames-memory = {path="../jit-pair-order-source/crates/trames-memory"}
+trames-interpreter = {path="../jit-pair-order-source/crates/trames-interpreter"}
+trames-jit = {path="../jit-pair-order-source/crates/trames-jit", features=["native-aarch64"]}
+serde_json="=1.0.151"
+[profile.release]
+overflow-checks=true
+lto="thin"

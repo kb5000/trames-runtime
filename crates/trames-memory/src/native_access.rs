@@ -2,6 +2,31 @@
 //! Scoped host slices over checked guest pages. No guest address is a host pointer.
 use super::*;
 
+#[repr(align(16))]
+struct AlignedPage([u8; PAGE_SIZE as usize]);
+#[inline]
+fn read_ordered<const ORDERED: bool, T>(
+    bytes: &[u8],
+    operation: impl FnOnce(&[u8]) -> T,
+) -> (T, bool) {
+    #[cfg(feature = "native-code")]
+    if ORDERED {
+        return crate::ordered::read(bytes, operation);
+    }
+    (operation(bytes), true)
+}
+#[inline]
+fn write_ordered<const ORDERED: bool, T>(
+    bytes: &mut [u8],
+    operation: impl FnOnce(&mut [u8]) -> T,
+) -> (T, bool) {
+    #[cfg(feature = "native-code")]
+    if ORDERED {
+        return crate::ordered::write(bytes, operation);
+    }
+    (operation(bytes), true)
+}
+
 /// Bytes supplied to native operations directly or through coherent staging.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Transfer {
@@ -291,9 +316,31 @@ impl Memory {
         len: usize,
         operation: impl FnOnce(&[u8]) -> T,
     ) -> Result<(T, bool), MemoryError> {
+        self.read_chunk::<false, T>(address, len, operation)
+    }
+    #[cfg(feature = "native-code")]
+    pub(crate) fn with_acquire_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.read_chunk::<true, T>(address, len, operation)
+    }
+    fn read_chunk<const ACQUIRE: bool, T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
         let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
-            return shared.borrow().with_read_chunk(address, len, operation);
+            return shared
+                .borrow()
+                .read_chunk::<ACQUIRE, T>(address, len, operation);
         }
         if len == 0 {
             return Ok((operation(&[]), true));
@@ -309,7 +356,9 @@ impl Memory {
             .is_none_or(|b| !b.shared && b.private_current())
         {
             page.charge.note_zero_read();
-            return Ok((page.bytes.with_read(offset, len, operation), true));
+            return Ok(page.bytes.with_read(offset, len, |bytes| {
+                read_ordered::<ACQUIRE, T>(bytes, operation)
+            }));
         }
         if page
             .backing
@@ -327,17 +376,23 @@ impl Memory {
             .expect("live backing")
             .object
             .with_read(offset, len, &mut |bytes| {
-                result = Some(operation.take().expect("one callback")(bytes));
+                result = Some(read_ordered::<ACQUIRE, T>(
+                    bytes,
+                    operation.take().expect("one callback"),
+                ));
             })
             .map_err(|e| e.at_access(address))?
         {
-            return Ok((result.expect("resident callback"), true));
+            return Ok(result.expect("resident callback"));
         }
         let operation = operation.expect("unavailable borrow has no effects");
-        let mut snapshot = [0; PAGE_SIZE as usize];
-        page.read_bytes(offset, &mut snapshot[..len])
+        let mut snapshot = AlignedPage([0; PAGE_SIZE as usize]);
+        page.read_bytes(offset, &mut snapshot.0[..len])
             .map_err(|e| e.at_access(address))?;
-        Ok((operation(&snapshot[..len]), false))
+        if ACQUIRE {
+            std::sync::atomic::fence(Ordering::Acquire);
+        }
+        Ok((operation(&snapshot.0[..len]), false))
     }
 
     /// Borrow a checked writable fragment, making a private COW copy as needed.
@@ -348,7 +403,7 @@ impl Memory {
         len: usize,
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<(T, bool), MemoryError> {
-        self.write_chunk::<false, T>(address, len, operation)
+        self.write_chunk::<false, false, T>(address, len, operation)
     }
     /// Full overwrite: staging need not fetch previous provider bytes.
     pub(crate) fn with_store_chunk<T>(
@@ -357,9 +412,21 @@ impl Memory {
         len: usize,
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<(T, bool), MemoryError> {
-        self.write_chunk::<true, T>(address, len, operation)
+        self.write_chunk::<true, false, T>(address, len, operation)
     }
-    fn write_chunk<const FULL: bool, T>(
+    #[cfg(feature = "native-code")]
+    pub(crate) fn with_release_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.write_chunk::<true, true, T>(address, len, operation)
+    }
+    fn write_chunk<const FULL: bool, const RELEASE: bool, T>(
         &mut self,
         address: u64,
         len: usize,
@@ -369,7 +436,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared
                 .borrow_mut()
-                .write_chunk::<FULL, T>(address, len, operation);
+                .write_chunk::<FULL, RELEASE, T>(address, len, operation);
         }
         if len == 0 {
             return Ok((operation(&mut []), true));
@@ -417,27 +484,34 @@ impl Memory {
                 .expect("shared backing")
                 .object
                 .with_write(offset, len, &mut |bytes| {
-                    result = Some(operation.take().expect("one callback")(bytes));
+                    result = Some(write_ordered::<RELEASE, T>(
+                        bytes,
+                        operation.take().expect("one callback"),
+                    ));
                 })
                 .map_err(|e| e.at_access(address))?
             {
-                return Ok((result.expect("resident callback"), true));
+                return Ok(result.expect("resident callback"));
             }
             let operation = operation.expect("unavailable borrow has no effects");
-            let mut bytes = [0; PAGE_SIZE as usize];
+            let mut bytes = AlignedPage([0; PAGE_SIZE as usize]);
             if !FULL {
-                page.read_bytes(offset, &mut bytes[..len])
+                page.read_bytes(offset, &mut bytes.0[..len])
                     .map_err(|e| e.at_access(address))?;
             }
-            let result = operation(&mut bytes[..len]);
-            page.write_bytes(offset, &bytes[..len])
+            let result = operation(&mut bytes.0[..len]);
+            if RELEASE {
+                std::sync::atomic::fence(Ordering::Release);
+            }
+            page.write_bytes(offset, &bytes.0[..len])
                 .map_err(|e| e.at_access(address))?;
             return Ok((result, false));
         }
-        Ok((
-            Arc::make_mut(&mut page.bytes).with_write(offset, len, operation),
-            true,
-        ))
+        Ok(
+            Arc::make_mut(&mut page.bytes).with_write(offset, len, |bytes| {
+                write_ordered::<RELEASE, T>(bytes, operation)
+            }),
+        )
     }
 
     pub(crate) fn mark_native_write(&mut self, frame: usize) {

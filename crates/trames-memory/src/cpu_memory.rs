@@ -32,6 +32,44 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 pub struct InstructionEpochs<'a>(pub [Option<&'a std::sync::atomic::AtomicU64>; 3]);
 
 pub trait CpuMemory {
+    /// Cold embedding capability: RAM and publication obey the host memory model.
+    /// Unknown embeddings retain their existing abstract fence/interpreter path.
+    #[cfg(feature = "native-code")]
+    fn cpu_hardware_ordering(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_acquire_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) || len as u64 > PAGE_SIZE - address % PAGE_SIZE {
+            return Err(MemoryError::InvalidRange);
+        }
+        let mut bytes = crate::ordered::Operand([0; 8]);
+        self.read(address, &mut bytes.0[..len])?;
+        std::sync::atomic::fence(Ordering::Acquire);
+        Ok((operation(&bytes.0[..len]), false))
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_release_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if !crate::ordered::valid(len) || len as u64 > PAGE_SIZE - address % PAGE_SIZE {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.check(address, len, Access::Write)?;
+        let mut bytes = crate::ordered::Operand([0; 8]);
+        let result = operation(&mut bytes.0[..len]);
+        std::sync::atomic::fence(Ordering::Release);
+        self.write(address, &bytes.0[..len])?;
+        Ok((result, false))
+    }
     /// Cold entry capability, separate from CPU instruction support. A false
     /// result keeps the existing checked lowering without inline cache probes.
     #[cfg(feature = "native-code")]
@@ -269,6 +307,28 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    #[cfg(feature = "native-code")]
+    fn cpu_hardware_ordering(&self) -> bool {
+        true
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_acquire_chunk<T>(
+        &self,
+        a: u64,
+        n: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.with_acquire_chunk(a, n, f)
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_release_chunk<T>(
+        &mut self,
+        a: u64,
+        n: usize,
+        f: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.with_release_chunk(a, n, f)
+    }
     #[cfg(feature = "native-code")]
     fn cpu_native_available(&self) -> bool {
         self.shared.is_none() && !self.async_faults_possible() && !self.userfaults_active()
