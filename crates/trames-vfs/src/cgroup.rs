@@ -2154,6 +2154,65 @@ impl CgroupFile {
     }
 }
 
+// Original directory identity and ancestry are independent of pathname and PID reuse.
+#[derive(Clone)]
+pub(crate) struct PerfGroup {
+    groups: Arc<SharedCell<Cgroups>>,
+    id: u64,
+    _node: NodeRef,
+}
+impl PerfGroup {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.groups, &other.groups)
+    }
+    pub(crate) fn contains(&self, task: &CgroupTask) -> bool {
+        if !Arc::ptr_eq(&self.groups, &task.groups) {
+            return false;
+        }
+        let groups = self.groups.borrow();
+        let id = task.member.group();
+        id == self.id
+            || groups
+                .groups
+                .get(&id)
+                .is_some_and(|group| group.location.ancestors.contains(&self.id))
+    }
+}
+impl DescriptorControl {
+    pub(crate) fn perf_cgroup(
+        &self,
+        groups: &Arc<SharedCell<Cgroups>>,
+    ) -> Result<crate::perf::Scope> {
+        let open = self.0.open.borrow();
+        if !open
+            .mount
+            .as_ref()
+            .is_some_and(|mount| mount.kind == mounts::Kind::Cgroup)
+        {
+            return Err(Errno(9));
+        }
+        let node = open.node.as_ref().ok_or(Errno(9))?;
+        if !matches!(node.borrow().content, Content::Directory) {
+            return Err(Errno(9));
+        }
+        let id = node.borrow().inode;
+        if !groups.borrow().groups.contains_key(&id) {
+            return Err(Errno(9));
+        }
+        Ok(crate::perf::Scope(PerfGroup {
+            groups: groups.clone(),
+            id,
+            _node: node.clone(),
+        }))
+    }
+}
+impl DescriptorFactory {
+    pub fn perf_cgroup(&self, files: &FdFlags, fd: u32) -> Result<crate::perf::Scope> {
+        files.descriptor_control(fd)?.perf_cgroup(&self.cgroups)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2779,63 +2838,5 @@ mod tests {
         ));
         assert_eq!(replacement.kills.load(Ordering::Relaxed), 0);
         assert!(v.take_cgroup_kills().is_empty());
-    }
-}
-
-// Original directory identity and ancestry are independent of pathname and PID reuse.
-#[derive(Clone)]
-pub(crate) struct PerfGroup {
-    groups: Arc<SharedCell<Cgroups>>,
-    id: u64,
-    _node: NodeRef,
-}
-impl PerfGroup {
-    pub(crate) fn same(&self, other: &Self) -> bool {
-        self.id == other.id && Arc::ptr_eq(&self.groups, &other.groups)
-    }
-    pub(crate) fn contains(&self, task: &CgroupTask) -> bool {
-        if !Arc::ptr_eq(&self.groups, &task.groups) {
-            return false;
-        }
-        let groups = self.groups.borrow();
-        let id = task.member.group();
-        id == self.id
-            || groups
-                .groups
-                .get(&id)
-                .is_some_and(|group| group.location.ancestors.contains(&self.id))
-    }
-}
-impl DescriptorControl {
-    pub(crate) fn perf_cgroup(
-        &self,
-        groups: &Arc<SharedCell<Cgroups>>,
-    ) -> Result<crate::perf::Scope> {
-        let open = self.0.open.borrow();
-        if !open
-            .mount
-            .as_ref()
-            .is_some_and(|mount| mount.kind == mounts::Kind::Cgroup)
-        {
-            return Err(Errno(9));
-        }
-        let node = open.node.as_ref().ok_or(Errno(9))?;
-        if !matches!(node.borrow().content, Content::Directory) {
-            return Err(Errno(9));
-        }
-        let id = node.borrow().inode;
-        if !groups.borrow().groups.contains_key(&id) {
-            return Err(Errno(9));
-        }
-        Ok(crate::perf::Scope(PerfGroup {
-            groups: groups.clone(),
-            id,
-            _node: node.clone(),
-        }))
-    }
-}
-impl DescriptorFactory {
-    pub fn perf_cgroup(&self, files: &FdFlags, fd: u32) -> Result<crate::perf::Scope> {
-        files.descriptor_control(fd)?.perf_cgroup(&self.cgroups)
     }
 }
