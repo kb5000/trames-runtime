@@ -955,6 +955,11 @@ impl Fabric {
         self.0.borrow().gateway.waiters()
     }
 }
+fn gateway_ip(a: IpAddr) -> bool {
+    a == IpAddr::V4(v4(1))
+        || a == IpAddr::V6(v6(1))
+        || a == crate::direct_dns::ROUTABLE_ADDRESS.ip()
+}
 fn private_ip(a: IpAddr) -> bool {
     match a {
         IpAddr::V4(a) => a.octets()[..3] == [10, 0, 0],
@@ -1336,6 +1341,9 @@ impl Inner {
                             .is_some_and(|ns| {
                                 matches!(ns.mode, NetworkMode::Full | NetworkMode::Outbound)
                             });
+                        let allowed = allowed
+                            && (self.external.as_ref().is_none_or(|e| e.nat)
+                                || gateway_ip(wire.tuple.destination.ip()));
                         let ok = allowed
                             && self.gateway.route_flow(
                                 wire,
@@ -1417,20 +1425,13 @@ impl Inner {
                         s.rx_packets += 1;
                         s.rx_bytes += size;
                     }
-                } else if source != 0
-                    && dynamic.is_none()
-                    && private_ip(dst)
-                    && dst != IpAddr::V4(v4(1))
-                    && dst != IpAddr::V6(v6(1))
-                {
+                } else if source != 0 && dynamic.is_none() && private_ip(dst) && !gateway_ip(dst) {
                     // Guest-owned links always use Ethernet; no legacy raw-IP wire.
                     self.stats.dropped += 1;
                 } else if source != 0
                     && dynamic.is_none()
-                    && (dst == IpAddr::V4(v4(1))
-                        || dst == IpAddr::V6(v6(1))
-                        || self.external.as_ref().is_none_or(|e| e.nat))
-                    && (!private_ip(dst) || dst == IpAddr::V4(v4(1)) || dst == IpAddr::V6(v6(1)))
+                    && (gateway_ip(dst) || self.external.as_ref().is_none_or(|e| e.nat))
+                    && (!private_ip(dst) || gateway_ip(dst))
                 {
                     if !self.gateway.ingress(source, p, &h, &self.nodes, now) {
                         self.stats.dropped += 1;
@@ -2148,6 +2149,40 @@ impl Drop for Socket {
 #[cfg(test)]
 mod shared_lifetime_tests {
     use super::*;
+    #[test]
+    fn host_publication_owns_requested_wildcard_bind_until_teardown() {
+        for kind in [1, 2] {
+            let fabric = Fabric::new().unwrap();
+            fabric
+                .publish(
+                    "0.0.0.0:0".parse().unwrap(),
+                    "10.0.0.2:32123".parse().unwrap(),
+                    kind,
+                )
+                .unwrap();
+            let address = fabric
+                .native_waiters()
+                .into_iter()
+                .find_map(|(s, _)| {
+                    s.local_addr()
+                        .ok()
+                        .filter(|a| a.ip().is_unspecified() && a.port() != 0)
+                })
+                .expect("published host socket");
+            if kind == 1 {
+                assert!(std::net::TcpListener::bind(address).is_err());
+            } else {
+                assert!(std::net::UdpSocket::bind(address).is_err());
+            }
+            fabric.unpublish(address, kind).unwrap();
+            if kind == 1 {
+                std::net::TcpListener::bind(address).unwrap();
+            } else {
+                std::net::UdpSocket::bind(address).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn namespace_nodes_survive_tree_splits_and_removals() {
         let fabric = Fabric::new().unwrap();
