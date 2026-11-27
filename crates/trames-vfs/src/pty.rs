@@ -640,10 +640,15 @@ mod tests {
             query.open_at_resolve(AT_FDCWD, b"/pts/0", 2 | 0x100, 0, 0, &files),
             Some(Err(Errno(5)))
         );
-        assert_eq!(
-            query.open_at_resolve(AT_FDCWD, b"/pts/ptmx", O_PATH, 0, 0, &files),
-            None
+        let path = query
+            .open_at_resolve(AT_FDCWD, b"/pts/ptmx", O_PATH, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert!(
+            v.pty(path).unwrap().is_none(),
+            "O_PATH must not allocate a PTY"
         );
+        v.close(path).unwrap();
         let second = query
             .open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files)
             .unwrap()
@@ -1041,6 +1046,19 @@ mod tests {
             v.stat_at(AT_FDCWD, b"/pts").unwrap()[8..16],
             1u64.to_le_bytes()
         );
+        let queries = v.path_queries();
+        let files = DirectFiles::default();
+        for path in [b"/pts".as_slice(), b"/pts/ptmx"] {
+            let fd = queries
+                .open_at_resolve(AT_FDCWD, path, O_PATH | O_CLOEXEC, 0, 0, &files)
+                .expect("devpts path handles need no device/owner admission")
+                .unwrap();
+            assert_eq!(
+                v.stat_fd(fd).unwrap()[..40],
+                v.stat_at(AT_FDCWD, path).unwrap()[..40]
+            );
+            v.close(fd).unwrap();
+        }
         let path = v.open_at(AT_FDCWD, b"/pts/ptmx", O_PATH, 0).unwrap();
         let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
         for fd in [path, master] {

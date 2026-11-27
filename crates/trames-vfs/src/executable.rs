@@ -593,9 +593,23 @@ mod tests {
     }
     #[test]
     fn reopen_exec_magic_link_after_memfd_exec_and_last_descriptor_close() {
-        let mut v = Vfs::default();
+        reopen_memfd_image(Vfs::default());
+        let directory = std::env::temp_dir().join(format!(
+            "trames-memfd-exe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        reopen_memfd_image(Vfs::open_disk(&directory, DiskOptions::default()).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    fn reopen_memfd_image(mut v: Vfs) {
         let fd = v.memfd_create(b"runc_cloned:/proc/self/exe", 3).unwrap();
         v.write(fd, b"payload").unwrap();
+        v.seals(fd, Some(15)).unwrap();
         let file = v.executable_file_at(fd as i32, b"", 0x1000).unwrap();
         v.close(fd).unwrap();
         v.set_runtime_info(
@@ -611,10 +625,36 @@ mod tests {
                 ..Default::default()
             },
         );
+        struct Source(Arc<ProcessView>);
+        impl ProcSource for Source {
+            fn observe(&self, query: ProcQuery<'_>) -> RuntimeInfo {
+                RuntimeInfo {
+                    processes: self.0.observe(query.demand).into_iter().collect(),
+                    ..Default::default()
+                }
+            }
+        }
+        let process = Arc::new(ProcessView::default());
+        process.publish(
+            &ProcessInfo {
+                pid: 1,
+                tgid: 1,
+                executable_file: Some(Arc::downgrade(&file)),
+                ..Default::default()
+            },
+            v.proc_resources(),
+        );
+        v.set_proc_source(Arc::new(Source(process)));
         v.symlink_at(b"/proc/self/exe", AT_FDCWD, b"/exec-alias")
             .unwrap();
         for path in [b"/proc/self/exe".as_slice(), b"/exec-alias"] {
-            let reopened = v.open_at(AT_FDCWD, path, O_CLOEXEC, 0).unwrap();
+            let paths = v.path_queries();
+            let files = DirectFiles::default();
+            let reopened = paths
+                .open_at_resolve(AT_FDCWD, path, O_CLOEXEC, 0, 0, &files)
+                .expect("an executable's original memfd inode needs no owner fallback")
+                .unwrap();
+            assert_eq!(v.seals(reopened, None).unwrap(), 15);
             assert_eq!(v.read(reopened, 7).unwrap(), b"payload");
             assert_eq!(
                 v.stat_fd(reopened).unwrap()[8..16],
