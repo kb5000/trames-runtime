@@ -44,3 +44,14 @@ jobs:
       - run: rustup show
       - run: cargo clippy -p trames-jit --all-targets --features native-aarch64 --locked -- -D warnings
       - run: cargo test -p trames-jit --features native-aarch64 --locked
+      - name: Record CPU-only JIT boundary microbenchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run --release --locked -p trames-jit --features native-aarch64 --example cpu-boundary | tee target/jit-cpu-boundary.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jit-cpu-boundary
+          path: target/jit-cpu-boundary.jsonl
+          if-no-files-found: error
+          retention-days: 14

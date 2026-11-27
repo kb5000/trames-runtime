@@ -39,6 +39,36 @@ pub struct Stats {
     pub native_blocks: u64,
     pub native_instructions: u64,
     pub fallback_instructions: u64,
+    /// SVC exits compiled directly, without interpreter entry or a host SVC.
+    pub direct_syscall_exits: u64,
+}
+/// Cold compiler totals, never updated by individual executed instructions.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CompilationStats {
+    pub blocks: u64,
+    pub host_words: u64,
+    pub register_loads: u64,
+    pub register_stores: u64,
+}
+impl Engine {
+    pub fn compilation_stats(&self) -> CompilationStats {
+        #[cfg(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            self.native.stats
+        }
+        #[cfg(not(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )))]
+        {
+            CompilationStats::default()
+        }
+    }
 }
 impl Cpu {
     pub fn interpreter(&self) -> &trames_interpreter::Cpu {
@@ -71,10 +101,18 @@ impl Cpu {
                 .native
                 .execute(&mut self.inner, memory, budget - retired)
             {
-                Ok(Some(count)) => {
-                    retired += count;
+                Ok(Some(exit)) => {
+                    retired += exit.instructions;
                     engine.stats.native_blocks += 1;
-                    engine.stats.native_instructions += count;
+                    // SVC is a translated control exit, separate from native
+                    // guest ALU/branch instructions and fallback execution.
+                    engine.stats.native_instructions += exit.instructions - u64::from(exit.syscall);
+                    if exit.syscall {
+                        engine.stats.direct_syscall_exits += 1;
+                        return SliceOutcome::Syscall {
+                            instructions: retired,
+                        };
+                    }
                     continue;
                 }
                 Ok(None) => {}

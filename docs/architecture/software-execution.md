@@ -24,5 +24,17 @@ Original guest instructions are never changed. Derived code is private to each
 worker, bounded, and published RW -> RX, never RWX. Guest page identities drive
 invalidation at block entry, using the existing decoder invalidation model.
 Blocks do not cross 4 KiB guest pages; host allocations use the actual host page
-size, including 16 KiB Android hosts. Only x9-x12 scratch registers are used;
-host x18, TLS, FP state and callee-saved registers remain intact.
+size, including 16 KiB Android hosts. x0 retains the register-frame pointer; x1-x17 hold block-local guest values.
+Dirty evictions and block exits write values back. Host x18, TLS, FP state and
+callee-saved registers remain intact. Allocation runs only during compilation;
+ordinary translated instructions perform no dynamic register/feature checks.
+
+Guest SVC is compiled as a terminal block exit, with register writeback and
+exact instruction retirement/PC advancement. It returns `SliceOutcome::Syscall`
+without entering the interpreter or executing a host SVC. The common Session
+worker's syscall dispatcher still owns guest syscall policy, arguments, results,
+blocking/retry and tracing. Android's initial app currently validates the CPU
+exit only; its full shared Session integration is a separate milestone.
+
+Register choices follow [AAPCS64](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst)
+and [Android's reserved-x18 requirement](https://developer.android.com/ndk/guides/abis#arm64-v8a).
