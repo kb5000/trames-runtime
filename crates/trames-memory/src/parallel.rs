@@ -1135,6 +1135,20 @@ impl View {
 }
 impl CpuMemory for View {
     #[cfg(feature = "native-code")]
+    fn cpu_atomic_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        _release: bool,
+        _acquire: bool,
+        operation: impl FnOnce(&mut [u8]) -> (T, bool),
+    ) -> Result<(T, bool), MemoryError> {
+        self.atomic_update(address, len, |bytes| {
+            let (value, written) = operation(bytes);
+            ((value, true), written)
+        })
+    }
+    #[cfg(feature = "native-code")]
     fn cpu_hardware_ordering(&self) -> bool {
         true
     }

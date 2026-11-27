@@ -20,8 +20,9 @@ carry/conditional operations, multiply/divide, bitfields/variable shifts and
 fixed, conditional and register branches. CRC, FlagM/FlagM2 and CSSC use their
 actual host instructions only when the process-host HWCAP provides them.
 There are no new software replacements or emulated extension registers.
-Scalar LDR/STR now use checked native memory fragments as described below.
-FP/SIMD, atomics, traps and remaining untranslated families still retain
+Scalar, paired and ordered memory, LSE CAS/CASP/RMW and RCpc accesses now use
+native memory paths as described below.
+FP/SIMD, exclusive reservations, traps and remaining untranslated families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
 
@@ -159,8 +160,8 @@ the published scalar/SVC machine-entry ABI and existing Stats fields are retaine
 counts; these are updated only by memory execution. No extension register model,
 algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is added.
 
-Pairs, SIMD, acquire/release and atomics keep their existing path until separately
-lowered.
+The following sections extend this original scalar lowering with paired/ordered
+accesses, LSE and RCpc. SIMD and exclusive-reservation lowering remain pending.
 
 ### Entry-scoped hardware aliases
 
@@ -185,7 +186,7 @@ A successful checked store admits further writes and publishes private-page dirt
 fragments/reservation invalidation once before returning the alias. No write
 admission is inferred from a read. All potentially writable fragments of that
 private page are marked; there are no concurrent private actors or backing
-writeback providers to overwrite. RMW/exclusive instructions, syscalls and
+writeback providers to overwrite. Exclusive-reservation instructions, syscalls and
 native callbacks end the generated block/operand loan. Native stores therefore
 cannot hide a write from a later guest exclusive operation. Direct Memory also
 advances its existing data/revision and parallel-write metadata. Alias pointers
@@ -276,7 +277,7 @@ same-address width proofs still skip it. Hardware controls alignment behavior
 on native hits, including the host's LSE2 rules; there is no new strict software
 alignment model for buggy guest programs. Checked recovery keeps the existing
 interpreter fault boundary. Acquire/release does not terminate a private alias
-loan; RMW/exclusive operations still do.
+loan; exclusive-reservation operations still do. LSE is described below.
 
 The cold embedding capability `cpu_hardware_ordering` admits Memory/View, while
 unknown CpuMemory implementations retain their abstract interpreter/fence hooks.
@@ -294,3 +295,39 @@ probe is added to execution. The pair helper uses AAPCS64 x0/x1/x2 arguments and
 a two-u64 x0/x1 result, without touching host x18/TLS or callee-saved registers.
 The existing exact-site native fault recovery covers pair/ordered instructions.
 See [paired/ordered validation and matched measurement](../validation/jit-pairs-ordering-20261128.md).
+
+### Native LSE and RCpc
+
+Host HWCAP gates CAS/CASP, SWP, LDADD/LDCLR/LDEOR/LDSET and signed/unsigned min/max
+(including byte/halfword, discard-result aliases and all acquire/release variants)
+in the cold compiler. LDAPR requires LRCPC; LDAPUR/STLUR and signed unscaled loads
+require ILRCPC. An absent extension faults when reached instead of acquiring an
+interpreter implementation. No hot feature probe, software CAS loop, stronger
+ordinary fence or additional CPU extension state is added.
+
+Private hardware aliases use the existing page/affine/address proof and a single
+original LSE instruction. Write admission publishes dirty/reservation metadata
+before allowing inline RMW, as for native stores; no exclusive-reservation
+instruction can overlap that loan. Independent shared writers cannot obtain a
+private alias. Shared Views execute the actual instruction on canonical bytes
+inside their existing region transaction and publish existing version/code
+metadata conditionally. Quiescent Memory lends its existing anonymous/COW bytes
+with write intent; a failed CAS may conservatively lose an earlier reservation
+or prepare a private page, consistent with hardware write intent. Backing-only
+providers retain their previous transaction/staging boundary; release precedes
+canonical publication and acquire follows observation. The native-only hook is
+compiled out of ordinary interpreter/iPad builds.
+
+CAS/CASP inputs are captured before any guest output is changed, including base,
+compare/replacement aliases and W/X zero registers. CASP remaps onto fixed even
+pairs x10/x11 and x6/x7, keeps the selected diagnostic counter in x13 and leaves
+NZCV recovery in x12. It remains one atomic 64/128-bit host operation. Reserved
+registers are excluded by the cold allocator even when their slots are vacant;
+this also fixes ordinary memory code under high register pressure. No new guest
+error recovery precheck is emitted. The existing exact native fault site rejoins
+checked access before publishing outputs or replaying a dirty prefix.
+
+RCpc accesses retain their actual opcode and ordering; native hits do not
+substitute the interpreter's stronger abstract fence. Signed/unscaled offsets
+share ordinary address computation. See [LSE/RCpc validation and full matched
+measurement](../validation/jit-lse-rcpc-20261128.md).

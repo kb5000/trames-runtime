@@ -6,6 +6,12 @@ use trames_engine::CpuFault;
 use trames_interpreter::Cpu;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
+#[derive(Clone, Copy)]
+pub(super) enum Atomic {
+    Rmw { source: usize },
+    Cas { compare: usize, pair: bool },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Address {
     Offset(u64),
@@ -23,6 +29,7 @@ pub(super) struct Operation {
     pub(super) load: bool,
     pub(super) second: Option<usize>,
     pub(super) ordered: bool,
+    pub(super) atomic: Option<Atomic>,
     pub(super) opcode: Option<u32>,
     code: Option<Code>, // PRFM is an architecturally optional hint, no read.
 }
@@ -39,6 +46,80 @@ impl Operation {
         } // SIMD requires a separate lowering.
         let rt = (word & 31) as usize;
         let rn = ((word >> 5) & 31) as usize;
+        if !crate::features::permits(crate::features::profile().allowed, word) {
+            return Ok(None);
+        }
+        let cas_pair = word & 0xbfa07c00 == 0x08207c00;
+        let cas = word & 0x3fa07c00 == 0x08a07c00;
+        let rmw = word & 0x3f200c00 == 0x38200000 && word & 0x3ffffc00 != 0x38bfc000;
+        if cas_pair || cas || rmw {
+            if !memory.cpu_hardware_ordering() {
+                return Ok(None);
+            }
+            let source = ((word >> 16) & 31) as usize;
+            if cas_pair && (source % 2 != 0 || rt % 2 != 0) || rmw && (word >> 12) & 15 > 8 {
+                return Ok(None);
+            }
+            return Self {
+                pc,
+                address: Address::Offset(0),
+                rn,
+                rt,
+                size: if cas_pair {
+                    8usize << (word >> 30)
+                } else {
+                    1usize << (word >> 30)
+                },
+                load: false,
+                second: None,
+                ordered: false,
+                atomic: Some(if rmw {
+                    Atomic::Rmw { source }
+                } else {
+                    Atomic::Cas {
+                        compare: source,
+                        pair: cas_pair,
+                    }
+                }),
+                opcode: Some(word & !0x1f03ff),
+                code: None,
+            }
+            .publish()
+            .map(Some);
+        }
+        if word & 0x3ffffc00 == 0x38bfc000 || word & 0x3f200c00 == 0x19000000 {
+            if !memory.cpu_hardware_ordering() {
+                return Ok(None);
+            }
+            let unscaled = word & 0x3f200c00 == 0x19000000;
+            let size = 1usize << (word >> 30);
+            let opc = if unscaled { (word >> 22) & 3 } else { 1 };
+            if opc == 2 && size == 8 || opc == 3 && size >= 4 {
+                return Ok(None);
+            }
+            let load = opc != 0;
+            return Self {
+                pc,
+                rn,
+                rt,
+                size,
+                load,
+                second: None,
+                ordered: true,
+                atomic: None,
+                address: Address::Offset(if unscaled {
+                    signed(((word >> 12) & 511) as u64, 9)
+                } else {
+                    0
+                }),
+                opcode: Some(
+                    (word & !(if unscaled { 0x1ff3ff } else { 0x3ff })) | u32::from(!load),
+                ),
+                code: None,
+            }
+            .publish()
+            .map(Some);
+        }
         if matches!(word & 0x3ffffc00, 0x08dffc00 | 0x089ffc00) {
             if !memory.cpu_hardware_ordering() {
                 return Ok(None);
@@ -53,6 +134,7 @@ impl Operation {
                 load,
                 second: None,
                 ordered: true,
+                atomic: None,
                 opcode: Some((word & !0x3ff) | u32::from(!load)),
                 code: None,
             }
@@ -103,6 +185,7 @@ impl Operation {
                 load,
                 second: Some(second),
                 ordered: false,
+                atomic: None,
                 opcode: Some(opcode),
                 code: None,
             }
@@ -179,6 +262,7 @@ impl Operation {
             load,
             second: None,
             ordered: false,
+            atomic: None,
             opcode,
             code: None,
         }
@@ -188,7 +272,34 @@ impl Operation {
     fn publish(mut self) -> Result<Self, CpuFault> {
         self.code = self
             .opcode
-            .map(|word| Code::publish(&[0xd503245f, word, 0xd65f03c0]))
+            .map(|word| {
+                if let Some(atomic) = self.atomic {
+                    // AAPCS64 x0=borrow, x1=&[compare0,compare1,new0,new1].
+                    // Fixed even pairs keep CASP a single real host instruction.
+                    let mut words = vec![0xd503245f, 0xa9400c22, 0xa9411424];
+                    let rt = match atomic {
+                        Atomic::Rmw { .. } => {
+                            if self.rt == 31 {
+                                31
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 4,
+                    };
+                    words.push(word | (2 << 16) | rt);
+                    if matches!(atomic, Atomic::Cas { .. }) {
+                        words.push(0xaa0203e0);
+                    }
+                    if matches!(atomic, Atomic::Cas { pair: true, .. }) {
+                        words.push(0xaa0303e1);
+                    }
+                    words.push(0xd65f03c0);
+                    Code::publish(&words)
+                } else {
+                    Code::publish(&[0xd503245f, word, 0xd65f03c0])
+                }
+            })
             .transpose()
             .map_err(|e| CpuFault::Host(format!("JIT memory publication: {e}")))?;
         Ok(self)
@@ -197,11 +308,7 @@ impl Operation {
         self.pc
     }
     pub fn host_words(&self) -> u64 {
-        if self.code.is_some() {
-            3
-        } else {
-            0
-        }
+        self.code.as_ref().map_or(0, Code::word_count)
     }
     pub(super) fn operand(&self, cpu: &Cpu) -> (u64, Option<u64>) {
         let base = if self.rn == 31 {
@@ -236,6 +343,48 @@ impl Operation {
         };
         let (address, writeback) = self.operand(cpu);
         let fault = |error| CpuFault::Memory { pc, error };
+        if let Some(atomic) = self.atomic {
+            // Only the checked recovery path retains the reference fault model.
+            // Inline LSE instructions rely on hardware, without a preflight.
+            if !address.is_multiple_of(self.size as u64) {
+                return Err(fault(trames_memory::MemoryError::Alignment(address)));
+            }
+            let (compare, pair) = match atomic {
+                Atomic::Rmw { source } => (source, false),
+                Atomic::Cas { compare, pair } => (compare, pair),
+            };
+            let inputs = [
+                cpu.x(compare),
+                if pair { cpu.x(compare + 1) } else { 0 },
+                cpu.x(self.rt),
+                if pair { cpu.x(self.rt + 1) } else { 0 },
+            ];
+            let word = self.opcode.unwrap();
+            let rmw = matches!(atomic, Atomic::Rmw { .. });
+            let release = word & (1 << if rmw { 22 } else { 15 }) != 0;
+            let acquire = word & (1 << if rmw { 23 } else { 22 }) != 0 && (!rmw || self.rt != 31);
+            let element = if pair { self.size / 2 } else { self.size };
+            let mask = if element == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (element * 8)) - 1
+            };
+            let (old, direct) = memory
+                .cpu_atomic_chunk(address, self.size, release, acquire, |bytes| {
+                    let old = unsafe { code.call_atomic(bytes.as_mut_ptr(), &inputs) };
+                    let written = rmw
+                        || old.first == inputs[0] & mask
+                            && (!pair || old.second == inputs[1] & mask);
+                    (old, written)
+                })
+                .map_err(fault)?;
+            cpu.set_x(if rmw { self.rt } else { compare }, old.first);
+            if pair {
+                cpu.set_x(compare + 1, old.second);
+            }
+            cpu.pc = pc.wrapping_add(4);
+            return Ok(direct);
+        }
         // Checked-access recovery retains the existing interpreter fault boundary.
         // Inline native accesses rely on hardware, without a software preflight.
         if self.ordered && !address.is_multiple_of(self.size as u64) {

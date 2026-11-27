@@ -31,12 +31,57 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 /// address-space identity stay with the borrowed Memory/View, not these counters.
 pub struct InstructionEpochs<'a>(pub [Option<&'a std::sync::atomic::AtomicU64>; 3]);
 
+#[cfg(feature = "native-code")]
+fn atomic_transport<M: CpuMemory + ?Sized, T>(
+    memory: &mut M,
+    address: u64,
+    len: usize,
+    release: bool,
+    acquire: bool,
+    operation: impl FnOnce(&mut [u8]) -> (T, bool),
+) -> Result<(T, bool), MemoryError> {
+    #[repr(align(16))]
+    struct Operand([u8; 16]);
+    // An exceptional provider transaction may stage. Ordering surrounds the
+    // canonical publication, rather than only the instruction's temporary.
+    if release {
+        memory.fence(Ordering::Release);
+    }
+    let value = memory.atomic_update(address, len, |bytes| {
+        let mut operand = Operand([0; 16]);
+        operand.0[..len].copy_from_slice(bytes);
+        let (result, written) = operation(&mut operand.0[..len]);
+        if written {
+            bytes.copy_from_slice(&operand.0[..len]);
+        }
+        (result, written)
+    })?;
+    if acquire {
+        memory.fence(Ordering::Acquire);
+    }
+    Ok((value, false))
+}
+
 pub trait CpuMemory {
     /// Cold embedding capability: RAM and publication obey the host memory model.
     /// Unknown embeddings retain their existing abstract fence/interpreter path.
     #[cfg(feature = "native-code")]
     fn cpu_hardware_ordering(&self) -> bool {
         false
+    }
+    /// Native RMW over the same canonical storage/transaction as the CPU.
+    /// The callback executes the actual instruction and reports whether CAS
+    /// wrote; it does not implement an RMW algorithm in Rust. `len` is 1/2/4/8/16.
+    #[cfg(feature = "native-code")]
+    fn cpu_atomic_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        release: bool,
+        acquire: bool,
+        operation: impl FnOnce(&mut [u8]) -> (T, bool),
+    ) -> Result<(T, bool), MemoryError> {
+        atomic_transport(self, address, len, release, acquire, operation)
     }
     #[cfg(feature = "native-code")]
     fn cpu_acquire_chunk<T>(
@@ -307,6 +352,39 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    #[cfg(feature = "native-code")]
+    fn cpu_atomic_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        release: bool,
+        acquire: bool,
+        operation: impl FnOnce(&mut [u8]) -> (T, bool),
+    ) -> Result<(T, bool), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared
+                .borrow_mut()
+                .cpu_atomic_chunk(address, len, release, acquire, operation);
+        }
+        let address = address & 0x00ff_ffff_ffff_ffff;
+        let page = self.page_for_access(address, len, Access::Write)?;
+        self.check(address, len, Access::Read)?;
+        if page.shared_write_storage().is_some() {
+            // Existing region transaction and conditional publication, on real
+            // storage. The instruction itself supplies the required ordering.
+            return self.atomic_update(address, len, |bytes| {
+                let (value, written) = operation(bytes);
+                ((value, true), written)
+            });
+        }
+        if page.backing.as_ref().is_none_or(|b| !b.shared) {
+            // Quiescent Memory owns ordinary RAM/COW. Write intent prepares
+            // COW/permissions and existing metadata before native execution,
+            // including a failed CAS (architecturally allowed monitor loss).
+            return self.with_write_chunk(address, len, |bytes| operation(bytes).0);
+        }
+        atomic_transport(self, address, len, release, acquire, operation)
+    }
     #[cfg(feature = "native-code")]
     fn cpu_hardware_ordering(&self) -> bool {
         true

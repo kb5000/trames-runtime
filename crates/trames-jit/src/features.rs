@@ -73,7 +73,16 @@ pub(crate) fn profile() -> &'static Profile {
 /// Cold translation gate. A missing extension faults when reached, rather than
 /// acquiring the reference interpreter's software implementation.
 pub(crate) fn permits(host: Features, word: u32) -> bool {
-    let required = if word & 0x7fe0e000 == 0x1ac04000 {
+    let required = if word & 0x3ffffc00 == 0x38bfc000 {
+        Some((0, 15)) // LRCPC: LDAPR/B/H
+    } else if word & 0x3f200c00 == 0x19000000 {
+        Some((0, 26)) // ILRCPC: LDAPUR/STLUR and sign-extending forms
+    } else if word & 0xbfa07c00 == 0x08207c00
+        || word & 0x3fa07c00 == 0x08a07c00
+        || word & 0x3f200c00 == 0x38200000
+    {
+        Some((0, 8)) // LSE, including discard-result store aliases
+    } else if word & 0x7fe0e000 == 0x1ac04000 {
         Some((0, 7))
     } else if matches!(word & 0x7ffffc00, 0x5ac01800 | 0x5ac01c00 | 0x5ac02000)
         || word & 0x7fe0f000 == 0x1ac06000
@@ -124,7 +133,7 @@ mod tests {
         };
         for word in [
             0x1ac24020, 0x5ac01820, 0x1ac26020, 0xd500401f, 0xd500403f, 0xd53b2400, 0x19000400,
-            0x19208000,
+            0x19208000, 0xf8220020, 0xc8a07c22, 0x48207c22, 0xf8bfc020, 0xd9400020,
         ] {
             assert!(!permits(base, word), "{word:08x}");
             assert!(permits(

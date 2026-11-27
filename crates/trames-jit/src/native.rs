@@ -1056,14 +1056,15 @@ impl Assembler {
             let slot = self
                 .bindings
                 .iter()
-                .position(Option::is_none)
+                .enumerate()
+                .find_map(|(i, b)| (b.is_none() && avoid & (1 << (i + 1)) == 0).then_some(i))
                 .unwrap_or_else(|| {
                     self.bindings
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| avoid & (1 << (i + 1)) == 0)
                         .min_by_key(|(_, b)| b.expect("occupied register").used)
-                        .expect("at most two pinned sources")
+                        .expect("native operand bindings fit the caller-saved bank")
                         .0
                 });
             if let Some(binding) = self.bindings[slot] {
@@ -1184,9 +1185,14 @@ impl Assembler {
         }
     }
     fn hardware_memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
-        use crate::memory_ops::Address;
-        const SCRATCH: u32 = (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13);
-        for slot in 9..13 {
+        use crate::memory_ops::{Address, Atomic};
+        let cas_pair = matches!(op.atomic, Some(Atomic::Cas { pair: true, .. }));
+        let scratch: u32 = (1 << 10)
+            | (1 << 11)
+            | (1 << 12)
+            | (1 << 13)
+            | if cas_pair { (1 << 6) | (1 << 7) } else { 0 };
+        for slot in (0..13).filter(|slot| scratch & (1 << (slot + 1)) != 0) {
             if let Some(binding) = self.bindings[slot].take() {
                 self.store(slot, binding);
                 self.hosts[binding.guest as usize] = u8::MAX;
@@ -1223,23 +1229,54 @@ impl Assembler {
         let base = if matches!(op.address, Address::Literal(_)) {
             31
         } else {
-            self.read(sp_register(op.rn as u32), SCRATCH)
+            self.read(sp_register(op.rn as u32), scratch)
         };
         let source = if op.load {
             31
         } else {
-            self.read(op.rt as u32, SCRATCH | (1 << base))
+            self.read(
+                match op.atomic {
+                    Some(Atomic::Rmw { source }) => source as u32,
+                    _ => op.rt as u32,
+                },
+                scratch | (1 << base),
+            )
         };
         let source2 = if !op.load {
             op.second
-                .map(|reg| self.read(reg as u32, SCRATCH | (1 << base) | (1 << source)))
+                .or(cas_pair.then_some(op.rt + 1))
+                .map(|reg| self.read(reg as u32, scratch | (1 << base) | (1 << source)))
         } else {
             None
         };
         let index = if let Address::Register { reg, .. } = op.address {
-            self.read(reg as u32, SCRATCH | (1 << base) | (1 << source))
+            self.read(reg as u32, scratch | (1 << base) | (1 << source))
         } else {
             31
+        };
+        let compare = if let Some(Atomic::Cas { compare, .. }) = op.atomic {
+            Some(self.read(
+                compare as u32,
+                scratch | (1 << base) | (1 << source) | source2.map_or(0, |r| 1 << r),
+            ))
+        } else {
+            None
+        };
+        let compare2 = if let Some(Atomic::Cas {
+            compare: reg,
+            pair: true,
+        }) = op.atomic
+        {
+            Some(self.read(
+                (reg + 1) as u32,
+                scratch
+                    | (1 << base)
+                    | (1 << source)
+                    | source2.map_or(0, |r| 1 << r)
+                    | compare.map_or(0, |r| 1 << r),
+            ))
+        } else {
+            None
         };
         let prior = self.clone();
         let prior_stores = self.traffic.register_stores;
@@ -1331,26 +1368,67 @@ impl Assembler {
         if self.flags_live {
             self.words.push(0xd51b420c);
         }
-        let target = if op.load {
-            self.output(op.rt as u32, SCRATCH | (1 << base))
+        let output = match op.atomic {
+            Some(Atomic::Cas { compare, .. }) => Some(compare),
+            Some(Atomic::Rmw { .. }) => Some(op.rt),
+            None if op.load => Some(op.rt),
+            _ => None,
+        };
+        let target = if let Some(reg) = output {
+            self.output(reg as u32, scratch | (1 << base) | (1 << source))
         } else {
             source
         };
-        let target2 = if op.load {
+        let target2 = if cas_pair {
+            Some(self.output(
+                (output.unwrap() + 1) as u32,
+                scratch
+                    | (1 << base)
+                    | (1 << target)
+                    | (1 << source)
+                    | source2.map_or(0, |r| 1 << r),
+            ))
+        } else if op.load {
             op.second
-                .map(|reg| self.output(reg as u32, SCRATCH | (1 << base) | (1 << target)))
+                .map(|reg| self.output(reg as u32, scratch | (1 << base) | (1 << target)))
         } else {
             source2
         };
+        if cas_pair {
+            // Keep NZCV recovery in x12. CASP requires even consecutive register
+            // pairs, so reserve x6/x7 and x10/x11 only for this cold-chosen form.
+            self.words.push(0xaa0b03ed); // x13 keeps the selected hit counter
+            for (dest, src) in [
+                (10, compare.unwrap()),
+                (11, compare2.unwrap()),
+                (6, source),
+                (7, source2.unwrap()),
+            ] {
+                self.words.push(0xaa0003e0 | (src << 16) | dest);
+            }
+        }
         let fault = self.words.len();
-        self.words.push(if let Some(second) = target2 {
-            (op.opcode.expect("pair operand") & !0x7fff) | (second << 10) | (17 << 5) | target
-        } else {
-            (op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target
+        self.words.push(match op.atomic {
+            Some(Atomic::Rmw { .. }) => op.opcode.unwrap() | (source << 16) | (17 << 5) | target,
+            Some(Atomic::Cas { pair: false, .. }) => {
+                op.opcode.unwrap() | (target << 16) | (17 << 5) | source
+            }
+            Some(Atomic::Cas { pair: true, .. }) => op.opcode.unwrap() | (10 << 16) | (17 << 5) | 6,
+            None if target2.is_some() => {
+                (op.opcode.unwrap() & !0x7fff) | (target2.unwrap() << 10) | (17 << 5) | target
+            }
+            None => (op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target,
         });
+        if cas_pair {
+            self.words.extend_from_slice(&[
+                0xaa0a03e0 | target,
+                0xaa0b03e0 | target2.unwrap(),
+                0xaa0d03eb,
+            ]);
+        }
         if let Address::Pre(offset) | Address::Post(offset) = op.address {
             constant(&mut self.words, 10, offset);
-            let target = self.output(sp_register(op.rn as u32), SCRATCH | (1 << base));
+            let target = self.output(sp_register(op.rn as u32), scratch | (1 << base));
             self.words.push(0x8b0a0000 | (base << 5) | target);
         }
         load(&mut self.words, 10, 11, 0);
@@ -2040,6 +2118,7 @@ fn compile_with_features(
 pub(super) struct Code {
     pointer: *mut libc::c_void,
     length: usize,
+    words: usize,
     fixups: Option<trames_memory::NativeCodeFixups>,
     _thread: PhantomData<Rc<()>>,
 }
@@ -2076,6 +2155,7 @@ impl Code {
         let mut mapping = Self {
             pointer,
             length,
+            words: words.len(),
             fixups: None,
             _thread: PhantomData,
         };
@@ -2122,6 +2202,16 @@ impl Code {
         let function: unsafe extern "C" fn(*mut u8, u64, u64) -> PairValues =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(pointer, first, second) }
+    }
+    pub(super) fn word_count(&self) -> u64 {
+        self.words as u64
+    }
+    pub(super) unsafe fn call_atomic(&self, pointer: *mut u8, inputs: &[u64; 4]) -> PairValues {
+        // One native LSE instruction, fixed even pairs for CASP. Canonical
+        // storage or the original provider transaction retains all byte custody.
+        let function: unsafe extern "C" fn(*mut u8, *const u64) -> PairValues =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(pointer, inputs.as_ptr()) }
     }
     unsafe fn call_tail(&self, offset: usize, registers: &mut [u64; 31], links: *const usize) {
         // SAFETY: the caller validated the bounded two-block edge and owns both
@@ -2194,6 +2284,48 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lse_and_rcpc_lower_to_one_original_hardware_instruction() {
+        let host = crate::features::profile().allowed;
+        for word in [
+            0xf8240020, 0xf824803f, 0xc8a27c24, 0x48227c24, 0xf8bfc020, 0xd9400020, 0x99800020,
+            0xd9000020,
+        ] {
+            if !crate::features::permits(host, word) {
+                continue;
+            }
+            let m = memory(&[word, 0xd4000001]);
+            let op = crate::memory_ops::Operation::compile(&m, 0x1000)
+                .unwrap()
+                .unwrap();
+            let compiled = compile(&m, 0x1000, 64, 0, 8 | 16 | 1).unwrap().unwrap();
+            assert_eq!(compiled.block.instructions, 2);
+            let words = unsafe {
+                std::slice::from_raw_parts(
+                    compiled.block.code.pointer.cast::<u32>(),
+                    compiled.block.traffic.host_words as usize,
+                )
+            };
+            let mask = if op.atomic.is_some() {
+                !0x1f03ff
+            } else {
+                !0x3ff
+            };
+            let sites: Vec<_> = words
+                .iter()
+                .filter(|&&w| w & mask == op.opcode.unwrap() & mask)
+                .collect();
+            assert_eq!(sites.len(), 1, "{word:08x}");
+            if matches!(
+                op.atomic,
+                Some(crate::memory_ops::Atomic::Cas { pair: true, .. })
+            ) {
+                assert_eq!((sites[0] >> 16) & 1, 0);
+                assert_eq!(sites[0] & 1, 0);
+            }
+        }
+    }
 
     #[test]
     fn pair_ordered_and_barrier_lowerings_preserve_hardware_opcodes() {
