@@ -1,0 +1,26 @@
+[
+  {
+    "transport": "smccc",
+    "version": "before",
+    "jit_ns_per_add": 1.6914277538176505,
+    "kvm_ns_per_add": 0.22382508554766256
+  },
+  {
+    "transport": "smccc",
+    "version": "after",
+    "jit_ns_per_add": 0.2145919184530935,
+    "kvm_ns_per_add": 0.2239814881355532
+  },
+  {
+    "transport": "mmio",
+    "version": "before",
+    "jit_ns_per_add": 1.7018107445009294,
+    "kvm_ns_per_add": 0.22493387037707913
+  },
+  {
+    "transport": "mmio",
+    "version": "after",
+    "jit_ns_per_add": 0.21571737720120338,
+    "kvm_ns_per_add": 0.22445444906911544
+  }
+]

@@ -1,0 +1,28 @@
+{
+  "controlled_runtime_base": "eefc3b2d9efa46899d68248cae1249a2b2add349",
+  "integrated_parent": "10dcf23f6e57e3a7a4fa25409754912778712d5a",
+  "kvm_source": "9db947eba448b871f31ca06511c46430bfb35387",
+  "raw_host_hwcap": "0xefb3ffff",
+  "raw_host_hwcap2": "0x2000100326181",
+  "host_page_size": 4096,
+  "cpu_affinity": [
+    2
+  ],
+  "toolchain": "nightly-2026-10-16",
+  "profile": "release, thin LTO, overflow checks, incremental off",
+  "before_binary_sha256": "854f9f7bff475de0080ebd1af76a3a6e697cda686a7ce4c736d5c53e14dd1147",
+  "after_binary_sha256": "8c2f0b8749e353b8db89eb97e964667c5adbb24b004543f3f4d86a4bfa10334e",
+  "jit_source_sha256": {
+    "crates/trames-jit/src/lib.rs": "3274fc5a69a17e0085ae3e70d7753e5085d81019614bda1f726af86676ef3650",
+    "crates/trames-jit/src/native.rs": "61afe1a3e3c8cc8721e520a6568f651d70b4a9f07bd2ca78551b2d12d7f060f6",
+    "crates/trames-jit/src/features.rs": "f04f6171d752e2dd1a65259e293518f88a9a4279336a76ba764a6f436a4ae1b8",
+    "crates/trames-jit/examples/cpu-boundary.rs": "f4554399c9f398d8e9037365d2b9616a985120386e87038ee90ca509c78fbe0e",
+    "crates/trames-jit/tests/differential.rs": "5ffee10361d8c50fc04e0551318562e56824d33a0cce290c5deec0a67c11aa37"
+  },
+  "notes": [
+    "Controlled before/after cohort uses the same pre-integration Runtime base.",
+    "Final integration with the independent perf commit has separate functional/Clippy checks; do not relabel frozen performance samples.",
+    "The only paired benchmark source change is the post-timing native-countdown assertion from 6291456 fallback instructions to zero.",
+    "No Android SDK, NDK, emulator, new VM or extension emulation state installed."
+  ]
+}

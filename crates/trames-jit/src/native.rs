@@ -34,8 +34,27 @@ struct Block {
     traffic: CompilationStats,
     fast_offset: usize,
     tail_offset: usize,
+    context: bool,
+    flow: Flow,
+}
+#[derive(Clone, Copy)]
+enum Flow {
+    Fixed,
+    Syscall,
+    Choice(u64),
+    Register,
 }
 impl Block {
+    fn accepts(&self, pc: u64) -> bool {
+        match self.flow {
+            Flow::Fixed | Flow::Syscall => pc == self.next_pc,
+            Flow::Choice(taken) => pc == self.next_pc || pc == taken,
+            Flow::Register => true,
+        }
+    }
+    fn dynamic(&self) -> bool {
+        matches!(self.flow, Flow::Choice(_) | Flow::Register)
+    }
     fn entry(&self) -> usize {
         self.code.pointer as usize + CHAIN_ENTRY
     }
@@ -61,9 +80,12 @@ struct Frame {
     links: *const usize,
     epochs: [*const std::sync::atomic::AtomicU64; 3],
     expected: [u64; 3],
+    link_pcs: *const u64,
+    sp: u64,
+    nzcv: u64,
 }
 const _: () = {
-    assert!(std::mem::size_of::<Frame>() == 96);
+    assert!(std::mem::size_of::<Frame>() == 120);
     assert!(std::mem::offset_of!(Frame, remaining) == 0);
     assert!(std::mem::offset_of!(Frame, blocks) == 8);
     assert!(std::mem::offset_of!(Frame, pc) == 16);
@@ -72,6 +94,9 @@ const _: () = {
     assert!(std::mem::offset_of!(Frame, links) == 40);
     assert!(std::mem::offset_of!(Frame, epochs) == 48);
     assert!(std::mem::offset_of!(Frame, expected) == 72);
+    assert!(std::mem::offset_of!(Frame, link_pcs) == 96);
+    assert!(std::mem::offset_of!(Frame, sp) == 104);
+    assert!(std::mem::offset_of!(Frame, nzcv) == 112);
 };
 
 pub(super) struct Cache {
@@ -80,6 +105,7 @@ pub(super) struct Cache {
     // Addresses never move; only this worker writes cells, between native calls.
     links: Box<[usize; CACHE_LIMIT]>,
     tails: Box<[usize; CACHE_LIMIT]>,
+    link_pcs: Box<[u64; CACHE_LIMIT]>,
     active: Option<(Identity, u8)>,
     hot: Option<Handle>,
     last: Option<Handle>,
@@ -95,6 +121,7 @@ impl Default for Cache {
             nodes: Box::new(std::array::from_fn(|_| None)),
             links: Box::new([0; CACHE_LIMIT]),
             tails: Box::new([0; CACHE_LIMIT]),
+            link_pcs: Box::new([0; CACHE_LIMIT]),
             active: None,
             hot: None,
             last: None,
@@ -225,8 +252,7 @@ impl Cache {
                 })
         });
         self.remove(slot);
-        let block = compile(memory, pc, limit, slot, mode)
-            .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?;
+        let block = compile(memory, pc, limit, slot, mode)?;
         if let Some(block) = &block {
             self.stats.blocks += 1;
             self.stats.host_words += block.traffic.host_words;
@@ -271,7 +297,7 @@ impl Cache {
             || b.checked != checked
             || a.key.2 != b.key.2
             || a.page != b.page
-            || from.next_pc != b.key.0
+            || !from.accepts(b.key.0)
             || a.key.0 / PAGE_SIZE != b.key.0 / PAGE_SIZE
             // Budget-cut prefixes remain usable for exact stepping, but must
             // never replace a full-block hot edge with a shorter fragment.
@@ -280,13 +306,20 @@ impl Cache {
             return;
         }
         let entry = to.entry();
-        let tail = if a.key.2 == 8 && !from.syscall && to.syscall {
+        let tail = if a.key.2 == 8
+            && !from.syscall
+            && to.syscall
+            && !from.context
+            && !to.context
+            && !from.dynamic()
+        {
             to.scalar_entry()
         } else {
             0
         };
         self.nodes[source.slot].as_mut().unwrap().next = Some(target);
         self.links[source.slot] = entry;
+        self.link_pcs[source.slot] = self.nodes[target.slot].as_ref().unwrap().key.0;
         self.tails[source.slot] = tail;
     }
     pub(super) fn execute(
@@ -302,10 +335,9 @@ impl Cache {
         if let Some(handle) = self.hot {
             if let Some(node) = self.node(handle) {
                 if node.key.0 == pc
-                    && node
-                        .block
-                        .as_ref()
-                        .is_some_and(|block| block.syscall && block.instructions <= budget)
+                    && node.block.as_ref().is_some_and(|block| {
+                        block.syscall && !block.context && block.instructions <= budget
+                    })
                     && node.checked == memory.instruction_identity()
                 {
                     let block = node.block.as_ref().unwrap();
@@ -385,6 +417,9 @@ impl Cache {
             links: self.links.as_ptr(),
             epochs: [std::ptr::null(); 3],
             expected: [0; 3],
+            link_pcs: self.link_pcs.as_ptr(),
+            sp: cpu.sp,
+            nzcv: (cpu.nzcv() as u64) << 28,
         };
         let mut mode = if epochs.is_some() { 8 } else { 0 };
         if let Some(epochs) = &epochs {
@@ -410,13 +445,13 @@ impl Cache {
         let source = self.last.take().filter(|handle| {
             self.node(*handle).is_some_and(|node| {
                 node.checked == checked
-                    && node.block.as_ref().is_some_and(|block| block.next_pc == pc)
+                    && node.block.as_ref().is_some_and(|block| block.accepts(pc))
             })
         });
         let resume = source
             .and_then(|h| self.node(h))
             .filter(|n| n.checked == checked)
-            .and_then(|n| n.block.as_ref().filter(|b| b.next_pc == pc).and(n.next))
+            .and_then(|n| n.block.as_ref().filter(|b| b.accepts(pc)).and(n.next))
             .filter(|h| {
                 self.node(*h).is_some_and(|n| {
                     n.checked == checked
@@ -466,13 +501,23 @@ impl Cache {
         if block.syscall || self.links[handle.slot] == 0 {
             // Never pay chain-frame stores for an entry that cannot chain.
             unsafe {
-                block
-                    .code
-                    .call_scalar(block.fast_offset, cpu.general_registers_mut());
+                if block.context {
+                    block.code.call_context(
+                        block.fast_offset,
+                        cpu.general_registers_mut(),
+                        &mut frame,
+                    );
+                } else {
+                    block
+                        .code
+                        .call_scalar(block.fast_offset, cpu.general_registers_mut());
+                }
             }
             frame.remaining = budget - block.instructions;
             frame.blocks = 1;
-            frame.pc = block.next_pc;
+            if !block.dynamic() {
+                frame.pc = block.next_pc;
+            }
             frame.syscall = u64::from(block.syscall);
             frame.last_slot = handle.slot as u64;
         } else {
@@ -483,6 +528,8 @@ impl Cache {
         self.links_stats.entries += 1;
         self.links_stats.linked_blocks += frame.blocks.saturating_sub(1);
         cpu.pc = frame.pc;
+        cpu.sp = frame.sp;
+        cpu.set_nzcv((frame.nzcv >> 28) as u32);
         if frame.last_slot < NO_SLOT {
             self.last = Some(self.handle(frame.last_slot as usize));
         }
@@ -510,7 +557,10 @@ struct Binding {
 struct Assembler {
     words: Vec<u32>,
     bindings: [Option<Binding>; 13],
-    hosts: [u8; 31],
+    hosts: [u8; 33],
+    context: bool,
+    flags_live: bool,
+    flags_dirty: bool,
     clock: u32,
     traffic: CompilationStats,
 }
@@ -519,15 +569,22 @@ impl Assembler {
         Self {
             words: Vec::new(),
             bindings: [None; 13],
-            hosts: [u8::MAX; 31],
+            hosts: [u8::MAX; 33],
+            context: false,
+            flags_live: false,
+            flags_dirty: false,
             clock: 0,
             traffic: CompilationStats::default(),
         }
     }
     fn store(&mut self, slot: usize, binding: Binding) {
         if binding.dirty {
-            self.words
-                .push(0xf9000000 | (binding.guest << 10) | (slot as u32 + 1)); // str xH,[x0,#guest*8]
+            if binding.guest == 32 {
+                store(&mut self.words, slot as u32 + 1, 104);
+            } else {
+                self.words
+                    .push(0xf9000000 | (binding.guest << 10) | (slot as u32 + 1));
+            }
             self.traffic.register_stores += 1;
         }
     }
@@ -558,8 +615,13 @@ impl Assembler {
                 self.hosts[binding.guest as usize] = u8::MAX;
             }
             if read {
-                self.words
-                    .push(0xf9400000 | (guest << 10) | (slot as u32 + 1)); // ldr xH,[x0,#guest*8]
+                if guest == 32 {
+                    load(&mut self.words, slot as u32 + 1, 16, 104);
+                    self.context = true;
+                } else {
+                    self.words
+                        .push(0xf9400000 | (guest << 10) | (slot as u32 + 1));
+                }
                 self.traffic.register_loads += 1;
             }
             self.hosts[guest as usize] = slot as u8;
@@ -570,6 +632,7 @@ impl Assembler {
             });
             slot
         };
+        self.context |= guest == 32;
         let binding = self.bindings[slot].as_mut().expect("bound register");
         binding.used = self.clock;
         binding.dirty |= !read;
@@ -596,14 +659,33 @@ impl Assembler {
             }
         }
     }
-    fn finish(mut self) -> (Vec<u32>, CompilationStats) {
+    fn flags_read(&mut self) {
+        self.context = true;
+        if !self.flags_live {
+            load(&mut self.words, 17, 16, 112);
+            self.words.push(0xd51b4211); // msr nzcv,x17; never host TLS
+            self.flags_live = true;
+        }
+    }
+    fn flags_written(&mut self) {
+        self.context = true;
+        self.flags_live = true;
+        self.flags_dirty = true;
+    }
+    fn finish(mut self) -> (Vec<u32>, CompilationStats, bool) {
         for slot in 0..self.bindings.len() {
             if let Some(binding) = self.bindings[slot] {
                 self.store(slot, binding);
             }
         }
+        if self.flags_dirty {
+            // Bindings have all been flushed. x11 is now scratch, while x17
+            // may hold a dynamic guest PC computed before an aliased LR write.
+            self.words.push(0xd53b420b); // mrs x11,nzcv
+            store(&mut self.words, 11, 112);
+        }
         self.traffic.host_words = self.words.len() as u64;
-        (self.words, self.traffic)
+        (self.words, self.traffic, self.context)
     }
 }
 
@@ -645,8 +727,10 @@ fn render(
     slot: usize,
     count: u64,
     mask: u8,
-    syscall: bool,
+    flow: Flow,
 ) -> Vec<u32> {
+    let syscall = matches!(flow, Flow::Syscall);
+    let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
     let mut words = vec![0xd503245f, 0xaa0103f0, 0xf940020f, 0xaa1f03ee, 0xd50324df]; // BTI c; ctx=x1; budget; blocks=0; BTI jc
     let mut guards = Vec::new();
     for i in 0..3 {
@@ -669,11 +753,21 @@ fn render(
     words.push(0x54000003); // b.lo: no over-retirement
     words.push(0xd1000000 | ((count as u32) << 10) | (15 << 5) | 15);
     words.extend_from_slice(body);
+    if dynamic {
+        store(&mut words, 17, 16);
+    }
     words.push(0x91000000 | (1 << 10) | (14 << 5) | 14);
     let mut done = Vec::new();
     if !syscall {
         done.push(words.len());
         words.push(0xb400000f); // cbz budget
+        if dynamic {
+            load(&mut words, 11, 16, 96);
+            load(&mut words, 11, 11, slot as u32 * 8);
+            words.push(0xeb0b023f); // cmp selected guest PC (x17), cached edge PC (x11)
+            done.push(words.len());
+            words.push(0x54000001); // b.ne actual-PC exit
+        }
         load(&mut words, 17, 16, 40);
         load(&mut words, 17, 17, slot as u32 * 8);
         done.push(words.len());
@@ -681,7 +775,16 @@ fn render(
         words.push(0xd61f0220); // br x17 (link entry has BTI jc)
     }
     let success = words.len();
-    exit(&mut words, next, slot as u64, syscall);
+    if dynamic {
+        // The selected PC was published before link lookup could clobber x17.
+        constant(&mut words, 17, slot as u64);
+        store(&mut words, 17, 32);
+        store(&mut words, 15, 0);
+        store(&mut words, 14, 8);
+        words.push(0xd65f03c0);
+    } else {
+        exit(&mut words, next, slot as u64, syscall);
+    }
     let failed = words.len();
     exit(&mut words, start, NO_SLOT, false);
     for at in done {
@@ -697,35 +800,105 @@ fn signed(value: u64, bits: u32) -> u64 {
     ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 
+fn sp_register(reg: u32) -> u32 {
+    if reg == 31 {
+        32
+    } else {
+        reg
+    }
+}
+
+// Translation-time validation, identical to the canonical logical-immediate
+// mask decoder. No mask decoding executes inside a generated block.
+fn logical_mask(n: u32, s: u32, _r: u32, wide: bool) -> bool {
+    let value = (n << 6) | (!s & 63);
+    if value == 0 || (!wide && n != 0) {
+        return false;
+    }
+    let len = 31 - value.leading_zeros();
+    len >= 1 && s & ((1 << len) - 1) != (1 << len) - 1
+}
+
+fn select_pc(code: &mut Assembler, test: u32, fall: u64, taken: u64) {
+    code.context = true;
+    let yes = code.words.len();
+    code.words.push(test);
+    constant(&mut code.words, 17, fall);
+    let done = code.words.len();
+    code.words.push(0x14000000);
+    let target = code.words.len();
+    constant(&mut code.words, 17, taken);
+    let end = code.words.len();
+    branch(&mut code.words, yes, target);
+    code.words[done] |= (end - done) as u32;
+}
+
 fn compile(
     memory: &impl CpuMemory,
     start: u64,
     limit: u64,
     slot: usize,
     mode: u8,
-) -> std::io::Result<Option<Block>> {
+) -> Result<Option<Block>, CpuFault> {
+    compile_with_features(
+        memory,
+        start,
+        limit,
+        slot,
+        mode,
+        crate::features::profile().allowed,
+    )
+}
+fn compile_with_features(
+    memory: &impl CpuMemory,
+    start: u64,
+    limit: u64,
+    slot: usize,
+    mode: u8,
+    host: trames_execution::Features,
+) -> Result<Option<Block>, CpuFault> {
     let mut code = Assembler::new();
     let mut count = 0;
     let mut next = start;
     let mut syscall = false;
+    let mut flow = Flow::Fixed;
     for _ in 0..limit {
         let pc = next;
         // Never report lookahead faults; fault only when the reached PC fails.
         let Ok(word) = memory.fetch_u32(pc) else {
             break;
         };
+        if !crate::features::permits(host, word) {
+            if count == 0 {
+                return Err(CpuFault::Instruction {
+                    pc,
+                    instruction: word,
+                });
+            }
+            break; // A preceding prefix must retire before the reached fault.
+        }
         let rd = word & 31;
         let rn = (word >> 5) & 31;
         let rm = (word >> 16) & 31;
         let sf = word >> 31;
+        let flags = word & (1 << 29) != 0;
         let mut terminal = false;
         if word & 0xffe0001f == 0xd4000001 {
-            // Retire SVC exactly once, advance guest PC and return to Runtime.
-            // Never put the guest SVC opcode in host executable memory.
             syscall = true;
+            flow = Flow::Syscall;
             next = pc.wrapping_add(4);
             terminal = true;
         } else if word == 0xd503201f { // NOP
+        } else if word & 0x7fe0e000 == 0x1ac04000 {
+            let bytes = 1 << ((word >> 10) & 3);
+            if (sf != 0) != (bytes == 8) {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
         } else if word & 0x1f800000 == 0x12800000 {
             let opc = (word >> 29) & 3;
             if opc == 1 || (sf == 0 && (word >> 21) & 3 >= 2) {
@@ -736,14 +909,14 @@ fn compile(
             }
             let dest = code.output(rd, 0);
             code.words.push((word & !31) | dest);
-        } else if word & 0x1f800000 == 0x11000000 && word & (1 << 29) == 0 {
-            if rd == 31 || rn == 31 {
-                break;
-            } // SP forms still use interpreter
-            let lhs = code.read(rn, 0);
-            let dest = code.output(rd, 1 << lhs);
+        } else if word & 0x1f800000 == 0x11000000 {
+            let lhs = code.read(sp_register(rn), 0);
+            let dest = code.output(if flags { rd } else { sp_register(rd) }, 1 << lhs);
             code.words.push((word & !0x3ff) | (lhs << 5) | dest);
-        } else if word & 0x1f200000 == 0x0b000000 && word & (1 << 29) == 0 {
+            if flags {
+                code.flags_written();
+            }
+        } else if word & 0x1f200000 == 0x0b000000 {
             if (word >> 22) & 3 == 3 || (sf == 0 && (word >> 10) & 63 >= 32) {
                 break;
             }
@@ -752,7 +925,32 @@ fn compile(
             let dest = code.output(rd, (1 << lhs) | (1 << rhs));
             code.words
                 .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-        } else if word & 0x1f000000 == 0x0a000000 && (word >> 29) & 3 != 3 {
+            if flags {
+                code.flags_written();
+            }
+        } else if word & 0x1f200000 == 0x0b200000 {
+            if (word >> 10) & 7 > 4 || word & (3 << 22) != 0 {
+                break;
+            }
+            let lhs = code.read(sp_register(rn), 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(
+                if flags { rd } else { sp_register(rd) },
+                (1 << lhs) | (1 << rhs),
+            );
+            // The reference accepts UXTX/SXTX in a W operation. Its low 32
+            // bits are identical to UXTW/SXTW; use the valid host W encoding.
+            let word = if sf == 0 && (word >> 13) & 3 == 3 {
+                word & !(1 << 13)
+            } else {
+                word
+            };
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+            if flags {
+                code.flags_written();
+            }
+        } else if word & 0x1f000000 == 0x0a000000 {
             if sf == 0 && (word >> 10) & 63 >= 32 {
                 break;
             }
@@ -761,6 +959,149 @@ fn compile(
             let dest = code.output(rd, (1 << lhs) | (1 << rhs));
             code.words
                 .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+            if (word >> 29) & 3 == 3 {
+                code.flags_written();
+            }
+        } else if word & 0x1f800000 == 0x12000000 {
+            if !logical_mask(
+                (word >> 22) & 1,
+                (word >> 10) & 63,
+                (word >> 16) & 63,
+                sf != 0,
+            ) {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let writes_flags = (word >> 29) & 3 == 3;
+            let dest = code.output(if writes_flags { rd } else { sp_register(rd) }, 1 << lhs);
+            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
+            if writes_flags {
+                code.flags_written();
+            }
+        } else if word & 0x1f800000 == 0x13000000 {
+            let opc = (word >> 29) & 3;
+            let bits = if sf == 0 { 32 } else { 64 };
+            if opc == 3
+                || (word >> 22) & 1 != sf
+                || (word >> 16) & 63 >= bits
+                || (word >> 10) & 63 >= bits
+            {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            if opc == 1 {
+                code.read(rd, 1 << lhs);
+            }
+            let dest = code.output(rd, 1 << lhs);
+            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
+        } else if word & 0x1f800000 == 0x13800000 {
+            if word & 0x60200000 != 0
+                || (word >> 22) & 1 != sf
+                || (sf == 0 && (word >> 10) & 63 >= 32)
+            {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+        } else if word & 0x1fe00800 == 0x1a800000 {
+            if flags {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            code.flags_read();
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+        } else if word & 0x1fe00410 == 0x1a400000 {
+            if !flags {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = if word & (1 << 11) == 0 {
+                code.read(rm, 1 << lhs)
+            } else {
+                rm
+            };
+            code.flags_read();
+            code.words
+                .push((word & !0x1f03e0) | (rhs << 16) | (lhs << 5));
+            code.flags_written();
+        } else if word & 0x1fe0fc00 == 0x1a000000 {
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            code.flags_read();
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+            if flags {
+                code.flags_written();
+            }
+        } else if word & 0x1f000000 == 0x1b000000 {
+            let kind = (word >> 21) & 7;
+            let ra = (word >> 10) & 31;
+            if word & 0x60000000 != 0
+                || !(kind == 0
+                    || (sf != 0 && matches!(kind, 1 | 5))
+                    || (sf != 0 && word & (1 << 15) == 0 && ra == 31 && matches!(kind, 2 | 6)))
+            {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let addend = code.read(ra, (1 << lhs) | (1 << rhs));
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs) | (1 << addend));
+            code.words
+                .push((word & !0x1f7fff) | (rhs << 16) | (addend << 10) | (lhs << 5) | dest);
+        } else if word & 0x7fe0f000 == 0x1ac06000 || word & 0x7ff00000 == 0x11c00000 {
+            let immediate = word & 0x7ff00000 == 0x11c00000;
+            let lhs = code.read(rn, 0);
+            let rhs = if immediate {
+                0
+            } else {
+                code.read(rm, 1 << lhs)
+            };
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            let mask = if immediate { 0x3ff } else { 0x1f03ff };
+            code.words
+                .push((word & !mask) | (if immediate { 0 } else { rhs << 16 }) | (lhs << 5) | dest);
+        } else if word & 0x5fe00000 == 0x1ac00000 {
+            if flags || !matches!((word >> 10) & 63, 2 | 3 | 8..=11) {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let rhs = code.read(rm, 1 << lhs);
+            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
+            code.words
+                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
+        } else if word & 0x7fe00000 == 0x5ac00000 {
+            let kind = (word >> 10) & 63;
+            if rm != 0 || kind > 8 || (sf == 0 && kind == 3) {
+                break;
+            }
+            let lhs = code.read(rn, 0);
+            let dest = code.output(rd, 1 << lhs);
+            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
+        } else if matches!(word, 0xd500401f | 0xd500403f | 0xd500405f) {
+            code.flags_read();
+            code.words.push(word);
+            code.flags_written();
+        } else if word & 0xffe07c10 == 0xba000400 || word & 0xffffbc1f == 0x3a00080d {
+            let source = code.read(rn, 0);
+            code.flags_read();
+            code.words.push((word & !0x3e0) | (source << 5));
+            code.flags_written();
+        } else if word & 0xffffffe0 == 0xd53b4200 {
+            let dest = code.output(rd, 0);
+            code.flags_read();
+            code.words.push(0xd53b4200 | dest);
+        } else if word & 0xffffffe0 == 0xd51b4200 {
+            let value = code.read(rd, 0);
+            code.words.push(0xd51b4200 | value);
+            code.flags_written();
         } else if word & 0x1f000000 == 0x10000000 {
             let imm = signed(
                 (((word >> 5) & 0x7ffff) as u64) << 2 | ((word >> 29) & 3) as u64,
@@ -778,6 +1119,36 @@ fn compile(
             }
             next = pc.wrapping_add(signed((word & 0x3ffffff) as u64, 26) << 2);
             terminal = true;
+        } else if matches!(word & 0xfffffc1f, 0xd61f0000 | 0xd63f0000 | 0xd65f0000) {
+            let source = code.read(rn, 0);
+            code.words.push(0xaa0003f1 | (source << 16)); // mov x17,target before BLR aliases LR
+            if word & 0xfffffc1f == 0xd63f0000 {
+                code.constant(30, pc.wrapping_add(4));
+            }
+            code.context = true;
+            flow = Flow::Register;
+            next = pc.wrapping_add(4);
+            terminal = true;
+        } else if word & 0x7e000000 == 0x34000000 || word & 0x7e000000 == 0x36000000 {
+            let source = code.read(rd, 0);
+            let test_bit = word & 0x7e000000 == 0x36000000;
+            let taken = pc.wrapping_add(if test_bit {
+                signed(((word >> 5) & 0x3fff) as u64, 14) << 2
+            } else {
+                signed(((word >> 5) & 0x7ffff) as u64, 19) << 2
+            });
+            next = pc.wrapping_add(4);
+            let mask = if test_bit { 0x7ffff } else { 0xffffff };
+            select_pc(&mut code, (word & !mask) | source, next, taken);
+            flow = Flow::Choice(taken);
+            terminal = true;
+        } else if word & 0xff000010 == 0x54000000 {
+            next = pc.wrapping_add(4);
+            let taken = pc.wrapping_add(signed(((word >> 5) & 0x7ffff) as u64, 19) << 2);
+            code.flags_read();
+            select_pc(&mut code, word & !0xffffe0, next, taken);
+            flow = Flow::Choice(taken);
+            terminal = true;
         } else {
             break;
         }
@@ -790,11 +1161,18 @@ fn compile(
     if count == 0 {
         return Ok(None);
     }
-    let (body, mut traffic) = code.finish();
-    let mut words = render(&body, start, next, slot, count, mode & 7, syscall);
+    let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
+    let (body, mut traffic, context) = code.finish();
+    let mut words = render(&body, start, next, slot, count, mode & 7, flow);
     let fast_offset = words.len() * 4;
-    words.push(0xd50324df); // callable and tail-jump entry
+    words.push(0xd50324df);
+    if context {
+        words.push(0xaa0103f0);
+    } // ctx=x1; ordinary C scalar entry
     words.extend_from_slice(&body);
+    if dynamic {
+        store(&mut words, 17, 16);
+    }
     words.push(0xd65f03c0);
     let tail_offset = words.len() * 4;
     words.extend_from_slice(&[0xd503245f, 0xaa0103f0]);
@@ -803,13 +1181,16 @@ fn compile(
     words.push(0xd61f0220);
     traffic.host_words = words.len() as u64;
     Ok(Some(Block {
-        code: Code::publish(&words)?,
+        code: Code::publish(&words)
+            .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
         instructions: count,
         next_pc: next,
         syscall,
         traffic,
         fast_offset,
         tail_offset,
+        context,
+        flow,
     }))
 }
 
@@ -865,6 +1246,14 @@ impl Code {
             unsafe { std::mem::transmute(self.pointer.cast::<u8>().add(offset)) };
         unsafe {
             function(registers.as_mut_ptr(), links);
+        }
+    }
+    unsafe fn call_context(&self, offset: usize, registers: &mut [u64; 31], frame: &mut Frame) {
+        // SAFETY: published AAPCS64 entry, live frame and worker-owned mapping.
+        let function: unsafe extern "C" fn(*mut u64, *mut Frame) =
+            unsafe { std::mem::transmute(self.pointer.cast::<u8>().add(offset)) };
+        unsafe {
+            function(registers.as_mut_ptr(), frame);
         }
     }
     unsafe fn call_scalar(&self, offset: usize, registers: &mut [u64; 31]) {
@@ -942,6 +1331,9 @@ mod tests {
             links: links.as_ptr(),
             epochs: [std::ptr::null(); 3],
             expected: [0; 3],
+            link_pcs: std::ptr::null(),
+            sp: 0,
+            nzcv: 0,
         }
     }
     #[test]

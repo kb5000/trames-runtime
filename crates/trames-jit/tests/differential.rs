@@ -71,7 +71,7 @@ fn integer_blocks_preserve_exact_state_and_budgets() {
             }
         }
         assert_eq!(engine.stats.native_instructions > 0, NATIVE_COMPILED);
-        assert!(engine.stats.fallback_instructions > 0);
+        assert_eq!(engine.stats.fallback_instructions == 0, NATIVE_COMPILED);
         // Code is still the original immutable guest image.
         assert_eq!(
             a.read_array::<64>(0x1000).unwrap(),
@@ -610,5 +610,344 @@ fn memory_embeddings_without_epoch_capability_never_follow_native_links() {
     assert_eq!(after.linked_blocks, before.linked_blocks);
     if NATIVE_COMPILED {
         assert_eq!(after.entries - before.entries, 64);
+    }
+}
+
+#[test]
+fn scalar_flags_sp_and_bit_operations_are_native_and_match_reference() {
+    let cases: &[u32] = &[
+        0x1100041f, 0x7100041f, 0x31000400, 0x510007e1, // SP / CMP / flags immediates
+        0x0b020020, 0x6b82003f, 0x0b226020, 0x2b22e03f, // shifted/extended ADD(S)/SUB(S)
+        0x6a021020, 0x0a621020, 0x12001c20, 0x72001c3f, // ANDS/BIC/logical immediate
+        0x13017c20, 0x330c1c20, 0x53042020, 0x13821c20, // SBFM/BFM/UBFM/EXTR
+        0x1a820020, 0x5a821420, 0x3a42002a, 0x7a42082a, // CSEL/CSNEG/CCMN/CCMP
+        0x1a020020, 0x3a020020, 0x5a020020, 0x7a020020, // ADC/ADCS/SBC/SBCS
+        0x1b020c20, 0x1b028c20, 0x1ac20820, 0x1ac20c20, // MADD/MSUB/UDIV/SDIV
+        0x1ac22020, 0x1ac22420, 0x1ac22820, 0x1ac22c20, // variable shifts/rotate
+        0x5ac00020, 0x5ac00420, 0x5ac00820, 0x5ac01020, 0x5ac01420, 0xd53b4200,
+        0xd51b4200, // virtual NZCV
+    ];
+    for &base in cases {
+        for wide in [false, true] {
+            // EXTR and bitfield encodings require N == sf.
+            let word = if matches!(base & 0x1f800000, 0x13000000 | 0x13800000) {
+                base | if wide { 0x80400000 } else { 0 }
+            } else if base & 0xff000000 == 0xd5000000 {
+                base
+            } else {
+                base | if wide { 0x80000000 } else { 0 }
+            };
+            for nzcv in 0..16 {
+                let mut state = initial();
+                state.nzcv = nzcv << 28;
+                state.registers[0] = 0x80000000ffffffff;
+                state.registers[1] = 0x8000000000000000;
+                state.registers[2] = if nzcv % 2 == 0 { 0 } else { u64::MAX };
+                state.registers[3] = u64::MAX;
+                let mut a = memory(&[word]);
+                let mut b = memory(&[word]);
+                let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+                let mut actual = Cpu::new(0x1000, 0);
+                expected.restore_architectural_state(&state);
+                actual.restore_architectural_state(&state);
+                let mut engine = Engine::default();
+                let reference = expected.run_slice(&mut a, 1);
+                let compiled = actual.run_slice(&mut engine, &mut b, 1);
+                assert_eq!(
+                    format!("{compiled:?}"),
+                    format!("{reference:?}"),
+                    "{word:08x}"
+                );
+                assert_eq!(
+                    actual.architectural_state(),
+                    expected.architectural_state(),
+                    "{word:08x} NZCV={nzcv}"
+                );
+                if NATIVE_COMPILED {
+                    assert_eq!(engine.stats.fallback_instructions, 0, "{word:08x}");
+                    assert_eq!(engine.stats.native_instructions, 1, "{word:08x}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_countdown_links_and_retires_exactly_without_fallback() {
+    for flags in [false, true] {
+        let words = if flags {
+            [0x91000400, 0xf1000421, 0x54ffffc1, 0xd4000001] // ADD; SUBS; B.NE; SVC
+        } else {
+            [0x91000400, 0xd1000421, 0xb5ffffc1, 0xd4000001] // ADD; SUB; CBNZ; SVC
+        };
+        for budget in [1, 2, 3, 4, 31, 32, 33, 64, 10_000] {
+            let mut a = memory(&words);
+            let mut b = memory(&words);
+            let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+            let mut actual = Cpu::new(0x1000, 0);
+            expected.set_x(1, 127);
+            actual.set_x(1, 127);
+            let mut engine = Engine::default();
+            loop {
+                let x = expected.run_slice(&mut a, budget);
+                let y = actual.run_slice(&mut engine, &mut b, budget);
+                assert_eq!(outcome(&x), outcome(&y));
+                assert_eq!(actual.architectural_state(), expected.architectural_state());
+                if matches!(x, SliceOutcome::Syscall { .. }) {
+                    break;
+                }
+            }
+            assert_eq!((actual.x(0), actual.x(1), actual.pc()), (127, 0, 0x1010));
+            if NATIVE_COMPILED {
+                assert_eq!(engine.stats.fallback_instructions, 0);
+                if budget >= 64 {
+                    assert!(engine.link_stats().linked_blocks > 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_and_register_branches_preserve_flags_links_and_aliases() {
+    for word in [
+        0x34000040, 0x35000040, 0xb4000040, 0xb5000040, 0x36000040, 0x37000040, 0xb6f80040,
+        0xb7f80040, 0xd61f0020, 0xd63f03c0, 0xd65f03c0,
+    ] {
+        for value in [0, 1, 1 << 31, 1 << 63, u64::MAX] {
+            let mut state = initial();
+            state.nzcv = 0xd0000000;
+            state.registers[0] = value;
+            state.registers[1] = 0x1010;
+            state.registers[30] = 0x1014;
+            let mut a = memory(&[word]);
+            let mut b = memory(&[word]);
+            let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+            let mut actual = Cpu::new(0x1000, 0);
+            expected.restore_architectural_state(&state);
+            actual.restore_architectural_state(&state);
+            let mut engine = Engine::default();
+            assert_eq!(
+                outcome(&expected.run_slice(&mut a, 1)),
+                outcome(&actual.run_slice(&mut engine, &mut b, 1))
+            );
+            assert_eq!(
+                actual.architectural_state(),
+                expected.architectural_state(),
+                "{word:08x} {value:x}"
+            );
+            if NATIVE_COMPILED {
+                assert_eq!(engine.stats.fallback_instructions, 0);
+            }
+        }
+    }
+    for condition in 0..16 {
+        for nzcv in 0..16 {
+            let word = 0x54000040 | condition;
+            let mut state = initial();
+            state.nzcv = nzcv << 28;
+            let mut a = memory(&[word]);
+            let mut b = memory(&[word]);
+            let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+            let mut actual = Cpu::new(0x1000, 0);
+            expected.restore_architectural_state(&state);
+            actual.restore_architectural_state(&state);
+            let mut engine = Engine::default();
+            expected.run_slice(&mut a, 1);
+            actual.run_slice(&mut engine, &mut b, 1);
+            assert_eq!(
+                actual.architectural_state(),
+                expected.architectural_state(),
+                "cond={condition} NZCV={nzcv}"
+            );
+            if NATIVE_COMPILED {
+                assert_eq!(engine.stats.fallback_instructions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn crc_and_flag_extensions_use_native_lowerings_with_exact_nzcv() {
+    for word in [
+        0x1ac24020, 0x1ac24420, 0x1ac24820, 0x9ac24c20, 0x1ac25020, 0x1ac25420, 0x1ac25820,
+        0x9ac25c20, 0xd500401f, 0xba00842f, 0xba1f8425, 0x3a00082d, 0x3a00482d, 0xd500403f,
+        0xd500405f,
+    ] {
+        for nzcv in 0..16 {
+            for value in [
+                0,
+                0x7f,
+                0x80,
+                0xff,
+                0x100,
+                0x7fff,
+                0x8000,
+                0xffff,
+                0x10000,
+                u64::MAX,
+            ] {
+                let mut state = initial();
+                state.nzcv = nzcv << 28;
+                state.registers[1] = value;
+                state.registers[2] = 0x9876543210fedcba;
+                let mut a = memory(&[word]);
+                let mut b = memory(&[word]);
+                let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+                let mut actual = Cpu::new(0x1000, 0);
+                expected.restore_architectural_state(&state);
+                actual.restore_architectural_state(&state);
+                let mut engine = Engine::default();
+                if NATIVE_COMPILED {
+                    let host = <Cpu as Backend>::features();
+                    let present = if word & 0x7fe0e000 == 0x1ac04000 {
+                        host.hwcap & (1 << 7) != 0
+                    } else if matches!(word, 0xd500403f | 0xd500405f) {
+                        host.hwcap2 & (1 << 7) != 0
+                    } else {
+                        host.hwcap & (1 << 27) != 0
+                    };
+                    if !present {
+                        assert!(matches!(
+                            actual.run_slice(&mut engine, &mut b, 1),
+                            SliceOutcome::Fault(trames_engine::CpuFault::Instruction { .. })
+                        ));
+                        assert_eq!(engine.stats.fallback_instructions, 0);
+                        continue;
+                    }
+                }
+                assert_eq!(
+                    format!("{:?}", expected.run_slice(&mut a, 1)),
+                    format!("{:?}", actual.run_slice(&mut engine, &mut b, 1)),
+                    "{word:08x}"
+                );
+                assert_eq!(
+                    actual.architectural_state(),
+                    expected.architectural_state(),
+                    "{word:08x} {value:x} NZCV={nzcv}"
+                );
+                if NATIVE_COMPILED {
+                    assert_eq!(engine.stats.fallback_instructions, 0, "{word:08x}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_alias_pressure_long_products_and_sink_registers_match_reference() {
+    let bases = [
+        0xab000000, 0xcb000000, 0x9a000000, 0xfa000000, 0xaa000000, 0xea000000, 0x9a800000,
+        0xda800400, 0x9b000000, 0x9b200000, 0x9ba00000, 0x9b407c00, 0x9bc07c00, 0x9ac00800,
+        0x9ac00c00, 0x9ac02400, 0x93403c00, 0xb3483c00, 0xd3483c00, 0x93c01c00,
+    ];
+    let mut seed = 0x82a5ed401ccb7f39u64;
+    for index in 0..4096 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let base = bases[index % bases.len()];
+        let rd = (seed & 31) as u32;
+        let rn = ((seed >> 5) & 31) as u32;
+        let rm = ((seed >> 10) & 31) as u32;
+        let mut word = base | (rn << 5) | rd;
+        if base & 0x1f000000 == 0x1b000000 {
+            word |= rm << 16;
+            if base & 0x00600000 == 0 || base & 0x00600000 == 0x00200000 {
+                word |= (((seed >> 15) & 31) as u32) << 10;
+            }
+        } else if !matches!(base & 0x1f800000, 0x13000000) {
+            word |= rm << 16;
+        }
+        let mut state = initial();
+        state.nzcv = ((seed >> 20) as u32 & 15) << 28;
+        for reg in &mut state.registers {
+            *reg ^= seed;
+        }
+        let mut a = memory(&[word]);
+        let mut b = memory(&[word]);
+        let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+        let mut actual = Cpu::new(0x1000, 0);
+        expected.restore_architectural_state(&state);
+        actual.restore_architectural_state(&state);
+        let mut engine = Engine::default();
+        assert_eq!(
+            format!("{:?}", expected.run_slice(&mut a, 1)),
+            format!("{:?}", actual.run_slice(&mut engine, &mut b, 1)),
+            "{word:08x}"
+        );
+        assert_eq!(
+            actual.architectural_state(),
+            expected.architectural_state(),
+            "{word:08x}"
+        );
+        if NATIVE_COMPILED {
+            assert_eq!(engine.stats.fallback_instructions, 0, "{word:08x}");
+        }
+    }
+}
+
+#[test]
+fn host_extensions_are_direct_when_present_and_sigill_when_absent() {
+    for (base, feature_word, bit) in [
+        (0x5ac01820, 1, 34),
+        (0xdac01c20, 1, 34),
+        (0xdac02020, 1, 34),
+        (0x1ac26020, 1, 34),
+        (0x9ac26420, 1, 34),
+        (0x1ac26820, 1, 34),
+        (0x9ac26c20, 1, 34),
+        (0x11c3fc20, 1, 34),
+        (0x91c7fc20, 1, 34),
+        (0x11cbfc20, 1, 34),
+        (0x91cffc20, 1, 34),
+    ] {
+        let mut a = memory(&[base]);
+        let mut b = memory(&[base]);
+        let mut expected = trames_interpreter::Cpu::new(0x1000, 0);
+        let mut actual = Cpu::new(0x1000, 0);
+        expected.set_x(1, u64::MAX);
+        actual.set_x(1, u64::MAX);
+        expected.set_x(2, 1 << 63);
+        actual.set_x(2, 1 << 63);
+        let mut engine = Engine::default();
+        let features = <Cpu as Backend>::features();
+        let present = [features.hwcap, features.hwcap2][feature_word] & (1 << bit) != 0;
+        let outcome = actual.run_slice(&mut engine, &mut b, 1);
+        if NATIVE_COMPILED && !present {
+            assert!(
+                matches!(outcome,SliceOutcome::Fault(trames_engine::CpuFault::Instruction{pc:0x1000,instruction}) if instruction==base)
+            );
+            assert_eq!(actual.pc(), 0x1000);
+            assert_eq!(actual.fault_retired(), 0);
+        } else {
+            expected.run_slice(&mut a, 1);
+            assert_eq!(
+                actual.architectural_state(),
+                expected.architectural_state(),
+                "{base:08x}"
+            );
+        }
+        if NATIVE_COMPILED {
+            assert_eq!(engine.stats.fallback_instructions, 0);
+        }
+    }
+    if NATIVE_COMPILED && <Cpu as Backend>::features().hwcap2 & (1 << 34) == 0 {
+        let mut m = memory(&[0x91000400, 0xdac01c20]);
+        let mut c = Cpu::new(0x1000, 0);
+        let mut e = Engine::default();
+        assert!(matches!(
+            c.run_slice(&mut e, &mut m, 64),
+            SliceOutcome::Fault(trames_engine::CpuFault::Instruction { pc: 0x1004, .. })
+        ));
+        assert_eq!(
+            (
+                c.x(0),
+                c.pc(),
+                c.fault_retired(),
+                e.stats.fallback_instructions
+            ),
+            (1, 0x1004, 1, 0)
+        );
     }
 }

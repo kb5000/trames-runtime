@@ -1,0 +1,6 @@
+{"workload":"integer-loop","interpreter_ns":15423704,"jit_ns":3492833,"speedup":4.416}
+{"workload":"svc-round-trip","interpreter_ns":4668404,"jit_ns":586889,"speedup":7.954}
+{"workload":"svc-only","interpreter_ns":3084907,"jit_ns":534429,"speedup":5.772}
+{"workload":"svc-continuation","interpreter_ns":3572586,"jit_ns":829770,"speedup":4.306}
+{"workload":"integer-countdown-compare","interpreter_ns":12280086,"jit_ns":1744792,"fallback_instructions":0,"speedup":7.038}
+{"workload":"integer-countdown-flags","interpreter_ns":8051152,"jit_ns":1735334,"fallback_instructions":0,"speedup":4.640}

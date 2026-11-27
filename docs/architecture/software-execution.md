@@ -15,10 +15,14 @@ members: shared kernel/session/memory crates never depend on them. An independen
 CPU repository would complicate paired versions without providing an API benefit.
 
 The initial native compiler targets AArch64 hosts on Linux/Android. Other hosts
-use the interpreter and report native availability as false. Native blocks cover
-non-flag integer operations and direct branches. Memory, flags, FP/SIMD, atomics,
-traps and unsupported operations retain interpreter semantics. This is an initial
-backend, not a claim of full JIT coverage or native-equivalent performance.
+use the interpreter and report native availability as false. Native blocks now cover baseline integer arithmetic/logic, SP forms, NZCV,
+carry/conditional operations, multiply/divide, bitfields/variable shifts and
+fixed, conditional and register branches. CRC, FlagM/FlagM2 and CSSC use their
+actual host instructions only when the process-host HWCAP provides them.
+There are no new software replacements or emulated extension registers.
+Memory, FP/SIMD, atomics, traps and remaining untranslated families still retain
+the legacy interpreter path. Full host-ISA native coverage remains in progress;
+this is not yet a claim that every host instruction has a native lowering.
 
 Original guest instructions are never changed. Derived code is private to each
 worker, bounded, and published RW -> RX, never RWX. Guest page identities drive
@@ -49,7 +53,7 @@ through its slot without returning to the Rust block-dispatch loop. Natural
 blocks use canonical cache keys. Exact-budget prefixes remain available for
 stepping but cannot replace full-block hot edges.
 
-A 96-byte native entry frame supplies GPR storage, budget and borrowed existing
+A 120-byte native entry frame supplies GPR storage, budget and borrowed existing
 instruction epochs. Budget and block counts stay in caller-saved registers while
 chained; every exit publishes the actual guest PC and retirement count. No full
 architectural-state copy occurs. Ordinary translated accesses acquire no new
@@ -76,3 +80,40 @@ signal redirection, restart and worker migration retain the existing scheduler
 path, with cache misses falling back to lookup. Incoming links are cleared before
 RX eviction; generation handles reject slot/address reuse. Only RW link data is
 updated after publication; guest bytes and RX instructions remain unchanged.
+
+
+## Host-driven ISA and integer/control-flow coverage
+
+The native backend reads process `AT_HWCAP`/`AT_HWCAP2` once. Its dynamic
+`Cpu::features()` / `feature_names()` no longer advertise the interpreter's
+fixed software-only capabilities. During migration, the guest mask is the
+intersection of actual host capabilities and the existing shared CPU ABI;
+`host_features()` exposes the unfiltered process-host mask for diagnostics.
+Stateful extensions require their real context-save path before advertisement.
+The target is complete coverage of the host ISA, not a second virtual extension
+model. Platform/interpreter-only builds keep their existing software profile.
+
+Capability gates for the newly translated extension families execute only in
+cold translation. Missing CRC/CSSC/FlagM/FlagM2, RNDR, MOPS and LSE128 instructions
+fault when reached rather than acquiring a software replacement. A preceding
+translated prefix retires before that fault. Added scalar extensions emit the
+host opcode with compile-time register remapping; no per-instruction feature
+probe or additional extension state is maintained.
+
+The entry frame carries temporary SP/NZCV values for the existing task state.
+Virtual SP uses a compiler-only register binding; generated code never changes
+host SP or x18/TLS. Guest NZCV uses the hardware flags, materialized into existing
+CPU state at entry/exit. Block guards may clobber host flags, so an instruction
+that reads flags restores guest NZCV first; dirty flags are captured before the
+next guard. No full architectural-state copy or additional per-task register bank
+is introduced.
+
+A dynamic block publishes its selected guest PC and follows its stable RW link
+only if that PC matches the resolved edge. Register branches never jump to a
+raw guest address as host code. Cold resolution still enforces checked identity,
+same-page ownership, canonical budgets and generation handles. Both conditional
+outcomes remain exact; repeated loop edges chain natively, while a different
+outcome returns to normal lookup. Original guest bytes and published RX words
+remain unchanged.
+
+See [native scalar validation](../validation/jit-host-scalars-20261127.md).

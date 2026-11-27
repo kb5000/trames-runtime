@@ -52,6 +52,40 @@ fn measure<C: Backend>(words: &[u32], syscalls: bool, continuation: bool) -> (u1
     samples.sort_unstable();
     (samples[samples.len() / 2], black_box(checksum))
 }
+fn countdown<C: Backend>(flags: bool) -> (u128, u64, C::Engine) {
+    let mut words = vec![0x91000400; 31];
+    words.extend_from_slice(if flags {
+        &[0xf1000421, 0x54fffc01, 0xd4000001]
+    } else {
+        &[0xd1000421, 0xb5fffc01, 0xd4000001]
+    });
+    let mut memory = memory(&words);
+    let mut cpu = C::new(0x1000, 0);
+    let mut engine = C::Engine::default();
+    let mut samples = Vec::new();
+    for sample in 0..6 {
+        let start = Instant::now();
+        for _ in 0..8 {
+            cpu.set_pc(0x1000);
+            cpu.set_x(1, 32768);
+            loop {
+                match cpu.run(&mut engine, &mut memory, 1_048_576) {
+                    SliceOutcome::Yield { .. } => {}
+                    SliceOutcome::Syscall { .. } => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!((cpu.x(1), cpu.pc()), (0, 0x1088));
+        }
+        if sample != 0 {
+            samples.push(start.elapsed().as_nanos());
+        }
+    }
+    samples.sort_unstable();
+    assert_eq!(cpu.x(0), 6 * 8 * 32768 * 31);
+    (samples[samples.len() / 2], black_box(cpu.x(0)), engine)
+}
+
 fn main() {
     if !trames_jit::NATIVE_COMPILED {
         eprintln!("Requires native-aarch64 on an AArch64 Linux/Android host");
@@ -76,5 +110,12 @@ fn main() {
         let (jit, b) = measure::<trames_jit::Cpu>(&words, svc, continuation);
         assert_eq!(a, b);
         println!("{{\"workload\":\"{name}\",\"interpreter_ns\":{interpreter},\"jit_ns\":{jit},\"speedup\":{:.3}}}", interpreter as f64 / jit as f64);
+    }
+    for flags in [false, true] {
+        let (reference, a, _) = countdown::<trames_interpreter::Cpu>(flags);
+        let (jit, b, engine) = countdown::<trames_jit::Cpu>(flags);
+        assert_eq!(a, b);
+        assert_eq!(engine.stats.fallback_instructions, 0);
+        println!("{{\"workload\":\"integer-countdown-{}\",\"interpreter_ns\":{reference},\"jit_ns\":{jit},\"fallback_instructions\":0,\"speedup\":{:.3}}}",if flags { "flags" } else { "compare" }, reference as f64 / jit as f64);
     }
 }

@@ -10,7 +10,33 @@ use trames_memory::{parallel::View, CpuMemory, Memory};
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
+mod features;
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 mod native;
+
+/// Actual process-host capabilities; absent when native JIT is not compiled.
+pub fn host_features() -> Option<Features> {
+    #[cfg(all(
+        feature = "native-aarch64",
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    {
+        Some(features::profile().raw)
+    }
+    #[cfg(not(all(
+        feature = "native-aarch64",
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    )))]
+    {
+        None
+    }
+}
 
 pub const NATIVE_COMPILED: bool = cfg!(all(
     feature = "native-aarch64",
@@ -206,8 +232,47 @@ impl Registers for Cpu {
 }
 impl Backend for Cpu {
     type Engine = Engine;
-    const FEATURES: Features = <trames_interpreter::Cpu as Backend>::FEATURES;
-    const FEATURE_NAMES: &'static str = <trames_interpreter::Cpu as Backend>::FEATURE_NAMES;
+    const FEATURES: Features = Features {
+        hwcap: 3,
+        hwcap2: 0,
+    };
+    const FEATURE_NAMES: &'static str = "fp asimd";
+    fn features() -> Features {
+        #[cfg(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            features::profile().allowed
+        }
+        #[cfg(not(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )))]
+        {
+            <trames_interpreter::Cpu as Backend>::features()
+        }
+    }
+    fn feature_names() -> &'static str {
+        #[cfg(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            &features::profile().names
+        }
+        #[cfg(not(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )))]
+        {
+            <trames_interpreter::Cpu as Backend>::feature_names()
+        }
+    }
     const EXACT_INSTRUCTIONS: bool = true;
     fn new(pc: u64, sp: u64) -> Self {
         Self {
