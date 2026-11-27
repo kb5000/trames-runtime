@@ -25,16 +25,18 @@ def closure(name):
                        if any(k['kind'] is None for k in d['dep_kinds']))
     return {names[i] for i in found}
 
-for name in ['trames-kernel', 'trames-linux', 'trames-memory', 'trames-elf', 'trames-distro', 'trames-engine', 'trames-session', 'trames-hvf', 'trames-mac']:
+for name in ['trames-kernel', 'trames-linux', 'trames-memory', 'trames-elf', 'trames-distro', 'trames-host', 'trames-engine', 'trames-session', 'trames-hvf', 'trames-mac']:
     if name not in ids:
         continue
     forbidden = closure(name) & {'trames-cpu', 'trames-compute', 'trames-core', 'trames-ffi'}
     assert not forbidden, (name, 'depends on the interpreter/product:', sorted(forbidden))
+if 'trames-host' in ids:
+    assert not closure('trames-host') & {'trames-cli-common', 'trames-hvf', 'trames-mac'}, 'host transports must remain independent of CLI/product/CPU backends'
 assert closure('trames-execution') == {'trames-execution'}
-for name in ['trames-kernel', 'trames-linux', 'trames-memory', 'trames-elf', 'trames-distro', 'trames-engine', 'trames-session']:
+for name in ['trames-kernel', 'trames-linux', 'trames-memory', 'trames-elf', 'trames-distro', 'trames-host', 'trames-engine', 'trames-session']:
     assert not closure(name) & {'trames-hvf', 'trames-mac'}, (name, 'depends on a hardware/product transport')
 members = {names[i] for i in metadata['workspace_members']}
-common = {'trames-engine', 'trames-session', 'trames-native', 'trames-accel', 'trames-vulkan', 'trames-video', 'trames-audio', 'trames-graphics', 'trames-execution', 'trames-kernel', 'trames-memory', 'trames-elf', 'trames-linux', 'trames-vfs', 'trames-net', 'trames-distro', 'trames-bridge', 'trames-shared', 'trames-wayland', 'trames-control'}
+common = {'trames-engine', 'trames-session', 'trames-native', 'trames-accel', 'trames-vulkan', 'trames-video', 'trames-audio', 'trames-graphics', 'trames-execution', 'trames-kernel', 'trames-memory', 'trames-elf', 'trames-linux', 'trames-vfs', 'trames-net', 'trames-distro', 'trames-bridge', 'trames-shared', 'trames-wayland', 'trames-control', 'trames-host'}
 if 'trames-core' in members:
     assert not members & common
     assert {'trames-cpu', 'trames-linux', 'trames-execution', 'trames-kernel'} <= closure('trames-core')
