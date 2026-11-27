@@ -199,6 +199,23 @@ pub trait CpuMemory {
         self.write(address, &bytes)?;
         Ok((result, false))
     }
+    /// Full-overwrite fragment: prior contents are unspecified. Unlike the
+    /// read/modify/write borrow, a staging-only embedding needs no guest read
+    /// permission. Production Memory/View reuse their existing write borrow.
+    fn cpu_store_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if len > (crate::PAGE_SIZE - address % crate::PAGE_SIZE) as usize {
+            return Err(MemoryError::InvalidRange);
+        }
+        let mut bytes = vec![0; len];
+        let result = operation(&mut bytes);
+        self.write(address, &bytes)?;
+        Ok((result, false))
+    }
     fn read_u64(&self, address: u64) -> Result<u64, MemoryError> {
         Ok(u64::from_le_bytes(self.read_array(address)?))
     }
@@ -332,6 +349,14 @@ impl CpuMemory for Memory {
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<(T, bool), MemoryError> {
         self.with_write_chunk(address, len, operation)
+    }
+    fn cpu_store_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.with_store_chunk(address, len, operation)
     }
     #[inline]
     fn cpu_slice(&mut self) -> CpuSlice<'_, Self> {

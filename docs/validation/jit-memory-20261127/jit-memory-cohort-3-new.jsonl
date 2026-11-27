@@ -1,0 +1,7 @@
+{"workload":"integer-loop","interpreter_ns":16156723,"jit_ns":3515891,"speedup":4.595}
+{"workload":"svc-round-trip","interpreter_ns":4671535,"jit_ns":588593,"speedup":7.937}
+{"workload":"svc-only","interpreter_ns":3125968,"jit_ns":549217,"speedup":5.692}
+{"workload":"svc-continuation","interpreter_ns":3769561,"jit_ns":832014,"speedup":4.531}
+{"workload":"integer-countdown-compare","interpreter_ns":12560497,"jit_ns":1759945,"fallback_instructions":0,"speedup":7.137}
+{"workload":"integer-countdown-flags","interpreter_ns":8244344,"jit_ns":1828738,"fallback_instructions":0,"speedup":4.508}
+{"workload":"scalar-memory-loop","interpreter_ns":921390,"jit_ns":4480657,"native_memory_instructions":786432,"fallback_instructions":0,"speedup":0.206}

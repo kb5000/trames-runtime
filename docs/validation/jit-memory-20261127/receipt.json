@@ -1,0 +1,26 @@
+{
+  "base_runtime": "f3f45e56c02f020d9ac2e7792f1a1550f1ee8286",
+  "host": "existing ARM64 Lima/VZ Linux VM, 4096-byte pages",
+  "cpu_affinity": [
+    2
+  ],
+  "toolchain": "nightly-2026-10-16",
+  "profile": "release, thin LTO, overflow checks, incremental off",
+  "old_binary_sha256": "a72c2724362e5a500647918266417a84fab9d64482ca33d989b5579a18a3df91",
+  "new_binary_sha256": "8f8bca63d83e4ca624a1809c76e9d3fd19787ce4134bfca78619934ed0307763",
+  "source_sha256": {
+    "crates/trames-jit/src/lib.rs": "9f1f46016f2e3a997fafbeaf220a3b4fcd129c95db0c1945a31e184fb4f293ad",
+    "crates/trames-jit/src/native.rs": "151bb7dc3e34cc98cb7d50e20076d9daf92ff27c67447616034da40c1476099b",
+    "crates/trames-jit/src/memory_ops.rs": "dd82ff5ebe24846b42cf67bd9fc8f781c45574fe4eec00e7d1433fa9a9bbac59",
+    "crates/trames-memory/src/cpu_memory.rs": "2d131210c14ea3110da87feb4035af344f0719614cca079e5d76ef0ce91224c0",
+    "crates/trames-memory/src/native_access.rs": "6f36bcea09e89d0ae82ec8a67f03f1e28c3b72a6882b67333bcff89736c3cf9b",
+    "crates/trames-memory/src/parallel.rs": "eeb7a8f1cffb90d7b1e685f08d971bad4124fef4ef7ce059724329a72ee8e013"
+  },
+  "notes": [
+    "Five alternating old/new process pairs; each output is a five-sample median after one warm-up.",
+    "Earlier two pairs are retained separately; no spliced medians.",
+    "Old fixture differs only in post-timing expected fallback checks and unavailable memory counter reporting.",
+    "The native.rs ABI test was appended after release measurement; production prefix is unchanged."
+  ],
+  "native_production_prefix_sha256": "bd250cb8d601031179c1e6f187bb06a1b2c1f4b6ac6dabcaa22e3e091aa029b0"
+}

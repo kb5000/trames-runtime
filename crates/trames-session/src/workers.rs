@@ -52,22 +52,6 @@ impl PerfPacing {
         };
     }
 }
-#[cfg(test)]
-mod perf_pacing_tests {
-    use super::*;
-    #[test]
-    fn deadline_pacing_preserves_instruction_and_single_step_limits() {
-        let mut pacing = PerfPacing::default();
-        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
-        assert_eq!(pacing.limit(0, Duration::from_secs(1)), 0);
-        pacing.observe(0, Duration::ZERO);
-        pacing.observe(1000, Duration::from_millis(1));
-        let count = pacing.limit(10000, Duration::from_micros(100));
-        assert!((100..=125).contains(&count));
-        assert!(Duration::from_micros(count) <= Duration::from_micros(125));
-        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
-    }
-}
 
 pub(super) struct Work<C: Cpu> {
     /// Original task body, retained through every queue/checkpoint and return.
@@ -5284,3 +5268,20 @@ mod tests {
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "workers_uring_tests.rs"]
 mod uring_tests;
+
+#[cfg(test)]
+mod perf_pacing_tests {
+    use super::*;
+    #[test]
+    fn deadline_pacing_preserves_instruction_and_single_step_limits() {
+        let mut pacing = PerfPacing::default();
+        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
+        assert_eq!(pacing.limit(0, Duration::from_secs(1)), 0);
+        pacing.observe(0, Duration::ZERO);
+        pacing.observe(1000, Duration::from_millis(1));
+        let count = pacing.limit(10000, Duration::from_micros(100));
+        assert!((100..=125).contains(&count));
+        assert!(Duration::from_micros(count) <= Duration::from_micros(125));
+        assert_eq!(pacing.limit(1, Duration::from_secs(1)), 1);
+    }
+}

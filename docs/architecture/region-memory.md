@@ -3,8 +3,8 @@
 Owner direction: reduce the memory regression and coarse page exclusion. Ordinary
 guest races may produce different allowed results on different runs; the runtime
 does not invent a race error or deterministic global ordering. Synchronized
-programs retain ARM atomic/exclusive/acquire/release/fence constraints. One cached
-CPU interpreter remains, with no JIT or extra execution backend.
+programs retain ARM atomic/exclusive/acquire/release/fence constraints. The cached interpreter and optional software JIT share the same CPU memory
+contract; see [software execution](software-execution.md).
 
 Owner clarification, 2026-10-14: native conversion preserves each original
 function's thread-safety contract. A non-thread-safe guest function is not owed

@@ -20,7 +20,8 @@ carry/conditional operations, multiply/divide, bitfields/variable shifts and
 fixed, conditional and register branches. CRC, FlagM/FlagM2 and CSSC use their
 actual host instructions only when the process-host HWCAP provides them.
 There are no new software replacements or emulated extension registers.
-Memory, FP/SIMD, atomics, traps and remaining untranslated families still retain
+Scalar LDR/STR now use checked native memory fragments as described below.
+FP/SIMD, atomics, traps and remaining untranslated families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
 
@@ -117,3 +118,35 @@ outcome returns to normal lookup. Original guest bytes and published RX words
 remain unchanged.
 
 See [native scalar validation](../validation/jit-host-scalars-20261127.md).
+
+
+## Native scalar memory fragments
+
+Integer LDR/STR byte/halfword/word/doubleword, signed loads, immediate/unscaled,
+pre/post-index, extended register offsets, literal loads and optional PRFM hints
+now have cached native fragments. Cold decode selects the exact baseline host
+LDR/STR opcode. The driver computes the decoded guest address and commits result
+and base writeback only after success. Each real same-page access runs inside the
+existing `CpuMemory` read/full-write callback; no host pointer or lease is cached.
+
+`cpu_store_chunk` is a full-overwrite contract. Memory/View reuse the existing
+write borrowing and dirty/code/exclusive publication. A staging-only provider
+need not read previous bytes: the shared Memory helper specializes this choice
+at compile time. Ordinary read/write paths gain no fields, probes or extra
+permission policy. Cross-page data uses canonical read/write staging and then
+the same exact-width native fragment; CPU results remain precise on faults.
+
+Memory fragments have a separate call ABI from integer chains. Cached metadata
+may resolve their continuation, but generated machine edges never target them.
+The worker returns to the existing instruction-identity boundary between memory
+fragments and subsequent code, including after executable stores. Generation
+handles reject evicted fragments. `Engine::memory_stats()` separately reports
+retired fragments and staging; scalar/SVC return ABI and counters stay unchanged.
+No guest bytes or published RX words are patched, and no additional extension
+register model, algorithm lock, coordinator or ordinary-memory fence is added.
+
+This is an initial checked lowering, not block fusion. Separate guest LDR and STR
+release their borrows independently and still allow lost updates. Tight memory
+loops are faster than the old JIT's per-instruction interpreter fallback but
+remain slower than the cached interpreter. Pairs, SIMD, acquire/release and
+atomic instructions retain their existing path until separately lowered.

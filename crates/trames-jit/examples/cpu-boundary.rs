@@ -86,6 +86,35 @@ fn countdown<C: Backend>(flags: bool) -> (u128, u64, C::Engine) {
     (samples[samples.len() / 2], black_box(cpu.x(0)), engine)
 }
 
+fn memory_loop<C: Backend>() -> (u128, u64, C::Engine) {
+    let mut memory = memory(&[
+        0xf9400020, 0x91000400, 0xf9000020, 0xf1000442, 0x54ffff81, 0xd4000001,
+    ]);
+    memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+    let mut cpu = C::new(0x1000, 0);
+    cpu.set_x(1, 0x2000);
+    let mut engine = C::Engine::default();
+    let mut samples = Vec::new();
+    for sample in 0..6 {
+        cpu.set_pc(0x1000);
+        cpu.set_x(2, 65536);
+        let start = Instant::now();
+        assert!(matches!(
+            cpu.run(&mut engine, &mut memory, 1_048_576),
+            SliceOutcome::Syscall {
+                instructions: 327681
+            }
+        ));
+        if sample != 0 {
+            samples.push(start.elapsed().as_nanos());
+        }
+    }
+    samples.sort_unstable();
+    let result = memory.read_u64(0x2000).unwrap();
+    assert_eq!(result, 6 * 65536);
+    (samples[2], result, engine)
+}
+
 fn main() {
     if !trames_jit::NATIVE_COMPILED {
         eprintln!("Requires native-aarch64 on an AArch64 Linux/Android host");
@@ -118,4 +147,10 @@ fn main() {
         assert_eq!(engine.stats.fallback_instructions, 0);
         println!("{{\"workload\":\"integer-countdown-{}\",\"interpreter_ns\":{reference},\"jit_ns\":{jit},\"fallback_instructions\":0,\"speedup\":{:.3}}}",if flags { "flags" } else { "compare" }, reference as f64 / jit as f64);
     }
+    let (reference, a, _) = memory_loop::<trames_interpreter::Cpu>();
+    let (jit, b, engine) = memory_loop::<trames_jit::Cpu>();
+    assert_eq!(a, b);
+    assert_eq!(engine.stats.fallback_instructions, 0);
+    assert_eq!(engine.memory_stats().instructions, 6 * 65536 * 2);
+    println!("{{\"workload\":\"scalar-memory-loop\",\"interpreter_ns\":{reference},\"jit_ns\":{jit},\"native_memory_instructions\":{},\"fallback_instructions\":0,\"speedup\":{:.3}}}",engine.memory_stats().instructions,reference as f64/jit as f64);
 }

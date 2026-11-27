@@ -16,6 +16,12 @@ mod features;
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
+mod memory_ops;
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 mod native;
 
 /// Actual process-host capabilities; absent when native JIT is not compiled.
@@ -84,7 +90,31 @@ pub struct LinkStats {
     pub syscall_resumes: u64,
     pub lookups: u64,
 }
+/// Diagnostics updated only by native memory fragments, never scalar/SVC exits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryStats {
+    pub instructions: u64,
+    pub staged: u64,
+}
 impl Engine {
+    pub fn memory_stats(&self) -> MemoryStats {
+        #[cfg(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            self.native.memory_stats
+        }
+        #[cfg(not(all(
+            feature = "native-aarch64",
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )))]
+        {
+            MemoryStats::default()
+        }
+    }
     pub fn link_stats(&self) -> LinkStats {
         #[cfg(all(
             feature = "native-aarch64",

@@ -348,11 +348,28 @@ impl Memory {
         len: usize,
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<(T, bool), MemoryError> {
+        self.write_chunk::<false, T>(address, len, operation)
+    }
+    /// Full overwrite: staging need not fetch previous provider bytes.
+    pub(crate) fn with_store_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.write_chunk::<true, T>(address, len, operation)
+    }
+    fn write_chunk<const FULL: bool, T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
         let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared
                 .borrow_mut()
-                .with_write_chunk(address, len, operation);
+                .write_chunk::<FULL, T>(address, len, operation);
         }
         if len == 0 {
             return Ok((operation(&mut []), true));
@@ -408,8 +425,10 @@ impl Memory {
             }
             let operation = operation.expect("unavailable borrow has no effects");
             let mut bytes = [0; PAGE_SIZE as usize];
-            page.read_bytes(offset, &mut bytes[..len])
-                .map_err(|e| e.at_access(address))?;
+            if !FULL {
+                page.read_bytes(offset, &mut bytes[..len])
+                    .map_err(|e| e.at_access(address))?;
+            }
             let result = operation(&mut bytes[..len]);
             page.write_bytes(offset, &bytes[..len])
                 .map_err(|e| e.at_access(address))?;

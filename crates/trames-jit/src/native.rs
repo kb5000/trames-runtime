@@ -24,7 +24,14 @@ struct Node {
     page: Identity,
     generation: u64,
     block: Option<Block>,
+    memory: Option<Box<crate::memory_ops::Operation>>,
     next: Option<Handle>,
+}
+impl Node {
+    fn accepts(&self, pc: u64) -> bool {
+        self.block.as_ref().is_some_and(|b| b.accepts(pc))
+            || (self.memory.is_some() && self.key.0.wrapping_add(4) == pc)
+    }
 }
 struct Block {
     code: Code,
@@ -111,6 +118,7 @@ pub(super) struct Cache {
     last: Option<Handle>,
     serial: u64,
     victim: usize,
+    pub memory_stats: crate::MemoryStats,
     pub stats: CompilationStats,
     pub links_stats: LinkStats,
 }
@@ -127,6 +135,7 @@ impl Default for Cache {
             last: None,
             serial: 0,
             victim: 0,
+            memory_stats: crate::MemoryStats::default(),
             stats: CompilationStats::default(),
             links_stats: LinkStats::default(),
         }
@@ -253,6 +262,15 @@ impl Cache {
         });
         self.remove(slot);
         let block = compile(memory, pc, limit, slot, mode)?;
+        let memory_op = if block.is_none() {
+            crate::memory_ops::Operation::compile(memory, pc)?.map(Box::new)
+        } else {
+            None
+        };
+        if let Some(op) = &memory_op {
+            self.stats.blocks += 1;
+            self.stats.host_words += op.host_words();
+        }
         if let Some(block) = &block {
             self.stats.blocks += 1;
             self.stats.host_words += block.traffic.host_words;
@@ -269,6 +287,7 @@ impl Cache {
             page,
             generation: self.serial,
             block,
+            memory: memory_op,
             next: None,
         });
         self.index.insert(key, slot);
@@ -289,15 +308,12 @@ impl Cache {
         let Some(b) = self.node(target) else {
             return;
         };
-        let (Some(from), Some(to)) = (&a.block, &b.block) else {
-            return;
-        };
         if a.key.2 & 8 == 0
             || a.checked != checked
             || b.checked != checked
             || a.key.2 != b.key.2
             || a.page != b.page
-            || !from.accepts(b.key.0)
+            || !a.accepts(b.key.0)
             || a.key.0 / PAGE_SIZE != b.key.0 / PAGE_SIZE
             // Budget-cut prefixes remain usable for exact stepping, but must
             // never replace a full-block hot edge with a shorter fragment.
@@ -305,6 +321,12 @@ impl Cache {
         {
             return;
         }
+        let (Some(from), Some(to)) = (&a.block, &b.block) else {
+            self.nodes[source.slot].as_mut().unwrap().next = Some(target);
+            self.links[source.slot] = 0;
+            self.tails[source.slot] = 0;
+            return;
+        };
         let entry = to.entry();
         let tail = if a.key.2 == 8
             && !from.syscall
@@ -325,7 +347,7 @@ impl Cache {
     pub(super) fn execute(
         &mut self,
         cpu: &mut Cpu,
-        memory: &impl CpuMemory,
+        memory: &mut impl CpuMemory,
         budget: u64,
     ) -> Result<Option<Executed>, CpuFault> {
         let pc = cpu.pc;
@@ -404,6 +426,38 @@ impl Cache {
                 }
             }
         }
+        if let Some(target) = self
+            .last
+            .and_then(|h| self.node(h))
+            .and_then(|n| n.next)
+            .filter(|h| {
+                self.node(*h).is_some_and(|n| {
+                    n.key.0 == pc
+                        && n.memory.is_some()
+                        && n.checked == memory.instruction_identity()
+                })
+            })
+        {
+            self.hot = Some(target);
+        }
+        if let Some(op) = self
+            .hot
+            .and_then(|h| self.node(h))
+            .filter(|n| n.key.0 == pc && n.memory.is_some())
+            .filter(|n| n.checked == memory.instruction_identity())
+            .and_then(|n| n.memory.as_ref())
+        {
+            let direct = op.execute(cpu, memory)?;
+            self.memory_stats.instructions += 1;
+            self.memory_stats.staged += u64::from(!direct);
+            self.last = self.hot;
+            self.links_stats.entries += 1;
+            return Ok(Some(Executed {
+                instructions: 1,
+                blocks: 1,
+                syscall: false,
+            }));
+        }
         let limit = budget
             .min(BLOCK_LIMIT)
             .min((PAGE_SIZE - (pc & (PAGE_SIZE - 1))) / 4);
@@ -443,21 +497,19 @@ impl Cache {
             self.active = Some((checked, mode));
         }
         let source = self.last.take().filter(|handle| {
-            self.node(*handle).is_some_and(|node| {
-                node.checked == checked
-                    && node.block.as_ref().is_some_and(|block| block.accepts(pc))
-            })
+            self.node(*handle)
+                .is_some_and(|node| node.checked == checked && node.accepts(pc))
         });
         let resume = source
             .and_then(|h| self.node(h))
             .filter(|n| n.checked == checked)
-            .and_then(|n| n.block.as_ref().filter(|b| b.accepts(pc)).and(n.next))
+            .and_then(|n| n.accepts(pc).then_some(n.next).flatten())
             .filter(|h| {
                 self.node(*h).is_some_and(|n| {
                     n.checked == checked
                         && n.key.0 == pc
                         && n.key.2 == mode
-                        && n.block.as_ref().is_some_and(|b| b.instructions <= budget)
+                        && n.block.as_ref().is_none_or(|b| b.instructions <= budget)
                 })
             });
         let handle = if let Some(target) = resume {
@@ -493,6 +545,21 @@ impl Cache {
         }
         self.hot = Some(handle);
         let Some(block) = self.node(handle).and_then(|n| n.block.as_ref()) else {
+            if let Some(op) = self.node(handle).and_then(|n| n.memory.as_ref()) {
+                // Native epoch references are not used by this single checked
+                // access. The mutable borrow may invalidate executable bytes;
+                // return to the ordinary identity boundary before any next op.
+                let direct = op.execute(cpu, memory)?;
+                self.memory_stats.instructions += 1;
+                self.memory_stats.staged += u64::from(!direct);
+                self.last = Some(handle);
+                self.links_stats.entries += 1;
+                return Ok(Some(Executed {
+                    instructions: 1,
+                    blocks: 1,
+                    syscall: false,
+                }));
+            }
             return Ok(None);
         };
         // SAFETY: slots/code remain owned and unchanged until this call returns.
@@ -1196,13 +1263,13 @@ fn compile_with_features(
 
 /// Thread-affine executable mapping. Never writable while callable; mappings
 /// are released on eviction/worker drop. No Rust allocation becomes executable.
-struct Code {
+pub(super) struct Code {
     pointer: *mut libc::c_void,
     length: usize,
     _thread: PhantomData<Rc<()>>,
 }
 impl Code {
-    fn publish(words: &[u32]) -> std::io::Result<Self> {
+    pub(super) fn publish(words: &[u32]) -> std::io::Result<Self> {
         // SAFETY: sysconf has no memory arguments; host page size is cold-path.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page <= 0 {
@@ -1238,6 +1305,13 @@ impl Code {
             }
         }
         Ok(mapping)
+    }
+    pub(super) unsafe fn call_memory(&self, pointer: *mut u8, value: u64) -> u64 {
+        // SAFETY: the decoder selects a single baseline LDR/STR with exactly
+        // the checked width. Pointer and lease live only through this call.
+        let function: unsafe extern "C" fn(*mut u8, u64) -> u64 =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(pointer, value) }
     }
     unsafe fn call_tail(&self, offset: usize, registers: &mut [u64; 31], links: *const usize) {
         // SAFETY: the caller validated the bounded two-block edge and owns both
@@ -1372,28 +1446,71 @@ mod tests {
     }
     #[test]
     fn eviction_revokes_native_edges_before_rx_unmap_and_generations_reject_reuse() {
-        let m = memory(&[0x14000004, 0, 0, 0, 0xd4000001]);
+        let mut m = memory(&[0x14000004, 0, 0, 0, 0xd4000001]);
         let mut cpu = Cpu::new(0x1000, 0);
         let mut cache = Cache::default();
-        cache.execute(&mut cpu, &m, 64).unwrap().unwrap();
+        cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
         let source = cache.hot.unwrap();
-        assert!(cache.execute(&mut cpu, &m, 64).unwrap().unwrap().syscall);
+        assert!(
+            cache
+                .execute(&mut cpu, &mut m, 64)
+                .unwrap()
+                .unwrap()
+                .syscall
+        );
         let target = cache.hot.unwrap();
         cpu.pc = 0x1000;
-        let hit = cache.execute(&mut cpu, &m, 64).unwrap().unwrap();
+        let hit = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
         assert_eq!((hit.blocks, hit.instructions, hit.syscall), (2, 2, true));
         assert_ne!(cache.links[source.slot], 0);
         cache.remove(target.slot);
         assert_eq!(cache.links[source.slot], 0);
         assert!(cache.node(target).is_none());
         cpu.pc = 0x1000;
-        let miss = cache.execute(&mut cpu, &m, 64).unwrap().unwrap();
+        let miss = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
         assert_eq!((miss.blocks, miss.syscall, cpu.pc), (1, false, 0x1010));
-        assert!(cache.execute(&mut cpu, &m, 64).unwrap().unwrap().syscall);
+        assert!(
+            cache
+                .execute(&mut cpu, &mut m, 64)
+                .unwrap()
+                .unwrap()
+                .syscall
+        );
         let replacement = cache.hot.unwrap();
         assert_eq!(target.slot, replacement.slot);
         assert_ne!(target.generation, replacement.generation);
         cpu.pc = 0x1000;
-        assert_eq!(cache.execute(&mut cpu, &m, 64).unwrap().unwrap().blocks, 2);
+        assert_eq!(
+            cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap().blocks,
+            2
+        );
+    }
+    #[test]
+    fn memory_edges_remain_metadata_only_and_reject_evicted_generations() {
+        let mut m = memory(&[0x14000004, 0, 0, 0, 0xf9400020]);
+        m.map(0x2000, PAGE_SIZE, trames_memory::Permissions::RW)
+            .unwrap();
+        m.write_array(0x2000, 99u64.to_le_bytes()).unwrap();
+        let mut cpu = Cpu::new(0x1000, 0);
+        cpu.set_x(1, 0x2000);
+        let mut cache = Cache::default();
+        cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
+        let source = cache.hot.unwrap();
+        cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
+        let target = cache.hot.unwrap();
+        assert!(cache.node(target).unwrap().memory.is_some());
+        assert_eq!(cache.node(source).unwrap().next, Some(target));
+        assert_eq!(cache.links[source.slot], 0); // The fragment uses a different ABI.
+        cache.remove(target.slot);
+        assert!(cache.node(target).is_none());
+        cpu.pc = 0x1000;
+        let branch = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
+        assert_eq!((branch.instructions, branch.blocks, cpu.pc), (1, 1, 0x1010));
+        cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
+        let replacement = cache.hot.unwrap();
+        assert_eq!(replacement.slot, target.slot);
+        assert_ne!(replacement.generation, target.generation);
+        assert_eq!((cpu.x(0), cpu.pc), (99, 0x1014));
+        assert_eq!(cache.links[source.slot], 0);
     }
 }

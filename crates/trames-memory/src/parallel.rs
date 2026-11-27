@@ -1249,6 +1249,14 @@ impl CpuMemory for View {
         self.changed(frame, &mut guard, offset, len);
         Ok((operation(guard.write(offset, len)), true))
     }
+    fn cpu_store_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.cpu_write_chunk(address, len, operation)
+    }
     fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
         let address = address & 0x00ffffffffffffff;
         Memory::end(address, len as u64)?;
