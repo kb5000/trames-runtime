@@ -562,11 +562,15 @@ impl IoTask {
         };
         // Nonleader exec retires the old leader and takes its PID. Its previous
         // observer record belongs to that task, even if the debugger is the same.
-        if let Some(old) = previous_leader.trace.get() {
-            let former = old.lock().unwrap().relationship.take();
-            if let Some(former) = former {
-                former.child.detach_trace().notify();
-            }
+        // Notices and released stop acknowledgements may enter the run queue;
+        // retain them until the replacement trace slot has been unlocked.
+        let former = previous_leader
+            .trace
+            .get()
+            .and_then(|old| old.lock().unwrap().relationship.take());
+        let mut notices = Vec::new();
+        if let Some(former) = &former {
+            notices.push(former.child.detach_trace());
         }
         rel.former_tid = Some(
             tracer
@@ -575,21 +579,35 @@ impl IoTask {
                 .get()
                 .map_or(self.tid(), |ns| ns.local(self.tid())),
         );
-        rel.child.detach_trace().notify();
+        notices.push(rel.child.detach_trace());
         if let Ok(notice) = original.trace_by_parent(&queue) {
             rel.child = original;
             rel.thread_source = None;
             drop(guard);
+            drop(former);
+            for notice in notices {
+                notice.notify();
+            }
             notice.notify();
             return;
         }
         let Ok(wait) = original.observe(&tracer, &queue) else {
-            guard.relationship = None;
+            let released = guard.relationship.take();
+            drop(guard);
+            drop(released);
+            drop(former);
+            for notice in notices {
+                notice.notify();
+            }
             return;
         };
         rel.child = wait.clone();
         rel.thread_source = None;
         drop(guard);
+        drop(former);
+        for notice in notices {
+            notice.notify();
+        }
         // Preserve lock order with tracer retirement and cover a simultaneous
         // departure between rebinding the task and registering its exit record.
         let mut list = tracer.tracees.lock().unwrap();
@@ -953,6 +971,9 @@ impl IoTask {
                 (_, Some(sig)) => sig,
                 (ControlStop::Group, None) => return false,
                 (ControlStop::Interrupt, None) => 5,
+                // Automatically attached SEIZE children start at an event
+                // trap, not a SIGSTOP group-stop that requires SIGCONT.
+                (ControlStop::Attach, None) if rel.mode == Mode::Seize => 5,
                 (ControlStop::Attach, None) => 19,
             };
             control_status = Some(if rel.mode == Mode::Seize {
@@ -1200,7 +1221,7 @@ impl IoRoutes {
             || !rel
                 .tracer
                 .upgrade()
-                .is_some_and(|t| t.tgid() == caller.tgid())
+                .is_some_and(|t| std::ptr::eq(&*t, caller))
         {
             return Err(Errno(3));
         }
@@ -1236,10 +1257,12 @@ impl IoRoutes {
         }
         if let Some(lock) = target.trace.get() {
             let mut slot = lock.lock().unwrap();
+            // Linux retains the original ptracer task, not its thread group.
+            // A sibling may wait, but cannot issue this task's ptrace controls.
             if let Some(rel) = slot.relationship.as_mut().filter(|r| {
                 r.tracer
                     .upgrade()
-                    .is_some_and(|t| t.tgid() == caller.tgid())
+                    .is_some_and(|t| std::ptr::eq(&*t, caller))
             }) {
                 if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
                     return Err(Errno(1));
@@ -1536,6 +1559,176 @@ impl IoRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seized_birth_reports_an_event_trap_instead_of_a_group_stop() {
+        for mode in [Mode::Attach, Mode::Seize] {
+            let routes = IoRoutes {
+                directory: Arc::default(),
+                namespace: Default::default(),
+                uid: 1000,
+                euid: 1000,
+            };
+            let tracer = Arc::new(IoTask::default());
+            let parent = Arc::new(IoTask::default());
+            let child = Arc::new(IoTask::default());
+            let waits = Arc::new(crate::children::Children::default());
+            let births = Arc::new(crate::children::Children::default());
+            tracer.lifecycle().bind_wait_children(&waits);
+            parent.lifecycle().bind_wait_children(&births);
+            routes.directory.publish(&tracer, 42, 42, 42, 1000, 1000);
+            let mut records = Vec::new();
+            for (task, tid, owner, queue) in [
+                (&parent, 43, &tracer, &waits),
+                (&child, 44, &parent, &births),
+            ] {
+                routes
+                    .directory
+                    .publish(task, tid, tid, owner.tid(), 1000, 1000);
+                let relation = Arc::new(crate::task_parent::Parentage::default());
+                relation.set_parent_thread(owner.tid());
+                task.bind_parentage(&relation);
+                let record = Arc::new(crate::children::Child::default());
+                task.lifecycle()
+                    .bind(&record, Some(owner.lifecycle()), tid, 1000);
+                record.attach(Some(queue), tid, 42, 1000);
+                records.push(record);
+            }
+            assert_eq!(
+                routes.trace_child(&tracer, &parent, mode, PTRACE_O_TRACEFORK, None),
+                Ok(0)
+            );
+            parent.trace_birth(&child, false, 17, Default::default);
+            assert!(child.trace_control_point(Default::default));
+            let slot = child.trace.get().unwrap().lock().unwrap();
+            let stop = slot.relationship.as_ref().unwrap().stop.as_ref().unwrap();
+            assert_eq!(
+                stop.status,
+                if mode == Mode::Seize {
+                    5 | (128 << 8)
+                } else {
+                    19
+                }
+            );
+            assert!(!stop.group_stop);
+        }
+    }
+
+    #[test]
+    fn ptrace_controls_belong_to_the_original_tracer_thread() {
+        let routes = IoRoutes {
+            directory: Arc::default(),
+            namespace: Default::default(),
+            uid: 1000,
+            euid: 1000,
+        };
+        let tracer = Arc::new(IoTask::default());
+        let sibling = Arc::new(IoTask::default());
+        sibling.share_process(&tracer);
+        let task = Arc::new(IoTask::default());
+        for (source, tid, group) in [(&tracer, 42, 42), (&sibling, 44, 42), (&task, 43, 43)] {
+            routes.directory.publish(source, tid, group, 42, 1000, 1000);
+        }
+        let parentage = Arc::new(crate::task_parent::Parentage::default());
+        parentage.set_parent_thread(42);
+        task.bind_parentage(&parentage);
+        let child = Arc::new(crate::children::Child::default());
+        let children = Arc::new(crate::children::Children::default());
+        tracer.lifecycle().bind_wait_children(&children);
+        task.lifecycle()
+            .bind(&child, Some(tracer.lifecycle()), 43, 1000);
+        child.attach(Some(&children), 43, 42, 1000);
+        assert_eq!(routes.trace_me(&task), Ok(0));
+        assert!(task.trace_point(5, None, Default::default));
+        let mut memory = trames_memory::Memory::default();
+        assert_eq!(
+            routes.ptrace(
+                &sibling,
+                [PTRACE_GETREGSET, 43, 1, u64::MAX, 0, 0],
+                &mut memory
+            ),
+            Err(Errno(3))
+        );
+        assert_eq!(
+            routes.ptrace(&sibling, [PTRACE_CONT, 43, 0, 0, 0, 0], &mut memory),
+            Err(Errno(3))
+        );
+        assert!(task.trace_stopped());
+        assert_eq!(
+            routes.ptrace(&tracer, [PTRACE_CONT, 43, 0, 0, 0, 0], &mut memory),
+            Ok(0)
+        );
+        assert!(!task.trace_stopped());
+    }
+
+    #[test]
+    fn nonleader_exec_observer_notifications_run_after_the_trace_slot_unlocks() {
+        struct Wake {
+            task: Weak<IoTask>,
+            calls: AtomicU32,
+        }
+        impl trames_shared::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+                let task = self.task.upgrade().unwrap();
+                assert!(
+                    task.trace.get().unwrap().try_lock().is_ok(),
+                    "trace slot held during wait notification"
+                );
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let routes = IoRoutes {
+            directory: Arc::default(),
+            namespace: Default::default(),
+            uid: 1000,
+            euid: 1000,
+        };
+        let tracer = Arc::new(IoTask::default());
+        let leader = Arc::new(IoTask::default());
+        let thread = Arc::new(IoTask::default());
+        thread.share_process(&leader);
+        for (source, tid, group) in [(&tracer, 42, 42), (&leader, 43, 43), (&thread, 44, 43)] {
+            routes.directory.publish(source, tid, group, 42, 1000, 1000);
+            let parentage = Arc::new(crate::task_parent::Parentage::default());
+            parentage.set_parent_thread(42);
+            source.bind_parentage(&parentage);
+        }
+        let children = Arc::new(crate::children::Children::default());
+        tracer.lifecycle().bind_wait_children(&children);
+        let child = Arc::new(crate::children::Child::default());
+        leader
+            .lifecycle()
+            .bind(&child, Some(tracer.lifecycle()), 43, 1000);
+        child.attach(Some(&children), 43, 42, 1000);
+        assert_eq!(
+            routes.trace_child(&tracer, &leader, Mode::Attach, 0, None),
+            Ok(0)
+        );
+        assert_eq!(
+            routes.trace_child(&tracer, &thread, Mode::Attach, 0, None),
+            Ok(0)
+        );
+        let wake = Arc::new(Wake {
+            task: Arc::downgrade(&thread),
+            calls: AtomicU32::new(0),
+        });
+        let target: Arc<dyn trames_shared::IoWake> = wake.clone();
+        let signal = trames_shared::IoSignal::new(42, Arc::downgrade(&target));
+        let _subscription = children.subscribe(&signal);
+        thread.rebind_thread_observer(&leader);
+        assert!(wake.calls.load(Ordering::Relaxed) > 0);
+        assert!(thread
+            .trace
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .relationship
+            .as_ref()
+            .unwrap()
+            .thread_source
+            .is_none());
+    }
 
     #[test]
     fn regset_prefix_preserves_tls_and_rejects_privileged_state() {

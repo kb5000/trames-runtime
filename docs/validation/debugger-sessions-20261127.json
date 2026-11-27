@@ -1,0 +1,2318 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-27",
+  "runtime_base": "8bd058556ffb35be8e127afbaf7c1c26dae998d9",
+  "mac_source_base": "f620fa2958b920f8f5ae9c77e6c04387cd309daf",
+  "source_manifest_sha256": "e0988da2bd5f49940c0b2f75308249d4eaa0d71da51e4885102ad6614277b13a",
+  "sources": {
+    "crates/trames-kernel/src/signal/io_ptrace.rs": "16f672ae7536673ad93781f1a653b82a7b902bc558117c9224475788e5a47fa4",
+    "crates/trames-session/src/workers.rs": "e3fc248fd636ade456d0e9ee32a00b6212df3226d5ad360ea2a06c7486ebf3fd",
+    "tests/fixtures/debugger-sessions.c": "802c5ffbefffcc41eaff73c9891771564327af5a2daa699902ccad351b956e1a",
+    "tests/fixtures/debugger-sessions.py": "6b5a8f7ded6132ef4bf5008b205cb574a505f0c9571868bc9bcb7683f3ea4355"
+  },
+  "inputs": {
+    "native_root": "/var/tmp/trames-debugger-20261127-root",
+    "fixture_command": [
+      "musl-gcc",
+      "-mno-outline-atomics",
+      "-O0",
+      "-g3",
+      "-fno-omit-frame-pointer",
+      "-fno-pie",
+      "-no-pie",
+      "-pthread",
+      "-idirafter",
+      "/usr/include",
+      "-idirafter",
+      "/usr/include/aarch64-linux-gnu",
+      "/mnt/trames-source/runtime/tests/fixtures/debugger-sessions.c",
+      "-o",
+      "/mnt/trames-output/debugger-20261127/debugger-sessions"
+    ],
+    "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+    "fixture_source_sha256": "802c5ffbefffcc41eaff73c9891771564327af5a2daa699902ccad351b956e1a",
+    "driver_sha256": "6b5a8f7ded6132ef4bf5008b205cb574a505f0c9571868bc9bcb7683f3ea4355",
+    "archive_sha256": "8eef91489edc0f3c591fe31bfebcd0be28cab8d720fb17cd41dedcc301c44e20",
+    "archive": "/mnt/trames-output/debugger-20261127/debugger-rootfs-c3.tar.gz"
+  },
+  "apk_inputs_manifest_sha256": "6180b73226d504738f2d3655584abfd5c585ae615c412d20392554e11a7978fc",
+  "tools": {
+    "gdb": {
+      "path": "/usr/bin/gdb",
+      "version": "GNU gdb (GDB) 15.2",
+      "sha256": "6c3009db815edec67292d42cda2aa3d31b9e5bb13a27dd8fbb643564b89ad1eb"
+    },
+    "gdbserver": {
+      "path": "/usr/bin/gdbserver",
+      "version": "GNU gdbserver (GDB) 15.2",
+      "sha256": "7368bdef6139082bf343d6dca87aa411e201558ed169146564105e85a7435ef4"
+    },
+    "strace": {
+      "path": "/usr/bin/strace",
+      "version": "strace -- version 6.13",
+      "sha256": "8b656d6aa075bb0ab1e57166b6dd6a3e2d96e8c85372c672dc80d1daed9014a2"
+    }
+  },
+  "runners": {
+    "cli": {
+      "path": "/Users/main/dev/trames/target/validation-debugger-20261127/trames-run-debugger",
+      "sha256": "d50ce7da4585f849fed16d229351f422628f1e1f89f162019f1c457871baa336",
+      "runtime_source_manifest": "/Users/main/dev/trames/target/validation-debugger-20261127/runtime-source-candidate3.json",
+      "source": "/Users/main/dev/trames"
+    },
+    "mac": {
+      "path": "/Users/main/dev/trames/target/validation-debugger-20261127/trames-hvf-debugger",
+      "sha256": "d0c246e7215a66860d9e85552243f7b532c1dc2b6a18473e0a147de1e1aa3625",
+      "runtime_source_manifest": "/Users/main/dev/trames/target/validation-debugger-20261127/runtime-source-candidate3.json",
+      "source": "/Users/main/dev/trames/target/validation-cgroup-20261127/mac-source"
+    }
+  },
+  "sessions": [
+    {
+      "backend": "native",
+      "cpus": null,
+      "kernel": "7.0.0-44-generic",
+      "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+      "rows": [
+        {
+          "name": "ptrace-thread-ownership",
+          "status": "passed",
+          "seconds": 0.000677480005833786
+        },
+        {
+          "name": "live-attach",
+          "status": "passed",
+          "seconds": 0.053209876001346856
+        },
+        {
+          "name": "multithread-attach",
+          "status": "passed",
+          "seconds": 0.05226446999586187
+        },
+        {
+          "name": "clone-while-traced",
+          "status": "passed",
+          "seconds": 0.05121089399472112
+        },
+        {
+          "name": "explicit-detach",
+          "status": "passed",
+          "seconds": 0.05033424199791625
+        },
+        {
+          "name": "gdbserver-attach",
+          "status": "passed",
+          "seconds": 0.07481006900343345
+        },
+        {
+          "name": "gdbserver-launch",
+          "status": "passed",
+          "seconds": 0.07429305199912051
+        },
+        {
+          "name": "gdbserver-detach",
+          "status": "passed",
+          "seconds": 0.06477116300084163
+        },
+        {
+          "name": "attach-denied",
+          "status": "passed",
+          "seconds": 0.02560198900027899
+        },
+        {
+          "name": "tracer-abrupt-exit",
+          "status": "passed",
+          "seconds": 0.038261187000898644
+        },
+        {
+          "name": "target-early-exit",
+          "status": "passed",
+          "seconds": 0.042045975002110936
+        },
+        {
+          "name": "target-killed-while-stopped",
+          "status": "passed",
+          "seconds": 0.04891048699937528
+        },
+        {
+          "name": "strace-fork-exec",
+          "status": "passed",
+          "seconds": 0.005037995004386175
+        },
+        {
+          "name": "strace-thread-exec",
+          "status": "passed",
+          "seconds": 0.004531728998699691
+        }
+      ],
+      "evidence": "target/local-ci/io/debugger-20261127/native-c3/sessions.json"
+    },
+    {
+      "backend": "interpreter",
+      "cpus": 2,
+      "kernel": "6.0.0-trames",
+      "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+      "rows": [
+        {
+          "name": "ptrace-thread-ownership",
+          "status": "passed",
+          "seconds": 0.05783841700000014
+        },
+        {
+          "name": "live-attach",
+          "status": "passed",
+          "seconds": 3.5258928749999994
+        },
+        {
+          "name": "multithread-attach",
+          "status": "passed",
+          "seconds": 3.486376709
+        },
+        {
+          "name": "clone-while-traced",
+          "status": "passed",
+          "seconds": 3.463663833
+        },
+        {
+          "name": "explicit-detach",
+          "status": "passed",
+          "seconds": 3.3098062089999996
+        },
+        {
+          "name": "gdbserver-attach",
+          "status": "passed",
+          "seconds": 3.8444273749999986
+        },
+        {
+          "name": "gdbserver-launch",
+          "status": "passed",
+          "seconds": 4.005952874999998
+        },
+        {
+          "name": "gdbserver-detach",
+          "status": "passed",
+          "seconds": 4.121858208999999
+        },
+        {
+          "name": "attach-denied",
+          "status": "passed",
+          "seconds": 2.5174020000000006
+        },
+        {
+          "name": "tracer-abrupt-exit",
+          "status": "passed",
+          "seconds": 3.336155542
+        },
+        {
+          "name": "target-early-exit",
+          "status": "passed",
+          "seconds": 3.342731915999998
+        },
+        {
+          "name": "target-killed-while-stopped",
+          "status": "passed",
+          "seconds": 3.7383481250000017
+        },
+        {
+          "name": "strace-fork-exec",
+          "status": "passed",
+          "seconds": 0.08634270800000365
+        },
+        {
+          "name": "strace-thread-exec",
+          "status": "passed",
+          "seconds": 0.07653650000000312
+        }
+      ],
+      "evidence": "target/validation-debugger-20261127/interpreter-results/interpreter-c3/sessions.json"
+    },
+    {
+      "backend": "hvf",
+      "cpus": 2,
+      "kernel": "6.0.0-trames",
+      "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+      "rows": [
+        {
+          "name": "ptrace-thread-ownership",
+          "status": "passed",
+          "seconds": 0.029322832999999993
+        },
+        {
+          "name": "live-attach",
+          "status": "passed",
+          "seconds": 0.356908542
+        },
+        {
+          "name": "multithread-attach",
+          "status": "passed",
+          "seconds": 0.3382887499999999
+        },
+        {
+          "name": "clone-while-traced",
+          "status": "passed",
+          "seconds": 0.3861227919999999
+        },
+        {
+          "name": "explicit-detach",
+          "status": "passed",
+          "seconds": 0.39024812500000006
+        },
+        {
+          "name": "gdbserver-attach",
+          "status": "passed",
+          "seconds": 0.7686258749999997
+        },
+        {
+          "name": "gdbserver-launch",
+          "status": "passed",
+          "seconds": 0.516472834
+        },
+        {
+          "name": "gdbserver-detach",
+          "status": "passed",
+          "seconds": 0.5334500000000002
+        },
+        {
+          "name": "attach-denied",
+          "status": "passed",
+          "seconds": 0.29237883299999945
+        },
+        {
+          "name": "tracer-abrupt-exit",
+          "status": "passed",
+          "seconds": 0.3535004580000001
+        },
+        {
+          "name": "target-early-exit",
+          "status": "passed",
+          "seconds": 0.3881492909999995
+        },
+        {
+          "name": "target-killed-while-stopped",
+          "status": "passed",
+          "seconds": 0.2883257919999993
+        },
+        {
+          "name": "strace-fork-exec",
+          "status": "passed",
+          "seconds": 0.09282412499999992
+        },
+        {
+          "name": "strace-thread-exec",
+          "status": "passed",
+          "seconds": 0.1397177910000007
+        }
+      ],
+      "evidence": "target/validation-debugger-20261127/hvf-results/hvf-c3/sessions.json"
+    },
+    {
+      "backend": "interpreter",
+      "cpus": 1,
+      "kernel": "6.0.0-trames",
+      "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+      "rows": [
+        {
+          "name": "multithread-attach",
+          "status": "passed",
+          "seconds": 3.046300833
+        },
+        {
+          "name": "clone-while-traced",
+          "status": "passed",
+          "seconds": 3.033850084000001
+        },
+        {
+          "name": "explicit-detach",
+          "status": "passed",
+          "seconds": 2.8766519170000002
+        },
+        {
+          "name": "gdbserver-attach",
+          "status": "passed",
+          "seconds": 3.260987791999998
+        },
+        {
+          "name": "tracer-abrupt-exit",
+          "status": "passed",
+          "seconds": 2.8384658750000007
+        },
+        {
+          "name": "target-killed-while-stopped",
+          "status": "passed",
+          "seconds": 3.0032294999999998
+        },
+        {
+          "name": "strace-fork-exec",
+          "status": "passed",
+          "seconds": 0.07005591600000116
+        },
+        {
+          "name": "strace-thread-exec",
+          "status": "passed",
+          "seconds": 0.06751520799999966
+        }
+      ],
+      "evidence": "target/validation-debugger-20261127/interpreter-results/interpreter-single-slot/sessions.json"
+    },
+    {
+      "backend": "hvf",
+      "cpus": 1,
+      "kernel": "6.0.0-trames",
+      "fixture_sha256": "b2833bde29e8d18b1a9e19bbafdd69b951e036b4ae46b8a47648ef32c6b29abd",
+      "rows": [
+        {
+          "name": "multithread-attach",
+          "status": "passed",
+          "seconds": 0.233807541
+        },
+        {
+          "name": "clone-while-traced",
+          "status": "passed",
+          "seconds": 0.23919258399999999
+        },
+        {
+          "name": "explicit-detach",
+          "status": "passed",
+          "seconds": 0.21690687500000005
+        },
+        {
+          "name": "gdbserver-attach",
+          "status": "passed",
+          "seconds": 0.3727717919999999
+        },
+        {
+          "name": "tracer-abrupt-exit",
+          "status": "passed",
+          "seconds": 0.19819366699999996
+        },
+        {
+          "name": "target-killed-while-stopped",
+          "status": "passed",
+          "seconds": 0.17855258299999988
+        },
+        {
+          "name": "strace-fork-exec",
+          "status": "passed",
+          "seconds": 0.04909187500000001
+        },
+        {
+          "name": "strace-thread-exec",
+          "status": "passed",
+          "seconds": 0.058980708999999854
+        }
+      ],
+      "evidence": "target/validation-debugger-20261127/hvf-results/hvf-single-slot/sessions.json"
+    }
+  ],
+  "checks": {
+    "apple-build-c2": {
+      "exit_code": 0,
+      "elapsed_seconds": 10.07,
+      "command": [
+        "env",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "test",
+        "--manifest-path",
+        "runtime/Cargo.toml",
+        "-p",
+        "trames-kernel",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "--no-run",
+        "--message-format=json",
+        "-j",
+        "2"
+      ]
+    },
+    "linux-build-c2-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 13.39,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "220",
+        "/mnt/trames-output/debugger-20261127/linux-build-c2.log",
+        "env",
+        "CARGO_TARGET_DIR=/mnt/trames-output/fuse-runtime-target-20261125",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "test",
+        "-p",
+        "trames-kernel",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "--no-run",
+        "--message-format=json",
+        "-j",
+        "2"
+      ]
+    },
+    "apple-kernel-tests-c2": {
+      "exit_code": 0,
+      "elapsed_seconds": 1.05,
+      "command": [
+        "python3",
+        "target/validation-cgroup-closeout-20261127/libtest-runner.py",
+        "target/validation-debugger-20261127/apple-build-c2.log",
+        "target/validation-debugger-20261127/apple-kernel-c2"
+      ]
+    },
+    "linux-kernel-tests-c2-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 1.82,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "160",
+        "/mnt/trames-output/debugger-20261127/linux-kernel-tests-c2.log",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/libtest-runner.py",
+        "/mnt/trames-output/debugger-20261127/linux-build-c2.log",
+        "/mnt/trames-output/debugger-20261127/linux-kernel-c2"
+      ]
+    },
+    "apple-clippy-c2": {
+      "exit_code": 0,
+      "elapsed_seconds": 96.46,
+      "command": [
+        "env",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "runtime/Cargo.toml",
+        "-p",
+        "trames-kernel",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "linux-clippy-c2-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 74.7,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "180",
+        "/mnt/trames-output/debugger-20261127/linux-clippy-c2.log",
+        "env",
+        "CARGO_TARGET_DIR=/mnt/trames-output/fuse-runtime-target-20261125",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "clippy",
+        "-p",
+        "trames-kernel",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "kernel-conformance-build-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 102.86,
+      "command": [
+        "env",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "test",
+        "-p",
+        "trames-core",
+        "--test",
+        "kernel-conformance",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "--no-run",
+        "--message-format=json",
+        "-j",
+        "2"
+      ]
+    },
+    "kernel-conformance-tests-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 11.65,
+      "command": [
+        "python3",
+        "target/validation-cgroup-closeout-20261127/libtest-runner.py",
+        "target/validation-debugger-20261127/kernel-conformance-build-c3.log",
+        "target/validation-debugger-20261127/kernel-conformance-c3"
+      ]
+    },
+    "session-check-linux-c3-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 75.28,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "200",
+        "/mnt/trames-output/debugger-20261127/session-build-c3.log",
+        "env",
+        "CARGO_TARGET_DIR=/mnt/trames-output/fuse-runtime-target-20261125",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "test",
+        "-p",
+        "trames-session",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "--no-run",
+        "--message-format=json",
+        "-j",
+        "2"
+      ]
+    },
+    "session-tests-linux-c3-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 0.3,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "160",
+        "/mnt/trames-output/debugger-20261127/session-tests-c3.log",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/libtest-runner.py",
+        "/mnt/trames-output/debugger-20261127/session-build-c3.log",
+        "/mnt/trames-output/debugger-20261127/linux-session-c3"
+      ]
+    },
+    "session-clippy-apple-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 159.14,
+      "command": [
+        "env",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "runtime/Cargo.toml",
+        "-p",
+        "trames-session",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "session-clippy-linux-c3-driver": {
+      "exit_code": 0,
+      "elapsed_seconds": 104.49,
+      "command": [
+        "env",
+        "LIMA_HOME=/Users/main/dev/trames/target/local-ci/lima",
+        "target/tools/lima-2.2.1/bin/limactl",
+        "shell",
+        "--workdir=/mnt/trames-source/runtime",
+        "linux",
+        "--",
+        "python3",
+        "/mnt/trames-source/target/validation-cgroup-closeout-20261127/stage.py",
+        "200",
+        "/mnt/trames-output/debugger-20261127/session-clippy-c3.log",
+        "env",
+        "CARGO_TARGET_DIR=/mnt/trames-output/fuse-runtime-target-20261125",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_TEST_DEBUG=0",
+        "cargo",
+        "clippy",
+        "-p",
+        "trames-session",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--offline",
+        "-j",
+        "2",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "build-cli-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 136.83,
+      "command": [
+        "python3",
+        "target/validation-debugger-20261127/build-cli.py",
+        "cli"
+      ]
+    },
+    "build-hvf-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 153.99,
+      "command": [
+        "python3",
+        "target/validation-debugger-20261127/build-mac.py",
+        "mac"
+      ]
+    },
+    "ios-arm64-c3": {
+      "exit_code": 0,
+      "elapsed_seconds": 95.2,
+      "command": [
+        "env",
+        "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
+        "CARGO_NET_OFFLINE=true",
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_RELEASE_DEBUG=0",
+        "CARGO_BUILD_JOBS=2",
+        "python3",
+        "scripts/stage-ios-rust.py",
+        "aarch64-apple-ios",
+        "/Users/main/dev/trames/target/moltenvk-patched/ios-arm64-d63d9672b06094154f4f"
+      ]
+    }
+  },
+  "unit_results": {
+    "apple_kernel": {
+      "passed": 204,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 0,
+      "total": 204,
+      "seconds": 0.965
+    },
+    "linux_kernel": {
+      "passed": 204,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 0,
+      "total": 204,
+      "seconds": 1.578
+    },
+    "linux_session": {
+      "passed": 11,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 0,
+      "total": 11,
+      "seconds": 0.126
+    },
+    "interpreter_composition": {
+      "passed": 547,
+      "failed": 0,
+      "timeout": 0,
+      "ignored": 3,
+      "total": 550,
+      "seconds": 11.532
+    }
+  },
+  "gvisor": {
+    "suites": [
+      {
+        "name": "exec",
+        "sha256": "670f79e29cc064a0e29bbb5a0f76d731f7568f71a82a7f638b877e039883d5a8",
+        "available": 73,
+        "cases": [
+          "ExecTest.Basic",
+          "ExecTest.WithSiblingThread",
+          "ExecTest.FromSiblingThread",
+          "ExecTest.SUIDExecDoesntGainUIDWithPtracerAttached",
+          "ExecTest.ReadProcMemAfterExecFromChild",
+          "ExecStateTest.HandlerReset",
+          "ExecStateTest.SignalMask"
+        ]
+      },
+      {
+        "name": "fork",
+        "sha256": "7e65bcb17a1cd12e9411256a0b47775834bc7048ee07880bae06a85eb10865ef",
+        "available": 24,
+        "cases": [
+          "ForkTest.Simple",
+          "ForkTest.ExitCode",
+          "ForkTest.Multi",
+          "ForkTest.Pipe"
+        ]
+      },
+      {
+        "name": "ptrace",
+        "sha256": "a20c525167adfbfe127c07f0161f4dbcee62385419c575bc9f8b0e0ad46698ba",
+        "available": 36,
+        "cases": [
+          "PtraceTest.AttachSelf",
+          "PtraceTest.AttachSameThreadGroup",
+          "PtraceTest.AccessVmUsesAttachCreds_CapDroppedAfterAttach",
+          "PtraceTest.AccessVmUsesAttachCreds_CapGainedAfterAttach",
+          "PtraceTest.TracemeNonDumpableInUserns",
+          "PtraceTest.TraceParentNotAllowed",
+          "PtraceTest.TraceNonDescendantNotAllowed",
+          "PtraceTest.TraceNonDescendantWithCapabilityAllowed",
+          "PtraceTest.TraceDescendantsAllowed",
+          "PtraceTest.PrctlSetPtracerInvalidPID",
+          "PtraceTest.PrctlSetPtracer",
+          "PtraceTest.PrctlSetPtracerPersistsPastTraceeThreadExit",
+          "PtraceTest.PrctlSetPtracerPersistsPastLeaderExec",
+          "PtraceTest.PrctlSetPtracerDoesNotPersistPastNonLeaderExec",
+          "PtraceTest.PrctlSetPtracerDoesNotPersistPastTracerThreadExit",
+          "PtraceTest.PrctlSetPtracerRespectsTracerThreadID",
+          "PtraceTest.PrctlClearPtracerDoesNotAffectCurrentTracer",
+          "PtraceTest.PrctlNotInherited",
+          "PtraceTest.AttachParent_PeekData_PokeData_SignalSuppression",
+          "PtraceTest.GetSigMask",
+          "PtraceTest.GetSiginfo_SetSiginfo_SignalInjection",
+          "PtraceTest.SIGKILLDoesNotCauseSignalDeliveryStop",
+          "PtraceTest.PtraceKill",
+          "PtraceTest.GetRegSet",
+          "PtraceTest.GetRegSetPartialRead",
+          "PtraceTest.SetRegSetKeepsTLS",
+          "PtraceTest.ExitWhenParentIsNotTracer_Syscall_TraceVfork_TraceVforkDone",
+          "PtraceTest.Seize_Interrupt_Listen",
+          "PtraceTest.Interrupt_Listen_RequireSeize",
+          "PtraceTest.SeizeSetOptions",
+          "PtraceTest.SetYAMAPtraceScope",
+          "PtraceTest.ExecvePtraceLockStress",
+          "Seize/PtraceAttachTest.AttachingConvertsGroupStopToPtraceStop/0",
+          "Seize/PtraceAttachTest.AttachingConvertsGroupStopToPtraceStop/1",
+          "TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/0",
+          "TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/1"
+        ]
+      },
+      {
+        "name": "vfork",
+        "sha256": "dc7205f06a008e390600e863cc67fbb9f6fc33990436f28ffb65417ec67db41b",
+        "available": 4,
+        "cases": [
+          "VforkTest.ParentStopsUntilChildExits",
+          "VforkTest.ParentStopsUntilChildExecves",
+          "VforkTest.ExecedChildExitDoesntUnstopParent",
+          "VforkTest.SigchldReceivedDuringVforkIsDelivered"
+        ]
+      },
+      {
+        "name": "wait",
+        "sha256": "4d664675762a3a2d4935f12ec4022fc7a17c919c8e427e989b422f1d2d869ce6",
+        "available": 64,
+        "cases": [
+          "WaitTest.SignalExit",
+          "WaitTest.WaitidOptions",
+          "WaitTest.WaitidNoWEXITED",
+          "WaitTest.WaitidWNOWAIT",
+          "WaitTest.WaitPid",
+          "WaitTest.KillZombie",
+          "WaitTest.Wait4Rusage",
+          "WaitTest.WaitidRusage",
+          "WaitTest.TraceeWALL",
+          "WaitTest.NonConsumingWaitPrefersGroupExitStatus",
+          "Waiters/WaitAnyChildTest.Fork/0",
+          "Waiters/WaitAnyChildTest.Fork/1",
+          "Waiters/WaitAnyChildTest.AfterExit/0",
+          "Waiters/WaitAnyChildTest.AfterExit/1",
+          "Waiters/WaitAnyChildTest.MultipleFork/0",
+          "Waiters/WaitAnyChildTest.MultipleFork/1",
+          "Waiters/WaitAnyChildTest.CloneSIGCHLD/0",
+          "Waiters/WaitAnyChildTest.CloneSIGCHLD/1",
+          "Waiters/WaitAnyChildTest.ForkAndClone/0",
+          "Waiters/WaitAnyChildTest.ForkAndClone/1",
+          "Waiters/WaitAnyChildTest.WaitWNOHANG/0",
+          "Waiters/WaitAnyChildTest.WaitWNOHANG/1",
+          "Waiters/WaitAnyChildTest.BadOption/0",
+          "Waiters/WaitAnyChildTest.BadOption/1",
+          "Waiters/WaitAnyChildTest.WaitedChildRusage/0",
+          "Waiters/WaitAnyChildTest.WaitedChildRusage/1",
+          "Waiters/WaitAnyChildTest.IgnoredChildRusage/0",
+          "Waiters/WaitAnyChildTest.IgnoredChildRusage/1",
+          "Waiters/WaitSpecificChildTest.Fork/0",
+          "Waiters/WaitSpecificChildTest.Fork/1",
+          "Waiters/WaitSpecificChildTest.NormalExit/0",
+          "Waiters/WaitSpecificChildTest.NormalExit/1",
+          "Waiters/WaitSpecificChildTest.MultipleFork/0",
+          "Waiters/WaitSpecificChildTest.MultipleFork/1",
+          "Waiters/WaitSpecificChildTest.MultipleForkOutOfOrder/0",
+          "Waiters/WaitSpecificChildTest.MultipleForkOutOfOrder/1",
+          "Waiters/WaitSpecificChildTest.ForkSleep/0",
+          "Waiters/WaitSpecificChildTest.ForkSleep/1",
+          "Waiters/WaitSpecificChildTest.ForkBlock/0",
+          "Waiters/WaitSpecificChildTest.ForkBlock/1",
+          "Waiters/WaitSpecificChildTest.AfterExit/0",
+          "Waiters/WaitSpecificChildTest.AfterExit/1",
+          "Waiters/WaitSpecificChildTest.SiblingChildren/0",
+          "Waiters/WaitSpecificChildTest.SiblingChildren/1",
+          "Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/0",
+          "Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/1",
+          "Waiters/WaitSpecificChildTest.CloneSIGCHLD/0",
+          "Waiters/WaitSpecificChildTest.CloneSIGCHLD/1",
+          "Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/0",
+          "Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/1",
+          "Waiters/WaitSpecificChildTest.CloneAfterExit/0",
+          "Waiters/WaitSpecificChildTest.CloneAfterExit/1",
+          "Waiters/WaitSpecificChildTest.CloneThread/0",
+          "Waiters/WaitSpecificChildTest.CloneThread/1",
+          "Waiters/WaitSpecificChildTest.CloneWCLONE/0",
+          "Waiters/WaitSpecificChildTest.CloneWCLONE/1",
+          "Waiters/WaitSpecificChildTest.ForkWCLONE/0",
+          "Waiters/WaitSpecificChildTest.ForkWCLONE/1",
+          "Waiters/WaitSpecificChildTest.WALL/0",
+          "Waiters/WaitSpecificChildTest.WALL/1",
+          "Waiters/WaitSpecificChildTest.BadChild/0",
+          "Waiters/WaitSpecificChildTest.BadChild/1",
+          "Waiters/WaitSpecificChildTest.AfterChildExecve/0",
+          "Waiters/WaitSpecificChildTest.AfterChildExecve/1"
+        ]
+      },
+      {
+        "name": "process_vm_read_write",
+        "sha256": "193ac48fb2afc4b9cd29dda80b1243237897907fad161567bfb40fa493d3bf3f",
+        "available": 51,
+        "cases": [
+          "ProcessVMInvalidTest.EmptyTransferPrecedesRemoteValidation",
+          "ProcessVMInvalidTest.NonZeroFlags",
+          "ProcessVMInvalidTest.NullLocalIovec",
+          "ProcessVMInvalidTest.NULLRemoteIovec",
+          "ProcessVMInvalidTest.ProcessNoExist",
+          "ProcessVMInvalidTest.GreaterThanIOV_MAX",
+          "ProcessVMInvalidTest.PartialReadWrite",
+          "ProcessVMInvalidTest.AccessInvalidMemoryFailsWithEINVAL",
+          "ProcessVMTest.WriteToZombie",
+          "ProcessVMTest.TestReadvNull",
+          "ProcessVMTest.TestWritevNull",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/BothEmpty",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/EmptyLocal",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/EmptyRemote",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/SingleChar",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargerRemoteBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargerLocalBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/BothWithMultipleIovecs",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargeBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/BothEmpty",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/EmptyLocal",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/EmptyRemote",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/SingleChar",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargerRemoteBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargerLocalBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/BothWithMultipleIovecs",
+          "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargeBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/BothEmpty",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/EmptyLocal",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/EmptyRemote",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/SingleChar",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargerRemoteBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargerLocalBuffer",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/BothWithMultipleIovecs",
+          "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargeBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/BothEmpty",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/EmptyLocal",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/EmptyRemote",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/SingleChar",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargerRemoteBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargerLocalBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/BothWithMultipleIovecs",
+          "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargeBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/BothEmpty",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/EmptyLocal",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/EmptyRemote",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/SingleChar",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargerRemoteBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargerLocalBuffer",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/BothWithMultipleIovecs",
+          "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargeBuffer"
+        ]
+      }
+    ],
+    "counts": {
+      "passed": 165,
+      "skipped": 1
+    },
+    "interpreter_rerun": 38,
+    "interpreter_reused": 128,
+    "native_refreshed_cases": [
+      "VforkTest.ParentStopsUntilChildExecves",
+      "Waiters/WaitSpecificChildTest.ForkBlock/0"
+    ],
+    "rows": [
+      {
+        "suite": "exec",
+        "case": "ExecStateTest.HandlerReset",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecStateTest.SignalMask",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecTest.Basic",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecTest.FromSiblingThread",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecTest.ReadProcMemAfterExecFromChild",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecTest.SUIDExecDoesntGainUIDWithPtracerAttached",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "exec",
+        "case": "ExecTest.WithSiblingThread",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "fork",
+        "case": "ForkTest.ExitCode",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "fork",
+        "case": "ForkTest.Multi",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "fork",
+        "case": "ForkTest.Pipe",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "fork",
+        "case": "ForkTest.Simple",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.AccessInvalidMemoryFailsWithEINVAL",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.EmptyTransferPrecedesRemoteValidation",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.GreaterThanIOV_MAX",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.NULLRemoteIovec",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.NonZeroFlags",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.NullLocalIovec",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.PartialReadWrite",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMInvalidTest.ProcessNoExist",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTest.TestReadvNull",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTest.TestWritevNull",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTest.WriteToZombie",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/BothEmpty",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/BothWithMultipleIovecs",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/EmptyLocal",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/EmptyRemote",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargeBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargerLocalBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/LargerRemoteBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcess/SingleChar",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/BothEmpty",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/BothWithMultipleIovecs",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/EmptyLocal",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/EmptyRemote",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargeBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargerLocalBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/LargerRemoteBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSameProcessDifferentThread/SingleChar",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/BothEmpty",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/BothWithMultipleIovecs",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/EmptyLocal",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/EmptyRemote",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargeBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargerLocalBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/LargerRemoteBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestReadvSubProcess/SingleChar",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/BothEmpty",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/BothWithMultipleIovecs",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/EmptyLocal",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/EmptyRemote",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargeBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargerLocalBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/LargerRemoteBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSameProcess/SingleChar",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/BothEmpty",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/BothWithMultipleIovecs",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/EmptyLocal",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/EmptyRemote",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargeBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargerLocalBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/LargerRemoteBuffer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "process_vm_read_write",
+        "case": "ProcessVMTests/ProcessVMTest.TestWritevSubProcess/SingleChar",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.AccessVmUsesAttachCreds_CapDroppedAfterAttach",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.AccessVmUsesAttachCreds_CapGainedAfterAttach",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.AttachParent_PeekData_PokeData_SignalSuppression",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.AttachSameThreadGroup",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.AttachSelf",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.ExecvePtraceLockStress",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.ExitWhenParentIsNotTracer_Syscall_TraceVfork_TraceVforkDone",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.GetRegSet",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.GetRegSetPartialRead",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.GetSigMask",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.GetSiginfo_SetSiginfo_SignalInjection",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.Interrupt_Listen_RequireSeize",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlClearPtracerDoesNotAffectCurrentTracer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlNotInherited",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracer",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerDoesNotPersistPastNonLeaderExec",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerDoesNotPersistPastTracerThreadExit",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerInvalidPID",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerPersistsPastLeaderExec",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerPersistsPastTraceeThreadExit",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PrctlSetPtracerRespectsTracerThreadID",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.PtraceKill",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.SIGKILLDoesNotCauseSignalDeliveryStop",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.SeizeSetOptions",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.Seize_Interrupt_Listen",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.SetRegSetKeepsTLS",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.SetYAMAPtraceScope",
+        "native": "skipped",
+        "interpreter": "skipped",
+        "hvf": "skipped",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.TraceDescendantsAllowed",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.TraceNonDescendantNotAllowed",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.TraceNonDescendantWithCapabilityAllowed",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.TraceParentNotAllowed",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "PtraceTest.TracemeNonDumpableInUserns",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "Seize/PtraceAttachTest.AttachingConvertsGroupStopToPtraceStop/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "Seize/PtraceAttachTest.AttachingConvertsGroupStopToPtraceStop/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "ptrace",
+        "case": "TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "vfork",
+        "case": "VforkTest.ExecedChildExitDoesntUnstopParent",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "vfork",
+        "case": "VforkTest.ParentStopsUntilChildExecves",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "vfork",
+        "case": "VforkTest.ParentStopsUntilChildExits",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "vfork",
+        "case": "VforkTest.SigchldReceivedDuringVforkIsDelivered",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.KillZombie",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.NonConsumingWaitPrefersGroupExitStatus",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.SignalExit",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.TraceeWALL",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter-c3"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.Wait4Rusage",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.WaitPid",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.WaitidNoWEXITED",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.WaitidOptions",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.WaitidRusage",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "WaitTest.WaitidWNOWAIT",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.AfterExit/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.AfterExit/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.BadOption/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.BadOption/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.CloneSIGCHLD/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.CloneSIGCHLD/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.Fork/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.Fork/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.ForkAndClone/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.ForkAndClone/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.IgnoredChildRusage/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.IgnoredChildRusage/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.MultipleFork/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.MultipleFork/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.WaitWNOHANG/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.WaitWNOHANG/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.WaitedChildRusage/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitAnyChildTest.WaitedChildRusage/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.AfterChildExecve/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.AfterChildExecve/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.AfterExit/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.AfterExit/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.BadChild/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.BadChild/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneAfterExit/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneAfterExit/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneSIGCHLD/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneSIGCHLD/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneThread/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneThread/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneWCLONE/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.CloneWCLONE/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.Fork/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.Fork/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkBlock/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkBlock/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkSleep/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkSleep/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkWCLONE/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.ForkWCLONE/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.MultipleFork/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.MultipleFork/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.MultipleForkOutOfOrder/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.MultipleForkOutOfOrder/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.NormalExit/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.NormalExit/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.SiblingChildren/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.SiblingChildren/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.WALL/0",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      },
+      {
+        "suite": "wait",
+        "case": "Waiters/WaitSpecificChildTest.WALL/1",
+        "native": "passed",
+        "interpreter": "passed",
+        "hvf": "passed",
+        "interpreter_source": "gvisor-interpreter"
+      }
+    ]
+  }
+}

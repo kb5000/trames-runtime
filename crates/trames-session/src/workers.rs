@@ -1021,7 +1021,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                 }
                             }
-                            if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
+                            // A pending SVC at ptrace entry has no accepted effects yet.
+                            // Remote-memory servicing may wake this job while the
+                            // debugger still owns that stop; retain the entry until resume.
+                            if work.syscalls.as_ref().is_some_and(|s| if job.pending_cpu.is_some() { s.io_signals.trace_stopped() } else { s.quiesced() }) {
                                 maintenance=true;break SliceOutcome::Yield {instructions:0};
                             }
                             if job.pending_cpu.is_none() {
