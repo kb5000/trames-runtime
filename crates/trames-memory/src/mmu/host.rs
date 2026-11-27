@@ -202,7 +202,7 @@ impl CpuMapping {
                 .as_ptr()
                 .add(source_offset)
                 .cast::<libc::c_void>();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(target_os = "linux")]
             let ok = libc::mremap(
                 source,
                 0,
@@ -210,6 +210,8 @@ impl CpuMapping {
                 libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
                 target,
             ) == target;
+            #[cfg(target_os = "android")]
+            let ok = android_clone_alias(source, target, len);
             #[cfg(target_vendor = "apple")]
             let ok = {
                 let mut address = target as u64;
@@ -304,5 +306,45 @@ mod tests {
         assert_eq!(BUDGET.used.load(Ordering::Relaxed), 0);
         assert!(CpuMapping::with_budget(&BUDGET).is_some());
         assert_eq!(BUDGET.used.load(Ordering::Relaxed), 0);
+    }
+}
+
+// libc's Android bindings omit mremap and MREMAP_* although the Android Linux
+// kernel provides the same UAPI. Only mapping setup uses this direct syscall.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+unsafe fn android_clone_alias(
+    source: *mut libc::c_void,
+    target: *mut libc::c_void,
+    len: usize,
+) -> bool {
+    // SAFETY: caller owns the entire target reservation and retains the shared
+    // source mapping. old_size=0 clones instead of moving/deleting source RAM.
+    // Linux UAPI MREMAP_MAYMOVE=1, MREMAP_FIXED=2; SYS_mremap is target-specific.
+    unsafe {
+        libc::syscall(libc::SYS_mremap, source, 0usize, len, 3usize, target) as *mut libc::c_void
+            == target
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod android_alias_tests {
+    use super::*;
+    #[test]
+    fn bionic_syscall_alias_shares_bytes_and_keeps_source_after_drop() {
+        let source = Mapping::new().unwrap();
+        let target = CpuMapping::new().unwrap();
+        let page = page_size().unwrap();
+        unsafe {
+            assert!(android_clone_alias(
+                source.kernel.as_ptr().add(page).cast(),
+                target.cpu.as_ptr().add(page).cast(),
+                page
+            ));
+            source.kernel.as_ptr().add(page).write(41);
+            assert_eq!(target.cpu.as_ptr().add(page).read(), 41);
+            target.cpu.as_ptr().add(page).write(42);
+            assert_eq!(source.kernel.as_ptr().add(page).read(), 42);
+        }
+        drop(target);
+        assert_eq!(unsafe { source.kernel.as_ptr().add(page).read() }, 42);
     }
 }
