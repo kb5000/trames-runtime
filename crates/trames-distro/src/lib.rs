@@ -8,6 +8,8 @@ pub mod environment;
 pub mod glibc;
 pub mod packages;
 pub mod progress;
+pub mod registry;
+pub mod registry_data;
 pub mod rootfs;
 mod static_libc;
 pub mod systemd;
