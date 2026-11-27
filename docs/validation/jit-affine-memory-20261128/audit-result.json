@@ -1,0 +1,15 @@
+{
+  "processes": 32,
+  "workloads": 7,
+  "timed_samples": 1120,
+  "warmup_samples": 224,
+  "negative_cases_rejected": [
+    "missing-process",
+    "changed-instructions",
+    "false-median",
+    "false-kvm-count",
+    "false-hardware-hit",
+    "false-data-checksum"
+  ],
+  "runtime_source_files_verified": 970
+}

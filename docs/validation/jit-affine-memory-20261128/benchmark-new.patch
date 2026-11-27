@@ -1,0 +1,112 @@
+--- a/tools/cpu-backends/src/main.rs
++++ b/tools/cpu-backends/src/main.rs
+@@ -30,7 +30,7 @@
+             "native_instructions":engine.stats.native_instructions,
+             "direct_syscall_exits":engine.stats.direct_syscall_exits,
+             "memory_instructions":memory.instructions,"staged":memory.staged,
+-            "fused_entries":memory.fused_entries,"fused_blocks":memory.fused_blocks})
++            "direct":memory.direct,"address_reuses":engine.compilation_stats().address_reuses,"hardware":memory.hardware,"fused_entries":memory.fused_entries,"fused_blocks":memory.fused_blocks})
+     }
+ }
+ impl Bench for trames_kvm::kernel::Cpu {
+@@ -82,6 +82,12 @@
+             looping_svc: false,
+         });
+     }
++    result.push(Work {
++        name: "memory-stream-512k",
++        words: vec![0xf9400020,0x91000400,0xf8008420,0xf1000442,0x54ffff81,0xd4000001],
++        trips: 1, iterations: if quick {16} else {65536},
++        per_trip_instructions: 5, delta: 1, memory: true, looping_svc: false,
++    });
+     for (name, adds) in [("svc-only", 0), ("svc-continuation", 1), ("svc-16-add", 16)] {
+         let mut words = vec![0x91000400; adds];
+         words.push(0xd4000001);
+@@ -103,7 +109,11 @@
+ fn measure<C: Bench>(backend: &str, mode: &str, work: Work) -> Value {
+     let mut memory = Memory::default();
+     memory.map(CODE, PAGE_SIZE, Permissions::RW).unwrap();
+-    memory.map(DATA, PAGE_SIZE, Permissions::RW).unwrap();
++    let streaming=work.name=="memory-stream-512k";
++    let data_len=if streaming { work.iterations*8 } else { PAGE_SIZE };
++    let mapped=data_len.div_ceil(PAGE_SIZE)*PAGE_SIZE;
++    memory.map(DATA,mapped,Permissions::RW).unwrap();
++    memory.write(DATA,&vec![0;mapped as usize]).unwrap();
+     for (i, word) in work.words.iter().enumerate() {
+         memory
+             .write_array(CODE + i as u64 * 4, word.to_le_bytes())
+@@ -114,10 +124,15 @@
+     cpu.set_x(1, DATA);
+     let mut engine = C::Engine::default();
+     let mut registry = Registry::default();
+-    let mut view = if mode == "worker" {
++    let mut view = if mode != "direct" {
+         C::prepare_hardware_memory(&mut memory, &mut registry).unwrap();
+         let mut view = memory.parallel_view(&mut registry).unwrap();
+         C::prepare_hardware_view(&mut view);
++        if mode == "worker-private" && backend != "kvm" {
++            // Sole actor and all mm roots remain here, no clone/fork/host bytes
++            // or mapping access until the view is dropped after all samples.
++            assert!(unsafe { trames_memory::parallel::View::try_private_epoch(&mut [&mut view]) });
++        }
+         Some(view)
+     } else {
+         None
+@@ -141,6 +156,7 @@
+         if !work.looping_svc {
+             cpu.set_pc(CODE);
+             cpu.set_x(2, work.iterations);
++            if streaming { cpu.set_x(1,DATA); }
+         }
+         let start = Instant::now();
+         let mut calls = 0u64;
+@@ -178,7 +194,8 @@
+         }
+         C::finish_execution(&mut engine);
+         let ns = start.elapsed().as_nanos();
+-        let expected = (sample as u64 + 1) * work.trips * work.iterations * work.delta;
++        let expected = if streaming { sample as u64 + 1 }
++            else { (sample as u64 + 1) * work.trips * work.iterations * work.delta };
+         assert_eq!((cpu.x(0), cpu.pc()), (expected, next_pc));
+         if !work.looping_svc {
+             assert_eq!(cpu.x(2), 0);
+@@ -199,12 +216,20 @@
+     } else {
+         memory.read_u64(DATA).unwrap()
+     };
+-    let expected_data = if work.memory {
++    let expected_data = if streaming { SAMPLES as u64 + 1 } else if work.memory {
+         (SAMPLES as u64 + 1) * work.iterations
+     } else {
+         0
+     };
+     assert_eq!(data, expected_data);
++    let mut canonical=vec![0;data_len as usize];
++    if let Some(view)=&view { view.read(DATA,&mut canonical).unwrap(); }
++    else { memory.read(DATA,&mut canonical).unwrap(); }
++    if streaming {
++        assert!(canonical.chunks_exact(8).all(|b| u64::from_le_bytes(b.try_into().unwrap())==expected_data));
++        assert_eq!(cpu.x(1),DATA+work.iterations*8);
++    }
++    let data_checksum=canonical.iter().fold(0xcbf29ce484222325u64,|hash,b| (hash ^ *b as u64).wrapping_mul(0x100000001b3));
+     let mut original = vec![0; work.words.len() * 4];
+     if let Some(view) = &view {
+         view.read(CODE, &mut original).unwrap();
+@@ -229,7 +254,7 @@
+     times.sort_unstable();
+     json!({"kind":"workload","backend":backend,"mode":mode,"workload":work.name,
+         "words":work.words,"trips":work.trips,"iterations":work.iterations,
+-        "logical_guest_instructions":logical,"exact_instructions":C::EXACT_INSTRUCTIONS,
++        "logical_guest_instructions":logical,"data_bytes":data_len,"data_checksum":data_checksum,"final_x1":cpu.x(1),"exact_instructions":C::EXACT_INSTRUCTIONS,
+         "median_ns":times[SAMPLES/2],"samples":samples,"final_data":data,
+         "final_x0":cpu.x(0),"final_pc":cpu.pc(),"diagnostics":C::diagnostics(&engine)})
+ }
+@@ -245,7 +270,7 @@
+     let backend = args.first().map(String::as_str).unwrap_or("jit");
+     let mode = args.get(1).map(String::as_str).unwrap_or("worker");
+     let quick = args.iter().any(|a| a == "--quick");
+-    assert!(matches!(mode, "worker" | "direct"));
++    assert!(matches!(mode, "worker" | "worker-private" | "direct"));
+     assert!(matches!(backend, "interpreter" | "jit" | "kvm"));
+     if backend == "kvm" {
+         assert_eq!(

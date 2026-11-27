@@ -164,9 +164,9 @@ lowered.
 
 ### Entry-scoped hardware aliases
 
-Native scalar memory blocks can inline guest-address computation, a bounded
-64-slot guest-page tag lookup, guest-page containment, and LDR/STR through the
-existing protected CPU alias. The final translation and page protection use the
+Native scalar memory blocks first try the register-held affine path described
+below, then an inline 64-slot guest-page tag lookup. Both retain guest-page
+containment and LDR/STR through the existing protected CPU alias. The final translation and page protection use the
 host MMU. Cache hits keep guest registers bound in host registers, skip the Rust
 helper and do not acquire a region lock or add a memory fence. Guest TBI follows
 the shared memory model; the remaining guest address is compared in full, never
@@ -213,3 +213,47 @@ staging and fused-entry counts retain their meanings. See
 [hardware-memory validation](../validation/jit-hardware-memory-20261128.md).
 
 See [fusion validation and complete measurements](../validation/jit-memory-fusion-20261127.md).
+
+### Register-held affine regions
+
+The hardware entry now keeps a connected admitted region's guest base, final
+legal start offset and fixed host bias in x19/x20/x21. Successful exports grow a
+region only when adjacent/overlapping pages have the same bias and sufficient
+rights, with a 1 MiB bound. No virtual arena or physical copy is added. Mixed
+read/store blocks require both read and prepared write rights; load-only blocks
+can use read-only exports. A read cannot invent dirty/write admission. Unknown
+pages, holes and different biases never become part of the region.
+
+Region hits replace indexed page-cache lookup with register subtraction/range
+comparison and fixed-bias addition. The existing page cache and checked helper
+remain the fallback. Every non-reused access retains one-guest-page containment,
+including unaligned operands, so a faulting cross-page store cannot partially
+retire through this optimization. The block's widest scalar width supplies a
+conservative region bound; narrower boundary operands can use the fallback.
+
+Cold compiler register-definition versions identify unchanged effective addresses
+(base/SP, index, extension/shift and offset), not just equal register names.
+x22 holds the derived host address and x23 marks a valid direct proof. A later
+same-address access of no greater width can reuse it; a helper always clears the
+proof, reloads the affine descriptor and refreshes the CPU register-array borrow.
+Pre/post-index addresses are normalized for checking, while guest base writeback
+still retires after the actual access and invalidates future base proofs.
+
+For a same-block backedge whose first guest instruction is memory, a verified
+invariant first/last address can retain the proof through the existing epoch and
+budget guards. The base/index must be unwritten throughout the whole block and
+the final proof must cover the first operand width. First entry and helper
+recovery have x23=0 and recheck. This is a cold proof; it adds no per-instruction
+ISA probes, register-version counters, new CPU state or synchronization.
+
+Hardware-memory entries save x19..x23 in a balanced 48-byte AAPCS64 frame and
+restore them on normal, helper/fault, epoch and budget returns. Scalar/SVC entries
+retain their original frame/layout and tail path. Exact native fault recovery
+sites cover reused addresses as well as region/page-cache accesses; all routes
+preserve guest NZCV and retire result/SP/base changes only after success.
+
+`MemoryStats::direct` counts actual region/reused-address accesses and remains a
+subset of `hardware`. Its selected counter replaces the page-path increment,
+without adding another increment per access. `CompilationStats::address_reuses`
+counts emitted reuse sites, not dynamic executions. The original counters and
+JNI layout remain unchanged. See [affine validation and full measurements](../validation/jit-affine-memory-20261128.md).

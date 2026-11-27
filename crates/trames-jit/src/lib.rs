@@ -81,6 +81,8 @@ pub struct CompilationStats {
     pub host_words: u64,
     pub register_loads: u64,
     pub register_stores: u64,
+    /// Native sites that can reuse a previously checked unchanged guest address.
+    pub address_reuses: u64,
 }
 /// Execution/link counters; per-instruction guest memory accesses are unchanged.
 #[derive(Clone, Copy, Default, Debug)]
@@ -99,6 +101,8 @@ pub struct MemoryStats {
     pub fused_blocks: u64,
     /// Inline LDR/STR through an entry-scoped hardware-protected CPU alias.
     pub hardware: u64,
+    /// Hardware accesses using the register-held affine region/address path.
+    pub direct: u64,
 }
 impl Engine {
     pub fn memory_stats(&self) -> MemoryStats {

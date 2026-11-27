@@ -39,7 +39,8 @@ pub trait CpuMemory {
         false
     }
     /// Whether exported aliases/ownership survive further checked scalar
-    /// reads/stores on this same frozen View. Never permits mapping operations,
+    /// reads/stores, further exports and metadata-only observations (including
+    /// instruction identity) on this same frozen View. Never permits mapping operations,
     /// atomics, native callbacks or retaining exports beyond this CPU entry.
     #[cfg(feature = "native-code")]
     fn cpu_native_stable(&self) -> bool {
@@ -51,10 +52,10 @@ pub trait CpuMemory {
     ///
     /// # Safety
     /// All earlier exports must be discarded before ANY other CpuMemory call,
-    /// except further exports and checked scalar reads/stores when
+    /// except further exports, metadata-only observations and checked scalar reads/stores when
     /// cpu_native_stable() admits them.
     /// The caller may access only this guest page through the returned alias,
-    /// with the admitted read/write rights, until its next CpuMemory call. No
+    /// with the admitted read/write rights until its next non-admitted call. No
     /// guest exclusive operation or native callback may overlap that interval.
     /// Never retain an export across CPU entries, mapping edits or a syscall.
     #[cfg(feature = "native-code")]

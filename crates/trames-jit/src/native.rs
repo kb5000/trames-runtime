@@ -12,6 +12,9 @@ const BLOCK_LIMIT: u64 = 64;
 const CACHE_LIMIT: usize = 128;
 const NO_SLOT: u64 = CACHE_LIMIT as u64;
 const CHAIN_ENTRY: usize = 16;
+// Hardware-only entry preserves x19..x23 and initializes affine operands before
+// its backedge marker. Scalar/SVC entry layout stays unchanged.
+const DIRECT_CHAIN_ENTRY: usize = 44;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Handle {
@@ -37,6 +40,8 @@ struct Block {
     code: Code,
     has_memory: bool,
     has_hardware: bool,
+    read_only_memory: bool,
+    memory_width: usize,
     instructions: u64,
     next_pc: u64,
     syscall: bool,
@@ -98,7 +103,12 @@ impl Block {
         matches!(self.flow, Flow::Choice(_) | Flow::Register)
     }
     fn entry(&self) -> usize {
-        self.code.pointer as usize + CHAIN_ENTRY
+        self.code.pointer as usize
+            + if self.has_hardware {
+                DIRECT_CHAIN_ENTRY
+            } else {
+                CHAIN_ENTRY
+            }
     }
     fn scalar_entry(&self) -> usize {
         self.code.pointer as usize + self.fast_offset
@@ -152,11 +162,63 @@ struct MemoryFrame<M> {
     memory: *mut M,
     registers: *mut u64,
     hits: u64,
+    direct: DirectRegion,
+    direct_hits: u64,
     pages: [OperandPage; 64],
     stable: bool,
+    read_only: bool,
+    width: usize,
     checked: Identity,
     fault: Option<CpuFault>,
     stats: crate::MemoryStats,
+}
+/// A connected union of already exported pages, never an assertion about holes.
+/// `last` is the final legal start offset for the block's widest memory operand.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DirectRegion {
+    base: u64,
+    last: u64,
+    bias: usize,
+}
+impl DirectRegion {
+    // Guest TBI-clean addresses are <2^56, so wrapping_sub(MAX) is always >0.
+    const EMPTY: Self = Self {
+        base: u64::MAX,
+        last: 0,
+        bias: 0,
+    };
+    fn admit(&mut self, page: &trames_memory::NativePage, read_only: bool, width: usize) {
+        let pointer = if read_only {
+            page.read
+        } else if page.read == page.write {
+            page.write
+        } else {
+            0
+        };
+        if pointer == 0 {
+            return;
+        }
+        let bias = pointer.wrapping_sub(page.base as usize);
+        let mut base = page.base;
+        let mut end = base + PAGE_SIZE;
+        if self.base != u64::MAX && self.bias == bias {
+            let old_end = self.base + self.last + width as u64;
+            if base <= old_end && self.base <= end {
+                base = base.min(self.base);
+                end = end.max(old_end);
+                if end - base > 1024 * 1024 {
+                    base = page.base;
+                    end = base + PAGE_SIZE;
+                }
+            }
+        }
+        *self = Self {
+            base,
+            last: end - base - width as u64,
+            bias,
+        };
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -178,7 +240,10 @@ const _: () = {
     assert!(std::mem::offset_of!(MemoryFrame<()>, helper) == 120);
     assert!(std::mem::offset_of!(MemoryFrame<()>, registers) == 144);
     assert!(std::mem::offset_of!(MemoryFrame<()>, hits) == 152);
-    assert!(std::mem::offset_of!(MemoryFrame<()>, pages) == 160);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, direct) == 160);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, direct_hits) == 184);
+    assert!(std::mem::offset_of!(MemoryFrame<()>, pages) == 192);
+    assert!(std::mem::size_of::<DirectRegion>() == 24);
     assert!(std::mem::size_of::<OperandPage>() == 32);
 };
 struct MemorySite {
@@ -205,6 +270,7 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
     // survives. Stores also populate the read slot after actual write admission.
     if HARDWARE && !frame.stable {
         frame.pages.fill(OperandPage::EMPTY);
+        frame.direct = DirectRegion::EMPTY;
     }
     let address = if HARDWARE {
         op.operand(cpu).0 & 0x00ff_ffff_ffff_ffff
@@ -225,6 +291,7 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
                     // SAFETY: prior loans are gone; native execution performs
                     // only bounded scalar accesses until the next helper/return.
                     if let Some(page) = unsafe { memory.cpu_native_page(address, !op.load) } {
+                        frame.direct.admit(&page, frame.read_only, frame.width);
                         frame.pages[(page.base / PAGE_SIZE) as usize & 63] = OperandPage {
                             tag: page.base,
                             read: page.read,
@@ -441,6 +508,7 @@ impl Cache {
             self.cold.compilation.host_words += block.traffic.host_words;
             self.cold.compilation.register_loads += block.traffic.register_loads;
             self.cold.compilation.register_stores += block.traffic.register_stores;
+            self.cold.compilation.address_reuses += block.traffic.address_reuses;
         }
         self.cold.serial = self
             .cold
@@ -846,8 +914,12 @@ impl Cache {
             memory: memory as *mut _,
             registers,
             hits: 0,
+            direct: DirectRegion::EMPTY,
+            direct_hits: 0,
             pages: [OperandPage::EMPTY; 64],
             stable: memory.cpu_native_stable(),
+            read_only: block.read_only_memory,
+            width: block.memory_width,
             checked,
             fault: None,
             stats: crate::MemoryStats::default(),
@@ -855,8 +927,9 @@ impl Cache {
         // All Rust register references end before entry. The helper temporarily
         // reborrows this same CPU/mm; no guest lease survives the callback.
         unsafe { block.code.call_memory_block(registers, &mut fused) };
-        self.cold.memory.instructions += fused.stats.instructions + fused.hits;
-        self.cold.memory.hardware += fused.hits;
+        self.cold.memory.instructions += fused.stats.instructions + fused.hits + fused.direct_hits;
+        self.cold.memory.hardware += fused.hits + fused.direct_hits;
+        self.cold.memory.direct += fused.direct_hits;
         self.cold.memory.staged += fused.stats.staged;
         self.cold.memory.fused_entries += 1;
         self.cold.memory.fused_blocks += fused.frame.blocks;
@@ -894,6 +967,34 @@ struct Binding {
     dirty: bool,
     used: u32,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OperandKey {
+    address: crate::memory_ops::Address,
+    base: usize,
+    version: u32,
+    index_version: u32,
+}
+impl OperandKey {
+    fn loop_invariant(self, versions: &[u32; 33]) -> bool {
+        if matches!(self.address, crate::memory_ops::Address::Literal(_)) {
+            return true;
+        }
+        self.version == 0
+            && self.index_version == 0
+            && versions[sp_register(self.base as u32) as usize] == 0
+            && match self.address {
+                crate::memory_ops::Address::Register { reg, .. } => versions[reg] == 0,
+                _ => true,
+            }
+    }
+}
+#[derive(Clone, Copy)]
+struct LoopOperand {
+    key: OperandKey,
+    width: usize,
+    branch: usize,
+    normal: usize,
+}
 /// Compile-time allocation only. Between helpers, x0 holds the register-frame
 /// argument; x1-x13 are caller-saved and x14/x15/x16 hold count/budget/context.
 /// Scalar bodies use no host stack or FP/SIMD state. Memory calls balance the
@@ -910,6 +1011,10 @@ struct Assembler {
     flags_dirty: bool,
     clock: u32,
     traffic: CompilationStats,
+    direct: bool,
+    versions: [u32; 33],
+    operand: Option<(OperandKey, usize)>,
+    first_operand: Option<LoopOperand>,
 }
 impl Assembler {
     fn new() -> Self {
@@ -922,6 +1027,10 @@ impl Assembler {
             flags_dirty: false,
             clock: 0,
             traffic: CompilationStats::default(),
+            direct: false,
+            versions: [0; 33],
+            operand: None,
+            first_operand: None,
         }
     }
     fn store(&mut self, slot: usize, binding: Binding) {
@@ -989,6 +1098,9 @@ impl Assembler {
         self.bind(guest, avoid, true)
     }
     fn output(&mut self, guest: u32, avoid: u32) -> u32 {
+        if guest != 31 {
+            self.versions[guest as usize] += 1;
+        }
         self.bind(guest, avoid, false)
     }
     fn constant(&mut self, guest: u32, value: u64) {
@@ -1035,6 +1147,7 @@ impl Assembler {
         self.hosts.fill(u8::MAX);
         self.flags_live = false;
         self.flags_dirty = false;
+        self.operand = None;
     }
     fn memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
         self.flush();
@@ -1055,6 +1168,12 @@ impl Assembler {
             0xa9413fee, 0xf94013fe, 0xa8c343e0,
         ]);
         load(&mut self.words, 0, 16, 144); // refreshed CPU register reborrow
+        if self.direct {
+            load(&mut self.words, 19, 16, 160);
+            load(&mut self.words, 20, 16, 168);
+            load(&mut self.words, 21, 16, 176);
+            self.words.push(0xaa1f03f7); // x23=0: a helper ends address reuse
+        }
         let stop = self.words.len();
         self.words.push(0xb4000011); // cbz x17: precise fault/code-change exit
         MemorySite {
@@ -1067,8 +1186,6 @@ impl Assembler {
     fn hardware_memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
         use crate::memory_ops::Address;
         const SCRATCH: u32 = (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13);
-        // Evict just four scratch registers, retaining other guest bindings and
-        // flags across every successful access. No helper ABI on a cache hit.
         for slot in 9..13 {
             if let Some(binding) = self.bindings[slot].take() {
                 self.store(slot, binding);
@@ -1076,6 +1193,33 @@ impl Assembler {
             }
         }
         self.context = true;
+        let address_key = match op.address {
+            Address::Pre(offset) => Address::Offset(offset),
+            Address::Post(_) => Address::Offset(0),
+            other => other,
+        };
+        let key = match address_key {
+            Address::Literal(_) => Some(OperandKey {
+                address: address_key,
+                base: 0,
+                version: 0,
+                index_version: 0,
+            }),
+            _ => Some(OperandKey {
+                address: address_key,
+                base: op.rn,
+                version: self.versions[sp_register(op.rn as u32) as usize],
+                index_version: if let Address::Register { reg, .. } = address_key {
+                    self.versions[reg]
+                } else {
+                    0
+                },
+            }),
+        };
+        let reuse = key.is_some_and(|key| {
+            self.operand
+                .is_some_and(|(old, size)| old == key && size >= op.size)
+        });
         let base = if matches!(op.address, Address::Literal(_)) {
             31
         } else {
@@ -1086,45 +1230,97 @@ impl Assembler {
         } else {
             self.read(op.rt as u32, SCRATCH | (1 << base))
         };
+        let index = if let Address::Register { reg, .. } = op.address {
+            self.read(reg as u32, SCRATCH | (1 << base) | (1 << source))
+        } else {
+            31
+        };
+        let prior = self.clone();
+        let prior_stores = self.traffic.register_stores;
+        // All routes, including a reused address, publish the same precise NZCV
+        // recovery state before any comparison or possibly faulting instruction.
+        if self.flags_live {
+            self.words.push(0xd53b420c);
+        }
+        let mut reused_jump = None;
+        let mut normal = None;
+        let loop_candidate = before == 0 && self.first_operand.is_none();
+        if reuse || loop_candidate {
+            self.traffic.address_reuses += u64::from(reuse);
+            normal = Some(self.words.len());
+            // The first site's proof is enabled only after cold whole-block
+            // dataflow and the actual same-block backedge have been verified.
+            self.words.push(if reuse { 0xb4000017 } else { 0xb400001f });
+            self.words.push(0xaa1603f1); // x17 = retained protected address
+            self.words.push(0x9102e20b); // x11 = &direct_hits (frame+184)
+            reused_jump = Some(self.words.len());
+            self.words.push(0x14000000);
+        }
+        let normal_start = self.words.len();
+        if let Some(at) = normal {
+            branch(&mut self.words, at, normal_start);
+            if loop_candidate {
+                self.first_operand = key.map(|key| LoopOperand {
+                    key,
+                    width: op.size,
+                    branch: at,
+                    normal: normal_start,
+                });
+            }
+        }
+        self.words.push(0xaa1f03f7); // no proof survives a non-reused access
         match op.address {
             Address::Literal(address) => constant(&mut self.words, 17, address),
-            Address::Register { reg, option, shift } => {
-                let index = self.read(reg as u32, SCRATCH | (1 << base) | (1 << source));
-                self.words.push(
-                    0x8b200000 | (index << 16) | (option << 13) | (shift << 10) | (base << 5) | 17,
-                );
-            }
+            Address::Register { option, shift, .. } => self.words.push(
+                0x8b200000 | (index << 16) | (option << 13) | (shift << 10) | (base << 5) | 17,
+            ),
             Address::Offset(offset) | Address::Pre(offset) => {
                 constant(&mut self.words, 10, offset);
                 self.words.push(0x8b0a0000 | (base << 5) | 17);
             }
             Address::Post(_) => self.words.push(0xaa0003f1 | (base << 16)),
         }
-        let prior = self.clone();
-        let prior_stores = self.traffic.register_stores;
-        if self.flags_live {
-            self.words.push(0xd53b420c);
-        } // save guest NZCV
-        self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17); // guest TBI
-        self.words.push(0xd3400000 | (11 << 10) | (17 << 5) | 10); // offset
+        self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17); // shared guest TBI
+                                                                   // Retain exact one-guest-page fault atomicity even for a larger affine
+                                                                   // run. Only a proof of the same address and sufficient width skips this.
+        self.words.push(0xd3400000 | (11 << 10) | (17 << 5) | 10);
         self.words
             .push(0xf100001f | (((4096 - op.size) as u32) << 10) | (10 << 5));
         let mut misses = vec![self.words.len()];
-        self.words.push(0x54000008); // b.hi cross-page slow path
-        self.words.push(0xcb0a022a); // x10 = guest page base
+        self.words.push(0x54000008);
+        self.words.push(0xcb13022a); // x10 = guest address - direct base
+        self.words.push(0xeb14015f); // cmp offset,last legal start
+        let page_jump = self.words.len();
+        self.words.push(0x54000008);
+        self.words.push(0x8b150231); // x17 = guest address + direct bias
+        self.words.push(0xaa1103f6); // retained address x22
+        self.words.push(0xd2800037); // proof x23=1 (mixed blocks require RW admission)
+        self.words.push(0x9102e20b); // &direct_hits
+        let direct_jump = self.words.len();
+        self.words.push(0x14000000);
+        let page_start = self.words.len();
+        branch(&mut self.words, page_jump, page_start);
+        self.words.push(0xd3400000 | (11 << 10) | (17 << 5) | 10);
+        self.words.push(0xcb0a022a);
         self.words
-            .push(0xd3400000 | (12 << 16) | (17 << 10) | (17 << 5) | 11); // ubfx index,#12,#6
-        self.words.push(0x8b0b160b); // add x11,x16,x11,lsl #5
-        self.words.push(0x9102816b); // add x11,x11,#160
+            .push(0xd3400000 | (12 << 16) | (17 << 10) | (17 << 5) | 11);
+        self.words.push(0x8b0b160b);
+        self.words.push(0x9103016b); // page cache now begins at frame+192
         load(&mut self.words, 13, 11, 0);
-        self.words.push(0xeb0a01bf); // cmp x13,x10 (full guest tag, no address masking)
+        self.words.push(0xeb0a01bf);
         misses.push(self.words.len());
         self.words.push(0x54000001);
         load(&mut self.words, 13, 11, if op.load { 8 } else { 16 });
         misses.push(self.words.len());
         self.words.push(0xb400000d);
-        self.words.push(0xcb0a0231); // x17 = offset
-        self.words.push(0x8b1101b1); // x17 = protected CPU alias + offset
+        self.words.push(0xcb0a0231);
+        self.words.push(0x8b1101b1);
+        self.words.push(0x9102620b); // &page-cache hits (frame+152)
+        let common = self.words.len();
+        self.words[direct_jump] |= (common - direct_jump) as u32;
+        if let Some(at) = reused_jump {
+            self.words[at] |= (common - at) as u32;
+        }
         if self.flags_live {
             self.words.push(0xd51b420c);
         }
@@ -1141,9 +1337,9 @@ impl Assembler {
             let target = self.output(sp_register(op.rn as u32), SCRATCH | (1 << base));
             self.words.push(0x8b0a0000 | (base << 5) | target);
         }
-        load(&mut self.words, 10, 16, 152);
-        self.words.push(0x9100054a); // diagnostic hit, no atomics/fence
-        store(&mut self.words, 10, 152);
+        load(&mut self.words, 10, 11, 0);
+        self.words.push(0x9100054a);
+        self.words.push(0xf900016a); // increment the selected non-atomic diagnostic
         let done = self.words.len();
         self.words.push(0x14000000);
         let slow_start = self.words.len();
@@ -1158,8 +1354,6 @@ impl Assembler {
         site.fixup = Some((fault, slow_start));
         self.words.extend(slow.words);
         self.traffic.register_stores += slow.traffic.register_stores - prior_stores;
-        // The helper publishes a new register-array borrow. Rebuild precisely
-        // the bindings expected by the hot continuation, without replaying it.
         for (slot, binding) in self.bindings.iter().enumerate() {
             if let Some(binding) = binding {
                 if binding.guest == 32 {
@@ -1178,6 +1372,7 @@ impl Assembler {
         for at in misses {
             branch(&mut self.words, at, slow_start);
         }
+        self.operand = key.map(|key| (key, op.size));
         site
     }
     fn finish(mut self) -> (Vec<u32>, CompilationStats, bool) {
@@ -1205,7 +1400,13 @@ fn constant(words: &mut Vec<u32>, rt: u32, value: u64) {
 fn branch(words: &mut [u32], at: usize, target: usize) {
     words[at] |= (((target as i64 - at as i64) as u32) & 0x7ffff) << 5;
 }
-fn exit(words: &mut Vec<u32>, pc: u64, slot: u64, syscall: bool) {
+fn native_return(words: &mut Vec<u32>, direct: bool) {
+    if direct {
+        words.extend_from_slice(&[0xf94013f7, 0xa9415bf5, 0xa8c353f3]);
+    }
+    words.push(0xd65f03c0);
+}
+fn exit(words: &mut Vec<u32>, pc: u64, slot: u64, syscall: bool, direct: bool) {
     constant(words, 17, pc);
     store(words, 17, 16);
     constant(words, 17, slot);
@@ -1216,7 +1417,7 @@ fn exit(words: &mut Vec<u32>, pc: u64, slot: u64, syscall: bool) {
     }
     store(words, 15, 0);
     store(words, 14, 8);
-    words.push(0xd65f03c0);
+    native_return(words, direct);
 }
 fn render(
     body: &[u32],
@@ -1225,11 +1426,32 @@ fn render(
     count: u64,
     mask: u8,
     flow: Flow,
-    memory: &[MemorySite],
+    (memory, direct): (&[MemorySite], bool),
 ) -> (Vec<u32>, usize) {
     let syscall = matches!(flow, Flow::Syscall);
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
-    let mut words = vec![0xd503245f, 0xaa0103f0, 0xf940020f, 0xaa1f03ee, 0xd50324df]; // BTI c; ctx=x1; budget; blocks=0; BTI jc
+    let mut words = vec![0xd503245f];
+    if direct {
+        // One 48-byte AAPCS64 frame owns the affine-region/proof registers.
+        words.extend_from_slice(&[0xa9bd53f3, 0xa9015bf5, 0xf90013f7]);
+    }
+    words.extend_from_slice(&[0xaa0103f0, 0xf940020f, 0xaa1f03ee]);
+    if direct {
+        load(&mut words, 19, 16, 160);
+        load(&mut words, 20, 16, 168);
+        load(&mut words, 21, 16, 176);
+        words.push(0xaa1f03f7);
+    }
+    let chain = words.len();
+    debug_assert_eq!(
+        chain * 4,
+        if direct {
+            DIRECT_CHAIN_ENTRY
+        } else {
+            CHAIN_ENTRY
+        }
+    );
+    words.push(0xd50324df);
     let mut guards = Vec::new();
     for i in 0..3 {
         if mask & (1 << i) == 0 {
@@ -1270,10 +1492,10 @@ fn render(
                     words.push(0xeb0b023f); // cmp selected PC, loop start
                     let at = words.len();
                     words.push(0x54000000); // b.eq guarded chain entry
-                    branch(&mut words, at, CHAIN_ENTRY / 4);
+                    branch(&mut words, at, chain);
                 }
                 Flow::Fixed if next == start => {
-                    let offset = (CHAIN_ENTRY as i64 / 4 - words.len() as i64) as u32;
+                    let offset = (chain as i64 - words.len() as i64) as u32;
                     words.push(0x14000000 | (offset & 0x3ffffff));
                 }
                 _ => {}
@@ -1299,12 +1521,12 @@ fn render(
         store(&mut words, 17, 32);
         store(&mut words, 15, 0);
         store(&mut words, 14, 8);
-        words.push(0xd65f03c0);
+        native_return(&mut words, direct);
     } else {
-        exit(&mut words, next, slot as u64, syscall);
+        exit(&mut words, next, slot as u64, syscall, direct);
     }
     let failed = words.len();
-    exit(&mut words, start, NO_SLOT, false);
+    exit(&mut words, start, NO_SLOT, false, direct);
     for at in done {
         branch(&mut words, at, success);
     }
@@ -1313,7 +1535,7 @@ fn render(
     }
     if !memory.is_empty() {
         let stopped = words.len();
-        words.push(0xd65f03c0); // helper already published precise exit state
+        native_return(&mut words, direct); // helper published precise exit state
         for site in memory {
             branch(&mut words, body_start + site.stop, stopped);
         }
@@ -1383,6 +1605,7 @@ fn compile_with_features(
     host: trames_execution::Features,
 ) -> Result<Option<Compiled>, CpuFault> {
     let mut code = Assembler::new();
+    code.direct = mode & 16 != 0;
     let mut memory_ops = Vec::new();
     let mut memory_sites = Vec::new();
     let mut count = 0;
@@ -1700,10 +1923,33 @@ fn compile_with_features(
         return Ok(None);
     }
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
+    if let Some(first) = code.first_operand {
+        let backedge = matches!(flow, Flow::Choice(taken) if taken == start)
+            || matches!(flow, Flow::Fixed if next == start);
+        if backedge
+            && first.key.loop_invariant(&code.versions)
+            && code
+                .operand
+                .is_some_and(|(key, size)| key == first.key && size >= first.width)
+        {
+            code.words[first.branch] = (code.words[first.branch] & !31) | 23;
+            code.traffic.address_reuses += 1;
+        } else {
+            code.words[first.branch] = 0x14000000 | (first.normal - first.branch) as u32;
+        }
+    }
     for site in &memory_sites {
         code.words[site.adjust] |= ((count - site.before) as u32) << 10;
     }
     let (body, mut traffic, context) = code.finish();
+    let has_hardware = !memory_sites.is_empty() && mode & 16 != 0;
+    let read_only_memory = memory_ops.iter().all(|op| op.load || op.opcode.is_none());
+    let memory_width = memory_ops
+        .iter()
+        .filter(|op| op.opcode.is_some())
+        .map(|op| op.size)
+        .max()
+        .unwrap_or(1);
     let (mut words, body_start) = render(
         &body,
         (start, next),
@@ -1711,7 +1957,7 @@ fn compile_with_features(
         count,
         mode & 7,
         flow,
-        &memory_sites,
+        (&memory_sites, has_hardware),
     );
     let fast_offset = words.len() * 4;
     let tail_offset;
@@ -1745,7 +1991,9 @@ fn compile_with_features(
             code: Code::publish_fixups(&words, &fixups)
                 .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
             has_memory: !memory_sites.is_empty(),
-            has_hardware: mode & 16 != 0,
+            has_hardware,
+            read_only_memory,
+            memory_width,
             instructions: count,
             next_pc: next,
             syscall,
@@ -1904,6 +2152,67 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_entries_preserve_native_callee_registers_on_every_return() {
+        for path in 0..3 {
+            let mut m = memory(&[0xf9400020, 0x91000400, 0xd4000001]);
+            m.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+            m.write_array(0x2000, 42u64.to_le_bytes()).unwrap();
+            let compiled = compile(&m, 0x1000, 64, 0, 8 | 16 | 1).unwrap().unwrap();
+            let counter = AtomicU64::new(1);
+            let links = [0usize; CACHE_LIMIT];
+            let mut cpu = Cpu::new(0x1000, 0);
+            cpu.set_x(1, 0x2000);
+            let checked = m.instruction_identity();
+            let cpu_pointer = &mut cpu as *mut Cpu;
+            let registers = unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() };
+            let mut f = frame(&links);
+            f.epochs[0] = &counter;
+            f.expected[0] = u64::from(path != 0);
+            if path == 1 {
+                f.remaining = 0;
+            }
+            let mut fused = MemoryFrame {
+                frame: f,
+                helper: memory_access::<Memory, true> as *const () as usize,
+                cpu: cpu_pointer,
+                memory: &mut m,
+                registers,
+                hits: 0,
+                direct: DirectRegion::EMPTY,
+                direct_hits: 0,
+                pages: [OperandPage::EMPTY; 64],
+                stable: false,
+                read_only: true,
+                width: 8,
+                checked,
+                fault: None,
+                stats: crate::MemoryStats::default(),
+            };
+            let mut observed = [19u64, 20, 21, 22, 23];
+            // SAFETY: exact generated entry/frame ABI, original code and all
+            // epoch/data owners remain live. Explicit canaries verify all new
+            // callee-saved registers, including epoch/budget early exits and a
+            // normal helper-bearing return. The asm balances the host stack.
+            unsafe {
+                std::arch::asm!(
+                "stp x19,x30,[sp,#-16]!", "mov x19,#19", "blr x9",
+                "str x19,[x24]", "ldp x19,x30,[sp],#16",
+                in("x9") compiled.code.pointer, in("x0") registers, in("x1") &mut fused,
+                in("x24") observed.as_mut_ptr(), inlateout("x20") observed[1],
+                inlateout("x21") observed[2], inlateout("x22") observed[3],
+                inlateout("x23") observed[4], clobber_abi("C"));
+            }
+            assert_eq!(observed, [19, 20, 21, 22, 23]);
+            assert!(fused.fault.is_none());
+            assert_eq!(fused.frame.blocks, u64::from(path == 2));
+            assert_eq!(fused.frame.pc, if path == 2 { 0x100c } else { 0x1000 });
+            if path == 2 {
+                assert_eq!(cpu.x(0), 43);
+            }
+        }
+    }
 
     #[test]
     fn hardware_admission_preserves_scalar_syscall_tail_cells() {

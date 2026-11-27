@@ -92,6 +92,8 @@ fn hardware_alias_loop_preserves_state_and_canonical_bytes() {
             "parallel={parallel}: {:?}",
             engine.memory_stats()
         );
+        assert!(engine.memory_stats().direct >= 120);
+        assert!(engine.compilation_stats().address_reuses > 0);
         assert_eq!(engine.memory_stats().instructions, 128);
     }
 }
@@ -1838,10 +1840,20 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
     }
     for store in [false, true] {
         let word = if store { 0xf8008420 } else { 0xf8408420 }; // post-index #8
-        let words = [
-            0xf94003bc, 0xf94003bc, 0xf90003bc, 0x910004a5, 0xb1000463, word, 0x9a9f37e4,
-            0xd4000001,
-        ];
+        let words = if store {
+            // The read succeeds with host PROT_READ, then the following store
+            // reuses that exact translated address and faults. Its recovery
+            // must also preserve newer flags and post-index writeback.
+            [
+                0xf94003bc, 0xf90003bc, 0xf94003a0, 0x910004a5, 0xb1000463, 0xf80087a0, 0x9a9f37e4,
+                0xd4000001,
+            ]
+        } else {
+            [
+                0xf94003bc, 0xf94003bc, 0xf90003bc, 0x910004a5, 0xb1000463, word, 0x9a9f37e4,
+                0xd4000001,
+            ]
+        };
         let mut a = memory(&words);
         let mut b = memory(&words);
         for m in [&mut a, &mut b] {
@@ -1973,4 +1985,128 @@ fn hardware_alias_readonly_and_sparse_pages_share_the_frozen_memory_model() {
             assert_eq!(cpu.x(reg), 0x8585858585858585);
         }
     }
+}
+
+#[test]
+fn affine_address_reuse_rechecks_changed_bases_indices_sp_and_operand_width() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    let cases: &[(&[u32], u64)] = &[
+        (&[0xf9400020, 0x91002021, 0xf9400023], 0x10000),
+        (&[0xf8627820, 0x91000442, 0xf8627823], 0x10000),
+        (&[0xf9400021, 0xf9400023], 0x10000),
+        (&[0xf94003e0, 0x910023ff, 0xf94003e3], 0x10000),
+        (&[0xf9400020, 0xf8008420, 0xf9400023], 0x10000),
+        (&[0x39400020, 0xf9400023], 0x10fff),
+    ];
+    for &(body, address) in cases {
+        let mut words = vec![0xf94003bc, 0xf90003bc]; // paid RW page admission
+        words.extend_from_slice(body);
+        words.push(0xd4000001);
+        for parallel in [false, true] {
+            let mut a = memory(&words);
+            let mut b = memory(&words);
+            for m in [&mut a, &mut b] {
+                m.map(0x10000, hardware_span(), Permissions::RW).unwrap();
+                let mut data = vec![0; hardware_span() as usize];
+                for (i, chunk) in data.chunks_exact_mut(8).enumerate() {
+                    chunk.copy_from_slice(&(0x10008 + i as u64 * 17).to_le_bytes());
+                }
+                m.write(0x10000, &data).unwrap();
+            }
+            let mut state = initial();
+            state.registers[1] = address;
+            state.registers[2] = 0;
+            state.registers[29] = 0x100f0;
+            state.sp = 0x10000;
+            let mut reference = trames_interpreter::Cpu::default();
+            reference.restore_architectural_state(&state);
+            let mut actual = Cpu::default();
+            actual.restore_architectural_state(&state);
+            let mut engine = Engine::default();
+            let x = reference.run_slice(&mut a, 64);
+            let y = if parallel {
+                let mut registry = trames_memory::parallel::Registry::default();
+                let mut view = b.parallel_view(&mut registry).unwrap();
+                assert!(unsafe {
+                    trames_memory::parallel::View::try_private_epoch(&mut [&mut view])
+                });
+                let result = actual.run_parallel(&mut engine, &mut view, 64);
+                drop(view);
+                b.commit_parallel().unwrap();
+                result
+            } else {
+                actual.run_slice(&mut engine, &mut b, 64)
+            };
+            assert_eq!(
+                format!("{x:?}"),
+                format!("{y:?}"),
+                "{body:x?} parallel={parallel}"
+            );
+            assert_eq!(
+                actual.architectural_state(),
+                reference.architectural_state(),
+                "{body:x?}"
+            );
+            assert_eq!(actual.fault_retired(), reference.fault_retired());
+            assert_eq!(
+                a.read_array::<16384>(0x10000).unwrap(),
+                b.read_array::<16384>(0x10000).unwrap()
+            );
+            assert_eq!(engine.stats.fallback_instructions, 0);
+            if address == 0x10fff {
+                assert_eq!(engine.memory_stats().staged, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn affine_runs_join_only_adjacent_admitted_pages_and_never_bridge_holes() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    // Read-only immutable exports may form a run across pages. Returning to the
+    // first page must take the region path after the second export, not the TLB.
+    let words = [0xf9400020, 0xf9400043, 0xf9400024, 0xf9400045, 0xd4000001];
+    let mut m = memory(&words);
+    m.map(0x10000, hardware_span(), Permissions::RW).unwrap();
+    m.write(0x10000, &vec![0x85; hardware_span() as usize])
+        .unwrap();
+    m.protect(0x10000, hardware_span(), Permissions::R).unwrap();
+    let mut registry = trames_memory::parallel::Registry::default();
+    let mut view = m.parallel_view(&mut registry).unwrap();
+    assert!(unsafe { trames_memory::parallel::View::try_private_epoch(&mut [&mut view]) });
+    let mut cpu = Cpu::new(0x1000, 0);
+    cpu.set_x(1, 0x10000);
+    cpu.set_x(2, 0x11000);
+    let mut engine = Engine::default();
+    assert_eq!(
+        outcome(&cpu.run_parallel(&mut engine, &mut view, 64)),
+        ("syscall", 5)
+    );
+    assert_eq!(engine.memory_stats().direct, 2);
+    drop(view);
+    // A hole between two readable runs cannot inherit the common affine bias.
+    m.unmap(0x11000, PAGE_SIZE).unwrap();
+    m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    let words = [0xf9400020u32, 0xf9400043, 0xf9400085, 0xd4000001];
+    for (i, word) in words.iter().enumerate() {
+        m.write_array(0x1000 + i as u64 * 4, word.to_le_bytes())
+            .unwrap();
+    }
+    m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+    let mut view = m.parallel_view(&mut registry).unwrap();
+    assert!(unsafe { trames_memory::parallel::View::try_private_epoch(&mut [&mut view]) });
+    cpu.set_pc(0x1000);
+    cpu.set_x(1, 0x10000);
+    cpu.set_x(2, 0x12000);
+    cpu.set_x(4, 0x11000);
+    assert!(matches!(
+        cpu.run_parallel(&mut engine, &mut view, 64),
+        SliceOutcome::Fault(_)
+    ));
+    assert_eq!(cpu.fault_retired(), 2);
+    assert_eq!(cpu.pc(), 0x1008);
 }

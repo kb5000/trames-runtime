@@ -6,7 +6,7 @@ use trames_engine::CpuFault;
 use trames_interpreter::Cpu;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Address {
     Offset(u64),
     Pre(u64),
