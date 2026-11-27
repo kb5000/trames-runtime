@@ -2,6 +2,9 @@
 resolver = "2"
 exclude = ["vendor/ext4-view"]
 members = [
+    "crates/trames-interpreter",
+    "crates/trames-host-compute",
+    "crates/trames-jit",
     "crates/trames-host",
     "crates/trames-control",
     "crates/trames-graphics",

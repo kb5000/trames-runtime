@@ -1,4 +1,4 @@
 {
-  "Cargo.lock": "1bcf83bbd65d036108762cb633d1409b12b4136bf71caa61e7aa50e23e50d5c2",
+  "Cargo.lock": "090243b542a1b775f2999e99166257a80ce1f9f1b5fa6b393827766699416dbb",
   "vendor/wayland-backend/Cargo.lock": "8425c06013be503aef48355a3d56476fbec307dbb4aa5f0045dacfd2964ee9aa"
 }

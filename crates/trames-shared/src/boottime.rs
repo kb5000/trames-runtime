@@ -43,7 +43,7 @@ pub fn continuous() -> Duration {
         let ns = unsafe { mach_continuous_time() } as u128 * numer as u128 / denom as u128;
         Duration::new((ns / 1_000_000_000) as u64, (ns % 1_000_000_000) as u32)
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -56,7 +56,7 @@ pub fn continuous() -> Duration {
         );
         Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
     }
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         START.get_or_init(Instant::now).elapsed()

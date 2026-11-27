@@ -157,7 +157,7 @@ extern "C" fn handle(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
 }
 
 unsafe fn context_mask(context: *mut libc::c_void) -> *const libc::sigset_t {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: same kernel-provided ucontext as context_pc; passing its address
     // avoids reading unused platform sigset padding as initialized Rust values.
     unsafe {
@@ -170,13 +170,19 @@ unsafe fn context_mask(context: *mut libc::c_void) -> *const libc::sigset_t {
 }
 
 unsafe fn context_pc(context: *mut libc::c_void) -> *mut usize {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "x86_64"
+    ))]
     // SAFETY: Linux's SA_SIGINFO ucontext matches this target's libc ABI.
     unsafe {
         (&raw mut (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RIP as usize])
             .cast()
     }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
     unsafe {
         (&raw mut (*(context.cast::<libc::ucontext_t>())).uc_mcontext.pc).cast()
     }

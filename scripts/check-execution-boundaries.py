@@ -28,7 +28,7 @@ def closure(name):
 for name in ['trames-kernel', 'trames-linux', 'trames-memory', 'trames-elf', 'trames-distro', 'trames-host', 'trames-engine', 'trames-session', 'trames-hvf', 'trames-mac']:
     if name not in ids:
         continue
-    forbidden = closure(name) & {'trames-cpu', 'trames-compute', 'trames-core', 'trames-ffi'}
+    forbidden = closure(name) & {'trames-cpu', 'trames-compute', 'trames-interpreter', 'trames-host-compute', 'trames-jit', 'trames-core', 'trames-ffi'}
     assert not forbidden, (name, 'depends on the interpreter/product:', sorted(forbidden))
 if 'trames-host' in ids:
     assert not closure('trames-host') & {'trames-cli-common', 'trames-hvf', 'trames-mac'}, 'host transports must remain independent of CLI/product/CPU backends'
@@ -48,5 +48,5 @@ elif 'trames-mac' in members:
     assert members == {'trames-hvf', 'trames-mac'}
     assert {'trames-hvf', 'trames-linux', 'trames-kernel'} <= closure('trames-mac')
 else:
-    assert members == common, members
+    assert members == common | {'trames-interpreter', 'trames-host-compute', 'trames-jit'}, members
 print('Project boundaries verified: standalone common runtime, iPad interpreter composition, Mac hardware composition')

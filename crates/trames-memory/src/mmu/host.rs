@@ -82,7 +82,7 @@ impl Mapping {
         // SAFETY: kernel-selected RW VA, never executable or fixed over host
         // allocations. Failed setup releases the FD and reservation budget.
         let kernel = unsafe {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 let fd = libc::memfd_create(c"trames-ram".as_ptr(), libc::MFD_CLOEXEC);
                 if fd < 0 {
@@ -202,7 +202,7 @@ impl CpuMapping {
                 .as_ptr()
                 .add(source_offset)
                 .cast::<libc::c_void>();
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let ok = libc::mremap(
                 source,
                 0,

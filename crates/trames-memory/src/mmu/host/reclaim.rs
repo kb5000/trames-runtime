@@ -58,7 +58,7 @@ impl Slots {
         if group.owners != 0 {
             return;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let advice = libc::MADV_REMOVE; // punch the shared memfd, including CPU aliases
         #[cfg(target_vendor = "apple")]
         let advice = libc::MADV_FREE_REUSABLE;

@@ -1,0 +1,22 @@
+[package]
+name = "trames-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Explicit product opt-in. This is never enabled by trames-interpreter/iPad.
+native-aarch64 = []
+
+[dependencies]
+trames-interpreter = { path = "../trames-interpreter" }
+trames-engine = { path = "../trames-engine" }
+trames-execution = { path = "../trames-execution" }
+trames-memory = { path = "../trames-memory" }
+libc = "=0.2.190"
+
+[lints]
+workspace = true

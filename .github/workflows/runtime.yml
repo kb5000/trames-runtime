@@ -36,3 +36,11 @@ jobs:
           cargo test -p trames-net --target x86_64-unknown-linux-musl --lib --locked
       - run: cargo build --workspace --all-features --release --locked
       - run: cargo run --release -p trames-memory --example reclaim-footprint --locked
+
+  software-jit:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo clippy -p trames-jit --all-targets --features native-aarch64 --locked -- -D warnings
+      - run: cargo test -p trames-jit --features native-aarch64 --locked
