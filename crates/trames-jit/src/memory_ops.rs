@@ -17,8 +17,14 @@ pub(super) enum Address {
     Offset(u64),
     Pre(u64),
     Post(u64),
+    PostRegister(usize),
     Register { reg: usize, option: u32, shift: u32 },
     Literal(u64),
+}
+#[derive(Clone, Copy)]
+pub(super) struct Structure {
+    pub registers: usize,
+    pub preserve: bool,
 }
 pub(super) struct Operation {
     pc: u64,
@@ -28,6 +34,7 @@ pub(super) struct Operation {
     pub(super) size: usize,
     pub(super) load: bool,
     pub(super) vector: bool,
+    pub(super) structure: Option<Structure>,
     pub(super) second: Option<usize>,
     pub(super) ordered: bool,
     pub(super) atomic: Option<Atomic>,
@@ -38,7 +45,81 @@ fn signed(value: u64, bits: u32) -> u64 {
     ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 impl Operation {
+    fn compile_structure(word: u32, pc: u64) -> Result<Option<Self>, CpuFault> {
+        if crate::features::profile().allowed.hwcap & (1 << 1) == 0 {
+            return Ok(None);
+        }
+        let load = word & (1 << 22) != 0;
+        let q = ((word >> 30) & 1) as usize;
+        let size = ((word >> 10) & 3) as usize;
+        let (registers, length, preserve) = if word & 0xbf000000 == 0x0d000000 {
+            let s = (word >> 12) & 1;
+            let opcode = (word >> 13) & 7;
+            let registers = (((opcode & 1) << 1) | ((word >> 21) & 1)) as usize + 1;
+            let (element, preserve) = match opcode >> 1 {
+                0 => (1, true),
+                1 if size & 1 == 0 => (2, true),
+                2 if size == 0 => (4, true),
+                2 if size == 1 && s == 0 => (8, true),
+                3 if load && s == 0 => (1 << size, false),
+                _ => return Ok(None),
+            };
+            (registers, element * registers, preserve)
+        } else if word & 0xbf200000 == 0x0c000000 {
+            let (registers, interleaved) = match (word >> 12) & 15 {
+                0 => (4, true),
+                2 => (4, false),
+                4 => (3, true),
+                6 => (3, false),
+                7 => (1, false),
+                8 => (2, true),
+                10 => (2, false),
+                _ => return Ok(None),
+            };
+            if q == 0 && size == 3 && interleaved {
+                return Ok(None);
+            }
+            (registers, (8 << q) * registers, false)
+        } else {
+            return Ok(None);
+        };
+        let post = word & (1 << 23) != 0;
+        let rm = ((word >> 16) & 31) as usize;
+        if !post && rm != 0 {
+            return Ok(None);
+        }
+        Self {
+            pc,
+            address: if !post {
+                Address::Offset(0)
+            } else if rm == 31 {
+                Address::Post(length as u64)
+            } else {
+                Address::PostRegister(rm)
+            },
+            rn: ((word >> 5) & 31) as usize,
+            rt: (word & 31) as usize,
+            size: length,
+            load,
+            vector: true,
+            structure: Some(Structure {
+                registers,
+                preserve,
+            }),
+            second: None,
+            ordered: false,
+            atomic: None,
+            // Keep the original operation/arrangement/lane, without writeback.
+            opcode: Some(word & !((1 << 23) | (31 << 16) | 0x3ff)),
+            code: None,
+        }
+        .publish()
+        .map(Some)
+    }
     fn compile_vector(word: u32, pc: u64) -> Result<Option<Self>, CpuFault> {
+        if matches!(word & 0xbf000000, 0x0c000000 | 0x0d000000) {
+            return Self::compile_structure(word, pc);
+        }
         if crate::features::profile().allowed.hwcap & 1 == 0 {
             return Ok(None);
         }
@@ -136,6 +217,7 @@ impl Operation {
             size,
             load,
             vector: true,
+            structure: None,
             second,
             ordered: false,
             atomic: None,
@@ -180,6 +262,7 @@ impl Operation {
                 },
                 load: false,
                 vector: false,
+                structure: None,
                 second: None,
                 ordered: false,
                 atomic: Some(if rmw {
@@ -214,6 +297,7 @@ impl Operation {
                 size,
                 load,
                 vector: false,
+                structure: None,
                 second: None,
                 ordered: true,
                 atomic: None,
@@ -243,6 +327,7 @@ impl Operation {
                 size: 1usize << (word >> 30),
                 load,
                 vector: false,
+                structure: None,
                 second: None,
                 ordered: true,
                 atomic: None,
@@ -295,6 +380,7 @@ impl Operation {
                 size: element * 2,
                 load,
                 vector: false,
+                structure: None,
                 second: Some(second),
                 ordered: false,
                 atomic: None,
@@ -373,6 +459,7 @@ impl Operation {
             size,
             load,
             vector: false,
+            structure: None,
             second: None,
             ordered: false,
             atomic: None,
@@ -387,14 +474,26 @@ impl Operation {
             .opcode
             .map(|word| {
                 if self.vector {
-                    let pair = self.second.is_some();
                     let mut words = vec![0xd503245f];
-                    if !self.load {
-                        words.push(if pair { 0xad400420 } else { 0x3dc00020 });
+                    let registers = self.vector_registers();
+                    if !self.load || self.structure.is_some_and(|s| s.preserve) {
+                        for i in (0..registers.len() as u32).step_by(2) {
+                            words.push(if i + 1 < registers.len() as u32 {
+                                0xad400020 | (i << 15) | ((i + 1) << 10) | i
+                            } else {
+                                0x3dc00020 | (i << 10) | i
+                            });
+                        }
                     }
                     words.push(word);
                     if self.load {
-                        words.push(if pair { 0xad000420 } else { 0x3d800020 });
+                        for i in (0..registers.len() as u32).step_by(2) {
+                            words.push(if i + 1 < registers.len() as u32 {
+                                0xad000020 | (i << 15) | ((i + 1) << 10) | i
+                            } else {
+                                0x3d800020 | (i << 10) | i
+                            });
+                        }
                     }
                     words.push(0xd65f03c0);
                     Code::publish(&words)
@@ -429,6 +528,20 @@ impl Operation {
             .map_err(|e| CpuFault::Host(format!("JIT memory publication: {e}")))?;
         Ok(self)
     }
+    pub(super) fn vector_registers(&self) -> impl ExactSizeIterator<Item = usize> + Clone + '_ {
+        let count = self
+            .structure
+            .map_or(1 + usize::from(self.second.is_some()), |s| s.registers);
+        (0..count).map(move |i| {
+            if self.structure.is_some() {
+                (self.rt + i) & 31
+            } else if i == 0 {
+                self.rt
+            } else {
+                self.second.unwrap()
+            }
+        })
+    }
     pub fn pc(&self) -> u64 {
         self.pc
     }
@@ -448,6 +561,7 @@ impl Operation {
                 (next, Some(next))
             }
             Address::Post(offset) => (base, Some(base.wrapping_add(offset))),
+            Address::PostRegister(reg) => (base, Some(base.wrapping_add(cpu.x(reg)))),
             Address::Literal(address) => (address, None),
             Address::Register { reg, option, shift } => {
                 let raw = cpu.x(reg);
@@ -517,10 +631,16 @@ impl Operation {
         }
         let crosses = self.size as u64 > PAGE_SIZE - (address & (PAGE_SIZE - 1));
         let direct = if self.vector {
-            let mut values = [0u128; 2];
+            let registers = self.vector_registers();
+            let mut values = [0u128; 4];
+            if !self.load || self.structure.is_some_and(|s| s.preserve) {
+                for (i, reg) in registers.clone().enumerate() {
+                    values[i] = cpu.vector(reg);
+                }
+            }
             if self.load {
                 let direct = if crosses {
-                    let mut bytes = [0u8; 32];
+                    let mut bytes = [0u8; 64];
                     memory
                         .read(address, &mut bytes[..self.size])
                         .map_err(fault)?;
@@ -536,18 +656,13 @@ impl Operation {
                         .map_err(fault)?
                         .1
                 };
-                cpu.set_vector(self.rt, values[0]);
-                if let Some(second) = self.second {
-                    cpu.set_vector(second, values[1]);
+                for (i, reg) in registers.clone().enumerate() {
+                    cpu.set_vector(reg, values[i]);
                 }
                 direct
             } else {
-                values[0] = cpu.vector(self.rt);
-                if let Some(second) = self.second {
-                    values[1] = cpu.vector(second);
-                }
                 if crosses {
-                    let mut bytes = [0u8; 32];
+                    let mut bytes = [0u8; 64];
                     unsafe {
                         code.call_vector_memory(bytes.as_mut_ptr(), values.as_mut_ptr());
                     }

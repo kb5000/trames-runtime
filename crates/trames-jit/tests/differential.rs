@@ -120,6 +120,240 @@ fn host_capability(bit: u32) -> bool {
     !NATIVE_COMPILED || trames_jit::host_features().unwrap().hwcap & (1 << bit) != 0
 }
 
+fn structure_word(base: u32, rt: u32, rn: u32, post: u32) -> u32 {
+    base | (rn << 5)
+        | rt
+        | if post == 0 {
+            0
+        } else {
+            (1 << 23) | (post << 16)
+        }
+}
+
+#[test]
+fn multiple_structures_keep_arrangements_interleaving_wrapped_lists_and_writeback() {
+    if !host_capability(1) {
+        return;
+    }
+    for q in 0..2 {
+        for size in 0..4 {
+            for opcode in [0, 2, 4, 6, 7, 8, 10] {
+                if q == 0 && size == 3 && matches!(opcode, 0 | 4 | 8) {
+                    continue;
+                }
+                for load in 0..2 {
+                    for rt in [0, 15, 31] {
+                        let rn = if rt == 15 { 31 } else { 1 };
+                        for post in [0, 31, 3, rn] {
+                            let word = structure_word(
+                                0x0c000000
+                                    | (q << 30)
+                                    | (size << 10)
+                                    | (opcode << 12)
+                                    | (load << 22),
+                                rt,
+                                rn,
+                                post,
+                            );
+                            let mut state = initial();
+                            state.registers[1] = 0xab00_0000_0001_0040;
+                            state.sp = 0x10080;
+                            state.registers[3] = 17;
+                            let words = [0x4ea1843f, word, 0xd4000001];
+                            for budget in [1, 64] {
+                                let e =
+                                    compare_memory_sequence(&words, &state, budget, budget == 64);
+                                if NATIVE_COMPILED {
+                                    assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                                    assert_eq!(e.memory_stats().instructions, 1, "{word:08x}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lane_structures_preserve_untouched_bits_and_replicates_clear_upper_halves() {
+    if !host_capability(1) {
+        return;
+    }
+    for count in 1..=4 {
+        for power in 0..4 {
+            for lane in 0..(16 >> power) {
+                let (q, s, size, scale) = match power {
+                    0 => (lane >> 3, (lane >> 2) & 1, lane & 3, 0),
+                    1 => (lane >> 2, (lane >> 1) & 1, (lane & 1) << 1, 1),
+                    2 => (lane >> 1, lane & 1, 0, 2),
+                    _ => (lane, 0, 1, 2),
+                };
+                for load in 0..2 {
+                    for rt in [7, 31] {
+                        for post in [0, 31, 3] {
+                            let opcode = (scale << 1) | ((count - 1) >> 1);
+                            let word = structure_word(
+                                0x0d000000
+                                    | (q << 30)
+                                    | (load << 22)
+                                    | (((count - 1) & 1) << 21)
+                                    | (opcode << 13)
+                                    | (s << 12)
+                                    | (size << 10),
+                                rt,
+                                1,
+                                post,
+                            );
+                            let mut state = initial();
+                            state.registers[1] = 0x10040;
+                            state.registers[3] = 19;
+                            for budget in [1, 64] {
+                                let e = compare_memory_sequence(
+                                    &[0x4ea1843f, word, 0xd4000001],
+                                    &state,
+                                    budget,
+                                    budget == 64,
+                                );
+                                if NATIVE_COMPILED {
+                                    assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                                    assert_eq!(e.memory_stats().instructions, 1, "{word:08x}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for q in 0..2 {
+                for post in [0, 31, 3] {
+                    let opcode = 6 | ((count - 1) >> 1);
+                    let word = structure_word(
+                        0x0d400000
+                            | (q << 30)
+                            | (((count - 1) & 1) << 21)
+                            | (opcode << 13)
+                            | (power << 10),
+                        31,
+                        1,
+                        post,
+                    );
+                    let mut state = initial();
+                    state.registers[1] = 0x10ff5;
+                    state.registers[3] = u64::MAX - 3;
+                    for budget in [1, 64] {
+                        let e = compare_memory_sequence(
+                            &[word, 0xd4000001],
+                            &state,
+                            budget,
+                            budget == 64,
+                        );
+                        if NATIVE_COMPILED {
+                            assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                            assert_eq!(e.memory_stats().instructions, 1, "{word:08x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn structure_groups_survive_dirty_repacking_cross_pages_and_precise_faults() {
+    if !host_capability(1) {
+        return;
+    }
+    for rt in [0, 7, 15, 30, 31] {
+        for load in 0..2 {
+            for class in [0x4c002000, 0x4c004000, 0x4d20b000, 0x4d60ec00] {
+                if class == 0x4d60ec00 && load == 0 {
+                    continue;
+                }
+                let word = structure_word(class | (load << 22), rt, 1, 3);
+                let mut words = Vec::new();
+                // Deliberately scramble the existing bindings so wrapped groups
+                // require relocation, cycles, dirty evictions and helper reloads.
+                for reg in (0..23).map(|r| (r * 13) & 31) {
+                    words.push(0x4ea08400 | (reg << 16) | (reg << 5) | reg);
+                }
+                words.extend_from_slice(&[word, 0x4ea08400, 0xf9400085, 0x4ea08400, 0xd4000001]);
+                for address in [0x10000, 0x10ff7, 0x10000 + hardware_span() - 7] {
+                    let mut state = initial();
+                    state.registers[1] = address;
+                    state.registers[3] = 9;
+                    state.registers[4] = 0x11000;
+                    for budget in [1, 8, 64] {
+                        for parallel in [false, true] {
+                            let e = compare_memory_sequence(&words, &state, budget, parallel);
+                            if NATIVE_COMPILED {
+                                assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reserved_structure_encodings_keep_reached_pc_faults() {
+    let mut state = initial();
+    state.registers[1] = 0x10000;
+    for word in [
+        0x4c417020,
+        0x4c607020,
+        0x4c401020,
+        0x0c400c20,
+        0x4d414020,
+        0x4d404420,
+        0x4d409420,
+        0x4d40c020 | (1 << 12),
+        0x4d00c020,
+    ] {
+        for budget in [1, 64] {
+            let e = compare_memory_sequence(
+                &[0x91000400, word, 0xd4000001],
+                &state,
+                budget,
+                budget == 64,
+            );
+            if NATIVE_COMPILED {
+                assert_eq!(e.memory_stats().instructions, 0, "{word:08x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn structure_neon_loops_reuse_aliases_without_fallback_or_staging() {
+    if !NATIVE_COMPILED || !host_capability(1) {
+        return;
+    }
+    for (load, store) in [
+        (0x4c40a03f, 0x4c00a03f), // LD1/ST1 {v31,v0}
+        (0x4c40803f, 0x4c00803f), // LD2/ST2
+        (0x4d60c03f, 0x4d20003f),
+    ] {
+        // LD2R / ST2 lane
+        let words = [load, 0x4ea38400, store, 0xf1000442, 0x54ffff81, 0xd4000001];
+        let mut state = initial();
+        state.registers[1] = 0x10000;
+        state.registers[2] = 32;
+        for parallel in [false, true] {
+            let e = compare_memory_sequence(&words, &state, 256, parallel);
+            assert_eq!(e.stats.fallback_instructions, 0);
+            assert_eq!(e.memory_stats().instructions, 64);
+            assert_eq!(e.memory_stats().staged, 0);
+            assert!(e.memory_stats().hardware >= 60);
+            assert!(e.memory_stats().direct >= 60);
+            assert_eq!(e.memory_stats().fused_entries, 1);
+            assert!(e.compilation_stats().address_reuses > 0);
+        }
+    }
+}
+
 fn compare_fp_word(word: u32, state: &Aarch64State) {
     for budget in [1, 64] {
         let e = compare_memory_sequence(&[word, 0xd4000001], state, budget, budget == 64);
@@ -2593,7 +2827,9 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
             Err(MemoryError::BackingIo(5))
         }
     }
-    for word in [0xf9000020, 0xa9000820, 0xc89ffc20, 0x3d800020, 0xad000420] {
+    for word in [
+        0xf9000020, 0xa9000820, 0xc89ffc20, 0x3d800020, 0xad000420, 0x4c002020,
+    ] {
         let output = Arc::new(Output::default());
         let mut m = memory(&[word]);
         m.unmap(0x2000, PAGE_SIZE).unwrap();
@@ -3056,6 +3292,10 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
         (true, 0x3d8003a4),
         (false, 0xad401424),
         (true, 0xad0017a4),
+        (false, 0x4c40203f),
+        (true, 0x4c0023bf),
+        (false, 0x4d60c03f),
+        (true, 0x4d2023bf),
     ] {
         if (word == 0xf82403a0 || word == 0x48287faa) && !host_capability(8) {
             continue;

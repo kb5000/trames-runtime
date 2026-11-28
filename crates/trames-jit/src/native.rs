@@ -1202,6 +1202,90 @@ impl Vectors {
         self.bindings[(host - 16) as usize].as_mut().unwrap().dirty = dirty;
         host
     }
+    fn group(
+        &mut self,
+        words: &mut Vec<u32>,
+        traffic: &mut CompilationStats,
+        guest: usize,
+        count: usize,
+        read: bool,
+    ) -> u32 {
+        self.used = true;
+        self.clock += 1;
+        let aligned = self.hosts[guest];
+        let start = if aligned != u8::MAX
+            && aligned as usize + count <= 16
+            && (0..count).all(|i| self.hosts[(guest + i) & 31] as usize == aligned as usize + i)
+        {
+            aligned as usize
+        } else {
+            (0..=16 - count)
+                .min_by_key(|start| {
+                    let mut cost = 0;
+                    let mut age = 0u64;
+                    for i in 0..count {
+                        if let Some(b) = self.bindings[start + i] {
+                            if b.guest as usize != (guest + i) & 31 {
+                                cost += 1 + 2 * u32::from(b.dirty);
+                            }
+                            age += b.used as u64;
+                        } else {
+                            cost += 1;
+                        }
+                    }
+                    (cost, age)
+                })
+                .unwrap()
+        };
+        // Spill every displaced dirty value before loading any relocated member,
+        // including cycles and guest lists wrapping V31 -> V0. An already packed
+        // group emits no moves, loads or stores here on subsequent instructions.
+        let mut pointer = false;
+        for slot in 0..16 {
+            let Some(b) = self.bindings[slot] else {
+                continue;
+            };
+            let member = (b.guest as usize + 32 - guest) & 31;
+            let displaced = (slot >= start
+                && slot < start + count
+                && b.guest as usize != (guest + slot - start) & 31)
+                || (member < count && slot != start + member);
+            if displaced {
+                if b.dirty {
+                    if !pointer {
+                        load(words, 17, 16, 96);
+                        pointer = true;
+                    }
+                    words.push(0x3d800000 | (b.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                    traffic.register_stores += 1;
+                }
+                self.hosts[b.guest as usize] = u8::MAX;
+                self.bindings[slot] = None;
+            }
+        }
+        for i in 0..count {
+            let slot = start + i;
+            let reg = (guest + i) & 31;
+            if self.bindings[slot].is_none() {
+                if read {
+                    if !pointer {
+                        load(words, 17, 16, 96);
+                        pointer = true;
+                    }
+                    words.push(0x3dc00000 | ((reg as u32) << 10) | (17 << 5) | (slot as u32 + 16));
+                    traffic.register_loads += 1;
+                }
+                self.bindings[slot] = Some(Binding {
+                    guest: reg as u32,
+                    dirty: false,
+                    used: self.clock,
+                });
+                self.hosts[reg] = slot as u8;
+            }
+            self.bindings[slot].as_mut().unwrap().used = self.clock;
+        }
+        start as u32 + 16
+    }
     fn reload(&self, words: &mut Vec<u32>, traffic: &mut CompilationStats) {
         if self.bindings.iter().any(Option::is_some) {
             load(words, 17, 16, 96);
@@ -1563,7 +1647,7 @@ impl Assembler {
         self.context = true;
         let address_key = match op.address {
             Address::Pre(offset) => Address::Offset(offset),
-            Address::Post(_) => Address::Offset(0),
+            Address::Post(_) | Address::PostRegister(_) => Address::Offset(0),
             other => other,
         };
         let key = match address_key {
@@ -1594,7 +1678,15 @@ impl Assembler {
             self.read(sp_register(op.rn as u32), scratch)
         };
         let vector_target = if op.vector {
-            Some(if op.load {
+            Some(if let Some(group) = op.structure {
+                self.vectors.group(
+                    &mut self.words,
+                    &mut self.traffic,
+                    op.rt,
+                    group.registers,
+                    !op.load || group.preserve,
+                )
+            } else if op.load {
                 self.vectors
                     .reserve(&mut self.words, &mut self.traffic, op.rt as u32, 0)
             } else {
@@ -1644,7 +1736,7 @@ impl Assembler {
         } else {
             None
         };
-        let index = if let Address::Register { reg, .. } = op.address {
+        let index = if let Address::Register { reg, .. } | Address::PostRegister(reg) = op.address {
             self.read(reg as u32, scratch | (1 << base) | (1 << source))
         } else {
             31
@@ -1716,7 +1808,9 @@ impl Assembler {
                 constant(&mut self.words, 10, offset);
                 self.words.push(0x8b0a0000 | (base << 5) | 17);
             }
-            Address::Post(_) => self.words.push(0xaa0003f1 | (base << 16)),
+            Address::Post(_) | Address::PostRegister(_) => {
+                self.words.push(0xaa0003f1 | (base << 16))
+            }
         }
         // Shared guest TBI, followed by the existing one-page custody bound.
         self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17);
@@ -1771,8 +1865,17 @@ impl Assembler {
         };
         let target = if op.vector {
             if op.load {
-                self.vectors
-                    .bind(&mut self.words, &mut self.traffic, op.rt as u32, 0, false);
+                if let Some(group) = op.structure {
+                    for i in 0..group.registers {
+                        self.vectors.bindings[(vector_target.unwrap() - 16) as usize + i]
+                            .as_mut()
+                            .unwrap()
+                            .dirty = true;
+                    }
+                } else {
+                    self.vectors
+                        .bind(&mut self.words, &mut self.traffic, op.rt as u32, 0, false);
+                }
             }
             vector_target.unwrap()
         } else if let Some(reg) = output {
@@ -1844,6 +1947,14 @@ impl Assembler {
             constant(&mut self.words, 10, offset);
             let target = self.output(sp_register(op.rn as u32), scratch | (1 << base));
             self.words.push(0x8b0a0000 | (base << 5) | target);
+        }
+        if let Address::PostRegister(_) = op.address {
+            let target = self.output(
+                sp_register(op.rn as u32),
+                scratch | (1 << base) | (1 << index),
+            );
+            self.words
+                .push(0x8b000000 | (index << 16) | (base << 5) | target);
         }
         load(&mut self.words, 10, 11, 0);
         self.words.push(0x9100054a);
@@ -2650,7 +2761,7 @@ impl Code {
     }
     pub(super) unsafe fn call_vector_memory(&self, pointer: *mut u8, values: *mut u128) {
         // The exact-width original load/store acts inside the existing borrow.
-        // Only caller-saved v0/v1 marshal the two existing CPU vector values.
+        // Only caller-saved v0..v3 marshal the existing CPU vector values.
         let function: unsafe extern "C" fn(*mut u8, *mut u128) =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe {
@@ -2746,6 +2857,25 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structure_register_groups_reuse_packed_bindings_without_emitted_traffic() {
+        let mut v = Vectors::new();
+        let mut words = Vec::new();
+        let mut traffic = CompilationStats::default();
+        let host = v.group(&mut words, &mut traffic, 31, 4, false);
+        assert!((16..=28).contains(&host));
+        assert!(words.is_empty()); // Full loads do not read old destinations.
+        for i in 0..4 {
+            v.bindings[(host - 16) as usize + i].as_mut().unwrap().dirty = true;
+        }
+        assert_eq!(v.group(&mut words, &mut traffic, 31, 4, true), host);
+        assert!(words.is_empty()); // A following store/lane read uses live values.
+        assert_eq!((traffic.register_loads, traffic.register_stores), (0, 0));
+        for i in 0..4 {
+            assert_eq!(v.hosts[(31 + i) & 31] as u32 + 16, host + i as u32);
+        }
+    }
 
     #[test]
     fn fp_blocks_preserve_aapcs64_callee_vector_registers() {

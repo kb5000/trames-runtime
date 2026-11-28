@@ -23,7 +23,8 @@ There are no new software replacements or emulated extension registers.
 Scalar, paired and ordered memory, LSE CAS/CASP/RMW and RCpc accesses now use
 native memory paths as described below.
 Common scalar FP and NEON arithmetic and scalar/paired vector memory also execute
-natively, including mixed memory/arithmetic blocks. Exclusive reservations, traps
+natively, including structure/lane/replicate transfers and mixed memory/arithmetic
+blocks. Exclusive reservations, traps
 and remaining untranslated families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
@@ -164,7 +165,7 @@ algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is adde
 
 The following sections extend this original scalar lowering with paired/ordered
 accesses, LSE and RCpc, plus mixed FP/NEON scalar/paired vector transfers.
-Exclusive-reservation lowering and structure/lane vector transfers remain pending.
+Exclusive-reservation lowering remains pending.
 
 ### Entry-scoped hardware aliases
 
@@ -394,8 +395,8 @@ Mixed blocks reuse the existing affine CPU alias, unchanged-address proof,
 one-guest-4-KiB boundary, and exact registered hardware-fault recovery. There is
 no new access preflight, ordinary-memory fence or mapping policy. A cross-page
 operand takes the existing checked staging path and commits vector destinations
-and base writeback only after the complete operand succeeds. Structure, lane,
-replicate, SVE/SME memory and native exclusive-reservation families remain pending.
+and base writeback only after the complete operand succeeds. SVE/SME memory and
+native exclusive-reservation families remain pending.
 
 [Vector-memory validation and paired measurements](../validation/jit-vector-memory-20261128.md)
 cover all widths/address modes, V31, pressure/evictions, checked providers, host FP
@@ -405,3 +406,31 @@ isolation, precise hardware and cross-page faults, and mixed-loop alias reuse.
 cover rounding, NaNs, infinities, denormals, alternative half conversion, FPSR/QC,
 source/destination aliases, spills, dynamic PC, syscall/yield/fault restoration,
 and concurrent code replacement at a running FP loop's existing epoch guard.
+
+
+### Structure, lane and replicate transfers
+
+Native LD1/ST1 (one to four registers), interleaved LD2/3/4 and ST2/3/4,
+single-lane LD/ST1..4, and LD1R..LD4R retain the original hardware instruction.
+The cold AdvSIMD capability gate, arrangement/reserved-encoding decoder and
+post-index selection run during compilation. Operands range from 1 to 64 bytes;
+base-only, immediate post-index and X-register post-index use the same guest
+address/writeback model as scalar vector transfers. V31-to-V0 lists wrap normally.
+
+The cold vector allocator reserves a contiguous host group within v16..v31,
+reuses an already packed group without emitted traffic, and spills displaced
+dirty values before loading relocated members. Full loads reserve outputs without
+reading old CPU values. Lane loads bind the old full vectors to preserve every
+untouched bit. Replicate and interleaved layouts are performed by hardware,
+with no software lane loop or new extension state on the native path.
+
+The existing whole-operand one-guest-4-KiB bound and precise recovery apply to
+64-byte transfers as well. Checked callbacks marshal up to four CPU vectors via
+caller-saved v0..v3 and a bounded 64-byte staging array when required; register
+lists are allocation-free iterators. Outputs and post-index writeback commit only
+after a successful checked operation. Memory accesses retain the original
+instruction's ordering and atomicity, without a new aggregate lock or fence.
+
+[Structure/lane/replicate validation and measurements](../validation/jit-structures-20261128.md)
+record all arrangements, lane indices, wrapped lists, register-group pressure,
+provider stores, fault recovery and Android CPU probes.

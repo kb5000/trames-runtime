@@ -1,0 +1,127 @@
+{
+  "processes": 8,
+  "timed_samples": 240,
+  "warmup_samples": 48,
+  "workloads": {
+    "fp-arithmetic-control": {
+      "change_percent": -0.09999339310104993,
+      "new_median_ns": 1852268.5,
+      "old_median_ns": 1854122.5,
+      "process_medians": {
+        "new": [
+          1781166,
+          1789374,
+          1915163,
+          1931663
+        ],
+        "old": [
+          1854789,
+          1853456,
+          1805124,
+          1910331
+        ]
+      },
+      "speedup": 1.0010009347996793
+    },
+    "scalar-memory-control": {
+      "change_percent": 2.76664901908259,
+      "new_median_ns": 1218034.0,
+      "old_median_ns": 1185242.5,
+      "process_medians": {
+        "new": [
+          1246887,
+          944644,
+          1219596,
+          1216472
+        ],
+        "old": [
+          1192138,
+          1248470,
+          1172764,
+          1178347
+        ]
+      },
+      "speedup": 0.9730783377147108
+    },
+    "vector-lane4-hot": {
+      "change_percent": -97.70720262746057,
+      "new_median_ns": 3885033.5,
+      "old_median_ns": 169445130.5,
+      "process_medians": {
+        "new": [
+          3862491,
+          3874783,
+          3895284,
+          3918908
+        ],
+        "old": [
+          170972115,
+          169541816,
+          169348445,
+          167664484
+        ]
+      },
+      "speedup": 43.61484411910477
+    },
+    "vector-ld1-four-hot": {
+      "change_percent": -99.28218519771266,
+      "new_median_ns": 3074699.0,
+      "old_median_ns": 428341543.0,
+      "process_medians": {
+        "new": [
+          3048635,
+          3097093,
+          3069387,
+          3080011
+        ],
+        "old": [
+          436620592,
+          420062494,
+          438371500,
+          419143389
+        ]
+      },
+      "speedup": 139.31169945415795
+    },
+    "vector-ld4-interleaved-hot": {
+      "change_percent": -97.65852087903102,
+      "new_median_ns": 4838656.5,
+      "old_median_ns": 206649568.5,
+      "process_medians": {
+        "new": [
+          4715512,
+          4812510,
+          4864803,
+          4872969
+        ],
+        "old": [
+          208540914,
+          204758223,
+          217803758,
+          203481937
+        ]
+      },
+      "speedup": 42.7080468514349
+    },
+    "vector-replicate4-hot": {
+      "change_percent": -97.75084842805946,
+      "new_median_ns": 3919157.5,
+      "old_median_ns": 174250484.0,
+      "process_medians": {
+        "new": [
+          3931823,
+          3894240,
+          3960157,
+          3906492
+        ],
+        "old": [
+          176668860,
+          172384839,
+          175404061,
+          173096907
+        ]
+      },
+      "speedup": 44.46120983910445
+    }
+  }
+}

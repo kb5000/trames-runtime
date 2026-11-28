@@ -75,6 +75,8 @@ pub(crate) fn profile() -> &'static Profile {
 pub(crate) fn permits(host: Features, word: u32) -> bool {
     let required = if let Some(op) = crate::vector_ops::decode(word) {
         Some((0, op.capability))
+    } else if matches!(word & 0xbf000000, 0x0c000000 | 0x0d000000) {
+        Some((0, 1)) // AdvSIMD multiple/single structures and replicate loads
     } else if word & 0x3ffffc00 == 0x38bfc000 {
         Some((0, 15)) // LRCPC: LDAPR/B/H
     } else if word & 0x3f200c00 == 0x19000000 {
@@ -142,6 +144,16 @@ mod tests {
                 Features {
                     hwcap: u64::MAX,
                     hwcap2: u64::MAX
+                },
+                word
+            ));
+        }
+        for word in [0x4c40203f, 0x4d40c03f, 0x4d00203f] {
+            assert!(permits(base, word));
+            assert!(!permits(
+                Features {
+                    hwcap: 1,
+                    hwcap2: 0
                 },
                 word
             ));
