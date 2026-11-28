@@ -4267,3 +4267,6 @@ mod compatibility_category;
 
 #[path = "support/execution_boundary_category.rs"]
 mod execution_boundary_category;
+
+#[path = "support/control_category.rs"]
+mod control_category;

@@ -8,8 +8,12 @@ use trames_interpreter::Cpu;
 mod compatibility;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
+#[cfg(test)]
+#[path = "control_category_tests.rs"]
+mod control_category_tests;
 #[path = "scalar_ops.rs"]
 mod scalar;
+
 #[cfg(test)]
 #[path = "scalar_codegen_tests.rs"]
 mod scalar_codegen_tests;
@@ -593,7 +597,7 @@ impl Cache {
                     let operation = crate::memory_ops::Operation::compile(memory, pc)?
                         .map(|op| Box::new(MemoryOps::Single(op)));
                     if operation.is_none() {
-                        if scalar::owns(word) {
+                        if scalar::owns(word) || trames_interpreter::control::owns_encoding(word) {
                             Some(Box::new(MemoryOps::Instruction(word)))
                         } else {
                             None
@@ -2862,11 +2866,23 @@ fn compile_body(
             select_pc(&mut code, (word & !mask) | source, next, taken);
             flow = Flow::Choice(taken);
             terminal = true;
-        } else if word & 0xff000010 == 0x54000000 {
+        } else if word & 0xff000000 == 0x54000000 {
             next = pc.wrapping_add(4);
             let taken = pc.wrapping_add(signed(((word >> 5) & 0x7ffff) as u64, 19) << 2);
             code.flags_read();
             select_pc(&mut code, word & !0xffffe0, next, taken);
+            flow = Flow::Choice(taken);
+            terminal = true;
+        } else if let Some(compare) = trames_interpreter::control::CompareBranch::decode(word) {
+            let lhs = code.read(compare.register as u32, 0);
+            let mut test = (word & !0x3fff) | lhs;
+            if !compare.immediate() {
+                let rhs = code.read(compare.operand as u32, 1 << lhs);
+                test = (test & !(31 << 16)) | (rhs << 16);
+            }
+            next = pc.wrapping_add(4);
+            let taken = pc.wrapping_add(compare.offset as i64 as u64);
+            select_pc(&mut code, test, next, taken);
             flow = Flow::Choice(taken);
             terminal = true;
         } else if mode & 8 != 0 {

@@ -1,0 +1,8 @@
+{
+  "encodings": 19568,
+  "cmpbr_selectors": 4096,
+  "cmpbr_valid": 1536,
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "llvm_library": "/home/main.guest/.rustup/toolchains/nightly-2026-10-16-aarch64-unknown-linux-gnu/lib/libLLVM.so.23.1-rust-1.101.0-nightly",
+  "llvm_library_sha256": "516820ebb1e51005c1e85bc6236b07959c96960f5b9e6421c27526c1dfaf6f3f"
+}

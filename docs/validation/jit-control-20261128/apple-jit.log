@@ -1,0 +1,167 @@
+UTC 2026-11-28T11:16:00.965073+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64']
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling rustix v1.1.5
+   Compiling smallvec v1.16.3
+   Compiling bitflags v2.13.2
+   Compiling getrandom v0.3.4
+   Compiling trames-execution v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-host-compute)
+   Compiling lock_api v0.4.14
+   Compiling errno v0.3.14
+   Compiling parking_lot v0.12.5
+   Compiling trames-shared v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-control-source/crates/trames-jit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.08s
+     Running unittests src/lib.rs (/Users/main/dev/trames/target/jit-control-macos/debug/build/trames-jit/4f3860579073cee8/out/trames_jit-4f3860579073cee8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/differential.rs (/Users/main/dev/trames/target/jit-control-macos/debug/build/trames-jit/58ad60b240b6e82c/out/differential-58ad60b240b6e82c)
+
+running 126 tests
+test abstract_memory_category::all_llvm_abstract_ordered_and_atomic_forms_preserve_canonical_callbacks_without_fallback ... ok
+test abstract_memory_category::abstract_ordered_and_atomic_faults_keep_fence_and_publication_order ... ok
+test abstract_memory_category::missing_host_extensions_fault_before_abstract_provider_data_callbacks ... ok
+test affine_address_reuse_rechecks_changed_bases_indices_sp_and_operand_width ... ok
+test abstract_memory_category::abstract_cas_publishes_only_successful_transactions_in_the_original_reservation_domain ... ok
+test a_running_fp_loop_observes_parallel_code_publication_at_its_block_guard ... ok
+test affine_runs_join_only_adjacent_admitted_pages_and_never_bridge_holes ... ok
+test adjacent_syscalls_always_return_to_runtime_between_entries ... ok
+test branch_link_fault_accounting_and_page_boundary ... ok
+test cached_native_call_rechecks_current_opt_ins_and_instruction_identity ... ok
+test architectural_counter_category_and_clock_samples_share_the_host_domain ... ok
+test compatibility_category::masked_pointer_and_zeroing_memory_reuse_native_aliases_after_warmup ... ok
+test compatibility_category::tag_alignment_faults_after_a_reused_unaligned_data_alias_preserve_the_first_store ... ok
+test compiled_syscalls_publish_arguments_once_and_resume_without_replay ... ok
+test arithmetic_category::complete_native_arithmetic_forms_have_a_reference_oracle ... ok
+test compatibility_category::zero_tag_permission_checks_do_not_publish_data_writes_but_zeroing_and_stgp_do ... ok
+test complete_move_and_crypto_blocks_preserve_pressure_helpers_and_dynamic_pc ... ok
+test conditional_countdown_links_and_retires_exactly_without_fallback ... ok
+test control_category::control_targets_preserve_dirty_prefixes_memory_callbacks_budgets_and_link_aliases ... ok
+test control_category::every_control_encoding_matches_independent_whole_state_or_reached_host_rejection ... ok
+test control_category::extension_reached_fault_retires_exact_prefix_without_changing_cpu_banks ... ok
+test control_category::original_invalid_control_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... ok
+test compatibility_category::compatibility_memory_faults_keep_dirty_prefixes_destinations_writeback_and_partial_bytes ... ok
+test counter_frequency_tracks_elapsed_time_across_worker_threads ... ok
+test cross_page_targets_remain_unlinked ... ok
+test conditional_and_register_branches_preserve_flags_links_and_aliases ... ok
+test compatibility_category::compatibility_register_lowering_survives_full_caller_saved_pressure_and_fp_memory_mixing ... ok
+test dirty_eviction_source_aliases_and_deferred_flags_match_interpreter ... ok
+test exclusive_category::closed_window_misalignment_uses_hardware_recovery_and_original_fault_boundary ... ok
+test exclusive_category::clrex_entire_option_category_clears_existing_monitor_without_interpreter ... ok
+test exclusive_category::exclusive_monitor_survives_helpers_and_task_migration_but_rejects_aba ... ok
+test exclusive_category::exclusive_zero_registers_aliases_pressure_and_unmatched_stores_remain_native ... ok
+test exclusive_category::exclusive_faults_have_precise_pc_retirement_and_no_status_writeback ... ok
+test exclusive_category::promoted_serial_pages_and_warm_cache_budget_cuts_reenter_hardware_windows ... ok
+test exclusive_category::shared_exclusive_retry_loops_preserve_updates_without_a_new_algorithm_lock ... ok
+test exclusive_reservation_survives_native_block_and_slice ... ok
+test execution_boundary_category::a_cooperative_invalidation_exit_preserves_the_original_exclusive_reservation ... ok
+test execution_boundary_category::empty_native_entries_preserve_every_architectural_nzcv_combination ... ok
+test execution_boundary_category::guest_self_modification_revalidates_memory_helper_exits_in_all_execution_modes ... ok
+test execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly ... ok
+test execution_boundary_category::repeated_target_invalidation_yields_only_the_committed_prefix_then_resumes ... ok
+test execution_boundary_category::retry_after_a_dirty_prefix_preserves_yield_syscall_native_call_and_fault_totals ... ok
+test execution_boundary_category::stale_linked_scalar_entries_reuse_unchanged_pages_without_interpreter_fetch_or_retirement ... ok
+test execution_boundary_category::stale_vector_checked_hardware_and_mixed_entries_retry_all_epoch_channels_without_interpreter ... ok
+test fp_cached_code_and_status_are_revalidated_after_instruction_replacement ... ok
+test exclusive_category::independent_llvm_exclusive_encodings_keep_all_register_aliases_native ... ok
+test fp_neon_hot_loops_keep_exact_budgets_without_per_instruction_entry ... ok
+test fp_vector_blocks_return_cleanly_to_existing_memory_and_system_boundaries ... ok
+test fused_memory_faults_publish_the_exact_dirty_prefix_and_do_not_replay ... ok
+test guest_release_acquire_publishes_canonical_data_between_workers ... ok
+test hardware_alias_loans_end_at_permissions_replacement_fork_and_worker_boundaries ... ok
+test hardware_alias_loop_preserves_state_and_canonical_bytes ... ok
+test hardware_alias_readonly_and_sparse_pages_share_the_frozen_memory_model ... ok
+test hardware_alias_scalar_forms_keep_live_bindings_flags_and_writeback ... ok
+test host_extensions_are_direct_when_present_and_sigill_when_absent ... ok
+test integer_blocks_preserve_exact_state_and_budgets ... ok
+test invalidation_rechecks_code_permissions_replacements_and_spaces ... ok
+test fused_memory_loops_keep_state_and_retirement_at_every_budget ... ok
+test linked_loop_keeps_exact_budgets_and_avoids_native_reentry ... ok
+test lse_and_rcpc_alias_loops_stay_native_at_slice_boundaries ... ok
+test baseline_precision_conversions_preserve_alternative_half_and_flush_rules ... ok
+test maintenance_only_checks_translation_and_zeroes_one_guest_cache_line ... ok
+test memory_embeddings_without_epoch_capability_never_follow_native_links ... ok
+test exclusive_category::entire_exclusive_category_preserves_all_state_bytes_and_slice_budgets ... ok
+test mixed_vector_loads_do_not_publish_a_new_destination_before_a_guest_fault ... ok
+test mixed_vector_loops_reuse_hardware_addresses_without_interpreter_or_bridge_hits ... ok
+test mixed_vector_memory_evictions_and_helper_reloads_preserve_every_live_bank ... ok
+test mops_category::absent_mops_faults_at_reached_pc_without_interpreter_entry ... ok
+test memory_faults_cross_page_and_writeback_are_precise ... ok
+test mops_category::mops_memory_faults_publish_the_real_stage_dirty_prefix_and_original_error ... ok
+test cache_maintenance_barrier_and_hint_category_keeps_precise_memory_semantics ... ok
+test crc_and_flag_extensions_use_native_lowerings_with_exact_nzcv ... ok
+test mops_category::mops_writes_share_the_original_reservation_domain_without_clearing_read_only_tokens ... ok
+test mops_category::mops_preserves_independent_top_bytes_and_zero_length_ignores_unmapped_operands ... ok
+test compatibility_category::compatibility_pointer_arithmetic_covers_sign_boundaries_flags_aliases_and_sp ... ok
+test mops_category::mops_overlap_zero_fill_and_long_cooperative_progress_use_real_stages ... ok
+test native_full_store_does_not_read_a_staging_only_backing ... ok
+test arithmetic_category::arithmetic_dirty_banks_and_status_publish_precisely_before_memory_faults ... ok
+test native_memory_reserves_scratch_registers_even_when_slots_are_free ... ok
+test native_cas_and_casp_match_success_failure_pairs_and_alias_pressure ... ok
+test native_store_invalidates_exclusives_and_cached_code_in_memory_and_views ... ok
+test native_vectors_evict_dirty_registers_and_preserve_v31_and_dynamic_pc ... ok
+test ordered_transfers_barriers_and_checked_faults_match_reference ... ok
+test lse_rmw_widths_ordering_and_register_aliases_match_reference ... ok
+test paired_integer_transfers_match_reference_including_aliases_and_writeback ... ok
+test pairs_and_ordered_loops_use_hardware_aliases_with_exact_budgets ... ok
+test parallel_code_write_breaks_a_running_native_chain_at_its_epoch_guard ... ok
+test parallel_code_write_interrupts_a_running_fused_memory_loop ... ok
+test pending_native_exit_and_parallel_view_keep_dispatch_boundaries ... ok
+test random_register_category_publishes_architectural_success_flags ... ok
+test rcpc_loads_signed_unscaled_and_release_stores_match_reference ... ok
+test register_cache_uses_one_load_and_writeback_for_a_chain ... ok
+test reserved_structure_encodings_keep_reached_pc_faults ... ok
+test paired_vector_transfers_keep_one_operand_and_precise_writeback ... ok
+test scalar_category::every_llvm_scalar_selector_executes_or_rejects_absent_host_features_without_fallback ... ok
+test scalar_category::original_invalid_scalar_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... ok
+test scalar_category::scalar_aliases_and_dirty_register_pressure_survive_single_step_and_memory_callbacks ... ok
+test native_neon_integer_float_accumulators_and_qc_match_reference ... ok
+test multiple_structures_keep_arrangements_interleaving_wrapped_lists_and_writeback ... ok
+test complete_crypto_category_preserves_accumulators_aliases_and_exact_boundaries ... ok
+test separate_native_load_and_store_do_not_make_guest_rmw_atomic ... ok
+test shared_native_ldadd_is_atomic_without_a_new_synchronization_path ... ok
+test scalar_view_borrows_match_reference_and_preserve_fork_cow ... ok
+test special_memory_category::host_lse128_forms_preserve_independent_inout_registers_sp_bases_and_atomic_bytes ... ok
+test special_memory_category::unadvertised_lse128_ls64_and_unowned_tag_setting_mops_fault_before_emulation ... ok
+test scalar_flags_sp_and_bit_operations_are_native_and_match_reference ... ok
+test structure_neon_loops_reuse_aliases_without_fallback_or_staging ... ok
+test syscall_at_page_end_and_reserved_exception_encodings_keep_precise_faults ... ok
+test syscall_continuations_use_current_arguments_and_revalidate_code_changes ... ok
+test lane_structures_preserve_untouched_bits_and_replicates_clear_upper_halves ... ok
+test system_register_category_uses_existing_guest_fields_and_preserves_live_banks ... ok
+test trap_and_native_call_category_caches_boundaries_without_interpreter_entry ... ok
+test unavailable_crypto_extensions_fault_before_any_interpreter_implementation ... ok
+test scalar_alias_pressure_long_products_and_sink_registers_match_reference ... ok
+test scalar_memory_address_modes_widths_signs_and_register_aliases_match_reference ... ok
+test structure_groups_survive_dirty_repacking_cross_pages_and_precise_faults ... ok
+test whitelist_encoding_corpus_matches_interpreter ... ok
+test native_scalar_fp_arithmetic_flags_conversions_and_aliases_match_reference ... ok
+test native_fp_special_values_rounding_and_sticky_status_match_reference ... ok
+test table_lookup_category_keeps_all_table_registers_and_aliases_live ... ok
+test vector_memory_widths_address_modes_and_register_namespaces_match_reference ... ok
+test mops_category::entire_mops_copy_move_set_options_preserve_banks_bytes_and_slice_budgets ... ok
+test compatibility_category::whole_llvm_compatibility_category_matches_state_memory_and_retirement_in_all_modes ... ok
+test simd_copy_permute_and_immediate_category_matches_reference ... ok
+test arithmetic_category::complete_arithmetic_encoding_category_matches_reference_without_fallback ... ok
+test arithmetic_category::complete_arithmetic_aliases_survive_low_register_relocation_helpers_and_faults ... ok
+
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.24s
+
+   Doc-tests trames_jit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 22.968078833

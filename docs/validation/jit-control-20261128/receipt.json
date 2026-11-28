@@ -1,0 +1,180 @@
+{
+  "baseline": {
+    "runtime": "bf8e801e09b43d9d04467cf2ca14711811da2d6a",
+    "android": "de69ef497bf84bb6db0e5ded4247a02a063a1bd9"
+  },
+  "source_sha256": {
+    "crates/trames-interpreter/src/lib.rs": "cdc098cafed8ea881abeee4f2929b7ceae268db6247ff11b94ecd235d71a2f2d",
+    "crates/trames-interpreter/src/cached.rs": "a85c9265b4a3b53df72ca673f55b9c3a1933cdaf9615fe823334aee1a20d6b31",
+    "crates/trames-interpreter/src/control.rs": "986e2eef437f9b36103bce5f72a1310fd8f1d9f9af2f4096ce8e1338fee75cc2",
+    "crates/trames-jit/src/features.rs": "d6786974917ffcdac81511744a3e90c1102ec87e0b25abd58dc4a6014f96c21f",
+    "crates/trames-jit/src/native.rs": "87aa6d2359d5b831942d2371cfb2cbd1831bd1506dbe7032450022241487df07"
+  },
+  "host": {
+    "hwcap": "0xefb3ffff",
+    "hwcap2": "0x2000100326181",
+    "page_size": 4096
+  },
+  "model": {
+    "tool": "QEMU 10.0.13 max",
+    "binary_sha256": "088500814a5a8e0e0ee3cad0f6c600b5dfa261f77cc0e6460f81b0b616e09509",
+    "process": {
+      "hwcap": "0xeffffffb",
+      "hwcap2": "0x18007fc77fff",
+      "page_size": 4096
+    },
+    "executables": {
+      "differential": {
+        "path": "/mnt/trames-output/jit-control-linux-target/debug/build/trames-jit/2ae1ad06ea568dd4/out/differential-2ae1ad06ea568dd4",
+        "sha256": "bb33ead41b57d29db9264ca51e8d023aa1444f84ea89387821a127615ccca752"
+      },
+      "trames_android_core": {
+        "path": "/mnt/trames-output/jit-control-linux-target/debug/build/trames-android-core/d9508bc8ef4a68e3/out/trames_android_core-d9508bc8ef4a68e3",
+        "sha256": "ec70184da06a120ebf3e7a431b6e2159f8314f3b2b7bc32d751ed231ec3f131e"
+      }
+    },
+    "acceptance": "positive HBC ISA model; CMPBR absent. Neither is positive extension hardware performance."
+  },
+  "scope": {
+    "encodings": 19568,
+    "cmpbr_selectors": 4096,
+    "cmpbr_valid": 1536,
+    "reference_programs_each_path": 119648,
+    "actual_native": 18016,
+    "actual_absent": 101632,
+    "original_control_fault_selectors": 822635,
+    "traced_fault_samples": 12854,
+    "android_probe_encodings": 244,
+    "android_probe_programs": 3904,
+    "linux_covered_tests": 167,
+    "apple_jit_covered_tests": 128,
+    "interpreter_tests": 55,
+    "android_jit_tests": 7,
+    "android_default_tests": 1
+  },
+  "verification": "Full Linux/Apple suites followed by six final category tests after two test-only additions; no unrelated full network/graphics checks repeated. Fresh iOS interpreter build. Prior isolated CPU graph reused only with unchanged manifests/lock. Owner root/pin/lock unmodified.",
+  "generated": {
+    "codegen": {
+      "identical": true,
+      "programs": 2816,
+      "before_sha256": "27bef106dc7a9873283119e2e1c93c90315f82c0c1095590f8515dbeb4a8bb70",
+      "after_sha256": "27bef106dc7a9873283119e2e1c93c90315f82c0c1095590f8515dbeb4a8bb70",
+      "layout": "LAYOUT 192 152 264 120"
+    },
+    "scalar-codegen": {
+      "identical": true,
+      "programs": 838,
+      "before_sha256": "87fc9c57b620d0fb5040d5ffc2abbd46dc38d76cc010ba45eb20732895cc284f",
+      "after_sha256": "87fc9c57b620d0fb5040d5ffc2abbd46dc38d76cc010ba45eb20732895cc284f",
+      "layout": "LAYOUT 192 152 264 120"
+    },
+    "decoded_layout": {
+      "same": true,
+      "Op_Instruction_Entry_Cpu": [
+        24,
+        32,
+        40,
+        992
+      ]
+    }
+  },
+  "benchmarks": {
+    "control-integer": {
+      "speed_ratio": 1.0194772907409702,
+      "pair_ratios": [
+        1.1714190992606173,
+        0.9049115400023298,
+        1.0400620086277035,
+        0.9797890115974413
+      ]
+    },
+    "control-scalar-memory": {
+      "speed_ratio": 0.9950391390825162,
+      "pair_ratios": [
+        0.9924523384952386,
+        0.9900760765429232,
+        0.992806418168985,
+        1.0048884457621283
+      ]
+    },
+    "svc-only": {
+      "speed_ratio": 1.0051925916246292,
+      "pair_ratios": [
+        1.0003861218034824,
+        1.0414268494352117,
+        0.9812745954760546,
+        0.9986427023952694
+      ]
+    },
+    "svc-round-trip": {
+      "speed_ratio": 1.0081473388883353,
+      "pair_ratios": [
+        1.0046976263503533,
+        0.9959679234883595,
+        1.0061211483374661,
+        1.0260417358112632
+      ]
+    },
+    "svc-continuation": {
+      "speed_ratio": 1.0031512163614684,
+      "pair_ratios": [
+        1.02119860482085,
+        1.0132895950100136,
+        0.9969944327646902,
+        0.9815876536910091
+      ]
+    }
+  },
+  "artifacts_sha256": {
+    "after-codegen.log": "62d78864725512d880037ad0343bf738ffb1ad8ec4e305d0ea86686443257e72",
+    "android-apple-clippy.log": "aac77901a11647e86db3e41c44a42ebd1d2bb0a4a428359b741013f1e5b81b39",
+    "android-apple-default.log": "d921c4369ecf3ede9d552954beb2baa19c312d35e7b478efa81322b89a51800a",
+    "android-apple.log": "1eb41bf8e7dc35a89daa5bc97ff04767da41ee0ab635c540cf5a5067b186e535",
+    "android-linux-clippy.log": "647b9be5cffd5a112b9d220cee853420f39c673a7b7f3af3568b0e8030a3318e",
+    "android-linux-default.log": "c5213a18349a6d219496944d24476dd74e21e823e6d60b9e1e1c15c0dbdfd33f",
+    "android-linux.log": "9affd29f571891ef7bc73f0ff90d63a3ccaa86a2cd45109c175059424dc32838",
+    "android-model.log": "8ede5453e9c8eac662ff0fdfeb1e77b971f092efa95d9bcf6203cb767c6c4d07",
+    "apple-jit.log": "569e107fdacd507fcc8e9d769c5c7731d6419f66adc4af688b697895909f5f50",
+    "baseline-codegen.log": "6ac3eb3dbe4e30a4eaefbe50b7a0fb23cc74b27b5cf4ae02c4cdc7de1d4c5f43",
+    "baseline-extension-red.log": "317673a2d413594f66ae16d6873c3f17d5bcd895f424882be0dc67ae847d30a1",
+    "baseline-fault-red.log": "cb6d063c3150ec098cfa7afc5693c6c10472fce27f839015c8b82f13dbd931e9",
+    "baseline-layout.log": "e72915541eadbd260e5a87f26dc05410ad5529ef2e1b0b491001af0312e7406d",
+    "benchmark-provenance.json": "53cc0724ce48c5e7a9a5fcb4a609784926ca723464ad5aa9873e618a15918879",
+    "benchmark-runner.py": "15f8af335da18b22d26acf36bff99704fdc1253e67e36765fd9a21bdc7003af9",
+    "benchmark-samples.jsonl": "8371c09b856ef090cbd35fd1ac820ef1e63ffc4077084aa733d7ba5a3d6add0b",
+    "benchmark-summary.json": "2d920be347e4a5750478ba4acdf4648f389036b8af6426c58b7420bf9b080c05",
+    "category.S": "2c4b5aa96587fba148ef58af08a26dade6ae1604caecd1c795f4f10873c52652",
+    "category.cases": "680080dc0d21630aba523e2189479622b6c3b6c1f57a0d039497d94005e13a4a",
+    "category.json": "154fec10c7ca8024f2dd55dc1f25e76120417fde1a213844777c9693be107085",
+    "category.words": "f7d7bb72012af958c3f55a1550cde997a95d8eba6472dd6ab126b83570d92446",
+    "codegen-comparison.json": "4d266db5376a9588451bf8963f6c0c7503542a3e01d6c662bb7f6463a94729db",
+    "codegen.txt.gz": "c48bb906eee2cdd6e38aa85e5ff511db997aa624f867cad6c88decbc4f54b28e",
+    "compare-selectors.words": "c24ea68a2f5de5fbd6d4077a6f1453436e2c3662be874903301ff941afa88312",
+    "default-clippy-apple.log": "4484bb4fccd1e688707acf8fa36b1317815f1d729d75a47233875fe6d8dc6f8c",
+    "final-apple-category.log": "7549f76b46847518eba992f2fb560bb89dbf7155821a70d2f3cd9e2a36efad34",
+    "final-category-debug.log": "781a38debef80a169ae85e288ab8455e2a2d486ca45dab4adfa55a02b45d1f96",
+    "final-category-release.log": "f245c62c5e2e9305346ed5f5f5a11a7fba289072ea2a14bb0d9e93b8515c4c26",
+    "final-clippy-amd64.log": "90285c703de10b269ffea19a059c8a45fb330509c8f48405c9b3439578e44417",
+    "final-clippy-apple.log": "e6320f2fa8bb21f6d00e527d7fd82e6b9d96b619c059b19af493799c462eba87",
+    "final-clippy-linux.log": "a7128bd87972aca9d8ab5141b1329a96f4015cb3b888bd4b2f631fe1c5942294",
+    "host-caps.c": "f9024c948f6ee8a54d1b100f21e0d3ac9911231c2b010183b28e266e2a5bea4b",
+    "host-caps.json": "1e3d3dba1c4b12b0b09674da7840ce9feda394d452fe2d0ee4910adc34b7f3c7",
+    "interpreter-apple2.log": "26c1a0a4c0f5a1946d70c00d8b4a7ca5de59e0ee06edd9a145e238cbde94a4e5",
+    "interpreter-linux.log": "513522f7d8bfbaf8f94addbde7f3b1698d0fb749c1fe22075bc9f548452fc846",
+    "ipad-check.log": "ebda5c119911bfc7323c47721623cfcdad10269599791d0000def14640eb2411",
+    "ipad-cpu-tree.txt": "6c3ca7ef47c6485b6fe3e4369074daf2d85bdee34cf982debbf0a42adc56885e",
+    "ipad-isolation-provenance.json": "f0826476c7c781b8d9a345667a29496ba90bf4410cd9e9d34a0c118a5075c9b6",
+    "linux-debug.log": "cd11bdd8cac22aa6dfc49ea4eeb40d8c520089e17f2b5d756d7b66a38b2de7f2",
+    "linux-release.log": "5ab1ea7f4a697235d1e91f92c2a39c3bcdfff1923b19e9cc4981cc4f3f9c163c",
+    "llvm-recheck.json": "154fec10c7ca8024f2dd55dc1f25e76120417fde1a213844777c9693be107085",
+    "model-caps.json": "e2639957b3d04ca816a7d1fd87bd5dd6d92bab365c40a137fc7e76c582b1d96f",
+    "model-category.log": "a38d51878089dec5759548201ad6429e4401abcf38c5b8f0854a4742a3d709c7",
+    "rejected.words": "3070cd34350dc13956e557079031c497d9c3ec0f633228042e00ce512820ec85",
+    "scalar-codegen.txt.gz": "0d635b8c2fe64d2e67f876428ee4c2113cdb47e413b29ea2e9cd37320a1aade2"
+  },
+  "retained_log_encoding": "Final empty lines only are normalized to a single final newline; original-byte hashes for affected logs are listed separately. No test output lines are removed.",
+  "original_log_sha256": {
+    "android-model.log": "ae20344c07ffcaaf67e0e0b70add35bbf7e136b73112e171310a74d2f2cc6a22",
+    "model-category.log": "f8d6693855c97118b725ede89ef1db04f9ab6acd94e9082925c8b24f13ef505e"
+  }
+}

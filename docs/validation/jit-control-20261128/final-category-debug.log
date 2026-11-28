@@ -1,0 +1,31 @@
+UTC 2026-11-28T11:19:26.089500+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', 'control_category', '--', '--nocapture']
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-control-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-control-source/crates/trames-jit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.04s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-control-linux-target/debug/build/trames-jit/24b6517ab8a40b53/out/trames_jit-24b6517ab8a40b53)
+
+running 3 tests
+test native::control_category_tests::control_generated_code_receipt ... ok
+test native::control_category_tests::every_cmpbr_selector_matches_llvm_admission_and_retains_real_opcode ... ok
+Original control fault closure: 822635 selectors
+test native::control_category_tests::untranslated_owned_control_selectors_are_original_reference_faults ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.17s
+
+     Running tests/differential.rs (/mnt/trames-output/jit-control-linux-target/debug/build/trames-jit/2ae1ad06ea568dd4/out/differential-2ae1ad06ea568dd4)
+
+running 6 tests
+test control_category::native_extension_loops_keep_flags_exact_budgets_and_syscall_resumption ... ok
+test control_category::extension_target_fault_and_code_permission_changes_rejoin_original_authority ... ok
+test control_category::extension_reached_fault_retires_exact_prefix_without_changing_cpu_banks ... ok
+Control dirty-prefix/memory/budget programs: 324
+test control_category::control_targets_preserve_dirty_prefixes_memory_callbacks_budgets_and_link_aliases ... ok
+Control whole-state matrix: 18016 native, 101632 reached host rejection
+test control_category::every_control_encoding_matches_independent_whole_state_or_reached_host_rejection ... ok
+test control_category::original_invalid_control_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 1.02s
+
+
+EXIT 0 ELAPSED 9.292028637981275

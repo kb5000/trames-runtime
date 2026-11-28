@@ -1,0 +1,5 @@
+UTC 2026-11-28T11:19:25.127518+00:00
+COMMAND ['cargo', 'clippy', '--locked', '-p', 'trames-jit', '-p', 'trames-interpreter', '--all-targets', '--features', 'trames-jit/native-aarch64', '--', '-D', 'warnings']
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+
+EXIT 0 ELAPSED 0.229882041

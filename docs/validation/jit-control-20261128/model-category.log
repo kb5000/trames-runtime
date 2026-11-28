@@ -1,0 +1,12 @@
+
+running 6 tests
+test control_category::control_targets_preserve_dirty_prefixes_memory_callbacks_budgets_and_link_aliases ... Control dirty-prefix/memory/budget programs: 1332
+ok
+test control_category::every_control_encoding_matches_independent_whole_state_or_reached_host_rejection ... Control whole-state matrix: 19808 native, 99840 reached host rejection
+ok
+test control_category::extension_reached_fault_retires_exact_prefix_without_changing_cpu_banks ... ok
+test control_category::extension_target_fault_and_code_permission_changes_rejoin_original_authority ... ok
+test control_category::native_extension_loops_keep_flags_exact_budgets_and_syscall_resumption ... ok
+test control_category::original_invalid_control_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 24.69s

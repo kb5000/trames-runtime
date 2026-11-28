@@ -1,0 +1,25 @@
+{
+  "codegen": {
+    "identical": true,
+    "programs": 2816,
+    "before_sha256": "27bef106dc7a9873283119e2e1c93c90315f82c0c1095590f8515dbeb4a8bb70",
+    "after_sha256": "27bef106dc7a9873283119e2e1c93c90315f82c0c1095590f8515dbeb4a8bb70",
+    "layout": "LAYOUT 192 152 264 120"
+  },
+  "scalar-codegen": {
+    "identical": true,
+    "programs": 838,
+    "before_sha256": "87fc9c57b620d0fb5040d5ffc2abbd46dc38d76cc010ba45eb20732895cc284f",
+    "after_sha256": "87fc9c57b620d0fb5040d5ffc2abbd46dc38d76cc010ba45eb20732895cc284f",
+    "layout": "LAYOUT 192 152 264 120"
+  },
+  "decoded_layout": {
+    "same": true,
+    "Op_Instruction_Entry_Cpu": [
+      24,
+      32,
+      40,
+      992
+    ]
+  }
+}

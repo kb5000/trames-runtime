@@ -139,6 +139,7 @@ enum Op {
         offset: u64,
         condition: u8,
     },
+    CompareRegistersBranch(super::control::CompareBranch),
     // Size/kind validation and scaled offsets are done once. Other memory
     // encodings retain the complete checked reference implementation.
     MemoryImmediate {
@@ -250,11 +251,13 @@ impl Instruction {
                 offset: branch_offset,
                 nonzero: word & (1 << 24) != 0,
             }
-        } else if word & 0xff000010 == 0x54000000 {
+        } else if word & 0xff000000 == 0x54000000 {
             Op::ConditionalBranch {
                 offset: branch_offset,
                 condition: (word & 15) as u8,
             }
+        } else if let Some(branch) = super::control::CompareBranch::decode(word) {
+            Op::CompareRegistersBranch(branch)
         } else if word & 0x1f800000 == 0x12000000 {
             let n = (word >> 22) & 1;
             match logical_mask(n, (word >> 10) & 63, (word >> 16) & 63, wide) {
@@ -1151,6 +1154,14 @@ impl Cpu {
                     });
                 }
             }
+            Op::CompareRegistersBranch(branch) if TAG == 26 => {
+                if branch.taken(
+                    self.x(branch.register as usize),
+                    self.x((branch.operand & 31) as usize),
+                ) {
+                    next = pc.wrapping_add(branch.offset as i64 as u64);
+                }
+            }
             Op::Fallback if TAG == 25 => {
                 self.condition_flags = *flags;
                 let result = self.execute_instruction(ins.word, memory);
@@ -1252,6 +1263,7 @@ macro_rules! tail_next {
             Op::Pair { .. } => become tail_op::<M, 23>($state, slot, $executed),
             Op::Memory { .. } => become tail_op::<M, 24>($state, slot, $executed),
             Op::Fallback => become tail_op::<M, 25>($state, slot, $executed),
+            Op::CompareRegistersBranch(_) => become tail_op::<M, 26>($state, slot, $executed),
         }
     }};
 }
@@ -1940,5 +1952,23 @@ mod tests {
         cpu.pc = 0x1000;
         cpu.run_slice(&mut b, 1);
         assert_eq!(cpu.x(0), 5);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn decoded_control_layout_receipt() {
+    if let Some(path) = std::env::var_os("TRAMES_CONTROL_DECODE_LAYOUT") {
+        std::fs::write(
+            path,
+            format!(
+                "{} {} {} {}\n",
+                std::mem::size_of::<Op>(),
+                std::mem::size_of::<Instruction>(),
+                std::mem::size_of::<Entry>(),
+                std::mem::size_of::<Cpu>()
+            ),
+        )
+        .unwrap();
     }
 }

@@ -1,0 +1,57 @@
+{
+  "baseline_runtime": "bf8e801e09b43d9d04467cf2ca14711811da2d6a",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "page_size": 4096,
+  "cpu_affinity": 0,
+  "samples": 32,
+  "warmup": 8,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "binaries": {
+    "before": {
+      "compatibility-category": {
+        "sha256": "b37454925815a2a9965151916cc7a0dd8c8199628201a79f6f224e801e3ff4a5",
+        "source": "/mnt/trames-output/jit-control-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-control-baseline-target"
+      },
+      "execution-entry": {
+        "sha256": "d40df124c360a6c1f638c16cdd5bd820e5a49d74ea47d331eb37928fde62be39",
+        "source": "/mnt/trames-output/jit-control-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-control-baseline-target"
+      }
+    },
+    "after": {
+      "compatibility-category": {
+        "sha256": "12d5386a5e215d6cd6d92f63c5e467802bde483dbaa66e3570f556394afc8bcc",
+        "source": "/mnt/trames-output/jit-control-source",
+        "target_dir": "/mnt/trames-output/jit-control-linux-target"
+      },
+      "execution-entry": {
+        "sha256": "0f1e61992c441ea249af691a5bbe5c2d172664b9c52422c5ac5ebf4aaa928485",
+        "source": "/mnt/trames-output/jit-control-source",
+        "target_dir": "/mnt/trames-output/jit-control-linux-target"
+      }
+    }
+  },
+  "harness_sha256": {
+    "compatibility-category": "534e367d4a68222f2516b7454502a3f7f6d1c384edbc744bd5a6ecabb4d1182b",
+    "execution-entry": "2a4bec21fdac2158f4e83542c35063978e202efd62cfeec9ac7d78b19ccebb4d"
+  },
+  "workloads": [
+    "control-integer",
+    "control-scalar-memory",
+    "svc-only",
+    "svc-round-trip",
+    "svc-continuation"
+  ],
+  "hwcap": "0xefb3ffff",
+  "hwcap2": "0x2000100326181"
+}

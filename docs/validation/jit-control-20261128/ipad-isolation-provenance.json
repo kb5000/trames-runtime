@@ -1,0 +1,41 @@
+{
+  "owner_lock_sha256": "ddcce133bc8d2ab489d855ef165272c42cd4ff7237e7c178a90ce8a41d269dbd",
+  "owner_manifest_sha256": {
+    "crates/trames-cpu/Cargo.toml": "cc9244aad6244253729bb6d688a88d94e2a374b91dd4a60776077b651efa28e2",
+    "crates/trames-core/Cargo.toml": "f82a23d76c5d64d21b364b9e515730c1a2610209cfd7dcdf2cb335da8366a9db",
+    "crates/trames-cli/Cargo.toml": "7c470318ab35db1bd236464d3d2433a8400afb695d60b704de12eb46a0dd162a",
+    "crates/trames-ffi/Cargo.toml": "1439b4600037175b9414e5ec220874ec10743128afb4ebbc7d388f2141d2ef4f",
+    "crates/trames-compute/Cargo.toml": "77c93429363a625a7d3876d0fec88c9f87c09e5f030fd981e87cb78e6ec4993c"
+  },
+  "reuse": "all owner manifests/lock and Runtime dependency manifests unchanged; prior isolated graph reused; fresh current interpreter iOS check passes",
+  "runtime_manifests": {
+    "Cargo.toml": "08b8314107784d85bca1276993e3bf574d3c58e0c2334ec79d71ab7a540b3721",
+    "crates/trames-wayland/Cargo.toml": "259225334b4791e2cd1b1dcab2dd9287ae58f2a64d4e56762e301fd5301c73a1",
+    "crates/trames-interpreter/Cargo.toml": "9b404c7c46817fc62bd665acac6e45ed03173a52461bcb7309fb374a942ac246",
+    "crates/trames-vulkan/Cargo.toml": "74fd04ce7478cdac1f5fa07df226f34c2dafa0542622ab3e3e5f73ac877172a6",
+    "crates/trames-video/Cargo.toml": "1e2034215e36e48aba2e5ec6b58450b5d1b1fb33c5a139bb2e3bc2251c6f705a",
+    "crates/trames-host/Cargo.toml": "cd67c3765bb00b545cc9647d10909fc7f506a362c9ea860dad6d3cdeb8727c6e",
+    "crates/trames-net/Cargo.toml": "6b4f741819e903d3e4ba6f9b641e0c9ddbeb6abfc3c1399a66680a9e29223b94",
+    "crates/trames-vfs/Cargo.toml": "b973f32a499fd3c0d3ab07adebf569c53fb16db8b5bdc0b3fb9d458b13b2a00e",
+    "crates/trames-session/Cargo.toml": "4db2fe26d28a9268baca55192056cf8f9306a35e48a07ffca765ffb8e894fd08",
+    "crates/trames-kernel/Cargo.toml": "e42a429e15bbfa415cfa91d9381a8f767e1187bb0ec890ca60875ffa5e610499",
+    "crates/trames-control/Cargo.toml": "2193ffa2caafe0bd3df86ad8b97fe5992ed62ff3ab0270666fbb21521526d7b7",
+    "crates/trames-engine/Cargo.toml": "609d71aa7ef07df796f3534d5b16bc5ec1001bebee24376892333ea5931a2896",
+    "crates/trames-execution/Cargo.toml": "808354cbb0ea873a0047d3f31f07ed0348e2c7e3e0d5a8b1894972de66c4b9c9",
+    "crates/trames-elf/Cargo.toml": "17e6ba9827a1c2c39571634a9d814454e9169384af1fde45b55c34b6f7800d87",
+    "crates/trames-native/Cargo.toml": "152f2cac44a80afa6af7cb5115c94976875a6325915f391185eea23a89d8bf57",
+    "crates/trames-memory/Cargo.toml": "0335770eac5b01d2370d88a4223ab76df0fa4c8e3e05d9187c5eeedc1b6003c3",
+    "crates/trames-host-compute/Cargo.toml": "dbb485311e640cc655bdd351c66839681f6286f5f8507463f8c71222e923adf0",
+    "crates/trames-accel/Cargo.toml": "f9ef888f5b1c13bab7107647422c0b8fd1d7da756f782ae552a4e2836f108918",
+    "crates/trames-bridge/Cargo.toml": "45f4af04cb3a91aa2913f9da2e76aac6a5f3f741205ba53d61207e143ef5147a",
+    "crates/trames-audio/Cargo.toml": "98fb17d413cfd1977be51f2b662ebf0ba7ae3131bea6bff86358aa3d1f138392",
+    "crates/trames-distro/Cargo.toml": "402c135910f91a70c35c288006c9764a895f80ca6ba148dbc83bb3d85a5505e1",
+    "crates/trames-jit/Cargo.toml": "4e1c17a7993316debd0650f371d2c4289a3d87d61000309f6e18db7c5f9e20f4",
+    "crates/trames-linux/Cargo.toml": "8e4eb178b5080d7df46262cfe62dc5a1f3f8e00757a36dd820e2ccca47d9cea8",
+    "crates/trames-graphics/Cargo.toml": "d4f7f5c192e07358df31a50c34c15ca31e64e85acb1bef757fd6beb37f90c180",
+    "crates/trames-shared/Cargo.toml": "660efd2776471a40466622a659507e76358f98233f56c6ab8441fb2d4699d824",
+    "vendor/wayland-backend/Cargo.toml": "856dde0a224d8443808c433727a51886be14a07b9a1f8d211a1c51d725680eb3",
+    "vendor/smoltcp/Cargo.toml": "b0778752d92467d6791ae5385ab98bcceee5b645ec746ea3a97a4c6edf8f36b7",
+    "vendor/ext4-view/Cargo.toml": "d191d00acc7f022ad4834f1d02417f7958fdb6181fbddd814d9ee47198460fd0"
+  }
+}

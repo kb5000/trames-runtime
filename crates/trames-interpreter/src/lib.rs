@@ -28,6 +28,7 @@ linux_features! {
 }
 mod cached;
 mod compatibility;
+pub mod control;
 pub mod counter;
 mod crypto;
 mod extended;
@@ -449,10 +450,17 @@ impl Cpu {
             if (self.x(rd) & width_mask(wide) != 0) == nonzero {
                 next = pc.wrapping_add(sign_extend((((ins >> 5) & 0x7ffff) as u64) << 2, 21));
             }
-        } else if ins & 0xff000010 == 0x54000000 {
+        } else if ins & 0xff000000 == 0x54000000 {
             // B.cond
             if self.condition(ins & 15) {
                 next = pc.wrapping_add(sign_extend((((ins >> 5) & 0x7ffff) as u64) << 2, 21));
+            }
+        } else if let Some(branch) = control::CompareBranch::decode(ins) {
+            if branch.taken(
+                self.x(branch.register as usize),
+                self.x((branch.operand & 31) as usize),
+            ) {
+                next = pc.wrapping_add(branch.offset as i64 as u64);
             }
         } else if let Some(target) = self.execute_extended(ins, memory)? {
             next = target;
@@ -1108,5 +1116,7 @@ impl trames_engine::Cpu for Cpu {
     }
 }
 
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod scalar_ignored_tests;

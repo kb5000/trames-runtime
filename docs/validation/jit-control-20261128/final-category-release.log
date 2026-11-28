@@ -1,0 +1,30 @@
+UTC 2026-11-28T11:19:35.560106+00:00
+COMMAND ['cargo', 'test', '--release', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', 'control_category', '--', '--nocapture']
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-control-source/crates/trames-jit)
+    Finished `release` profile [optimized] target(s) in 9.57s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-control-linux-target/release/build/trames-jit/8036540d47d34293/out/trames_jit-8036540d47d34293)
+
+running 3 tests
+test native::control_category_tests::control_generated_code_receipt ... ok
+test native::control_category_tests::every_cmpbr_selector_matches_llvm_admission_and_retains_real_opcode ... ok
+Original control fault closure: 822635 selectors
+test native::control_category_tests::untranslated_owned_control_selectors_are_original_reference_faults ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.04s
+
+     Running tests/differential.rs (/mnt/trames-output/jit-control-linux-target/release/build/trames-jit/de3dcead58910df6/out/differential-de3dcead58910df6)
+
+running 6 tests
+test control_category::native_extension_loops_keep_flags_exact_budgets_and_syscall_resumption ... ok
+test control_category::extension_target_fault_and_code_permission_changes_rejoin_original_authority ... ok
+test control_category::extension_reached_fault_retires_exact_prefix_without_changing_cpu_banks ... ok
+Control whole-state matrix: 18016 native, 101632 reached host rejection
+test control_category::every_control_encoding_matches_independent_whole_state_or_reached_host_rejection ... ok
+Control dirty-prefix/memory/budget programs: 324
+test control_category::control_targets_preserve_dirty_prefixes_memory_callbacks_budgets_and_link_aliases ... ok
+test control_category::original_invalid_control_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 0.58s
+
+
+EXIT 0 ELAPSED 10.22375724799349

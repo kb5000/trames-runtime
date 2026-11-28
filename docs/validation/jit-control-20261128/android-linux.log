@@ -1,0 +1,32 @@
+UTC 2026-11-28T11:18:41.356271+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-android-core', '--features', 'jit']
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-host-compute)
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-control-android-source/runtime/crates/trames-jit)
+   Compiling trames-android-core v0.1.0 (/mnt/trames-output/jit-control-android-source/crates/trames-android-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.02s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-control-linux-target/debug/build/trames-android-core/d9508bc8ef4a68e3/out/trames_android_core-d9508bc8ef4a68e3)
+
+running 7 tests
+test tests::execution_boundaries_revalidate_only_guest_authorized_code_changes ... ok
+test tests::abstract_ordered_memory_keeps_original_fence_callbacks_without_fallback ... ok
+test tests::special_memory_probe_uses_only_host_admitted_native_stages ... ok
+test tests::control_category_preserves_conditions_links_and_host_admission ... ok
+test tests::compatibility_probe_preserves_the_existing_profile_without_interpreter_fallback ... ok
+test tests::scalar_category_preserves_all_ignored_high_multiply_fields_and_fault_boundaries ... ok
+test tests::guest_cpu_probe_keeps_original_instructions_and_exact_exit ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+   Doc-tests trames_android_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 5.269089743989753

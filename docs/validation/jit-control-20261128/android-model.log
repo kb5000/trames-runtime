@@ -1,0 +1,5 @@
+
+running 1 test
+test tests::control_category_preserves_conditions_links_and_host_admission ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.42s

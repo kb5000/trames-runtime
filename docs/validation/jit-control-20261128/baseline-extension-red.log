@@ -1,0 +1,39 @@
+UTC 2026-11-28T11:17:15.161027+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-interpreter', 'complete_control_matrix_matches_independent', '--', '--nocapture']
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.16.3
+   Compiling rustix v1.1.5
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v2.13.2
+   Compiling getrandom v0.3.4
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-host-compute)
+   Compiling parking_lot v0.12.5
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-control-baseline-source/crates/trames-interpreter)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.30s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-control-baseline-target/debug/build/trames-interpreter/d8f1301848ee020a/out/trames_interpreter-d8f1301848ee020a)
+
+running 1 test
+
+thread 'control_tests::complete_control_matrix_matches_independent_conditions_in_cached_and_step_paths' (363916) panicked at crates/trames-interpreter/src/control_tests.rs:53:13:
+54800010/hbc 0 64 0 0 0 -1048576
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test control_tests::complete_control_matrix_matches_independent_conditions_in_cached_and_step_paths ... FAILED
+
+failures:
+
+failures:
+    control_tests::complete_control_matrix_matches_independent_conditions_in_cached_and_step_paths
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p trames-interpreter --lib`
+
+EXIT 101 ELAPSED 6.337134016997879

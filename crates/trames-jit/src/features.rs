@@ -34,6 +34,7 @@ const NAMES: &[(usize, u8, &str)] = &[
     (0, 26, "ilrcpc"),
     (0, 27, "flagm"),
     (0, 29, "sb"),
+    (0, 33, "cmpbr"),
     (1, 7, "flagm2"),
     (1, 8, "frint"),
     (1, 13, "i8mm"),
@@ -42,6 +43,7 @@ const NAMES: &[(usize, u8, &str)] = &[
     (1, 16, "rng"),
     (1, 34, "cssc"),
     (1, 43, "mops"),
+    (1, 44, "hbc"),
     (1, 47, "lse128"),
 ];
 pub(crate) fn profile() -> &'static Profile {
@@ -55,8 +57,8 @@ pub(crate) fn profile() -> &'static Profile {
         // Transitional ABI coverage: never add a software-only capability to
         // the host. Stateful extensions wait for their real context-save path.
         let allowed = Features {
-            hwcap: raw.hwcap & trames_interpreter::HWCAP,
-            hwcap2: raw.hwcap2 & (trames_interpreter::HWCAP2 | (1 << 47)),
+            hwcap: raw.hwcap & (trames_interpreter::HWCAP | (1 << 33)),
+            hwcap2: raw.hwcap2 & (trames_interpreter::HWCAP2 | (1 << 44) | (1 << 47)),
         };
         let words = [allowed.hwcap, allowed.hwcap2];
         let names = NAMES
@@ -78,6 +80,12 @@ pub(crate) fn profile() -> &'static Profile {
 /// Cold translation gate. A missing extension faults when reached, rather than
 /// acquiring the reference interpreter's software implementation.
 pub(crate) fn permits(host: Features, word: u32) -> bool {
+    if word & 0xff000010 == 0x54000010 {
+        return host.hwcap2 & (1 << 44) != 0;
+    }
+    if word & 0x7e000000 == 0x74000000 {
+        return host.hwcap & (1 << 33) != 0;
+    }
     if matches!(
         word & 0xffe0fc00,
         0xf8209000 | 0xf820a000 | 0xf820b000 | 0xf820d000
@@ -287,6 +295,8 @@ mod tests {
     }
     #[test]
     fn untranslated_extensions_cannot_escape_host_isa_gates() {
+        assert_eq!(trames_interpreter::HWCAP & (1 << 33), 0);
+        assert_eq!(trames_interpreter::HWCAP2 & (1 << 44), 0);
         let base = Features {
             hwcap: 3,
             hwcap2: 0,
@@ -307,6 +317,9 @@ mod tests {
             (0x4ef9d820, 0, 10),
             (0x1e284020, 1, 8),
             (0xd50330ff, 0, 29),
+            (0x54000010, 1, 44),
+            (0x74010020, 0, 33),
+            (0xf51f8020, 0, 33),
         ] {
             assert!(!permits(base, word), "{word:08x}");
             let mut enabled = base;
