@@ -229,7 +229,7 @@ fn idmapped_projection_retains_one_unpublished_payload_until_manifest_credit_or_
             let stored_root = root + 1000;
             let path = sidecar(&nodes[0]);
             let original = std::fs::read(&path).unwrap();
-            let manifest = std::fs::read(store.0.join("manifest")).unwrap();
+            let manifest = crate::storage::test_image(&store.0);
             write(&mut v, b"/sys/fs/cgroup/a/io.max", b"253:1 wiops=1");
             let task = v.cgroup_task(1).unwrap();
             let scope = task.resource_scope();
@@ -237,7 +237,7 @@ fn idmapped_projection_retains_one_unpublished_payload_until_manifest_credit_or_
             assert!(!work.ready());
             assert_eq!(cap_root(&nodes[0]), Some(root));
             assert_eq!(std::fs::read(&path).unwrap(), original);
-            assert_eq!(std::fs::read(store.0.join("manifest")).unwrap(), manifest);
+            assert_eq!(crate::storage::test_image(&store.0), manifest);
             assert_eq!(temporary(&store).len(), 1);
             assert_eq!(stat(&mut v, "a", "wios="), 1);
             drop(scope);
@@ -266,7 +266,7 @@ fn idmapped_projection_retains_one_unpublished_payload_until_manifest_credit_or_
                 assert_eq!(stat(&mut v, "a", "wios="), 2);
                 assert_eq!(
                     stat(&mut v, "a", "wbytes="),
-                    24 + std::fs::metadata(store.0.join("manifest")).unwrap().len()
+                    24 + crate::storage::test_record_bytes(&store.0)
                 );
                 assert_eq!(v.pread(fd, 32, 0).unwrap(), b"original data");
             }
@@ -301,7 +301,7 @@ fn two_projected_inodes_keep_completed_sidecars_across_separate_iops_waves() {
     assert_eq!(stat(&mut v, "a", "wios="), 3);
     assert_eq!(
         stat(&mut v, "a", "wbytes="),
-        48 + std::fs::metadata(store.0.join("manifest")).unwrap().len()
+        48 + crate::storage::test_record_bytes(&store.0)
     );
     assert!(temporary(&store).is_empty());
 }
@@ -327,6 +327,7 @@ fn a_real_manifest_rename_error_restores_projected_sidecars_without_another_budg
     assert!(!work.ready());
     assert_eq!(stat(&mut v, "a", "wios="), 2);
     drop(scope);
+    crate::storage::force_checkpoint_for_test(&v, &store.0);
     std::fs::rename(store.0.join("manifest"), store.0.join("manifest.saved")).unwrap();
     std::fs::create_dir(store.0.join("manifest")).unwrap();
     wave(&mut v);

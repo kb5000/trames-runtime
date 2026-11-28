@@ -652,7 +652,7 @@ impl Default for Cgroups {
             nsdelegate: Arc::default(),
             fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-                paths: BTreeMap::new(),
+                paths: BTreeMap::new().into(),
                 inodes: Vec::new(),
                 next_inode: ROOT,
                 limits: StorageLimits::memory(),

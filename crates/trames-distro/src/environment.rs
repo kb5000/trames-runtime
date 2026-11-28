@@ -153,7 +153,7 @@ impl Default for Components {
     fn default() -> Self {
         Self {
             vulkan: Switch::Enabled(true),
-            vaapi: Switch::Enabled(false),
+            vaapi: Default::default(),
             thunking: Default::default(),
             audio: false,
             audio_input: false,
@@ -176,15 +176,137 @@ pub struct Boot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Session {
+    pub user: String,
+    #[serde(default)]
     pub shell: Vec<String>,
     pub cwd: String,
 }
 impl Default for Session {
     fn default() -> Self {
         Self {
-            shell: vec!["/bin/sh".into(), "-l".into()],
-            cwd: "/".into(),
+            user: "root".into(),
+            shell: Vec::new(),
+            cwd: String::new(),
         }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedLogin {
+    pub user: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+    pub shell: String,
+    pub argv: Vec<String>,
+    pub cwd: String,
+}
+fn is_login_shell_allowed(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains('\0')
+        && !matches!(
+            path.rsplit('/').next(),
+            Some("nologin") | Some("false") | Some("")
+        )
+}
+fn read_passwd(vfs: &mut trames_vfs::Vfs) -> Option<String> {
+    let fd = vfs
+        .open_at(trames_vfs::AT_FDCWD, b"/etc/passwd", 0, 0)
+        .ok()?;
+    let mut bytes = Vec::new();
+    let mut ok = true;
+    while bytes.len() < 1024 * 1024 {
+        match vfs.read(fd, 4096) {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(_) => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    let _ = vfs.close(fd);
+    ok.then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+fn is_existing_dir(vfs: &mut trames_vfs::Vfs, path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains('\0')
+        && vfs
+            .stat_at(trames_vfs::AT_FDCWD, path.as_bytes())
+            .map(|st| {
+                let mode = u32::from_le_bytes([st[16], st[17], st[18], st[19]]);
+                (mode & 0o170000) == 0o040000
+            })
+            .unwrap_or(false)
+}
+pub fn resolve_login(vfs: &mut trames_vfs::Vfs, session: &Session) -> ResolvedLogin {
+    let user = if session.user.is_empty() {
+        "root".to_string()
+    } else {
+        session.user.clone()
+    };
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    let mut passwd_home = String::new();
+    let mut passwd_shell = String::new();
+    if let Some(content) = read_passwd(vfs) {
+        for line in content.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split(':');
+            let Some(name) = parts.next() else { continue };
+            if name != user {
+                continue;
+            }
+            let _pass = parts.next();
+            if let Some(u) = parts.next().and_then(|v| v.parse::<u32>().ok()) {
+                uid = u;
+            }
+            if let Some(g) = parts.next().and_then(|v| v.parse::<u32>().ok()) {
+                gid = g;
+            }
+            let _gecos = parts.next();
+            if let Some(h) = parts.next() {
+                passwd_home = h.to_string();
+            }
+            if let Some(s) = parts.next() {
+                passwd_shell = s.to_string();
+            }
+            break;
+        }
+    }
+    let shell = if is_login_shell_allowed(&passwd_shell)
+        && vfs.executable(passwd_shell.as_bytes()).is_ok()
+    {
+        passwd_shell
+    } else {
+        "/bin/sh".into()
+    };
+    let home = if is_existing_dir(vfs, &passwd_home) {
+        passwd_home
+    } else if user == "root" && is_existing_dir(vfs, "/root") {
+        "/root".into()
+    } else {
+        "/".into()
+    };
+    let cwd = if !session.cwd.is_empty() && is_existing_dir(vfs, &session.cwd) {
+        session.cwd.clone()
+    } else {
+        home.clone()
+    };
+    let argv = if !session.shell.is_empty() {
+        session.shell.clone()
+    } else {
+        vec![shell.clone(), "-l".into()]
+    };
+    ResolvedLogin {
+        user,
+        uid,
+        gid,
+        home,
+        shell,
+        argv,
+        cwd,
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -345,8 +467,10 @@ impl Manifest {
     pub fn command(&self) -> Vec<String> {
         if self.environment.kind == crate::boot::Target::Android {
             crate::android::command()
-        } else {
+        } else if !self.session.shell.is_empty() {
             self.session.shell.clone()
+        } else {
+            vec!["/bin/sh".into(), "-l".into()]
         }
     }
     pub fn parse(text: &str) -> Result<Self> {
@@ -408,14 +532,25 @@ impl Manifest {
         if self.environment.kind == crate::boot::Target::Linux && self.boot.mode == Init::Android {
             return Err("Linux cannot use Android init".into());
         }
-        if self.session.shell.is_empty()
-            || !self.session.shell[0].starts_with('/')
-            || self.session.shell.iter().any(|v| v.contains('\0'))
+        if self.session.user.is_empty()
+            || self
+                .session
+                .user
+                .chars()
+                .any(|c| matches!(c, ':' | '/' | '\0' | '\n' | '\r') || c.is_whitespace())
         {
-            return Err("session.shell must be an absolute argv array".into());
+            return Err("session.user must be a valid username".into());
         }
-        if !self.session.cwd.starts_with('/') || self.session.cwd.contains('\0') {
-            return Err("session needs an absolute cwd".into());
+        if !self.session.shell.is_empty()
+            && (!self.session.shell[0].starts_with('/')
+                || self.session.shell.iter().any(|v| v.contains('\0')))
+        {
+            return Err("session.shell must be empty or an absolute argv array".into());
+        }
+        if !self.session.cwd.is_empty()
+            && (!self.session.cwd.starts_with('/') || self.session.cwd.contains('\0'))
+        {
+            return Err("session.cwd must be empty or an absolute path".into());
         }
         for m in &self.mounts {
             if !m.target.starts_with('/')
@@ -927,5 +1062,75 @@ mod tests {
             .executable(b"/usr/local/bin/trames")
             .unwrap()
             .starts_with(b"\x7fELF"));
+    }
+    #[test]
+    fn resolve_login_uses_passwd_shell_and_home_with_safe_fallback() {
+        let mut v = trames_vfs::Vfs::default();
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/bin", 0o755).unwrap();
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/etc", 0o755).unwrap();
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/root", 0o755).unwrap();
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/home", 0o755).unwrap();
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/home/dev", 0o755)
+            .unwrap();
+        v.import_reader(b"/bin/sh", &mut std::io::Cursor::new(b"#!/bin/sh\n"), true)
+            .unwrap();
+        v.import_reader(
+            b"/bin/bash",
+            &mut std::io::Cursor::new(b"#!/bin/sh\n"),
+            true,
+        )
+        .unwrap();
+        v.import_reader(b"/bin/zsh", &mut std::io::Cursor::new(b"#!/bin/sh\n"), true)
+            .unwrap();
+        v.import_file(
+            b"/etc/passwd",
+            b"root:x:0:0:root:/root:/bin/bash\ndev:x:1000:1000:Dev:/home/dev:/bin/zsh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+                .to_vec(),
+        )
+        .unwrap();
+
+        let root_login = resolve_login(&mut v, &Session::default());
+        assert_eq!(root_login.user, "root");
+        assert_eq!(root_login.home, "/root");
+        assert_eq!(root_login.cwd, "/root");
+        assert_eq!(root_login.shell, "/bin/bash");
+        assert_eq!(root_login.argv, vec!["/bin/bash", "-l"]);
+
+        let dev_session = Session {
+            user: "dev".into(),
+            shell: Vec::new(),
+            cwd: String::new(),
+        };
+        let dev_login = resolve_login(&mut v, &dev_session);
+        assert_eq!(dev_login.user, "dev");
+        assert_eq!(dev_login.uid, 1000);
+        assert_eq!(dev_login.gid, 1000);
+        assert_eq!(dev_login.home, "/home/dev");
+        assert_eq!(dev_login.cwd, "/home/dev");
+        assert_eq!(dev_login.shell, "/bin/zsh");
+        assert_eq!(dev_login.argv, vec!["/bin/zsh", "-l"]);
+
+        let nologin = resolve_login(
+            &mut v,
+            &Session {
+                user: "nobody".into(),
+                shell: Vec::new(),
+                cwd: String::new(),
+            },
+        );
+        assert_eq!(nologin.shell, "/bin/sh");
+        assert_eq!(nologin.home, "/");
+        assert_eq!(nologin.argv, vec!["/bin/sh", "-l"]);
+
+        let custom = resolve_login(
+            &mut v,
+            &Session {
+                user: "root".into(),
+                shell: vec!["/bin/zsh".into(), "-i".into()],
+                cwd: "/home/dev".into(),
+            },
+        );
+        assert_eq!(custom.argv, vec!["/bin/zsh", "-i"]);
+        assert_eq!(custom.cwd, "/home/dev");
     }
 }

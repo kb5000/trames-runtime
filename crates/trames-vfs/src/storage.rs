@@ -13,6 +13,7 @@ mod io_write;
 pub(super) mod projection_caps;
 #[cfg(test)]
 mod resource_tests;
+mod wal;
 
 pub const DEFAULT_DISK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_DISK_NODES: usize = 131_072;
@@ -734,6 +735,9 @@ pub(super) struct DiskStore {
     _lock: File,
     checkpoint: std::sync::Mutex<Option<ManifestSnapshot>>,
     initializing: std::sync::atomic::AtomicBool,
+    wal_bytes: AtomicU64,
+    pub(super) wal_records: AtomicU64,
+    wal_failed: std::sync::atomic::AtomicBool,
     // Namespace publication only; normal byte reads/writes do not touch these.
     // A generation observed before a successful host flush is covered by it.
     // Concurrent later mutations remain pending; completion never regresses.
@@ -745,6 +749,8 @@ pub(super) struct DiskStore {
     sync_trace: std::sync::Mutex<Vec<&'static str>>,
     #[cfg(test)]
     directory_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(super) wal_failures: std::sync::atomic::AtomicUsize,
     pub(super) used: Arc<AtomicU64>,
 }
 fn regular(path: &Path) -> Result<()> {
@@ -768,9 +774,15 @@ impl DiskStore {
         // Refuse an ordinary host folder accidentally selected as a private store.
         for entry in fs::read_dir(&root).map_err(host_errno)? {
             let entry = entry.map_err(host_errno)?;
-            if !["objects", "manifest", "manifest.new", ".lock"]
-                .iter()
-                .any(|n| entry.file_name() == *n)
+            if ![
+                "objects",
+                "manifest",
+                "manifest.new",
+                "manifest.wal",
+                ".lock",
+            ]
+            .iter()
+            .any(|n| entry.file_name() == *n)
             {
                 return Err(Errno(22));
             }
@@ -808,6 +820,9 @@ impl DiskStore {
             _lock: lock,
             checkpoint: std::sync::Mutex::new(None),
             initializing: std::sync::atomic::AtomicBool::new(false),
+            wal_bytes: AtomicU64::new(0),
+            wal_records: AtomicU64::new(0),
+            wal_failed: std::sync::atomic::AtomicBool::new(false),
             objects_generation: AtomicU64::new(1),
             objects_synced: AtomicU64::new(0),
             directory_generation: AtomicU64::new(1),
@@ -816,6 +831,8 @@ impl DiskStore {
             sync_trace: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             directory_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            wal_failures: std::sync::atomic::AtomicUsize::new(0),
             used: Arc::new(AtomicU64::new(0)),
         }))
     }
@@ -880,12 +897,107 @@ impl DiskStore {
             }),
         }))
     }
-    fn commit(&self, bytes: &[u8]) -> Result<()> {
+    fn commit(&self, bytes: &[u8], previous: Option<&[u8]>) -> Result<()> {
         overlay::projection::prepare()?;
-        // Namespace callers retain/roll back their original metadata on an
-        // admission wait. No temporary manifest exists until credit is ours.
-        let permit = cgroup::admit_io(bytes.len() as u64, true).map_err(host_errno)?;
-        overlay::projection::publish(|| self.commit_admitted(bytes, permit))
+        if self.wal_failed.load(Ordering::Relaxed) {
+            return Err(Errno(5));
+        }
+        let compact = previous.is_none()
+            || self.wal_bytes.load(Ordering::Relaxed) >= wal::CHECKPOINT_BYTES
+            || self.wal_records.load(Ordering::Relaxed) >= wal::CHECKPOINT_RECORDS;
+        if compact {
+            let accepted = previous.unwrap_or(bytes);
+            let permit = cgroup::admit_io(accepted.len() as u64, true).map_err(host_errno)?;
+            // Maintenance publishes only previously accepted state. A later
+            // admission wait may roll back the current namespace transaction.
+            self.commit_admitted(accepted, permit)?;
+            self.sync_directory()?;
+            let path = self.root.join("manifest.wal");
+            if path.try_exists().map_err(host_errno)? {
+                regular(&path)?;
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(host_errno)?;
+                file.set_len(0)
+                    .and_then(|_| file.sync_all())
+                    .map_err(host_errno)?;
+            }
+            self.wal_bytes.store(0, Ordering::Relaxed);
+            self.wal_records.store(0, Ordering::Relaxed);
+        }
+        let record = previous
+            .filter(|old| *old != bytes)
+            .map(|old| wal::encode(old, bytes));
+        let permit = match &record {
+            Some(record) => cgroup::admit_io(record.len() as u64, true).map_err(host_errno)?,
+            None => None,
+        };
+        overlay::projection::publish(|| match &record {
+            Some(record) => self.append_wal(record, permit),
+            None => Ok(()),
+        })
+    }
+    fn sync_objects(&self) -> Result<()> {
+        let generation = self.objects_generation.load(Ordering::Relaxed);
+        if self.objects_synced.load(Ordering::Relaxed) < generation {
+            #[cfg(test)]
+            self.sync_trace.lock().unwrap().push("objects");
+            File::open(self.root.join("objects"))
+                .and_then(|f| f.sync_all())
+                .map_err(host_errno)?;
+            self.objects_synced.fetch_max(generation, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn append_wal(&self, record: &[u8], permit: Option<cgroup::IoPermit>) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let path = self.root.join("manifest.wal");
+        let created = !path.try_exists().map_err(host_errno)?;
+        if !created {
+            regular(&path)?;
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(created).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path).map_err(host_errno)?;
+        if !file.metadata().map_err(host_errno)?.is_file() {
+            return Err(Errno(22));
+        }
+        if created {
+            self.directory_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        let start = file.seek(SeekFrom::End(0)).map_err(host_errno)?;
+        let result = (|| {
+            self.sync_objects()?;
+            io_write::write_all(&mut file, record, permit).map_err(host_errno)?;
+            file.sync_all().map_err(host_errno)?;
+            #[cfg(test)]
+            if self
+                .wal_failures
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(Errno(5));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // A failed publication must not reappear after namespace rollback.
+            // If the host cannot remove its tail, stop subsequent publications.
+            if file.set_len(start).and_then(|_| file.sync_all()).is_err() {
+                self.wal_failed.store(true, Ordering::Relaxed);
+            }
+            return Err(error);
+        }
+        self.wal_bytes
+            .fetch_add(record.len() as u64, Ordering::Relaxed);
+        self.wal_records.fetch_add(1, Ordering::Relaxed);
+        // A complete synced frame is the commit point. Directory-flush retry
+        // retains the same post-publication policy as atomic manifest rename.
+        let _ = self.sync_directory();
+        Ok(())
     }
     fn commit_admitted(&self, bytes: &[u8], permit: Option<cgroup::IoPermit>) -> Result<()> {
         let tmp = self.root.join("manifest.new");
@@ -897,15 +1009,7 @@ impl DiskStore {
         let before_rename = (|| {
             io_write::write_all(&mut file, bytes, permit).map_err(host_errno)?;
             file.sync_all().map_err(host_errno)?;
-            let generation = self.objects_generation.load(Ordering::Relaxed);
-            if self.objects_synced.load(Ordering::Relaxed) < generation {
-                #[cfg(test)]
-                self.sync_trace.lock().unwrap().push("objects");
-                File::open(self.root.join("objects"))
-                    .and_then(|f| f.sync_all())
-                    .map_err(host_errno)?;
-                self.objects_synced.fetch_max(generation, Ordering::Relaxed);
-            }
+            self.sync_objects()?;
             fs::rename(&tmp, self.root.join("manifest")).map_err(host_errno)
         })();
         if let Err(e) = before_rename {
@@ -1067,20 +1171,16 @@ impl Filesystem {
         let offset = snapshot.metadata[index].1;
         let metadata = inode_metadata_bytes(&n)?;
         drop(n);
-        let old: [u8; 64] = snapshot.bytes[offset..offset + 64].try_into().unwrap();
-        if old == metadata {
+        if snapshot.bytes[offset..offset + 64] == metadata {
             return Ok(true);
         }
-        let checksum_at = snapshot.bytes.len() - 8;
-        let old_checksum: [u8; 8] = snapshot.bytes[checksum_at..].try_into().unwrap();
-        snapshot.bytes[offset..offset + 64].copy_from_slice(&metadata);
-        let hash = checksum(&snapshot.bytes[..checksum_at]);
-        snapshot.bytes[checksum_at..].copy_from_slice(&hash.to_le_bytes());
-        if let Err(error) = disk.commit(&snapshot.bytes) {
-            snapshot.bytes[offset..offset + 64].copy_from_slice(&old);
-            snapshot.bytes[checksum_at..].copy_from_slice(&old_checksum);
-            return Err(error);
-        }
+        let mut next = snapshot.bytes.clone();
+        let checksum_at = next.len() - 8;
+        next[offset..offset + 64].copy_from_slice(&metadata);
+        let hash = checksum(&next[..checksum_at]);
+        next[checksum_at..].copy_from_slice(&hash.to_le_bytes());
+        disk.commit(&next, Some(&snapshot.bytes))?;
+        snapshot.bytes = next;
         Ok(true)
     }
     pub(super) fn checkpoint(&self, overlay: Option<&overlay::Overlay>) -> Result<()> {
@@ -1154,7 +1254,7 @@ impl Filesystem {
         if out.len() as u64 > MAX_MANIFEST {
             return Err(Errno(28));
         }
-        disk.commit(&out)?;
+        disk.commit(&out, commit.as_ref().map(|s| s.bytes.as_slice()))?;
         *commit = Some(ManifestSnapshot {
             bytes: out,
             metadata,
@@ -1441,7 +1541,7 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     }
     Ok(Filesystem {
         shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-        paths,
+        paths: paths.into(),
         inodes: nodes.values().map(Arc::downgrade).collect(),
         next_inode,
         limits,
@@ -1637,6 +1737,7 @@ impl Vfs {
             if bytes.len() as u64 > MAX_MANIFEST {
                 return Err(Errno(22));
             }
+            wal::recover(&disk, &mut bytes)?;
             v.fs = FsHandle::new(decode(&disk, &bytes)?);
         } else {
             disk.recover(&BTreeMap::new())?;
@@ -2151,6 +2252,10 @@ impl FilesystemSync {
         }
         let fs = self.filesystem.borrow();
         if !self.checkpointed {
+            if let Some(disk) = &fs.disk {
+                disk.wal_records
+                    .store(wal::CHECKPOINT_RECORDS, Ordering::Relaxed);
+            }
             fs.checkpoint()?;
             self.checkpointed = true;
         }
@@ -2168,5 +2273,69 @@ impl Drop for FilesystemSync {
                 node.active_file_work.fetch_sub(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_image(root: &Path) -> Vec<u8> {
+    let mut bytes = fs::read(root.join("manifest")).unwrap();
+    if let Ok(wal) =
+        fs::read(root.join("manifest.wal")).or_else(|_| fs::read(root.join("manifest.wal.saved")))
+    {
+        let mut next = bytes.clone();
+        if wal::replay(&mut next, &wal).is_ok() {
+            bytes = next;
+        }
+    }
+    bytes
+}
+#[cfg(test)]
+pub(super) fn block_publication(root: &Path) -> io::Result<()> {
+    let wal = root.join("manifest.wal");
+    if wal.exists() {
+        fs::rename(&wal, root.join("manifest.wal.saved"))?;
+    }
+    fs::create_dir(wal)
+}
+#[cfg(test)]
+pub(super) fn unblock_publication(root: &Path) -> io::Result<()> {
+    fs::remove_dir(root.join("manifest.wal"))?;
+    let saved = root.join("manifest.wal.saved");
+    if saved.exists() {
+        fs::rename(saved, root.join("manifest.wal"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn test_record_bytes(root: &Path) -> u64 {
+    let wal = fs::read(root.join("manifest.wal")).unwrap();
+    let (mut at, mut last) = (0, 0);
+    while at + 16 <= wal.len() {
+        let length = u64::from_le_bytes(wal[at + 8..at + 16].try_into().unwrap()) as usize + 24;
+        last = length;
+        at += length;
+    }
+    last as u64
+}
+
+#[cfg(test)]
+pub(super) fn force_checkpoint_for_test(v: &Vfs, root: &Path) {
+    let set = |fs: &FsHandle| {
+        if let Some(disk) = &fs.borrow().disk {
+            if root.canonicalize().ok().as_ref() == Some(&disk.root) {
+                disk.wal_records
+                    .store(wal::CHECKPOINT_RECORDS, Ordering::Relaxed);
+            }
+        }
+    };
+    set(&v.fs);
+    for mount in v
+        .mount_resources
+        .borrow()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+    {
+        set(&mount.fs);
     }
 }

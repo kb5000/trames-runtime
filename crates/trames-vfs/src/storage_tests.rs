@@ -79,7 +79,7 @@ fn emit_file_provider_manifest_fixture() {
     v.sync().unwrap();
     drop(v);
     let path = std::env::var("TRAMES_PROVIDER_FIXTURE").expect("TRAMES_PROVIDER_FIXTURE");
-    let bytes = fs::read(dir.0.join("manifest")).unwrap();
+    let bytes = crate::storage::test_image(&dir.0);
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     fs::write(path, hex + "\n").unwrap();
     // The fixture is produced and reopened by the production Rust format.
@@ -138,14 +138,14 @@ fn posix_acl_persistence_and_chmod_checkpoint_failure_preserve_inode_authority()
     let old = v
         .get_xattr(AT_FDCWD, Some(b"/acl/file"), true, acl::ACCESS)
         .unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.chmod_at(AT_FDCWD, b"/acl/file", 0o600).is_err());
     assert_eq!(
         v.get_xattr(AT_FDCWD, Some(b"/acl/file"), true, acl::ACCESS)
             .unwrap(),
         old
     );
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     drop(v);
     let mut v = dir.open();
     v.credentials = Credentials::user(1000, 1000);
@@ -172,7 +172,7 @@ fn inode_attributes_persist_share_hardlinks_and_rollback_failed_commits() {
         b"a\0b"
     );
     let before = v.stat_at(AT_FDCWD, b"/attrs").unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v
         .set_xattr(
             AT_FDCWD,
@@ -189,7 +189,7 @@ fn inode_attributes_persist_share_hardlinks_and_rollback_failed_commits() {
             .unwrap(),
         b"a\0b"
     );
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     v.sync().unwrap();
     drop(v);
     let mut v = dir.open();
@@ -511,11 +511,11 @@ fn device_creation_failure_rolls_back_and_unprivileged_cannot_create() {
     let dir = Temp::new();
     let mut v = dir.open();
     let before = v.capacity();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.mknod_at(AT_FDCWD, b"/failed", 0o20666, 0x105).is_err());
     assert_eq!(v.stat_at(AT_FDCWD, b"/failed"), Err(Errno(2)));
     assert_eq!(v.capacity().nodes_used, before.nodes_used);
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     v.set_runtime_info(1, RuntimeInfo::default());
     assert_eq!(
         v.link_at(AT_FDCWD, b"/dev/zero", AT_FDCWD, b"/pseudo-alias"),
@@ -544,7 +544,9 @@ fn corrupt_device_payloads_are_rejected_before_storage_recovery() {
     v.import_file(b"/keep", b"keep".to_vec()).unwrap();
     drop(v);
     let manifest = dir.0.join("manifest");
-    let original = fs::read(&manifest).unwrap();
+    let original = crate::storage::test_image(&dir.0);
+    fs::write(&manifest, &original).unwrap();
+    fs::write(dir.0.join("manifest.wal"), []).unwrap();
     let mut offset = 40;
     while original[offset + 20] != 6 {
         let size = u32::from_le_bytes(original[offset + 72..offset + 76].try_into().unwrap());
@@ -677,10 +679,10 @@ fn private_usage_counts_live_objects_once_through_growth_replacement_and_rollbac
     exact(&v, 30);
     assert_eq!(v.import_file(b"/over", vec![1; 71]), Err(Errno(28)));
     exact(&v, 30);
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.import_file(b"/failed", vec![1; 10]).is_err());
     exact(&v, 30);
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     drop(v);
     let mut v = dir.open();
     exact(&v, 30);
@@ -799,7 +801,7 @@ fn bridge_device_is_volatile_nonseekable_and_shared_by_dup() {
 fn pseudo_views_do_not_enter_the_manifest_or_consume_disk_quota() {
     let dir = Temp::new();
     let mut v = dir.open();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
     let used = v.capacity().used_bytes;
     v.set_runtime_info(
         1,
@@ -820,7 +822,7 @@ fn pseudo_views_do_not_enter_the_manifest_or_consume_disk_quota() {
     assert_eq!(v.read(fd, 4096).unwrap(), vec![0; 4096]);
     v.close(fd).unwrap();
     v.sync().unwrap();
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
     assert_eq!(v.capacity().used_bytes, used);
     drop(v);
     let v = dir.open();
@@ -1060,7 +1062,7 @@ fn failed_namespace_commit_rolls_back_create_alias_rename_chmod_and_unlink() {
     v.import_file(b"/a", b"original".to_vec()).unwrap();
     let parent = v.stat_at(AT_FDCWD, b"/").unwrap();
     let before = v.stat_at(AT_FDCWD, b"/a").unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.open_at(AT_FDCWD, b"/b", 0x42, 0o600).is_err());
     assert!(v.link_at(AT_FDCWD, b"/a", AT_FDCWD, b"/alias").is_err());
     assert!(v.rename_at(AT_FDCWD, b"/a", AT_FDCWD, b"/new", 0).is_err());
@@ -1072,7 +1074,7 @@ fn failed_namespace_commit_rolls_back_create_alias_rename_chmod_and_unlink() {
         assert_eq!(v.stat_at(AT_FDCWD, path), Err(Errno(2)));
     }
     assert_eq!(fs::read_dir(dir.0.join("objects")).unwrap().count(), 1);
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     drop(v);
     let _v = dir.open();
 }
@@ -1207,14 +1209,14 @@ fn rename_exchange_commits_both_subtrees_or_neither() {
             namespace::RENAME_EXCHANGE,
         )
     };
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(exchange(&mut v).is_err());
     assert_eq!(child.cwd().unwrap(), b"/left");
     assert_eq!(v.stat_at(AT_FDCWD, b"/left").unwrap(), left);
     assert_eq!(v.stat_at(AT_FDCWD, b"/right").unwrap(), right);
     assert!(v.stat_at(AT_FDCWD, b"/left/leaf").is_ok());
     assert_eq!(v.read(notify, 4096), Err(Errno(11)));
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     exchange(&mut v).unwrap();
     assert_eq!(child.cwd().unwrap(), b"/right");
     assert_eq!(v.read(fd, 4).unwrap(), b"file");
@@ -1366,7 +1368,7 @@ fn unsupported_manifest_versions_are_rejected_without_deleting_data() {
         let mut v = dir.open();
         v.import_file(b"/data", b"retained".to_vec()).unwrap();
         drop(v);
-        let mut data = fs::read(dir.0.join("manifest")).unwrap();
+        let mut data = crate::storage::test_image(&dir.0);
         data[8..12].copy_from_slice(&version.to_le_bytes());
         let end = data.len() - 8;
         let hash = storage::checksum(&data[..end]).to_le_bytes();
@@ -1376,7 +1378,7 @@ fn unsupported_manifest_versions_are_rejected_without_deleting_data() {
             Vfs::open_disk(&dir.0, DiskOptions::default()),
             Err(Errno(22))
         ));
-        assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), data);
+        assert_eq!(crate::storage::test_image(&dir.0), data);
         assert_eq!(fs::read_dir(dir.0.join("objects")).unwrap().count(), 1);
     }
 }
@@ -1386,7 +1388,7 @@ fn version_three_manifest_reopens_without_attributes_and_upgrades_on_write() {
     let mut v = dir.open();
     v.import_file(b"/data", b"retained".to_vec()).unwrap();
     drop(v);
-    let mut bytes = fs::read(dir.0.join("manifest")).unwrap();
+    let mut bytes = crate::storage::test_image(&dir.0);
     let count = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
     let mut at = 40;
     for _ in 0..count {
@@ -1400,6 +1402,7 @@ fn version_three_manifest_reopens_without_attributes_and_upgrades_on_write() {
     let hash = storage::checksum(&bytes[..end]).to_le_bytes();
     bytes[end..].copy_from_slice(&hash);
     fs::write(dir.0.join("manifest"), bytes).unwrap();
+    fs::write(dir.0.join("manifest.wal"), []).unwrap();
     let mut v = dir.open();
     assert!(v
         .list_xattrs(AT_FDCWD, Some(b"/data"), true)
@@ -1415,7 +1418,7 @@ fn version_three_manifest_reopens_without_attributes_and_upgrades_on_write() {
     )
     .unwrap();
     drop(v);
-    let bytes = fs::read(dir.0.join("manifest")).unwrap();
+    let bytes = crate::storage::test_image(&dir.0);
     assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
     assert_eq!(
         dir.open()
@@ -1563,10 +1566,10 @@ fn reopened_inode_watches_keep_parent_identity_and_failed_transactions_are_silen
         inotify::ACCESS
     );
     assert_eq!(&bytes[16..21], b"file\0");
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.mkdir_at(AT_FDCWD, b"/watched/failed", 0o700).is_err());
     assert_eq!(v.read(fd, 128), Err(Errno(11)));
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
 }
 
 #[test]
@@ -1575,9 +1578,9 @@ fn anonymous_inode_metadata_does_not_commit_or_search_the_disk_namespace() {
     let mut v = dir.open();
     let fd = v.memfd_create(b"wayland-frame", 2).unwrap();
     let named = v.open_at(AT_FDCWD, b"/control", 0o102, 0o600).unwrap();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
     // Any attempted namespace commit now fails at create_new(manifest.new).
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     for length in [0, 4096, 16384, 65536, 4096] {
         v.truncate_fd(fd, length).unwrap();
         assert_eq!(size(super::Vfs::stat_fd(&v, fd).unwrap()), length);
@@ -1603,7 +1606,7 @@ fn anonymous_inode_metadata_does_not_commit_or_search_the_disk_namespace() {
         before_paths,
         "unnamed inodes cannot scan a directory tree"
     );
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
     assert!(
         v.truncate_fd(named, 4096).is_err(),
         "named files retain their existing namespace durability path"
@@ -1636,13 +1639,13 @@ fn tmpfs_resize_commits_only_its_own_namespace() {
     v.mkdir_at(AT_FDCWD, b"/ram", 0o755).unwrap();
     v.mount(None, b"/ram", Some(b"tmpfs"), 0, None).unwrap();
     let fd = v.open_at(AT_FDCWD, b"/ram/buffer", 0o102, 0o600).unwrap();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
+    crate::storage::block_publication(&dir.0).unwrap();
     v.truncate_fd(fd, 65536).unwrap();
     v.sync_fd(fd, false).unwrap();
     v.sync_fd(fd, true).unwrap();
     assert_eq!(size(v.stat_fd(fd).unwrap()), 65536);
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
 }
 
 #[test]
@@ -1656,8 +1659,8 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
     let deleted = v.open_at(AT_FDCWD, b"/deleted", 0o102, 0o600).unwrap();
     v.unlink_at(AT_FDCWD, b"/deleted", false).unwrap();
     v.umount(b"/ram", 2).unwrap();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
+    crate::storage::block_publication(&dir.0).unwrap();
     for fd in [ram, deleted] {
         v.write(fd, b"retained").unwrap();
         v.sync_fd(fd, false).unwrap();
@@ -1669,7 +1672,7 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
     // fdatasync preserves data/length without publishing timestamps. A blocked
     // unrelated manifest cannot turn a successful data flush into a failure.
     v.sync_fd(named, true).unwrap();
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
 }
 
 #[test]
@@ -1680,8 +1683,8 @@ fn tmpfs_metadata_uses_its_original_mount_without_publishing_the_disk_root() {
     v.mount(None, b"/ram", Some(b"tmpfs"), 0, None).unwrap();
     let fd = v.open_at(AT_FDCWD, b"/ram/file", 0o102, 0o600).unwrap();
     let control = v.open_at(AT_FDCWD, b"/control", 0o102, 0o600).unwrap();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
+    crate::storage::block_publication(&dir.0).unwrap();
     let times = Some([[123, 456], [789, 123]]);
     v.chmod_at(AT_FDCWD, b"/ram/file", 0o640).unwrap();
     v.chown_at(AT_FDCWD, b"/ram/file", 1000, 1000, false)
@@ -1705,7 +1708,7 @@ fn tmpfs_metadata_uses_its_original_mount_without_publishing_the_disk_root() {
     assert!(v.chown_fd(control, 1001, 1001).is_err());
     assert!(v.set_times(control as i32, None, times).is_err());
     assert_eq!(v.stat_fd(control).unwrap(), original);
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
 }
 
 #[test]
@@ -1715,8 +1718,8 @@ fn data_sync_preserves_grown_data_without_namespace_publication_on_both_paths() 
     v.import_file(b"/data", b"old".to_vec()).unwrap();
     v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
     let fd = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
-    let manifest = fs::read(dir.0.join("manifest")).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let manifest = crate::storage::test_image(&dir.0);
+    crate::storage::block_publication(&dir.0).unwrap();
     v.pwrite(fd, b"joined", 16384).unwrap();
     v.sync_fd(fd, true).unwrap();
     v.pwrite(fd, b"worker", 32768).unwrap();
@@ -1726,9 +1729,9 @@ fn data_sync_preserves_grown_data_without_namespace_publication_on_both_paths() 
         .unwrap()
         .unwrap();
     drop(pending);
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), manifest);
+    assert_eq!(crate::storage::test_image(&dir.0), manifest);
     assert!(v.sync_fd(fd, false).is_err());
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     drop(v);
     let mut reopened = dir.open();
     let fd = reopened.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
@@ -1744,13 +1747,13 @@ fn mapped_data_sync_flushes_pages_without_timestamp_checkpoint() {
     v.import_file(b"/mapped", vec![0; 4096]).unwrap();
     let fd = v.open_at(AT_FDCWD, b"/mapped", 2, 0).unwrap();
     let mappings = v.mapping_pages(fd, 0, 4096, true, true).unwrap();
-    let manifest = fs::read(dir.0.join("manifest")).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    let manifest = crate::storage::test_image(&dir.0);
+    crate::storage::block_publication(&dir.0).unwrap();
     mappings[0].write(512, b"mapped sync").unwrap();
     v.sync_fd(fd, true).unwrap();
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), manifest);
+    assert_eq!(crate::storage::test_image(&dir.0), manifest);
     assert!(v.sync_fd(fd, false).is_err());
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&dir.0).unwrap();
     drop(mappings);
     drop(v);
     let mut reopened = dir.open();
@@ -1771,7 +1774,7 @@ fn failed_synchronous_writes_keep_the_original_position_and_preserve_written_byt
             v.seek(fd, 1, 0).unwrap();
             let original = v.shared_files().lookup(fd).unwrap().unwrap();
             let disk = v.fs.borrow().disk.clone().unwrap();
-            disk.fail_directory_syncs(2);
+            disk.wal_failures.store(1, Ordering::Relaxed);
             if explicit_sync {
                 let target = original.clone().file_target().unwrap();
                 let command = FileCommand::WriteSync {
@@ -1851,13 +1854,14 @@ fn directory_flushes_follow_mutations_and_retry_post_rename_errors() {
     assert_eq!(disk.take_sync_trace(), ["objects", "directory"]);
     v.pwrite(fd, b"metadata", 0).unwrap();
     v.sync_fd(fd, false).unwrap();
-    assert_eq!(disk.take_sync_trace(), ["directory"]);
+    assert!(disk.take_sync_trace().is_empty());
     v.sync_fd(fd, true).unwrap();
     disk.sync_directory().unwrap();
     assert!(disk.take_sync_trace().is_empty());
     // Both the post-rename attempt and its explicit durability retry fail.
     // The publication remains committed and must not trigger namespace rollback.
     v.pwrite(fd, b"metadata", 0).unwrap();
+    disk.wal_records.store(1024, Ordering::Relaxed);
     disk.fail_directory_syncs(2);
     assert_eq!(v.sync_fd(fd, false), Err(Errno(5)));
     assert_eq!(disk.take_sync_trace(), ["directory", "directory"]);
@@ -1866,7 +1870,7 @@ fn directory_flushes_follow_mutations_and_retry_post_rename_errors() {
     v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
     assert_eq!(disk.take_sync_trace(), ["directory"]);
     let new = v.open_at(AT_FDCWD, b"/new", 0x42, 0o600).unwrap();
-    assert_eq!(disk.take_sync_trace(), ["objects", "directory"]);
+    assert_eq!(disk.take_sync_trace(), ["objects"]);
     v.close(new).unwrap();
     drop(disk);
     drop(v);
@@ -1952,22 +1956,22 @@ fn inode_sync_keeps_namespace_attributes_hardlinks_and_rollback_cache() {
     v.set_xattr(a as i32, None, true, b"user.cache", Some(b"retained"), 0)
         .unwrap();
     v.chmod_fd(a, 0o640).unwrap();
-    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
     v.pwrite(a, b"changed", 0).unwrap();
-    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    crate::storage::block_publication(&dir.0).unwrap();
     assert!(v.sync_fd(a, false).is_err());
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
-    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    assert_eq!(crate::storage::test_image(&dir.0), before);
+    crate::storage::unblock_publication(&dir.0).unwrap();
     v.pwrite(b, b"other", 0).unwrap();
     v.sync_fd(b, false).unwrap();
     // A subsequent commit must use the intact cached snapshot after failure.
     v.sync_fd(a, false).unwrap();
-    let after = fs::read(dir.0.join("manifest")).unwrap();
+    let after = crate::storage::test_image(&dir.0);
     let disk = v.fs.borrow().disk.clone().unwrap();
     disk.take_sync_trace();
     v.sync_fd(a, false).unwrap();
     assert!(disk.take_sync_trace().is_empty());
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), after);
+    assert_eq!(crate::storage::test_image(&dir.0), after);
     drop(disk);
     drop(v);
     let mut reopened = dir.open();
@@ -2048,10 +2052,10 @@ fn concurrent_inode_syncs_merge_metadata_into_the_latest_manifest() {
 fn staged_population_publishes_once_and_restores_checkpointing_after_error_or_panic() {
     let dir = Temp::new();
     let mut v = dir.open();
-    let original = fs::read(dir.0.join("manifest")).unwrap();
+    let original = crate::storage::test_image(&dir.0);
     v.populate_staged::<_, Errno>(|v| {
         v.import_reader(b"/one", &mut &b"first"[..], true)?;
-        assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), original);
+        assert_eq!(crate::storage::test_image(&dir.0), original);
         v.link_at(AT_FDCWD, b"/one", AT_FDCWD, b"/two")?;
         Ok(())
     })
@@ -2063,13 +2067,13 @@ fn staged_population_publishes_once_and_restores_checkpointing_after_error_or_pa
         v.stat_at(AT_FDCWD, b"/one").unwrap()[..8],
         v.stat_at(AT_FDCWD, b"/two").unwrap()[..8]
     );
-    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let before = crate::storage::test_image(&dir.0);
     let failed = v.populate_staged::<(), Errno>(|v| {
         v.import_reader(b"/not-published", &mut &b"partial"[..], false)?;
         Err(Errno(28))
     });
     assert_eq!(failed, Err(Errno(28)));
-    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(crate::storage::test_image(&dir.0), before);
     drop(v);
     let mut v = dir.open();
     assert_eq!(v.stat_at(AT_FDCWD, b"/not-published"), Err(Errno(2)));

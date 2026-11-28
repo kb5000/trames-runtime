@@ -106,7 +106,7 @@ fn accepted_import_keeps_consumed_input_and_original_owner_until_one_publication
         assert_eq!(stat(&mut v, "wios="), 4);
         assert_eq!(
             stat(&mut v, "wbytes="),
-            bytes.len() as u64 + std::fs::metadata(store.0.join("manifest")).unwrap().len()
+            bytes.len() as u64 + crate::storage::test_record_bytes(&store.0)
         );
         let fd = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
         assert_eq!(v.pread(fd, bytes.len(), 0).unwrap(), bytes);
@@ -158,7 +158,7 @@ fn a_manifest_wait_keeps_the_finished_import_stage_without_reading_or_writing_it
                 assert_eq!(stat(&mut v, "wios="), 2);
                 assert_eq!(
                     stat(&mut v, "wbytes="),
-                    65536 + std::fs::metadata(store.0.join("manifest")).unwrap().len()
+                    65536 + crate::storage::test_record_bytes(&store.0)
                 );
                 let fd = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
                 assert_eq!(v.read(fd, 65536).unwrap(), vec![7; 65536]);

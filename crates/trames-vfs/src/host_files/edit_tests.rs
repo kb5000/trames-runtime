@@ -157,7 +157,7 @@ fn conditional_save_resumes_staging_then_validation_without_reconsuming_or_rehas
     let stats = String::from_utf8(read(&mut v, b"/sys/fs/cgroup/a/io.stat")).unwrap();
     assert!(stats.split_whitespace().any(|word| word == "rios=3"));
     assert!(stats.split_whitespace().any(|word| word == "wios=3"));
-    let written = 131072 + std::fs::metadata(store.0.join("manifest")).unwrap().len();
+    let written = 131072 + crate::storage::test_record_bytes(&store.0);
     assert!(stats
         .split_whitespace()
         .any(|word| word == format!("wbytes={written}")));

@@ -446,6 +446,9 @@ impl Vfs {
     pub fn finish_network(&self) {
         self.network.finish();
     }
+    pub fn root_network(&self) -> trames_net::Network {
+        self.network.clone()
+    }
     pub fn socket(&mut self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
         if family == 1 {
             return self.local_create(kind, protocol);

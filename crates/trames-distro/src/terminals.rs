@@ -223,3 +223,65 @@ pub fn launcher_at(command: &[String], cwd: Option<&str>) -> String {
     let child = format!("{prefix}exec {command} <\"$1\" >\"$1\" 2>&1");
     format!("set -m; trap '' CHLD; while :; do if IFS= read -r tty <&3; then setsid /bin/sh -c {} sh \"$tty\" 3<&- & fi; done",quote(&child))
 }
+/// Build a multi-terminal launcher that resolves the login user's shell and home
+/// directory from `/etc/passwd` on each new terminal (falling back to `/bin/sh`),
+/// unless `session.shell` explicitly overrides the command.
+pub fn launcher_for_session(session: &crate::environment::Session) -> String {
+    fn quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+    let user = if session.user.is_empty() {
+        "root"
+    } else {
+        session.user.as_str()
+    };
+    let quoted_user = quote(user);
+    let cwd_cmd = if session.cwd.is_empty() {
+        "cd \"$h\" 2>/dev/null || cd /".to_string()
+    } else {
+        format!(
+            "cd {} 2>/dev/null || cd \"$h\" 2>/dev/null || cd /",
+            quote(&session.cwd)
+        )
+    };
+    let exec_cmd = if session.shell.is_empty() {
+        if user == "root" {
+            "exec \"$s\" -l <\"$1\" >\"$1\" 2>&1".to_string()
+        } else {
+            "if command -v su >/dev/null 2>&1; then exec su -m -s \"$s\" \"$u\" -c 'exec \"$0\" -l' \"$s\" <\"$1\" >\"$1\" 2>&1; else exec \"$s\" -l <\"$1\" >\"$1\" 2>&1; fi".to_string()
+        }
+    } else {
+        let cmd = session
+            .shell
+            .iter()
+            .map(|s| quote(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if user == "root" {
+            format!("exec {cmd} <\"$1\" >\"$1\" 2>&1")
+        } else {
+            format!(
+                "if command -v su >/dev/null 2>&1; then exec su -m -s /bin/sh \"$u\" -c 'exec \"$@\"' -- {cmd} <\"$1\" >\"$1\" 2>&1; else exec {cmd} <\"$1\" >\"$1\" 2>&1; fi"
+            )
+        }
+    };
+    let child = format!(
+        "u={quoted_user}; h=''; s=''; \
+if [ -r /etc/passwd ]; then \
+while IFS=: read -r n _ _ _ _ d sh; do \
+if [ \"$n\" = \"$u\" ]; then h=\"$d\"; s=\"$sh\"; break; fi; \
+done < /etc/passwd; \
+fi; \
+case \"$s\" in ''|*/nologin|*/false) s=/bin/sh ;; /*) [ -x \"$s\" ] || s=/bin/sh ;; *) s=/bin/sh ;; esac; \
+if [ -z \"$h\" ] || [ ! -d \"$h\" ]; then \
+if [ \"$u\" = root ] && [ -d /root ]; then h=/root; else h=/; fi; \
+fi; \
+export USER=\"$u\" LOGNAME=\"$u\" HOME=\"$h\" SHELL=\"$s\"; \
+{cwd_cmd}; \
+{exec_cmd}"
+    );
+    format!(
+        "set -m; trap '' CHLD; while :; do if IFS= read -r tty <&3; then setsid /bin/sh -c {} sh \"$tty\" 3<&- & fi; done",
+        quote(&child)
+    )
+}

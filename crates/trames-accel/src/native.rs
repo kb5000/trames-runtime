@@ -28,6 +28,9 @@ const MAX_STRING_BYTES: usize = 1024 * 1024;
 pub struct Metrics {
     pub calls: u64,
     pub worker_calls: u64,
+    pub compute_calls: u64,
+    pub compute_operations: [u64; crate::compute::FUNCTION_COUNT as usize],
+    pub compute_fallbacks: [u64; crate::compute::FUNCTION_COUNT as usize],
     pub glibc_calls: u64,
     pub glibc_operations: [u64; 2],
     pub glibc_fallbacks: [u64; 2],
@@ -76,6 +79,21 @@ pub struct Metrics {
 impl Metrics {
     /// Worker-local counters join here after every view user has stopped.
     pub fn merge(&mut self, other: Self) {
+        self.compute_calls += other.compute_calls;
+        for (a, b) in self
+            .compute_operations
+            .iter_mut()
+            .zip(other.compute_operations)
+        {
+            *a += b;
+        }
+        for (a, b) in self
+            .compute_fallbacks
+            .iter_mut()
+            .zip(other.compute_fallbacks)
+        {
+            *a += b;
+        }
         self.glibc_calls = self.glibc_calls.saturating_add(other.glibc_calls);
         for (a, b) in self.glibc_operations.iter_mut().zip(other.glibc_operations) {
             *a = a.saturating_add(b);
@@ -254,6 +272,8 @@ impl Registry {
                 && (1..=crate::bionic::FUNCTION_COUNT).contains(&function))
             || (module == crate::glibc::PROFILE
                 && (1..=crate::glibc::FUNCTION_COUNT).contains(&function))
+            || (module == crate::compute::PROFILE
+                && (1..=crate::compute::FUNCTION_COUNT).contains(&function))
             || (module == crate::callbacks::PROFILE && function == 1)
             || (module == crate::numeric::PROFILE && function == 1)
             || (module == crate::integer::PROFILE && function == 1)
@@ -394,6 +414,10 @@ impl Registry {
             self.metrics.glibc_calls += 1;
             self.metrics.glibc_operations[function as usize - 1] += 1;
             crate::glibc::execute(memory, function, a, &mut self.metrics)
+        } else if module == crate::compute::PROFILE {
+            self.metrics.compute_calls += 1;
+            self.metrics.compute_operations[function as usize - 1] += 1;
+            crate::compute::execute(memory, function, a, &mut self.metrics)
         } else if module == crate::callbacks::PROFILE {
             self.metrics.callback_calls = self.metrics.callback_calls.saturating_add(1);
             crate::callbacks::step(memory, a, &mut self.metrics)
@@ -419,6 +443,9 @@ impl Registry {
             Ok(Return { fallback: true, .. }) => {
                 if module == crate::bionic::PROFILE {
                     self.metrics.bionic_fallbacks[function as usize - 1] += 1;
+                }
+                if module == crate::compute::PROFILE {
+                    self.metrics.compute_fallbacks[function as usize - 1] += 1;
                 }
                 if module == crate::glibc::PROFILE {
                     self.metrics.glibc_fallbacks[function as usize - 1] += 1;

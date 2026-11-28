@@ -11,6 +11,12 @@ const GALLIUM_LIMIT: usize = 64 * 1024 * 1024;
 const LIBRARY: &[u8] = b"/usr/lib/libtrames_vulkan_icd.so";
 const MANIFEST: &[u8] = b"/usr/share/vulkan/icd.d/trames.json";
 const JSON: &[u8] = br#"{"file_format_version":"1.0.0","ICD":{"api_version":"1.1.0","library_path":"/usr/lib/libtrames_vulkan_icd.so"}}"#;
+const ALSA_PLUGIN_MUSL: &[u8] = b"/usr/lib/alsa-lib/libasound_module_pcm_trames.so";
+const ALSA_PLUGIN_GLIBC: &[u8] =
+    b"/usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_trames.so";
+const ALSA_CONF: &[u8] = b"/etc/asound.conf";
+// Omit </usr/share/alsa/alsa.conf> because standard ALSA already loads /etc/asound.conf.
+const ALSA_SYSTEM_CONF: &[u8] = b"# Expose the Trames native PCM plugin as the default ALSA device.\npcm.trames {\n    type trames\n    hint { show on description \"Trames host audio\" }\n}\npcm.!default {\n    type plug\n    slave.pcm trames\n    hint { show on description \"Trames host audio\" }\n}\n";
 
 /// Validate before changing the namespace, keep identical inodes, and replace
 /// updated files with a synced sibling + atomic rename before guest startup.
@@ -72,6 +78,25 @@ pub fn install_video_codec(
         format!("/usr/local/lib/{name}").as_bytes(),
         GALLIUM_LIMIT,
     )
+}
+/// Install the bundled ALSA PCM ioplug module and seed `/etc/asound.conf` if missing.
+pub fn install_alsa_plugin(
+    reader: &mut impl Read,
+    vfs: &mut Vfs,
+    glibc: bool,
+) -> Result<bool, Error> {
+    let plugin_path = if glibc {
+        ALSA_PLUGIN_GLIBC
+    } else {
+        ALSA_PLUGIN_MUSL
+    };
+    let plugin = install_library(reader, vfs, plugin_path, LIMIT)?;
+    let conf = match vfs.stat_at(AT_FDCWD, ALSA_CONF) {
+        Ok(_) => false,
+        Err(Errno(2)) => replace(vfs, ALSA_CONF, ALSA_SYSTEM_CONF)?,
+        Err(error) => return Err(Error::Vfs(error)),
+    };
+    Ok(plugin || conf)
 }
 fn install_library(
     reader: &mut impl Read,
@@ -347,5 +372,21 @@ mod tests {
         assert!(install_zink_gallium(&mut b"invalid".as_slice(), &mut vfs).is_err());
         assert_eq!(read(&mut vfs, path), bytes);
         assert_eq!(read(&mut vfs, b"/usr/lib/libgallium-25.1.9.so"), apk);
+    }
+    #[test]
+    fn alsa_plugin_installs_for_musl_and_glibc_and_preserves_custom_asound_conf() {
+        let mut vfs = Vfs::default();
+        let bytes = library();
+        assert!(install_alsa_plugin(&mut bytes.as_slice(), &mut vfs, false).unwrap());
+        assert_eq!(read(&mut vfs, ALSA_PLUGIN_MUSL), bytes);
+        assert_eq!(read(&mut vfs, ALSA_CONF), ALSA_SYSTEM_CONF);
+        assert!(!install_alsa_plugin(&mut bytes.as_slice(), &mut vfs, false).unwrap());
+
+        let mut glibc_vfs = Vfs::default();
+        let custom = b"pcm.!default { type null }\n";
+        glibc_vfs.import_file(ALSA_CONF, custom.to_vec()).unwrap();
+        assert!(install_alsa_plugin(&mut bytes.as_slice(), &mut glibc_vfs, true).unwrap());
+        assert_eq!(read(&mut glibc_vfs, ALSA_PLUGIN_GLIBC), bytes);
+        assert_eq!(read(&mut glibc_vfs, ALSA_CONF), custom);
     }
 }

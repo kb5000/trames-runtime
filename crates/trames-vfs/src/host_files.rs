@@ -17,6 +17,65 @@ pub use export::HostExportWork;
 mod edit;
 pub use edit::HostEditWork;
 impl Vfs {
+    /// Cold internal adaptation uses the original conditional private-file
+    /// replacement. Host mounts and non-root volumes are never rewritten.
+    pub fn transform_private_executable(
+        &mut self,
+        name: &[u8],
+        transform: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+    ) -> Result<bool> {
+        if self.fs.borrow().disk.is_none() {
+            return Ok(false);
+        }
+        let path = match self.resolve_final(AT_FDCWD, name, true) {
+            Ok(path) => path,
+            Err(Errno(2 | 20 | 13)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let filesystem = path.filesystem(self);
+        if !filesystem.same_data(&self.fs) {
+            return Ok(false);
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if filesystem.host.is_some() {
+            return Ok(false);
+        }
+        let node = match self.node(&path) {
+            Ok(node) => node,
+            Err(Errno(2)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let length = match &node.borrow().content {
+            Content::File(data) => data.len(),
+            _ => return Ok(false),
+        };
+        if length > 64 * 1024 * 1024 {
+            return Ok(false);
+        }
+        let mut original = Vec::new();
+        let visible = self.path_visible(&path)?;
+        self.export_writer(&visible, &mut original)?;
+        let Some(next) = transform(&original) else {
+            return Ok(false);
+        };
+        let edit = HostEdit {
+            node,
+            path,
+            filesystem,
+        };
+        let (data, _) = self.stage_import(&mut next.as_slice())?;
+        edit.commit(self, Some(data), true, |_, reader| {
+            let mut observed = Vec::new();
+            reader
+                .read_to_end(&mut observed)
+                .map_err(storage::host_errno)?;
+            if observed != original {
+                return Err(Errno(11));
+            }
+            Ok(false)
+        })?;
+        Ok(true)
+    }
     /// Conditional editor saves are restricted to the same private filesystem
     /// as before. Retain its original inode/path and mapping admission once.
     pub fn host_edit(&self, path: &[u8]) -> Result<HostEdit> {
@@ -358,7 +417,7 @@ mod tests {
         let edit = v.host_edit(b"/file").unwrap();
         let admission = admit(&edit);
         let result = edit.replace(&mut v, &admission, &mut &b"replacement"[..], |_, _| {
-            std::fs::create_dir(path.0.join("manifest.new")).unwrap();
+            crate::storage::block_publication(&path.0).unwrap();
             Ok(false)
         });
         assert!(result.is_err());
@@ -371,7 +430,7 @@ mod tests {
             .paths
             .keys()
             .any(|p| p.starts_with(b"/.trames-")));
-        std::fs::remove_dir(path.0.join("manifest.new")).unwrap();
+        crate::storage::unblock_publication(&path.0).unwrap();
         drop(v);
         let reopened = Vfs::open_disk(&path.0, DiskOptions::default()).unwrap();
         assert_eq!(read(&reopened, b"/file"), b"old");

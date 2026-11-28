@@ -388,8 +388,40 @@ fn stack_error(error: trames_linux::image::ImageError) -> RuntimeError {
         trames_linux::image::ImageError::Memory(error) => RuntimeError::Memory(error),
     }
 }
+fn prepare_compute(vfs: &mut trames_vfs::Vfs, enabled: bool) -> Result<(), RuntimeError> {
+    for directory in [
+        "/lib",
+        "/usr/lib",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ] {
+        for name in [
+            "libz.so.1",
+            "liblzma.so.5",
+            "libzstd.so.1",
+            "libcrypto.so.3",
+        ] {
+            let path = format!("{directory}/{name}");
+            match vfs.transform_private_executable(path.as_bytes(), |bytes| {
+                trames_accel::compute_elf::adapt(bytes, enabled)
+            }) {
+                Ok(_) | Err(trames_vfs::Errno(11 | 13 | 18 | 26 | 28 | 30)) => {}
+                Err(e) => return Err(RuntimeError::Elf(ElfError::Interpreter(e.0))),
+            }
+        }
+    }
+    Ok(())
+}
 fn stack_auxv(options: RuntimeOptions) -> Vec<(u64, u64)> {
     vec![
+        (
+            trames_accel::compute::AUXV_KEY,
+            if options.pure_accelerator {
+                trames_accel::compute::PROFILE
+            } else {
+                0
+            },
+        ),
         (
             trames_audio::AUXV_KEY,
             if options.audio_output || options.audio_input {
@@ -675,9 +707,10 @@ impl<C: Cpu> Runtime<C> {
         bytes: &[u8],
         argv: &[String],
         envp: &[String],
-        vfs: trames_vfs::Vfs,
+        mut vfs: trames_vfs::Vfs,
         options: RuntimeOptions,
     ) -> Result<Self, RuntimeError> {
+        prepare_compute(&mut vfs, options.pure_accelerator)?;
         let mut argv: Vec<_> = argv.iter().map(|s| s.as_bytes().to_vec()).collect();
         let envp: Vec<_> = envp.iter().map(|s| s.as_bytes().to_vec()).collect();
         let filename = bytes
@@ -1327,3 +1360,6 @@ mod shared_memory_policy_tests {
         assert_eq!(mapping.len(), 65536);
     }
 }
+
+#[cfg(all(test, trames_interpreter_conformance))]
+mod compute_tests;

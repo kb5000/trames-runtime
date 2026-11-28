@@ -891,7 +891,7 @@ impl Overlay {
         for (id, (n, _)) in &all {
             n.borrow_mut().links = counts.get(id).copied().unwrap_or(0);
         }
-        backing.paths = paths;
+        backing.paths = paths.into();
         let mut known: BTreeSet<_> = backing
             .inodes
             .iter()
@@ -938,7 +938,7 @@ impl Overlay {
                 projection::publish(|| Ok(()))
             });
         if let Err(error) = result {
-            backing.paths = old_paths;
+            backing.paths = old_paths.into();
             backing.inodes = old_inodes;
             for (_, (n, links)) in all {
                 n.borrow_mut().links = links;
@@ -1482,7 +1482,7 @@ impl Vfs {
         let ro = readonly || o.upper.is_none();
         let fs = Filesystem {
             shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-            paths,
+            paths: paths.into(),
             inodes: unique.into_values().collect(),
             next_inode: next,
             limits: budget,
@@ -2334,13 +2334,13 @@ mod tests {
             dirs(&mut v);
             write(&mut v, b"/lower/a", b"lower");
             mount(&mut v);
-            std::fs::create_dir(path.join("manifest.new")).unwrap();
+            crate::storage::block_publication(&path).unwrap();
             assert!(v.unlink_at(AT_FDCWD, b"/merged/a", false).is_err());
             assert_eq!(read(&mut v, b"/merged/a"), b"lower");
             assert_eq!(v.stat_at(AT_FDCWD, b"/upper/a"), Err(Errno(2)));
             assert!(v.mkdir_at(AT_FDCWD, b"/merged/new", 0o755).is_err());
             assert_eq!(v.stat_at(AT_FDCWD, b"/merged/new"), Err(Errno(2)));
-            std::fs::remove_dir(path.join("manifest.new")).unwrap();
+            crate::storage::unblock_publication(&path).unwrap();
             v.unlink_at(AT_FDCWD, b"/merged/a", false).unwrap();
             v.sync().unwrap();
         }
