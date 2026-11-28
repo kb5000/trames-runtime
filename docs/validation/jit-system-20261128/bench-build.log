@@ -1,0 +1,31 @@
+    Updating crates.io index
+     Locking 36 packages to highest compatible versions
+      Adding libc v0.2.190 (available: v0.2.191)
+      Adding rustix v1.1.5 (available: v1.1.6)
+      Adding serde_json v1.0.151 (available: v1.0.154)
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-execution)
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-shared)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-host-compute)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-system-base/crates/trames-jit)
+   Compiling jit-system-old v0.1.0 (/mnt/trames-output/jit-system-old)
+    Finished `release` profile [optimized] target(s) in 6.97s
+    Updating crates.io index
+     Locking 36 packages to highest compatible versions
+      Adding libc v0.2.190 (available: v0.2.191)
+      Adding rustix v1.1.5 (available: v1.1.6)
+      Adding serde_json v1.0.151 (available: v1.0.154)
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-execution)
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-shared)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-host-compute)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-jit)
+   Compiling jit-system-new v0.1.0 (/mnt/trames-output/jit-system-new)
+    Finished `release` profile [optimized] target(s) in 6.03s
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-system-source/crates/trames-jit)
+   Compiling jit-system-new v0.1.0 (/mnt/trames-output/jit-system-new)
+    Finished `release` profile [optimized] target(s) in 2.76s

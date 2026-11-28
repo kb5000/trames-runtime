@@ -14,12 +14,19 @@ pub(super) enum Atomic {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Address {
+    CacheLine,
     Offset(u64),
     Pre(u64),
     Post(u64),
     PostRegister(usize),
     Register { reg: usize, option: u32, shift: u32 },
     Literal(u64),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Maintenance {
+    Zero,
+    Translation,
+    Fence,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Structure {
@@ -37,6 +44,7 @@ pub(super) struct Operation {
     pub(super) structure: Option<Structure>,
     pub(super) second: Option<usize>,
     pub(super) ordered: bool,
+    pub(super) maintenance: Option<Maintenance>,
     pub(super) atomic: Option<Atomic>,
     pub(super) opcode: Option<u32>,
     code: Option<Code>, // PRFM is an architecturally optional hint, no read.
@@ -107,6 +115,7 @@ impl Operation {
                 preserve,
             }),
             second: None,
+            maintenance: None,
             ordered: false,
             atomic: None,
             // Keep the original operation/arrangement/lane, without writeback.
@@ -219,6 +228,7 @@ impl Operation {
             vector: true,
             structure: None,
             second,
+            maintenance: None,
             ordered: false,
             atomic: None,
             opcode: Some(opcode),
@@ -231,6 +241,36 @@ impl Operation {
         let word = memory
             .fetch_u32(pc)
             .map_err(|error| CpuFault::Memory { pc, error })?;
+        let maintenance = match word & !31 {
+            0xd50b7420 => Some(Maintenance::Zero),
+            0xd50b7b20 | 0xd50b7a20 | 0xd50b7e20 | 0xd50b7520 => Some(Maintenance::Translation),
+            _ => crate::system_ops::barrier(word).then_some(Maintenance::Fence),
+        };
+        if let Some(operation) = maintenance {
+            let zero = operation == Maintenance::Zero;
+            return Self {
+                pc,
+                address: if zero {
+                    Address::CacheLine
+                } else {
+                    Address::Offset(0)
+                },
+                rn: (word & 31) as usize,
+                rt: 31,
+                size: if zero { 64 } else { 1 },
+                load: !zero,
+                vector: false,
+                structure: None,
+                second: None,
+                ordered: false,
+                maintenance,
+                atomic: None,
+                opcode: zero.then_some(0xa9007c1f),
+                code: None,
+            }
+            .publish()
+            .map(Some);
+        }
         if word & (1 << 26) != 0 {
             return Self::compile_vector(word, pc);
         }
@@ -264,6 +304,7 @@ impl Operation {
                 vector: false,
                 structure: None,
                 second: None,
+                maintenance: None,
                 ordered: false,
                 atomic: Some(if rmw {
                     Atomic::Rmw { source }
@@ -299,6 +340,7 @@ impl Operation {
                 vector: false,
                 structure: None,
                 second: None,
+                maintenance: None,
                 ordered: true,
                 atomic: None,
                 address: Address::Offset(if unscaled {
@@ -329,6 +371,7 @@ impl Operation {
                 vector: false,
                 structure: None,
                 second: None,
+                maintenance: None,
                 ordered: true,
                 atomic: None,
                 opcode: Some((word & !0x3ff) | u32::from(!load)),
@@ -382,6 +425,7 @@ impl Operation {
                 vector: false,
                 structure: None,
                 second: Some(second),
+                maintenance: None,
                 ordered: false,
                 atomic: None,
                 opcode: Some(opcode),
@@ -461,6 +505,7 @@ impl Operation {
             vector: false,
             structure: None,
             second: None,
+            maintenance: None,
             ordered: false,
             atomic: None,
             opcode,
@@ -473,7 +518,11 @@ impl Operation {
         self.code = self
             .opcode
             .map(|word| {
-                if self.vector {
+                if self.maintenance == Some(Maintenance::Zero) {
+                    Code::publish(&[
+                        0xd503245f, 0xa9007c1f, 0xa9017c1f, 0xa9027c1f, 0xa9037c1f, 0xd65f03c0,
+                    ])
+                } else if self.vector {
                     let mut words = vec![0xd503245f];
                     let registers = self.vector_registers();
                     if !self.load || self.structure.is_some_and(|s| s.preserve) {
@@ -549,12 +598,15 @@ impl Operation {
         self.code.as_ref().map_or(0, Code::word_count)
     }
     pub(super) fn operand(&self, cpu: &Cpu) -> (u64, Option<u64>) {
-        let base = if self.rn == 31 {
+        let base = if self.maintenance.is_some() {
+            cpu.x(self.rn)
+        } else if self.rn == 31 {
             cpu.sp
         } else {
             cpu.x(self.rn)
         };
         match self.address {
+            Address::CacheLine => (base & !63, None),
             Address::Offset(offset) => (base.wrapping_add(offset), None),
             Address::Pre(offset) => {
                 let next = base.wrapping_add(offset);
@@ -576,6 +628,19 @@ impl Operation {
     }
     pub fn execute(&self, cpu: &mut Cpu, memory: &mut impl CpuMemory) -> Result<bool, CpuFault> {
         let pc = cpu.pc;
+        if let Some(operation) = self.maintenance {
+            if operation != Maintenance::Zero {
+                if operation == Maintenance::Translation {
+                    memory
+                        .check_translation(cpu.x(self.rn))
+                        .map_err(|error| CpuFault::Memory { pc, error })?;
+                } else {
+                    memory.fence(std::sync::atomic::Ordering::SeqCst);
+                }
+                cpu.pc = pc.wrapping_add(4);
+                return Ok(true);
+            }
+        }
         let Some(code) = &self.code else {
             cpu.pc = pc.wrapping_add(4);
             return Ok(true);

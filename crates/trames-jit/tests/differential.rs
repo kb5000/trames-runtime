@@ -639,6 +639,364 @@ fn unavailable_crypto_extensions_fault_before_any_interpreter_implementation() {
 }
 
 #[test]
+fn system_register_category_uses_existing_guest_fields_and_preserves_live_banks() {
+    for (read, write) in [
+        (0xd53bd040, 0xd51bd040),
+        (0xd53bd0a0, 0xd51bd0a0),
+        (0xd53b4400, 0xd51b4400),
+        (0xd53b4420, 0xd51b4420),
+    ] {
+        for (source, dest) in [(0, 1), (31, 31), (1, 1), (30, 0)] {
+            for value in [0, u64::MAX, 0x07c80000, 0x0800009f, 0x1234567890abcdef] {
+                let mut state = initial();
+                state.registers[source.min(30) as usize] = value;
+                state.fpcr = 0xffff_ffff;
+                state.fpsr = 0xffff_ffff;
+                let words = [read | dest, write | source, read | dest, 0xd4000001];
+                for budget in [1, 64] {
+                    for parallel in [false, true] {
+                        let e = compare_memory_sequence(&words, &state, budget, parallel);
+                        if NATIVE_COMPILED {
+                            assert_eq!(e.stats.fallback_instructions, 0, "{words:x?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for read in [0xd53bd060, 0xd53b0020, 0xd53b00e0] {
+        for rd in [0, 1, 31] {
+            compare_fp_word(read | rd, &initial());
+        }
+    }
+    let mut words = Vec::new();
+    for r in 0..24 {
+        words.push(0x91000400 | (r << 5) | r);
+    }
+    words.extend_from_slice(&[
+        0xd51bd040, 0xd53bd05f, 0xd51bd0a1, 0xd53bd0a2, 0x1e221820, 0xd53b4423, 0xd51b4424,
+        0xd53b4425, 0xd51b4406, 0x1e292907, 0xd53b440a, 0x3dc0003f, 0xd53bd04b, 0xd53b442c,
+        0xd4000001,
+    ]);
+    let mut state = initial();
+    state.registers[1] = 0x10ff7 - 1;
+    state.registers[4] = 0;
+    state.registers[6] = 2 << 22;
+    state.vectors[1] = 1f32.to_bits() as u128;
+    state.vectors[2] = 0;
+    for budget in [1, 8, 64] {
+        for parallel in [false, true] {
+            let e = compare_memory_sequence(&words, &state, budget, parallel);
+            if NATIVE_COMPILED {
+                assert_eq!(e.stats.fallback_instructions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn cache_maintenance_barrier_and_hint_category_keeps_precise_memory_semantics() {
+    for word in [0xd50b7420, 0xd50b7b20, 0xd50b7a20, 0xd50b7e20, 0xd50b7520] {
+        for reg in [0, 1, 30, 31] {
+            for address in [
+                0x10000,
+                0x10037,
+                0x10fff,
+                0x10000 + hardware_span() - 1,
+                0x10000 + hardware_span(),
+            ] {
+                let mut state = initial();
+                state.registers[reg.min(30) as usize] = address;
+                for budget in [1, 64] {
+                    for parallel in [false, true] {
+                        let e = compare_memory_sequence(
+                            &[0x910004a5, word | reg, 0xd4000001],
+                            &state,
+                            budget,
+                            parallel,
+                        );
+                        if NATIVE_COMPILED {
+                            assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut state = initial();
+    state.registers[1] = 0x10037;
+    let e = compare_memory_sequence(
+        &[0xf9400020, 0xd50b7421, 0xf9400022, 0xd4000001],
+        &state,
+        64,
+        false,
+    );
+    if NATIVE_COMPILED {
+        assert_eq!(e.stats.fallback_instructions, 0);
+        assert_eq!(e.memory_stats().instructions, 3);
+    }
+    for base in [0xd503309f, 0xd50330bf, 0xd50330df] {
+        for option in 0..16 {
+            compare_fp_word(base | (option << 8), &initial());
+        }
+    }
+    for word in [
+        0xd503201f, 0xd503203f, 0xd503205f, 0xd503207f, 0xd503209f, 0xd50320bf, 0xd50320df,
+        0xd50320ff, 0xd503221f, 0xd503229f, 0xd503211f, 0xd503215f, 0xd503219f, 0xd50321df,
+        0xd503231f, 0xd503235f, 0xd503239f, 0xd50323df, 0xd503241f, 0xd503245f, 0xd503249f,
+        0xd50324df, 0xd503251f, 0xd503233f, 0xd503237f, 0xd50323bf, 0xd50323ff, 0xd50322df,
+        0xd503225f, 0xd503227f, 0xd5031000, 0xd503103f,
+    ] {
+        compare_fp_word(word, &initial());
+    }
+    if host_capability(29) {
+        compare_fp_word(0xd50330ff, &initial());
+    }
+}
+
+#[test]
+fn trap_and_native_call_category_caches_boundaries_without_interpreter_entry() {
+    for instruction in [
+        0xd4200000, 0xd4200020, 0xd43fffe0, 0xd4400000, 0xd44a8a40, 0xd45fffe0,
+    ] {
+        let e = compare_memory_sequence(
+            &[0x91000400, instruction, 0xd4000001],
+            &initial(),
+            64,
+            false,
+        );
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0);
+        }
+    }
+    for mode in 0..5 {
+        for module in [0x10005, 0x10006, 0x10007, 0x10008] {
+            let mut a = memory(&[0x91000400, 0xd44a8a40, 0xd4000001]);
+            let mut b = a.clone();
+            let mut r = trames_interpreter::Cpu::new(0x1000, 0);
+            let mut c = Cpu::new(0x1000, 0);
+            match mode {
+                0 => {}
+                1 => {
+                    c.set_native_calls(true);
+                    r.set_native_calls(true);
+                }
+                2 => {
+                    c.set_vulkan_calls(true);
+                    r.set_vulkan_calls(true);
+                }
+                3 => {
+                    c.set_video_calls(true);
+                    r.set_video_calls(true);
+                }
+                _ => {
+                    c.set_audio_calls(true);
+                    r.set_audio_calls(true);
+                }
+            }
+            c.set_x(16, module);
+            r.set_x(16, module);
+            c.set_x(17, 7);
+            r.set_x(17, 7);
+            let mut e = Engine::default();
+            for budget in [1, 64, 64] {
+                let x = r.run_slice(&mut a, budget);
+                let y = c.run_slice(&mut e, &mut b, budget);
+                assert_eq!(format!("{x:?}"), format!("{y:?}"));
+                assert_eq!(c.architectural_state(), r.architectural_state());
+                assert_eq!(c.fault_retired(), r.fault_retired());
+                if matches!(x, SliceOutcome::Syscall { .. }) {
+                    break;
+                }
+            }
+            if NATIVE_COMPILED {
+                assert_eq!(e.stats.fallback_instructions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn architectural_counter_category_and_clock_samples_share_the_host_domain() {
+    let frequency = <Cpu as Backend>::counter_frequency();
+    assert!(frequency > 0);
+    for word in [0xd53be000, 0xd53be020, 0xd53be040, 0xd53be0a0, 0xd53be0c0] {
+        for rd in [0, 5, 31] {
+            // Explicit guest ordering makes the enclosing host bracket valid
+            // even for the architecturally relaxed counter aliases.
+            let mut m = memory(&[0xd5033fdf, word | rd, 0xd4000001]);
+            let mut c = Cpu::new(0x1000, 0);
+            let mut e = Engine::default();
+            let before = trames_interpreter::counter::read();
+            assert!(matches!(
+                c.run_slice(&mut e, &mut m, 64),
+                SliceOutcome::Syscall { instructions: 3 }
+            ));
+            let after = trames_interpreter::counter::read();
+            if rd != 31 {
+                if word == 0xd53be000 {
+                    assert_eq!(c.x(rd as usize), frequency);
+                } else {
+                    assert!((before..=after).contains(&c.x(rd as usize)));
+                }
+            }
+            if NATIVE_COMPILED {
+                assert_eq!(e.stats.fallback_instructions, 0);
+            }
+        }
+    }
+    if let Some(sample) = <Cpu as Backend>::clock_sample() {
+        assert_eq!(sample.frequency, frequency);
+        assert!(trames_interpreter::counter::read() >= sample.ticks);
+    }
+}
+
+#[test]
+fn maintenance_only_checks_translation_and_zeroes_one_guest_cache_line() {
+    for permission in [
+        Permissions {
+            read: false,
+            write: false,
+            execute: false,
+        },
+        Permissions::RX,
+    ] {
+        let words = [0xd50b7b21, 0xd50b7a21, 0xd50b7e21, 0xd50b7521, 0xd4000001];
+        let mut m = memory(&words);
+        m.protect(0x2000, PAGE_SIZE, permission).unwrap();
+        let mut c = Cpu::new(0x1000, 0);
+        c.set_x(1, 0x2fff);
+        let mut e = Engine::default();
+        assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 5));
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0);
+        }
+    }
+    let mut m = memory(&[0xd50b7421, 0xd4000001]);
+    m.write(0x2000, &[0xa5; 192]).unwrap();
+    m.protect(
+        0x2000,
+        PAGE_SIZE,
+        Permissions {
+            read: false,
+            write: true,
+            execute: false,
+        },
+    )
+    .unwrap();
+    let mut c = Cpu::new(0x1000, 0);
+    c.set_x(1, 0x207f);
+    let mut e = Engine::default();
+    assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 2));
+    m.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+    assert_eq!(m.read_array::<64>(0x2000).unwrap(), [0xa5; 64]);
+    assert_eq!(m.read_array::<64>(0x2040).unwrap(), [0; 64]);
+    assert_eq!(m.read_array::<64>(0x2080).unwrap(), [0xa5; 64]);
+    if NATIVE_COMPILED {
+        assert_eq!(e.stats.fallback_instructions, 0);
+    }
+}
+
+#[test]
+fn cached_native_call_rechecks_current_opt_ins_and_instruction_identity() {
+    let mut m = memory(&[0xd44a8a40]);
+    let mut c = Cpu::new(0x1000, 0);
+    c.set_x(16, 0x10006);
+    c.set_x(17, 17);
+    c.set_vulkan_calls(true);
+    let mut e = Engine::default();
+    assert!(matches!(
+        c.run_slice(&mut e, &mut m, 1),
+        SliceOutcome::NativeCall {
+            instructions: 0,
+            module: 0x10006,
+            function: 17,
+            ..
+        }
+    ));
+    c.set_vulkan_calls(false);
+    assert!(matches!(
+        c.run_slice(&mut e, &mut m, 1),
+        SliceOutcome::Fault(_)
+    ));
+    assert_eq!(c.fault_retired(), 0);
+    c.set_audio_calls(true);
+    c.set_x(16, 0x10008);
+    c.set_x(17, 18);
+    assert!(matches!(
+        c.run_slice(&mut e, &mut m, 1),
+        SliceOutcome::NativeCall {
+            instructions: 0,
+            module: 0x10008,
+            function: 18,
+            ..
+        }
+    ));
+    m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    m.write_array(0x1000, 0xd4000001u32.to_le_bytes()).unwrap();
+    m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+    assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 1)), ("syscall", 1));
+    if NATIVE_COMPILED {
+        assert_eq!(e.stats.fallback_instructions, 0);
+    }
+}
+
+#[test]
+fn random_register_category_publishes_architectural_success_flags() {
+    if !NATIVE_COMPILED || trames_jit::host_features().unwrap().hwcap2 & (1 << 16) == 0 {
+        return;
+    }
+    for base in [0xd53b2400, 0xd53b2420] {
+        for rd in [0, 30, 31] {
+            let mut m = memory(&[base | rd, 0xd4000001]);
+            let mut c = Cpu::new(0x1000, 0);
+            let mut e = Engine::default();
+            let mut state = initial();
+            state.nzcv = 15;
+            c.restore_architectural_state(&state);
+            assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 2));
+            let flags = c.architectural_state().nzcv;
+            assert!(flags == 0 || flags == 4);
+            if flags == 4 && rd != 31 {
+                assert_eq!(c.x(rd as usize), 0);
+            }
+            assert_eq!(e.stats.fallback_instructions, 0);
+        }
+    }
+}
+
+#[test]
+fn counter_frequency_tracks_elapsed_time_across_worker_threads() {
+    let start = std::time::Instant::now();
+    let first = trames_interpreter::counter::read();
+    let frequency = <Cpu as Backend>::counter_frequency();
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let a = trames_interpreter::counter::read();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let b = trames_interpreter::counter::read();
+                assert!(b >= a);
+                (a, b, <Cpu as Backend>::counter_frequency())
+            })
+        })
+        .collect();
+    for t in threads {
+        let (a, b, f) = t.join().unwrap();
+        assert!(a >= first && b >= a);
+        assert_eq!(f, frequency);
+    }
+    let last = trames_interpreter::counter::read();
+    let elapsed = start.elapsed().as_nanos();
+    let ns = (last - first) as u128 * 1_000_000_000 / frequency as u128;
+    // The outer bracket includes scheduling and the two clock-read costs.
+    assert!(
+        ns <= elapsed + 1_000_000 && ns + 1_000_000 >= elapsed,
+        "counter={ns}, instant={elapsed}"
+    );
+}
+
+#[test]
 fn vector_memory_widths_address_modes_and_register_namespaces_match_reference() {
     for (size, opc) in [
         (0, 0),
@@ -898,7 +1256,7 @@ fn backing_callbacks_see_host_fp_environment_and_cannot_pollute_guest_status() {
             Err(MemoryError::BackingIo(5))
         }
     }
-    for fail in [false, true] {
+    for (fail, clear) in [(false, false), (true, false), (false, true), (true, true)] {
         let _host = trames_host_compute::Scope::new(1 << 22, 0x10);
         let mut bytes = vec![0; PAGE_SIZE as usize];
         for lane in bytes[..16].chunks_exact_mut(4) {
@@ -910,12 +1268,20 @@ fn backing_callbacks_see_host_fp_environment_and_cannot_pollute_guest_status() {
             fail,
         });
         let prefix = 0x1e201800 | (22 << 16) | (21 << 5) | 20;
-        let mut m = memory(&[prefix, 0x3dc00020, 0x4e21d400, 0x3d800020, 0xd4000001]);
+        let mut words = vec![prefix];
+        if clear {
+            words.extend_from_slice(&[0xd51b443f, 0xd53b4425, 0xd51b4408, 0xd51bd049]);
+        }
+        let completed = words.len() as u64;
+        words.extend_from_slice(&[0x3dc00020, 0x4e21d400, 0x3d800020, 0xd4000001]);
+        let mut m = memory(&words);
         m.map_backed(0x10000, vec![backing.clone()], true, Permissions::RW, false)
             .unwrap();
         let mut c = Cpu::new(0x1000, 0);
         let mut s = initial();
         s.registers[1] = 0x10000;
+        s.registers[8] = 0;
+        s.registers[9] = 0xabcddcba;
         s.fpcr = 2 << 22;
         s.fpsr = 4;
         s.vectors[21] = 1f32.to_bits() as u128;
@@ -923,17 +1289,31 @@ fn backing_callbacks_see_host_fp_environment_and_cannot_pollute_guest_status() {
         s.vectors[1] = (1f32.to_bits() as u128) * 0x00000001000000010000000100000001;
         c.restore_architectural_state(&s);
         let mut e = Engine::default();
+        let before_tls: u64;
+        unsafe {
+            std::arch::asm!("mrs {v},tpidr_el0",v=out(reg)before_tls,options(nomem,nostack,preserves_flags));
+        }
         let result = c.run_slice(&mut e, &mut m, 64);
+        let after_tls: u64;
+        unsafe {
+            std::arch::asm!("mrs {v},tpidr_el0",v=out(reg)after_tls,options(nomem,nostack,preserves_flags));
+        }
+        assert_eq!(after_tls, before_tls);
         assert_eq!(environment(), (1 << 22, 0x10));
-        assert_eq!(c.architectural_state().fpsr, 6);
+        assert_eq!(c.architectural_state().fpsr, if clear { 0 } else { 6 });
+        if clear {
+            assert_eq!(c.x(5), 0);
+            assert_eq!(c.architectural_state().fpcr, 0);
+            assert_eq!(c.architectural_state().tpidr_el0, 0xabcddcba);
+        }
         assert_eq!(e.stats.fallback_instructions, 0);
         if fail {
             assert!(matches!(result, SliceOutcome::Fault(_)));
-            assert_eq!(c.fault_retired(), 1);
-            assert_eq!(c.pc(), 0x1004);
+            assert_eq!(c.fault_retired(), completed);
+            assert_eq!(c.pc(), 0x1000 + completed * 4);
             assert_eq!(c.architectural_state().vectors[0], s.vectors[0]);
         } else {
-            assert_eq!(outcome(&result), ("syscall", 5));
+            assert_eq!(outcome(&result), ("syscall", completed + 4));
             assert_eq!(
                 c.architectural_state().vectors[0],
                 (2f32.to_bits() as u128) * 0x00000001000000010000000100000001
@@ -1105,7 +1485,7 @@ fn fp_vector_blocks_return_cleanly_to_existing_memory_and_system_boundaries() {
     for budget in [1, 64] {
         let e = compare_memory_sequence(&words, &state, budget, budget == 64);
         if NATIVE_COMPILED {
-            assert_eq!(e.stats.fallback_instructions, 1);
+            assert_eq!(e.stats.fallback_instructions, 0);
         }
     }
 }
@@ -3102,7 +3482,7 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
         }
     }
     for word in [
-        0xf9000020, 0xa9000820, 0xc89ffc20, 0x3d800020, 0xad000420, 0x4c002020,
+        0xf9000020, 0xa9000820, 0xc89ffc20, 0x3d800020, 0xad000420, 0x4c002020, 0xd50b7421,
     ] {
         let output = Arc::new(Output::default());
         let mut m = memory(&[word]);
@@ -3131,10 +3511,14 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
             ("yield", 1)
         );
         assert_eq!(output.reads.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            &output.bytes.lock().unwrap()[..8],
-            &0x8877665544332211u64.to_le_bytes()
-        );
+        if word == 0xd50b7421 {
+            assert_eq!(&output.bytes.lock().unwrap()[..64], &[0; 64]);
+        } else {
+            assert_eq!(
+                &output.bytes.lock().unwrap()[..8],
+                &0x8877665544332211u64.to_le_bytes()
+            );
+        }
         if NATIVE_COMPILED {
             assert_eq!(
                 (
@@ -3570,6 +3954,7 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
         (true, 0x4c0023bf),
         (false, 0x4d60c03f),
         (true, 0x4d2023bf),
+        (true, 0xd50b743d),
     ] {
         if (word == 0xf82403a0 || word == 0x48287faa) && !host_capability(8) {
             continue;

@@ -59,18 +59,20 @@ enum MemoryOps {
     // Generated literals require stable operation addresses across Vec growth.
     #[allow(clippy::vec_box)]
     Fused(Vec<Box<crate::memory_ops::Operation>>),
+    Boundary(crate::system_ops::Boundary),
 }
 impl MemoryOps {
     fn single(&self) -> Option<&crate::memory_ops::Operation> {
         match self {
             Self::Single(op) => Some(op),
-            Self::Fused(_) => None,
+            Self::Fused(_) | Self::Boundary(_) => None,
         }
     }
     fn host_words(&self) -> u64 {
         match self {
             Self::Single(op) => op.host_words(),
             Self::Fused(ops) => ops.iter().map(|op| op.host_words()).sum(),
+            Self::Boundary(_) => 0,
         }
     }
 }
@@ -118,7 +120,13 @@ impl Block {
 pub(super) struct Executed {
     pub instructions: u64,
     pub blocks: u64,
-    pub syscall: bool,
+    pub exit: Exit,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Exit {
+    Continue,
+    Syscall,
+    NativeCall,
 }
 
 /// One native entry owns this stack frame and its borrowed epoch pointers.
@@ -273,7 +281,7 @@ struct MemorySite {
     adjust: usize,
     stop: usize,
     before: u64,
-    fixup: Option<(usize, usize)>,
+    fixups: Vec<(usize, usize)>,
 }
 unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool, const FP: bool>(
     pointer: *mut MemoryFrame<M>,
@@ -354,11 +362,11 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool, const FP:
         let floating =
             unsafe { &mut *std::ptr::addr_of_mut!((*pointer.cast::<MixedFrame<M>>()).floating) };
         floating.guest_status = cpu.fpsr as u64;
-        let (registers, vectors) = cpu.native_register_banks_mut();
-        frame.registers = registers.as_mut_ptr();
-        frame.frame.link_pcs = vectors.as_mut_ptr().cast();
+        let (registers, vectors) = cpu.native_register_pointers();
+        frame.registers = registers;
+        frame.frame.link_pcs = vectors.cast();
     } else {
-        frame.registers = cpu.general_registers_mut().as_mut_ptr();
+        frame.registers = cpu.native_register_pointers().0;
     }
     next
 }
@@ -533,8 +541,16 @@ impl Cache {
         } else {
             (
                 None,
-                crate::memory_ops::Operation::compile(memory, pc)?
-                    .map(|op| Box::new(MemoryOps::Single(op))),
+                if let Some(boundary) = crate::system_ops::Boundary::decode(
+                    memory
+                        .fetch_u32(pc)
+                        .map_err(|error| CpuFault::Memory { pc, error })?,
+                ) {
+                    Some(Box::new(MemoryOps::Boundary(boundary)))
+                } else {
+                    crate::memory_ops::Operation::compile(memory, pc)?
+                        .map(|op| Box::new(MemoryOps::Single(op)))
+                },
             )
         };
         if let Some(op) = &memory_op {
@@ -647,7 +663,7 @@ impl Cache {
                     unsafe {
                         block
                             .code
-                            .call_scalar(block.fast_offset, cpu.general_registers_mut());
+                            .call_scalar(block.fast_offset, cpu.native_register_pointers().0);
                     }
                     cpu.pc = block.next_pc;
                     let instructions = block.instructions;
@@ -693,7 +709,7 @@ impl Cache {
                                 unsafe {
                                     block.code.call_tail(
                                         block.tail_offset,
-                                        cpu.general_registers_mut(),
+                                        cpu.native_register_pointers().0,
                                         self.tails.as_ptr(),
                                     );
                                 }
@@ -705,7 +721,7 @@ impl Cache {
                                 return Ok(Some(Executed {
                                     instructions,
                                     blocks: 2,
-                                    syscall: true,
+                                    exit: Exit::Syscall,
                                 }));
                             }
                         }
@@ -761,7 +777,7 @@ impl Cache {
             return Ok(Some(Executed {
                 instructions: 1,
                 blocks: 1,
-                syscall: false,
+                exit: Exit::Continue,
             }));
         }
         let limit = budget
@@ -869,8 +885,23 @@ impl Cache {
                 return Ok(Some(Executed {
                     instructions: 1,
                     blocks: 1,
-                    syscall: false,
+                    exit: Exit::Continue,
                 }));
+            }
+            if let Some(MemoryOps::Boundary(boundary)) =
+                self.node(handle).and_then(|n| n.memory.as_deref())
+            {
+                let boundary = *boundary;
+                if boundary.native_call(cpu) {
+                    self.last = Some(handle);
+                    return Ok(Some(Executed {
+                        instructions: 0,
+                        blocks: 0,
+                        exit: Exit::NativeCall,
+                    }));
+                }
+                self.cold.fault_progress = (0, 0);
+                return Err(boundary.fault(pc));
             }
             return Ok(None);
         };
@@ -892,13 +923,13 @@ impl Cache {
                 if block.context {
                     block.code.call_context(
                         block.fast_offset,
-                        cpu.general_registers_mut(),
+                        cpu.native_register_pointers().0,
                         &mut frame,
                     );
                 } else {
                     block
                         .code
-                        .call_scalar(block.fast_offset, cpu.general_registers_mut());
+                        .call_scalar(block.fast_offset, cpu.native_register_pointers().0);
                 }
             }
             frame.remaining = budget - block.instructions;
@@ -910,7 +941,9 @@ impl Cache {
             frame.last_slot = handle.slot as u64;
         } else {
             unsafe {
-                block.code.call(cpu.general_registers_mut(), &mut frame);
+                block
+                    .code
+                    .call(cpu.native_register_pointers().0, &mut frame);
             }
         }
         self.links_stats.entries += 1;
@@ -927,7 +960,11 @@ impl Cache {
         Ok(Some(Executed {
             instructions: budget - frame.remaining,
             blocks: frame.blocks,
-            syscall: frame.syscall != 0,
+            exit: if frame.syscall != 0 {
+                Exit::Syscall
+            } else {
+                Exit::Continue
+            },
         }))
     }
     #[inline(never)]
@@ -942,13 +979,11 @@ impl Cache {
         // Existing host control/status scope, once per native entry, never per
         // instruction. No Rust/provider callback runs in this native FP block.
         let scope = trames_host_compute::Scope::new(cpu.fpcr, cpu.fpsr);
-        let (registers, vectors) = cpu.native_register_banks_mut();
+        let (registers, vectors) = cpu.native_register_pointers();
         let mut vector_frame = VectorFrame { frame };
-        vector_frame.frame.link_pcs = vectors.as_mut_ptr().cast();
+        vector_frame.frame.link_pcs = vectors.cast();
         unsafe {
-            block
-                .code
-                .call_vectors(registers.as_mut_ptr(), &mut vector_frame);
+            block.code.call_vectors(registers, &mut vector_frame);
         }
         cpu.fpsr |= trames_host_compute::status();
         drop(scope);
@@ -966,7 +1001,11 @@ impl Cache {
         Ok(Some(Executed {
             instructions: budget - vector_frame.frame.remaining,
             blocks: vector_frame.frame.blocks,
-            syscall: vector_frame.frame.syscall != 0,
+            exit: if vector_frame.frame.syscall != 0 {
+                Exit::Syscall
+            } else {
+                Exit::Continue
+            },
         }))
     }
     #[inline]
@@ -983,11 +1022,11 @@ impl Cache {
         // Derive both reborrows from one raw parent, then suspend Rust CPU access
         // until native return. Every helper publishes a fresh register sub-borrow.
         let registers = if FP {
-            let (registers, vectors) = unsafe { (*cpu_pointer).native_register_banks_mut() };
-            frame.link_pcs = vectors.as_mut_ptr().cast();
-            registers.as_mut_ptr()
+            let (registers, vectors) = unsafe { (*cpu_pointer).native_register_pointers() };
+            frame.link_pcs = vectors.cast();
+            registers
         } else {
-            unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() }
+            unsafe { (*cpu_pointer).native_register_pointers().0 }
         };
         MemoryFrame {
             frame,
@@ -1108,7 +1147,11 @@ impl Cache {
         Ok(Some(Executed {
             instructions: budget - fused.frame.remaining,
             blocks: fused.frame.blocks,
-            syscall: fused.frame.syscall != 0,
+            exit: if fused.frame.syscall != 0 {
+                Exit::Syscall
+            } else {
+                Exit::Continue
+            },
         }))
     }
 }
@@ -1632,6 +1675,108 @@ impl Assembler {
             self.flags_written();
         }
     }
+    fn cpu_field(
+        &mut self,
+        rt: u32,
+        register: trames_interpreter::NativeSystemRegister,
+        write: bool,
+        wide: bool,
+    ) {
+        let offset = Cpu::native_system_offset(register);
+        let scale = if wide { 8 } else { 4 };
+        let op = match (wide, write) {
+            (true, false) => 0xf9400000,
+            (true, true) => 0xf9000000,
+            (false, false) => 0xb9400000,
+            (false, true) => 0xb9000000,
+        };
+        if offset >= 0 && offset % scale == 0 && offset / scale < 4096 {
+            self.words.push(op | (((offset / scale) as u32) << 10) | rt);
+        } else if (-256..256).contains(&offset) {
+            self.words
+                .push((op & !0x01000000) | (((offset as u32) & 511) << 12) | rt);
+        } else {
+            constant(&mut self.words, 17, offset as u64);
+            self.words.push(0x8b110011); // add x17,x0,x17, from whole-CPU provenance
+            self.words.push(op | (17 << 5) | rt);
+        }
+    }
+    fn system(&mut self, word: u32, op: crate::system_ops::Register) {
+        use crate::system_ops::Register::*;
+        use trames_interpreter::NativeSystemRegister as R;
+        let rd = word & 31;
+        match op {
+            Constant(value) => self.constant(rd, value),
+            Counter { synchronized } => {
+                let dest = self.output(rd, 0);
+                if synchronized {
+                    self.words.push(0xd5033fdf);
+                }
+                self.words.push(0xd53be040 | dest);
+            }
+            Random => {
+                let dest = self.output(rd, 0);
+                self.words.push((word & !31) | dest);
+                self.flags_written();
+            }
+            Read(R::Tls | R::Tls2) => {
+                if let Read(reg) = op {
+                    let dest = self.output(rd, 0);
+                    self.cpu_field(dest, reg, false, true);
+                }
+            }
+            Write(R::Tls | R::Tls2) => {
+                if let Write(reg) = op {
+                    let src = self.read(rd, 0);
+                    self.cpu_field(src, reg, true, true);
+                }
+            }
+            Read(R::Fpcr) => {
+                let dest = self.output(rd, 0);
+                self.cpu_field(dest, R::Fpcr, false, false);
+            }
+            Read(R::Fpsr) | Write(R::Fpcr | R::Fpsr) => {
+                // These are actual operands of the virtual system instruction,
+                // not a hot capability probe. Scratch reservation is cold.
+                for slot in [9, 10] {
+                    if let Some(binding) = self.bindings[slot].take() {
+                        self.store(slot, binding);
+                        self.hosts[binding.guest as usize] = u8::MAX;
+                    }
+                }
+                if matches!(op, Read(R::Fpsr)) {
+                    let dest = self.output(rd, (1 << 10) | (1 << 11));
+                    self.cpu_field(10, R::Fpsr, false, false);
+                    self.words.push(0xd53b442b);
+                    constant(&mut self.words, 17, 0x0800009f);
+                    self.words.extend_from_slice(&[0x0a11016b, 0x2a0b014a]);
+                    self.cpu_field(10, R::Fpsr, true, false);
+                    if dest != 31 {
+                        self.words.push(0x2a0a03e0 | dest);
+                    }
+                } else {
+                    let Write(reg) = op else { unreachable!() };
+                    let src = self.read(rd, (1 << 10) | (1 << 11));
+                    constant(
+                        &mut self.words,
+                        10,
+                        if matches!(reg, R::Fpcr) {
+                            0x07c80000
+                        } else {
+                            0x0800009f
+                        },
+                    );
+                    self.words.push(0x0a0a000b | (src << 5)); // and w11,wSrc,w10
+                    self.cpu_field(11, reg, true, false);
+                    self.words.push(if matches!(reg, R::Fpcr) {
+                        0xd51b440b
+                    } else {
+                        0xd51b442b
+                    });
+                }
+            }
+        }
+    }
     fn memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
         self.flush();
         self.context = true;
@@ -1676,7 +1821,7 @@ impl Assembler {
             adjust,
             stop,
             before,
-            fixup: None,
+            fixups: Vec::new(),
         }
     }
     fn hardware_memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
@@ -1709,7 +1854,11 @@ impl Assembler {
             _ => Some(OperandKey {
                 address: address_key,
                 base: op.rn,
-                version: self.versions[sp_register(op.rn as u32) as usize],
+                version: self.versions[if op.maintenance.is_some() {
+                    op.rn
+                } else {
+                    sp_register(op.rn as u32) as usize
+                }],
                 index_version: if let Address::Register { reg, .. } = address_key {
                     self.versions[reg]
                 } else {
@@ -1724,7 +1873,14 @@ impl Assembler {
         let base = if matches!(op.address, Address::Literal(_)) {
             31
         } else {
-            self.read(sp_register(op.rn as u32), scratch)
+            self.read(
+                if op.maintenance.is_some() {
+                    op.rn as u32
+                } else {
+                    sp_register(op.rn as u32)
+                },
+                scratch,
+            )
         };
         let vector_target = if op.vector {
             Some(if let Some(group) = op.structure {
@@ -1849,6 +2005,7 @@ impl Assembler {
         }
         self.words.push(0xaa1f03f7); // no proof survives a non-reused access
         match op.address {
+            Address::CacheLine => self.words.push(0x927ae400 | (base << 5) | 17),
             Address::Literal(address) => constant(&mut self.words, 17, address),
             Address::Register { option, shift, .. } => self.words.push(
                 0x8b200000 | (index << 16) | (option << 13) | (shift << 10) | (base << 5) | 17,
@@ -1974,17 +2131,26 @@ impl Assembler {
             }
         }
         let fault = self.words.len();
-        self.words.push(match op.atomic {
-            Some(Atomic::Rmw { .. }) => op.opcode.unwrap() | (source << 16) | (17 << 5) | target,
-            Some(Atomic::Cas { pair: false, .. }) => {
-                op.opcode.unwrap() | (target << 16) | (17 << 5) | source
-            }
-            Some(Atomic::Cas { pair: true, .. }) => op.opcode.unwrap() | (10 << 16) | (17 << 5) | 6,
-            None if target2.is_some() => {
-                (op.opcode.unwrap() & !0x7fff) | (target2.unwrap() << 10) | (17 << 5) | target
-            }
-            None => (op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target,
-        });
+        if op.maintenance == Some(crate::memory_ops::Maintenance::Zero) {
+            self.words
+                .extend_from_slice(&[0xa9007e3f, 0xa9017e3f, 0xa9027e3f, 0xa9037e3f]);
+        } else {
+            self.words.push(match op.atomic {
+                Some(Atomic::Rmw { .. }) => {
+                    op.opcode.unwrap() | (source << 16) | (17 << 5) | target
+                }
+                Some(Atomic::Cas { pair: false, .. }) => {
+                    op.opcode.unwrap() | (target << 16) | (17 << 5) | source
+                }
+                Some(Atomic::Cas { pair: true, .. }) => {
+                    op.opcode.unwrap() | (10 << 16) | (17 << 5) | 6
+                }
+                None if target2.is_some() => {
+                    (op.opcode.unwrap() & !0x7fff) | (target2.unwrap() << 10) | (17 << 5) | target
+                }
+                None => (op.opcode.expect("scalar operand") & !0x3ff) | (17 << 5) | target,
+            });
+        }
         if cas_pair {
             self.words.extend_from_slice(&[
                 0xaa0a03e0 | target,
@@ -2019,7 +2185,13 @@ impl Assembler {
         let mut site = slow.memory(op, before);
         site.adjust += slow_start;
         site.stop += slow_start;
-        site.fixup = Some((fault, slow_start));
+        site.fixups = (0..if op.maintenance == Some(crate::memory_ops::Maintenance::Zero) {
+            4
+        } else {
+            1
+        })
+            .map(|i| (fault + i, slow_start))
+            .collect();
         self.words.extend(slow.words);
         self.traffic.register_stores += slow.traffic.register_stores - prior_stores;
         for (slot, binding) in self.bindings.iter().enumerate() {
@@ -2322,19 +2494,21 @@ fn compile_body(
             }
             code.floating = true;
             code.vector(word, op);
-        } else if (matches!(word & 0xfffff0ff, 0xd503309f | 0xd50330bf)
-            && matches!(
-                (word >> 8) & 15,
-                1 | 2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 | 13 | 14 | 15
-            ))
-            || word == 0xd5033fdf
-        {
-            if !memory.cpu_hardware_ordering() {
-                break;
+        } else if let Some(op) = crate::system_ops::register(word) {
+            if crate::system_ops::floating(op) {
+                if !code.floating && !memory_ops.is_empty() {
+                    return compile_body(memory, start, limit, slot, mode, host, true);
+                }
+                code.floating = true;
             }
-            // Preserve the guest's barrier domain/type exactly. No helper,
-            // catch-all SeqCst fence, flag clobber or ordinary-access barrier.
+            code.system(word, op);
+        } else if crate::system_ops::barrier(word) && memory.cpu_hardware_ordering() {
             code.words.push(word);
+        } else if crate::system_ops::hint(word) {
+            // Virtual WFx may wake spuriously. PAC/BTI hints keep the current
+            // unadvertised guest profile; never act on host LR/TLS/control regs.
+        } else if crate::system_ops::Boundary::decode(word).is_some() {
+            break;
         } else if word & 0xffe0001f == 0xd4000001 {
             syscall = true;
             flow = Flow::Syscall;
@@ -2694,7 +2868,7 @@ fn compile_body(
     traffic.host_words = words.len() as u64;
     let fixups: Vec<_> = memory_sites
         .iter()
-        .filter_map(|site| site.fixup)
+        .flat_map(|site| site.fixups.iter().copied())
         .map(|(pc, recovery)| ((body_start + pc) * 4, (body_start + recovery) * 4))
         .collect();
     Ok(Some(Compiled {
@@ -2835,39 +3009,39 @@ impl Code {
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(pointer, inputs.as_ptr()) }
     }
-    unsafe fn call_tail(&self, offset: usize, registers: &mut [u64; 31], links: *const usize) {
+    unsafe fn call_tail(&self, offset: usize, registers: *mut u64, links: *const usize) {
         // SAFETY: the caller validated the bounded two-block edge and owns both
         // live RX entries. Only this worker can mutate/revoke the RW jump cell.
         let function: unsafe extern "C" fn(*mut u64, *const usize) =
             unsafe { std::mem::transmute(self.pointer.cast::<u8>().add(offset)) };
         unsafe {
-            function(registers.as_mut_ptr(), links);
+            function(registers, links);
         }
     }
-    unsafe fn call_context(&self, offset: usize, registers: &mut [u64; 31], frame: &mut Frame) {
+    unsafe fn call_context(&self, offset: usize, registers: *mut u64, frame: &mut Frame) {
         // SAFETY: published AAPCS64 entry, live frame and worker-owned mapping.
         let function: unsafe extern "C" fn(*mut u64, *mut Frame) =
             unsafe { std::mem::transmute(self.pointer.cast::<u8>().add(offset)) };
         unsafe {
-            function(registers.as_mut_ptr(), frame);
+            function(registers, frame);
         }
     }
-    unsafe fn call_scalar(&self, offset: usize, registers: &mut [u64; 31]) {
+    unsafe fn call_scalar(&self, offset: usize, registers: *mut u64) {
         // SAFETY: the secondary BTI-c entry contains the same bounded register
         // body and returns without modifying host callee-saved state or TLS.
         let function: unsafe extern "C" fn(*mut u64) =
             unsafe { std::mem::transmute(self.pointer.cast::<u8>().add(offset)) };
         unsafe {
-            function(registers.as_mut_ptr());
+            function(registers);
         }
     }
-    unsafe fn call(&self, registers: &mut [u64; 31], frame: &mut Frame) {
+    unsafe fn call(&self, registers: *mut u64, frame: &mut Frame) {
         // SAFETY: codegen emits an AAPCS64 function with this exact ABI. The
         // entry begins with BTI c and returns through untouched host x30.
         let function: unsafe extern "C" fn(*mut u64, *mut Frame) =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe {
-            function(registers.as_mut_ptr(), frame);
+            function(registers, frame);
         }
     }
 }
@@ -3066,6 +3240,25 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_counter_reads_do_not_acquire_implicit_instruction_barriers() {
+        for word in [0xd53be020, 0xd53be040, 0xd53be0a0, 0xd53be0c0] {
+            let m = memory(&[word, 0xd4000001]);
+            let compiled = compile(&m, 0x1000, 64, 0, 8 | 1).unwrap().unwrap();
+            let words = unsafe {
+                std::slice::from_raw_parts(
+                    compiled.block.code.pointer.cast::<u32>(),
+                    compiled.block.traffic.host_words as usize,
+                )
+            };
+            assert!(words.iter().any(|w| w & !31 == 0xd53be040));
+            assert_eq!(
+                words.contains(&0xd5033fdf),
+                matches!(word, 0xd53be0a0 | 0xd53be0c0)
+            );
+        }
+    }
+
+    #[test]
     fn direct_entries_preserve_native_callee_registers_on_every_return() {
         for path in 0..3 {
             let mut m = memory(&[0xf9400020, 0x91000400, 0xd4000001]);
@@ -3078,7 +3271,7 @@ mod tests {
             cpu.set_x(1, 0x2000);
             let checked = m.instruction_identity();
             let cpu_pointer = &mut cpu as *mut Cpu;
-            let registers = unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() };
+            let registers = unsafe { (*cpu_pointer).native_register_pointers().0 };
             let mut f = frame(&links);
             f.epochs[0] = &counter;
             f.expected[0] = u64::from(path != 0);
@@ -3137,7 +3330,7 @@ mod tests {
             loop {
                 let result = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
                 retired += result.instructions;
-                if result.syscall {
+                if result.exit == Exit::Syscall {
                     break;
                 }
             }
@@ -3187,12 +3380,12 @@ mod tests {
             let mut regs = [0u64; 31];
             regs[0] = 123;
             unsafe {
-                block.code.call(&mut regs, &mut f);
+                block.code.call(regs.as_mut_ptr(), &mut f);
             }
             assert_eq!((f.blocks, f.remaining, f.pc, regs[0]), (0, 64, 0x1000, 123));
             f.expected[index] = 1;
             unsafe {
-                block.code.call(&mut regs, &mut f);
+                block.code.call(regs.as_mut_ptr(), &mut f);
             }
             assert_eq!(
                 (f.blocks, f.remaining, f.pc, f.syscall, regs[0]),
@@ -3214,31 +3407,25 @@ mod tests {
         let mut cache = Cache::default();
         cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
         let source = cache.hot.unwrap();
-        assert!(
-            cache
-                .execute(&mut cpu, &mut m, 64)
-                .unwrap()
-                .unwrap()
-                .syscall
-        );
+        assert!(cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap().exit == Exit::Syscall);
         let target = cache.hot.unwrap();
         cpu.pc = 0x1000;
         let hit = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
-        assert_eq!((hit.blocks, hit.instructions, hit.syscall), (2, 2, true));
+        assert_eq!(
+            (hit.blocks, hit.instructions, hit.exit == Exit::Syscall),
+            (2, 2, true)
+        );
         assert_ne!(cache.links[source.slot], 0);
         cache.remove(target.slot);
         assert_eq!(cache.links[source.slot], 0);
         assert!(cache.node(target).is_none());
         cpu.pc = 0x1000;
         let miss = cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap();
-        assert_eq!((miss.blocks, miss.syscall, cpu.pc), (1, false, 0x1010));
-        assert!(
-            cache
-                .execute(&mut cpu, &mut m, 64)
-                .unwrap()
-                .unwrap()
-                .syscall
+        assert_eq!(
+            (miss.blocks, miss.exit == Exit::Syscall, cpu.pc),
+            (1, false, 0x1010)
         );
+        assert!(cache.execute(&mut cpu, &mut m, 64).unwrap().unwrap().exit == Exit::Syscall);
         let replacement = cache.hot.unwrap();
         assert_eq!(target.slot, replacement.slot);
         assert_ne!(target.generation, replacement.generation);

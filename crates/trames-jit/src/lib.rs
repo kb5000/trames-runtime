@@ -28,6 +28,12 @@ mod native;
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
+mod system_ops;
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 mod vector_ops;
 
 /// Actual process-host capabilities; absent when native JIT is not compiled.
@@ -222,8 +228,17 @@ impl Cpu {
                     engine.stats.native_blocks += exit.blocks;
                     // SVC is a translated control exit, separate from native
                     // guest ALU/branch instructions and fallback execution.
-                    engine.stats.native_instructions += exit.instructions - u64::from(exit.syscall);
-                    if exit.syscall {
+                    engine.stats.native_instructions +=
+                        exit.instructions - u64::from(exit.exit == native::Exit::Syscall);
+                    if exit.exit == native::Exit::NativeCall {
+                        return SliceOutcome::NativeCall {
+                            instructions: retired,
+                            pc: self.inner.pc,
+                            module: self.inner.x(16),
+                            function: self.inner.x(17),
+                        };
+                    }
+                    if exit.exit == native::Exit::Syscall {
                         engine.stats.direct_syscall_exits += 1;
                         return SliceOutcome::Syscall {
                             instructions: retired,
@@ -338,6 +353,9 @@ impl Backend for Cpu {
         {
             <trames_interpreter::Cpu as Backend>::feature_names()
         }
+    }
+    fn clock_sample() -> Option<trames_engine::ClockSample> {
+        trames_interpreter::counter::sample()
     }
     const EXACT_INSTRUCTIONS: bool = true;
     fn new(pc: u64, sp: u64) -> Self {

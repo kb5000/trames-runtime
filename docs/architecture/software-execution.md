@@ -468,3 +468,68 @@ its HWCAP3/device-memory contract. Shared interpreter-only compatibility remains
 unchanged. [Validation and measurements](../validation/jit-move-crypto-20261128.md)
 and the [remaining category plan](../roadmap/native-jit-coverage.md) distinguish
 native execution, available-host coverage and outstanding categories.
+
+
+## Native system-register and control category
+
+Cold classification covers the complete shared-CPU system list: TLS/TLS2,
+FPCR/FPSR and existing NZCV, read-only TPIDRRO/cache geometry, timer frequency
+and all four virtual counter aliases, RNDR/RNDRRS, DC ZVA, CVAU/CVAC/CIVAC/IVAU,
+all supported DMB/DSB/ISB options and SB, architectural hints, BRK/HLT and the
+special native-call HLT. Capability admission stays in compilation. Guest SVC
+still returns through its existing direct translated exit, never a host SVC.
+
+TLS reads/writes address existing CPU fields through compile-time offsets. Host
+TLS/x18 and host TPIDR2 are never used as guest storage. Native bank pointers
+are derived directly from one whole-CPU raw pointer, without first narrowing
+provenance through an array reference. The register-relative offsets name only
+existing CPU fields in the same allocation. Rust CPU access is suspended until
+native return; helpers refresh both bank pointers after their last CPU access.
+This relies on the Rust whole-allocation raw grant and AArch64 entry ABI, not
+on a lucky struct layout or an adjacent-array overrun. Offsets come from
+`offset_of!` in the same build; no layout assertion runs in the hot path. The
+120-byte chain frame and scalar entry ABI are unchanged.
+
+FP system accesses select the existing floating entry and its host-environment
+scope. MSR FPCR/FPSR applies the existing guest masks and updates both the CPU
+field and hardware register. MRS FPSR merges hardware sticky status into that
+field. Clearing FPSR therefore survives the final merge and checked-memory
+callbacks. Callbacks continue to see the saved host FP environment; their
+arithmetic cannot pollute guest status. There is no per-instruction scope,
+second extension-state bank or full-state copy. RNDR/RNDRRS use the original
+host instruction and publish its NZCV, gated by process RNG support in the cold
+compiler.
+
+On AArch64 Linux/Android, interpreter and JIT share the user CNTVCT domain and
+actual CNTFRQ frequency. CNTFRQ is a cold compiled constant; ordinary guest
+counter reads emit CNTVCT directly, without an implicit ISB. The two self-
+synchronized aliases use ISB + CNTVCT in that same virtual domain. Explicit
+guest ISB retains its hardware instruction. The ordered backend clock sampler
+uses ISB + CNTVCT and enables the existing optional Linux vDSO calibration.
+No per-read conversion, helper dispatch or task-local clock is introduced.
+This intentionally replaces the previous artificial 1-GHz Linux software timer;
+Apple/iPad retain their portable 1-GHz counter and disabled software vDSO
+sampler. Linux handles trapped user CNTFRQ/CNTVCT accesses in its existing ABI;
+no new userspace signal probe or handler is installed.
+
+The guest cache geometry remains 64 bytes. DC ZVA aligns Xt (XZR, not SP) down
+to 64 bytes and emits four native zero-pair stores through the existing CPU
+alias. Host DC ZVA is not used because its block size can differ. Each store
+has precise recovery metadata while the guest instruction retires once. The
+checked provider path performs a full store without first reading write-only
+backing. Other supported cache-maintenance instructions check translation
+without requiring data-read permission, preserving the runtime's existing
+instruction-epoch coherency. Ordinary hardware-ordering memories execute guest
+barriers directly; other embeddings use their existing fence callback.
+
+Architectural hints preserve the existing guest profile, including permitted
+spurious WFx wakeups and unadvertised PAC/BTI/GCS hint behavior. They do not wait
+on host events, authenticate host LR or allocate extension state. Reached
+BRK/HLT is cached typed metadata, never emitted as a host trap. Current native-
+call opt-ins and x16/x17 are consulted at that boundary; its instruction does
+not retire, and disabled calls produce the original guest trap. Metadata shares
+the existing optional node storage, so ordinary nodes/entries do not grow.
+
+[Category verification and frozen CPU measurements](../validation/jit-system-20261128.md)
+cover exact slice budgets, live-bank pressure, callback restoration, permissions,
+cache-line footprint, aliases, invalidation and precise traps.

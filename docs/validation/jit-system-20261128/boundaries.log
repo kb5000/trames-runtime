@@ -1,0 +1,4 @@
+Session completion verified: source-only completion, original providers, zero production suspension routes
+Host wait verified: native events, no release checkpoint receiver, task scans or periodic control timer
+Host execution verified: one bootstrap, live-only execution interface, no host CPU loop or stopped callback
+Project boundaries verified: standalone common runtime, iPad interpreter composition, Mac hardware composition

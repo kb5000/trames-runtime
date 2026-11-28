@@ -28,6 +28,7 @@ linux_features! {
 }
 mod cached;
 mod compatibility;
+pub mod counter;
 mod crypto;
 mod extended;
 mod flags;
@@ -96,6 +97,16 @@ pub enum Event {
     Yield,
 }
 
+/// Compile-time offsets from a native GPR pointer carrying the whole CPU's raw
+/// provenance. These name existing fields; there is no second register model.
+#[derive(Clone, Copy)]
+pub enum NativeSystemRegister {
+    Tls,
+    Tls2,
+    Fpcr,
+    Fpsr,
+}
+
 #[inline]
 fn sign_extend(value: u64, bits: u32) -> u64 {
     (((value << (64 - bits)) as i64) >> (64 - bits)) as u64
@@ -158,6 +169,14 @@ impl Cpu {
     }
     pub fn native_calls_enabled(&self) -> bool {
         self.native_calls || self.vulkan_calls || self.video_calls || self.audio_calls
+    }
+    pub fn native_call_target(&self) -> Option<(u64, u64)> {
+        let module = self.x(16);
+        (self.native_calls
+            || self.vulkan_calls && module == 0x0001_0006
+            || self.video_calls && module == 0x0001_0007
+            || self.audio_calls && module == 0x0001_0008)
+            .then(|| (module, self.x(17)))
     }
     pub fn decode_stats(&self) -> DecodeStats {
         self.decoded.stats
@@ -243,17 +262,13 @@ impl Cpu {
         let wide = ins >> 31 != 0;
         let mut next = pc.wrapping_add(4);
         let mut event = Event::Continue;
-        if (self.native_calls
-            || self.vulkan_calls && self.x(16) == 0x0001_0006
-            || self.video_calls && self.x(16) == 0x0001_0007
-            || self.audio_calls && self.x(16) == 0x0001_0008)
-            && ins == 0xd44a8a40
-        {
+        if ins == 0xd44a8a40 && self.native_call_target().is_some() {
+            let (module, function) = self.native_call_target().unwrap();
             next = pc;
             event = Event::NativeCall {
                 pc,
-                module: self.x(16),
-                function: self.x(17),
+                module,
+                function,
             };
         } else if matches!(ins & 0xffe0001f, 0xd4200000 | 0xd4400000) {
             return Err(CpuFault::Trap {
@@ -425,6 +440,29 @@ impl Cpu {
     /// both at once avoids reborrowing the CPU parent over a live child pointer.
     pub fn native_register_banks_mut(&mut self) -> (&mut [u64; 31], &mut [u128; 32]) {
         (&mut self.registers, &mut self.vectors)
+    }
+    /// Raw native-entry banks derived directly from one whole-CPU grant, without
+    /// creating a narrower register-array reference. Native system instructions
+    /// may reach the named fields via `native_system_offset`. Suspend Rust CPU
+    /// access until native return; callbacks must refresh both pointers after
+    /// their final CPU access. No pointer may outlive the CPU or its entry.
+    pub fn native_register_pointers(&mut self) -> (*mut u64, *mut u128) {
+        let parent = self as *mut Self;
+        unsafe {
+            (
+                std::ptr::addr_of_mut!((*parent).registers).cast(),
+                std::ptr::addr_of_mut!((*parent).vectors).cast(),
+            )
+        }
+    }
+    pub const fn native_system_offset(register: NativeSystemRegister) -> i64 {
+        let offset = match register {
+            NativeSystemRegister::Tls => std::mem::offset_of!(Self, tpidr_el0),
+            NativeSystemRegister::Tls2 => std::mem::offset_of!(Self, tpidr2_el0),
+            NativeSystemRegister::Fpcr => std::mem::offset_of!(Self, fpcr),
+            NativeSystemRegister::Fpsr => std::mem::offset_of!(Self, fpsr),
+        };
+        offset as i64 - std::mem::offset_of!(Self, registers) as i64
     }
     pub fn run_slice(&mut self, memory: &mut impl CpuMemory, budget: u64) -> SliceOutcome {
         self.run_slice_with_engine(memory, budget, None)
@@ -782,7 +820,7 @@ mod tests {
         cpu.step(&mut memory).unwrap();
         cpu.step(&mut memory).unwrap();
         cpu.step(&mut memory).unwrap();
-        assert_eq!(cpu.x(0), 1_000_000_000);
+        assert_eq!(cpu.x(0), counter::frequency());
         assert!(cpu.x(2) >= cpu.x(1));
         for instruction in [0xd50b7b21, 0xd50b7a21, 0xd50b7e21, 0xd50b7521] {
             memory = code(&[instruction]);
@@ -955,7 +993,10 @@ impl trames_engine::Cpu for Cpu {
     };
     const FEATURE_NAMES: &'static str = FEATURE_NAMES;
     fn counter_frequency() -> u64 {
-        extended::COUNTER_HZ
+        counter::frequency()
+    }
+    fn clock_sample() -> Option<trames_engine::ClockSample> {
+        counter::sample()
     }
     const EXACT_INSTRUCTIONS: bool = true;
     fn new(pc: u64, sp: u64) -> Self {

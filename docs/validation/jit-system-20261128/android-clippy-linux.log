@@ -1,0 +1,3 @@
+    Checking trames-jit v1.3.0 (/mnt/trames-output/jit-system-android/runtime/crates/trames-jit)
+    Checking trames-android-core v0.1.0 (/mnt/trames-output/jit-system-android/crates/trames-android-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s

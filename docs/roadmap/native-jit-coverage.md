@@ -23,6 +23,14 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   host advertises the extension; absent SM3/SM4 test reached-PC SIGILL without
   software emulation. Real SM3/SM4-positive execution still needs suitable hardware.
 
+- System registers and control boundaries: guest TLS/TLS2, FPCR/FPSR, NZCV,
+  read-only cache geometry, host-domain virtual counters and RNDR/RNDRRS;
+  DC ZVA and all supported cache maintenance, barriers/hints, precise BRK/HLT
+  and typed native-call exits. The entire existing shared-CPU list is covered
+  without interpreter entry. PAC/BTI hints retain the unadvertised compatibility
+  profile; this does not implement authenticated branches, MTE, SVE or SME.
+  See [system-category validation](../validation/jit-system-20261128.md).
+
 Cold gate closure also covers untranslated JSCVT, BF16, FHM, FCMA (including its
 FP16 dependency), DotProd, I8MM, RDM, FP16 and FRINT32/64. Their presence does not
 yet imply full native lowering. LS64 is rejected because this profile does not
@@ -31,17 +39,14 @@ change the interpreter-only backend's compatibility policy.
 
 ## Remaining categories
 
-1. System-register/TLS/FP environment and virtual counters, cache maintenance,
-   architectural hints and trap/native-call exits. Use guest state/time semantics;
-   never expose host TLS, host keys or raw guest system-call instructions.
-2. Remaining SIMD/FP arithmetic: scalar SIMD, widening/narrowing, shifts,
+1. Remaining SIMD/FP arithmetic: scalar SIMD, widening/narrowing, shifts,
    indexed multiply/add, reductions/pairwise forms, reciprocal families and
    precision conversions; FP16/BF16/DotProd/I8MM/RDM/FCMA/FHM native forms.
-3. Exclusive reservations: all LDXR/LDAXR/LDXP/LDAXP and STXR/STLXR/STXP/STLXP
+2. Exclusive reservations: all LDXR/LDAXR/LDXP/LDAXP and STXR/STLXR/STXP/STLXP
    widths, CLREX, precise faults and transitions through helpers/slices/workers.
-4. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
+3. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
    contract that can actually execute their hardware semantics.
-5. Existing PAC/BTI/MTE compatibility paths and stateful SVE/SME require explicit
+4. Existing PAC/BTI/MTE compatibility paths and stateful SVE/SME require explicit
    hardware/ABI ownership. Do not substitute new software extension state.
 
 Keep native capability admission and reserved-encoding decisions in compilation.

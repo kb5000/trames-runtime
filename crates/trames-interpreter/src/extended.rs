@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{shifted, sign_extend, width_mask, Cpu, CpuFault, Flags};
-use std::{sync::OnceLock, time::Instant};
 use trames_memory::CpuMemory;
-pub(super) const COUNTER_HZ: u64 = 1_000_000_000;
-static COUNTER_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
 #[inline]
 pub(super) fn ones(bits: u32) -> u64 {
@@ -400,18 +397,12 @@ impl Cpu {
             // Virtual 64-byte I/D lines, with automatic instruction coherence.
             self.set_x(rd, 0xb4448004);
         } else if ins & 0xffffffe0 == 0xd53be000 {
-            self.set_x(rd, COUNTER_HZ);
+            self.set_x(rd, crate::counter::frequency());
         } else if matches!(
             ins & 0xffffffe0,
             0xd53be040 | 0xd53be020 | 0xd53be0c0 | 0xd53be0a0
         ) {
-            self.set_x(
-                rd,
-                COUNTER_ORIGIN
-                    .get_or_init(Instant::now)
-                    .elapsed()
-                    .as_nanos() as u64,
-            );
+            self.set_x(rd, crate::counter::read());
         } else if ins & 0xffffffe0 == 0xd53bd0a0 {
             self.set_x(rd, self.tpidr2_el0);
         } else if ins & 0xffffffe0 == 0xd51bd0a0 {
