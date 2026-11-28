@@ -1,0 +1,44 @@
+UTC 2026-11-28T09:37:07.290740+00:00
+COMMAND ['cargo', 'test', '--release', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', '--test', 'differential', 'execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly', '--', '--exact', '--test-threads=1']
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.16.3
+   Compiling rustix v1.1.5
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.12.1
+   Compiling getrandom v0.3.4
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-host-compute)
+   Compiling parking_lot v0.12.5
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-boundary-baseline-source/crates/trames-jit)
+    Finished `release` profile [optimized] target(s) in 12.17s
+     Running tests/differential.rs (/mnt/trames-output/jit-boundary-baseline-target/release/build/trames-jit/de3dcead58910df6/out/differential-de3dcead58910df6)
+
+running 1 test
+test execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly ... FAILED
+
+failures:
+
+---- execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly stdout ----
+
+thread 'execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly' (352756) panicked at crates/trames-jit/tests/support/execution_boundary_category.rs:275:21:
+assertion failed: matches!(cpu.run_slice(&mut engine, &mut m, budget), SliceOutcome::Yield
+    { instructions: 0 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    execution_boundary_category::repeated_invalidation_yields_after_two_empty_entries_then_resumes_exactly
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trames-jit --test differential`
+
+EXIT 101 ELAPSED 12.212436072004493

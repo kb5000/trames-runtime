@@ -1,0 +1,57 @@
+{
+  "control-integer": {
+    "speed_ratio": 0.9866720219976524,
+    "pair_ratios": [
+      0.9600256355596088,
+      1.0074489566973301,
+      1.02187336348324,
+      0.9589330649376703
+    ],
+    "before_median_ns_per_round": 45824.9453125,
+    "after_median_ns_per_round": 45539.63671875
+  },
+  "control-scalar-memory": {
+    "speed_ratio": 0.9514717233222395,
+    "pair_ratios": [
+      0.9927567989568835,
+      0.8255166905909983,
+      0.9997670068506583,
+      1.0002671706725912
+    ],
+    "before_median_ns_per_round": 78426.69140625,
+    "after_median_ns_per_round": 86754.05078125
+  },
+  "svc-only": {
+    "speed_ratio": 0.999114444701142,
+    "pair_ratios": [
+      0.9981473649613691,
+      1.0183494198026244,
+      0.9913847916256344,
+      0.9888427053680627
+    ],
+    "before_median_ns_per_round": 5.11183,
+    "after_median_ns_per_round": 5.1438675
+  },
+  "svc-round-trip": {
+    "speed_ratio": 0.9994008568693056,
+    "pair_ratios": [
+      1.0075188822233863,
+      0.9509987036669186,
+      0.9863602130781898,
+      1.055577695690698
+    ],
+    "before_median_ns_per_round": 5.2496675,
+    "after_median_ns_per_round": 5.30207125
+  },
+  "svc-continuation": {
+    "speed_ratio": 1.0153061298373105,
+    "pair_ratios": [
+      1.0371095835955968,
+      0.9615109859354757,
+      1.073652285188272,
+      0.9925342036289143
+    ],
+    "before_median_ns_per_round": 9.12169625,
+    "after_median_ns_per_round": 8.99953875
+  }
+}

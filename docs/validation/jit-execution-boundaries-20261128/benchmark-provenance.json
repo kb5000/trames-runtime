@@ -1,0 +1,57 @@
+{
+  "baseline_runtime": "77a2f4716c2231cc3956eb8253b3dda7506f83a4",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "page_size": 4096,
+  "cpu_affinity": 0,
+  "samples": 32,
+  "warmup": 8,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "binaries": {
+    "before": {
+      "compatibility-category": {
+        "sha256": "808f25846c86ea55bd5d5f3eb0399965bf779286d50cecfb7de6bf9ee6f06e5e",
+        "source": "/mnt/trames-output/jit-boundary-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-boundary-baseline-target"
+      },
+      "execution-entry": {
+        "sha256": "a23f13fc5f63ef84e738e5e6a58cc36e5450b39fbf92932eacdbd3fd3721f6f4",
+        "source": "/mnt/trames-output/jit-boundary-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-boundary-baseline-target"
+      }
+    },
+    "after": {
+      "compatibility-category": {
+        "sha256": "48d8da60eb7f3e9bbcf0a4b790df92df7d1bcf10f64178fc63d5033f8b6fb915",
+        "source": "/mnt/trames-output/jit-boundary-source",
+        "target_dir": "/mnt/trames-output/jit-boundary-linux-target"
+      },
+      "execution-entry": {
+        "sha256": "89c438ba8e5e30b0ca940d205bc47c6eba75588b6210bc712a1969ab3b567040",
+        "source": "/mnt/trames-output/jit-boundary-source",
+        "target_dir": "/mnt/trames-output/jit-boundary-linux-target"
+      }
+    }
+  },
+  "harness_sha256": {
+    "compatibility-category": "534e367d4a68222f2516b7454502a3f7f6d1c384edbc744bd5a6ecabb4d1182b",
+    "execution-entry": "2a4bec21fdac2158f4e83542c35063978e202efd62cfeec9ac7d78b19ccebb4d"
+  },
+  "workloads": [
+    "control-integer",
+    "control-scalar-memory",
+    "svc-only",
+    "svc-round-trip",
+    "svc-continuation"
+  ],
+  "hwcap": "0xefb3ffff",
+  "hwcap2": "0x2000100326181"
+}

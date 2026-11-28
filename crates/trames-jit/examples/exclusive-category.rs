@@ -63,7 +63,7 @@ fn measure(name: &str, words: &[u32], stride: u64, retry: u64, m: &mut impl CpuM
     let mut state = Aarch64State {
         pc: 0x1000,
         sp: DATA,
-        nzcv: 0xb,
+        nzcv: 0xb0000000,
         ..Default::default()
     };
     state.registers[1] = DATA;

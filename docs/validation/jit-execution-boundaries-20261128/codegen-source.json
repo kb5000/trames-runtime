@@ -1,0 +1,10 @@
+{
+  "unchanged_sections_sha256": {
+    "assembler": "62a67d04d65700211113d09c3878eb290462c004980fab5fc77be3c1168b9c51",
+    "renderer": "00db9bdf0644b6ab31ca34a75f1cee74f2e90294a11b99ee5406cf449170a09a",
+    "compiler": "2f350cdee450fb8b61ac41c8a4a606deed19c136c911a613937730ad1f1f4cdc"
+  },
+  "existing_frame_abi_bytes": 120,
+  "native_epoch_guard_emission_unchanged": true,
+  "retry_limit": "const-generic true/false, no hot runtime flag or counter"
+}

@@ -187,9 +187,9 @@ impl Cpu {
     ) -> SliceOutcome {
         self.fault_retired = 0;
         // Same slice borrow as the interpreter; no new global/resource lock.
-        self.run_borrowed(engine, &mut *memory.cpu_slice(), budget)
+        self.run_borrowed::<true>(engine, &mut *memory.cpu_slice(), budget)
     }
-    fn run_borrowed(
+    fn run_borrowed<const RETRY: bool>(
         &mut self,
         engine: &mut Engine,
         memory: &mut impl CpuMemory,
@@ -238,6 +238,18 @@ impl Cpu {
                             return SliceOutcome::Yield {
                                 instructions: retired,
                             }
+                        }
+                        native::Exit::Retry => {
+                            // No instruction ran. Reborrow current epochs and
+                            // let the original identity/page cache revalidate.
+                            // The retry limit is monomorphized: no hot local
+                            // counter/flag, and at most one cold extra entry.
+                            if RETRY {
+                                return self.retry_invalidated(engine, memory, budget, retired);
+                            }
+                            return SliceOutcome::Yield {
+                                instructions: retired,
+                            };
                         }
                         native::Exit::NativeCall => {
                             return SliceOutcome::NativeCall {
@@ -307,6 +319,47 @@ impl Cpu {
         }
         SliceOutcome::Yield {
             instructions: retired,
+        }
+    }
+    #[cfg(all(
+        feature = "native-aarch64",
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[cold]
+    #[inline(never)]
+    fn retry_invalidated(
+        &mut self,
+        engine: &mut Engine,
+        memory: &mut impl CpuMemory,
+        budget: u64,
+        retired: u64,
+    ) -> SliceOutcome {
+        // All epoch/data/FP loans ended with the previous native return. Keep
+        // the original slice custody and CPU banks; do not copy task state or
+        // request another slice borrow. Continued invalidation yields its slot.
+        match self.run_borrowed::<false>(engine, memory, budget - retired) {
+            SliceOutcome::Yield { instructions } => SliceOutcome::Yield {
+                instructions: retired + instructions,
+            },
+            SliceOutcome::Syscall { instructions } => SliceOutcome::Syscall {
+                instructions: retired + instructions,
+            },
+            SliceOutcome::NativeCall {
+                instructions,
+                pc,
+                module,
+                function,
+            } => SliceOutcome::NativeCall {
+                instructions: retired + instructions,
+                pc,
+                module,
+                function,
+            },
+            SliceOutcome::Fault(error) => {
+                self.fault_retired += retired;
+                SliceOutcome::Fault(error)
+            }
         }
     }
 }

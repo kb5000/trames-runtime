@@ -22,7 +22,7 @@ fn initial() -> Aarch64State {
         sp: 0x2ff0,
         tpidr_el0: 0x12345678,
         tpidr2_el0: 0x9876,
-        nzcv: 0xb,
+        nzcv: 0xb0000000,
         fpcr: 0,
         fpsr: 0x10,
         ..Default::default()
@@ -961,12 +961,12 @@ fn random_register_category_publishes_architectural_success_flags() {
             let mut c = Cpu::new(0x1000, 0);
             let mut e = Engine::default();
             let mut state = initial();
-            state.nzcv = 15;
+            state.nzcv = 0xf0000000;
             c.restore_architectural_state(&state);
             assert_eq!(outcome(&c.run_slice(&mut e, &mut m, 64)), ("syscall", 2));
             let flags = c.architectural_state().nzcv;
-            assert!(flags == 0 || flags == 4);
-            if flags == 4 && rd != 31 {
+            assert!(flags == 0 || flags == 0x40000000);
+            if flags == 0x40000000 && rd != 31 {
                 assert_eq!(c.x(rd as usize), 0);
             }
             assert_eq!(e.stats.fallback_instructions, 0);
@@ -2657,6 +2657,7 @@ fn parallel_code_write_breaks_a_running_native_chain_at_its_epoch_guard() {
     assert_eq!(instructions, c.x(0) * 2 + 1);
     assert_eq!(c.pc(), 0x1004);
     assert!(e.link_stats().linked_blocks > 0);
+    assert_eq!(e.stats.fallback_instructions, 0);
 }
 
 #[test]
@@ -4257,3 +4258,6 @@ mod special_memory_category;
 
 #[path = "support/compatibility_category.rs"]
 mod compatibility_category;
+
+#[path = "support/execution_boundary_category.rs"]
+mod execution_boundary_category;

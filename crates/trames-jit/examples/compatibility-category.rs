@@ -35,7 +35,7 @@ fn measure(name: &str, words: &[u32], stride: u64, tail: u64) {
     let mut state = Aarch64State {
         pc: 0x1000,
         sp: DATA,
-        nzcv: 0xb,
+        nzcv: 0xb0000000,
         tpidr_el0: 123,
         tpidr2_el0: 456,
         fpsr: 0x10,

@@ -73,6 +73,15 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   836 encodings, with whole-state/data/budget/fault and reservation acceptance.
   See [compatibility validation](../validation/jit-compatibility-20261128.md).
 
+- Execution invalidation boundaries: scalar/linked, vector and fused-memory
+  entries that observe a changed execution epoch now revalidate and retry
+  natively. One cold extra entry is selected by const specialization; continued
+  invalidation yields the execution slot without interpreting an instruction.
+  Existing CPU publication, FP scope, memory loans and reservation ownership
+  remain unchanged. Whole-state/retirement tests include all NZCV combinations,
+  dirty-prefix exits and guest-authorized self-modification. See
+  [execution-boundary validation](../validation/jit-execution-boundaries-20261128.md).
+
 LSE128 is exposed only when the process host provides it. LS64 and full hardware
 PAC/BTI/MTE remain unadvertised without their required shared-CPU/memory ownership.
 This does not change the interpreter-only backend's compatibility policy. New
@@ -88,13 +97,20 @@ This is not a claim of every host ISA extension or every future encoding.
    CPU/context/memory ABI ownership. LS64 needs its Device-memory contract and
    SETG needs allocation-tag ownership. These capabilities remain unadvertised;
    do not substitute software extension state or interpret them as simpler ops.
-2. A changed execution epoch can still use the original one-instruction boundary
-   fallback. This is separate from steady-state instruction-category coverage.
-   Unknown embeddings without hardware memory-order ownership retain their
-   conservative atomic/barrier path. Product Memory/View exposes that ownership.
+2. Unknown embeddings without hardware memory-order ownership retain their
+   conservative ordered/atomic path. Product Memory/View exposes that ownership.
+   The generic one-instruction interpreter entry also remains for encodings not
+   recognized by the native compiler; it can report an instruction fault rather
+   than successfully execute an instruction. This is not full host-ISA coverage.
+   Changed execution epochs now retry/yield natively, not through that fallback.
 3. Positive extension hardware, Option-B MOPS/migration and real Android app-UID,
    ART interaction and large-page devices remain acceptance work. Linux native,
    independent ISA-model execution and Windows APK compilation are distinct.
+
+Compile-time interpreter-only configurations (including iPad and non-AArch64
+hosts) intentionally omit native execution. Checked Memory/View callbacks,
+cross-page staging, syscall/native-call dispatch and guest faults are not by
+themselves interpreter fallback. The direct SVC exit remains native.
 
 Keep native capability admission and reserved-encoding decisions in compilation.
 Do not add guest-text rewrites, hot preflights, stronger ordinary-memory ordering,

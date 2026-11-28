@@ -154,6 +154,8 @@ pub(super) enum Exit {
     Syscall,
     NativeCall,
     Yield,
+    /// Existing entry guard observed changed code before any guest instruction.
+    Retry,
 }
 
 /// One native entry owns this stack frame and its borrowed epoch pointers.
@@ -1029,8 +1031,12 @@ impl Cache {
             self.last = Some(self.handle(frame.last_slot as usize));
         }
         if frame.blocks == 0 {
-            return Ok(None);
-        } // changed epoch: use existing single-step fallback
+            return Ok(Some(Executed {
+                instructions: 0,
+                blocks: 0,
+                exit: Exit::Retry,
+            }));
+        }
         Ok(Some(Executed {
             instructions: budget - frame.remaining,
             blocks: frame.blocks,
@@ -1070,7 +1076,11 @@ impl Cache {
             self.last = Some(self.handle(vector_frame.frame.last_slot as usize));
         }
         if vector_frame.frame.blocks == 0 {
-            return Ok(None);
+            return Ok(Some(Executed {
+                instructions: 0,
+                blocks: 0,
+                exit: Exit::Retry,
+            }));
         }
         Ok(Some(Executed {
             instructions: budget - vector_frame.frame.remaining,
@@ -1216,7 +1226,11 @@ impl Cache {
             self.last = Some(self.handle(fused.frame.last_slot as usize));
         }
         if fused.frame.blocks == 0 {
-            return Ok(None);
+            return Ok(Some(Executed {
+                instructions: 0,
+                blocks: 0,
+                exit: Exit::Retry,
+            }));
         }
         Ok(Some(Executed {
             instructions: budget - fused.frame.remaining,

@@ -1,0 +1,65 @@
+{
+  "baseline_runtime": "77a2f4716c2231cc3956eb8253b3dda7506f83a4",
+  "baseline_android": "31a1c75ec932d63a56cb0af02313f1a334345bba",
+  "runtime_source_sha256": {
+    "crates/trames-jit/src/lib.rs": "c6b253092323de54450bdada68641709af41f130a2a39a10da66dd1fb6a2facd",
+    "crates/trames-jit/src/native.rs": "0cb4dd4e6068417d539de76045e60f1aa85e758c59e9eecdae7b54e7bcdc0873",
+    "crates/trames-jit/tests/differential.rs": "75d77172f4cbddc4448ee65bd13d02943d2f2e601498013df2075ca4c712d67d",
+    "crates/trames-jit/tests/support/execution_boundary_category.rs": "ca7d06a90116fcc1f4fb3e551e0008e8af2c94067455be67d15a655bdefd697b",
+    "crates/trames-jit/examples/compatibility-category.rs": "534e367d4a68222f2516b7454502a3f7f6d1c384edbc744bd5a6ecabb4d1182b",
+    "crates/trames-jit/examples/exclusive-category.rs": "dbeb96adee9076751fd3008a2ff242e03397055abd83e4bcb51313d5359cb48a",
+    "crates/trames-jit/examples/execution-entry.rs": "2a4bec21fdac2158f4e83542c35063978e202efd62cfeec9ac7d78b19ccebb4d"
+  },
+  "android_core_sha256": "91e0a217ee7710160a4268d16764c0a99ea9f27422c5b42d1d1d81076119efe8",
+  "native_tests": {
+    "unit": 26,
+    "differential": 120,
+    "profiles": [
+      "debug",
+      "release"
+    ],
+    "new_category_tests": 8,
+    "new_category_scenarios": 618
+  },
+  "apple_fallback_tests": 115,
+  "android_core_tests": {
+    "jit": 4,
+    "default": 1,
+    "new_probe_programs": 20,
+    "linux_result": "passed, directly observed tool-session result; no retained raw log",
+    "apple_jit_log": "android-apple-jit.log"
+  },
+  "expected_negative": "baseline repeated-empty-invalidation test runs 1 and fails Yield{instructions:0}; exit 101",
+  "test_fixture_followup": "cpu_hardware_ordering method matches native-aarch64 trait cfg; final default-feature strict Clippy passes. Native-feature behavior unchanged.",
+  "benchmarks": {
+    "rows": 1280,
+    "warmup_rows_included": true,
+    "samples_per_run": 32,
+    "warmups_per_run": 8,
+    "balanced_pairs": 4,
+    "cpu_affinity": 0,
+    "independent_snapshot_target_directories": true
+  },
+  "native_lowering_source_unchanged": "codegen-source.json",
+  "android_device_status": "not executed; Windows Android tooling and actual app-UID/ART/16-KiB acceptance remain outstanding",
+  "artifact_sha256": {
+    "actual-ipad-cpu-tree.txt": "bf8eb4d517debe292e55f79daa2bec8792a2f0673c49ee1bcefc83f4d44d21ca",
+    "after-compatibility-category-build.jsonl": "a2e8209b7478f91b88491ea5df42b8b15a1d9eff72e4fdb90b7ddc9de953497b",
+    "after-execution-entry-build.jsonl": "f1647e698860db52f8552e8d6f61508e825d290f4691da07cf0cbdceb38531bb",
+    "android-apple-jit.log": "cd1080c09b48ab6008392c080af36b7a8063025cb91c3374f639d4ab0b695f43",
+    "apple-fallback.log": "a779bc777f18485543f610cd374bcc5205ad03d790fa03323d45435139b270b7",
+    "baseline-regression.log": "3b3ecf32c1b902432e601c637b35e61889442db43add4a6074ea34aa1b3ce43d",
+    "before-compatibility-category-build.jsonl": "9b0f9e35abc62bb18fb468351b65494fbb91526da3ee1b033ba37c47c0990d13",
+    "before-execution-entry-build.jsonl": "207f021fe24c444357af243416ed9215c589a5166858610eb813a4185f98054d",
+    "benchmark-provenance.json": "317bd6e91d2b27d005cb993c24be3b87d1579d7e68fb30561fd35d98c5361a88",
+    "benchmark-samples.jsonl": "a4bab36e956fb7824f40aef2720749f4206c0bc986f9997132757a8947f99d44",
+    "benchmark-summary.json": "8f945a0268c0b57a1618fa71236ad27a0f4566d7fd6ac7eb315ceb59ddde7130",
+    "clippy-amd64.log": "0ddd16b20ac73baddbfb8b96c93fb55f2fef10254c368e8c7245ef4b1d7ab777",
+    "clippy-apple-default.log": "712dc5424b13b1b4d4846eb65b758ebaaaed3ad3196e4dd2deb1f5c23ed1a6f4",
+    "clippy-apple.log": "20321c5755366e4e504770f8892d644ca0803b8e13aff1e310040e816454e1bb",
+    "clippy-linux.log": "a4043f961cfe0f0680c486ff384ea7f068379f5aa3ad9c3d12aafc4122093460",
+    "codegen-source.json": "47cb209963f661946ba883fc42d1301fcf03b503321198c071025de27b878439",
+    "native-debug.log": "d149511b308a7d1589af91882bd7f40522a56a2135c35c82552c924da5c87e92",
+    "native-release.log": "f9db663557315fa2fe4eb6978c3866fa2dc5250658f100818618b10ca1919c6c"
+  }
+}
