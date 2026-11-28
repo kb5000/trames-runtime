@@ -1,0 +1,12 @@
+{
+  "unchanged_source_sections_sha256": {
+    "assembler": "0b21bbb0def97e460c563697d2755bc819b5c84caf4f3d67ffb5d0e25ac39725",
+    "renderer": "64f78757f83e498a632700322c2ee5cb72a8ec37cb703ff6b5a09416be4a188d",
+    "execution": "7801d4be071b00b3c2a3a185b2d91b327091685fb0257098b0c33b8978413e58",
+    "product_memory_impl": "79770bff1aa393015ff16923999310af71546ffa08d032c96c60deb745d45fe8",
+    "product_view_file": "4cc141a9a1e9c88a30aea8717b8754b16a995a761064dc02df0b5b0f1dc1a473",
+    "jit_outer_dispatch_file": "c6b253092323de54450bdada68641709af41f130a2a39a10da66dd1fb6a2facd"
+  },
+  "new_decisions": "abstract ordering boundary selected only by the cold compiler; no Operation/Block/Frame field or generated instruction added",
+  "production_defaults": "Memory/View continue using their unchanged concrete ordered and atomic overrides"
+}

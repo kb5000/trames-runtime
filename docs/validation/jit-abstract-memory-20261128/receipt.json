@@ -1,0 +1,129 @@
+{
+  "baseline_runtime": "e8d9d339e5a3d78db0f7e3410538a4d48d97c846",
+  "baseline_android": "025e4e2a5cd038091db02665bf1d2c0d7e9bf7a0",
+  "runtime_source_sha256": {
+    "crates/trames-jit/src/native.rs": "18bced16e2da6a9e1aeb0aa4eee794b8235424bb17f180223440649b9e4b832d",
+    "crates/trames-jit/src/memory_ops.rs": "1b980a02d512e9df320071c4c506b1df96f2300789cf0f58411f946fed1a4ef3",
+    "crates/trames-memory/src/cpu_memory.rs": "2954e9775fdd59cb1924f3f9400e4f55b8193a7a5b2a36a58dff1c9ad6905e78",
+    "crates/trames-jit/tests/differential.rs": "53a9c074bcd116e4b78c2125eae1dcb793bdee83519770883c1cca1f5d29a1e6",
+    "crates/trames-jit/tests/support/abstract_memory_category.rs": "7ce4f008738c765ec621a05d028bca2dd8ee6f566b6195743eabf2cd963f914b",
+    "crates/trames-jit/examples/abstract-memory.rs": "5e9f5cf2042b957a47e22a802063bd6298ab185f8fef99e388086959647dbf3b",
+    "scripts/audit-jit-abstract-memory.py": "dcc29124de1a818a9b63438318ea97a08208ed4e4d0e1b7f38d633f8511380b0"
+  },
+  "android_source_sha256": {
+    "crates/trames-android-core/src/lib.rs": "c936c8dcb20edc15e855d5405a6d8eb0a3a8fbdaec40dff9ab4a11de740a3666",
+    "crates/trames-android-core/src/abstract_memory_probe.rs": "02645bc85ee5013ce4da0273d4e5903470537d01328a1e5a9818043ce6f3662f"
+  },
+  "fixture": {
+    "encodings": 795,
+    "families": {
+      "ldar": 12,
+      "stlr": 12,
+      "ldlar": 12,
+      "stllr": 12,
+      "ldapr": 12,
+      "stlur": 60,
+      "ldapur": 135,
+      "cas": 48,
+      "ldadd": 48,
+      "ldclr": 48,
+      "ldeor": 48,
+      "ldset": 48,
+      "ldsmax": 48,
+      "ldsmin": 48,
+      "ldumax": 48,
+      "ldumin": 48,
+      "swp": 48,
+      "casp": 24,
+      "swpp": 12,
+      "ldclrp": 12,
+      "ldsetp": 12
+    },
+    "cold_positive_codegen": 771,
+    "actual_host_positive_encodings": 735,
+    "successful_programs": 17640,
+    "fault_programs": 26460,
+    "reservation_programs": 6,
+    "missing_host_programs": 180,
+    "android_native_probe_programs": 21,
+    "all_probe_words_in_independent_fixture": true
+  },
+  "acceptance": {
+    "linux_full_suite_per_profile": [
+      27,
+      123
+    ],
+    "added_negative_test_per_profile": 1,
+    "linux_distinct_tests_per_profile": 151,
+    "apple_full_suite": 118,
+    "apple_added_negative_test": 1,
+    "linux_memory": [
+      287,
+      3
+    ],
+    "apple_memory": [
+      283,
+      3
+    ],
+    "memory_tuple_meaning": [
+      "passed",
+      "preexisting_ignored"
+    ],
+    "android_core": {
+      "jit": 5,
+      "default": 1
+    },
+    "expected_red": "baseline whole-category test executes and fails with fallback count 2, exit101"
+  },
+  "host": {
+    "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+    "page_size": 4096,
+    "hwcap": "0xefb3ffff",
+    "hwcap2": "0x2000100326181",
+    "cpu_affinity": 0
+  },
+  "comments_after_acceptance": "Two explanation-only comments in default memory transports were added after tests; executable code is unchanged.",
+  "performance": {
+    "samples_including_warmups": 1024,
+    "samples_per_run": 32,
+    "warmups": 8,
+    "balanced_pairs": 4,
+    "snapshot_caches_distinct": true,
+    "zero_fallback_after": true,
+    "positive_lse128_lor_hardware": false
+  },
+  "artifact_sha256": {
+    "actual-ipad-cpu-tree.txt": "bf8eb4d517debe292e55f79daa2bec8792a2f0673c49ee1bcefc83f4d44d21ca",
+    "after-abstract-memory-build.jsonl": "02efdc6cec14e9a2ed0658ed5aa4f70cbc3eb476ed84e7fe47c35a5168910030",
+    "after-compatibility-category-build.jsonl": "3a1817bf5aaad3dc3ba1e4b818d5561e4aa0b5a47258fe2cb66b6d33792f7f14",
+    "android-apple.log": "9f4dd1d2e8fe8ae84f5a602f28e66578de438a6c0827d59d835d8e1b79727b5f",
+    "android-clippy-apple.log": "a78f1ed114eb4ead4f47690366885aa1971e85513d329b083fb20b8754df4b07",
+    "android-clippy-linux.log": "8e9f4436c13b6aacf9c06d05ad4fb282db606ebf2ed9bcfbd4fbd3fa5f5315f4",
+    "android-default-apple.log": "d8c8e581724a88a7ef524a905a0850ab212fd10f2acd27ecb141615efd2bbb51",
+    "android-default-linux.log": "9228756577edb0b98784c7bff990d40982bf80629153f2adacc5a176f36a1dc9",
+    "android-linux.log": "87683ef5449fbdde6253204abd5d5e50882460aeccf11957b56b495045769a62",
+    "baseline-regression.log": "5e0b5102e11da7e6150521e7851c56a54a732758a3814229f43bd6bcf7103e23",
+    "before-abstract-memory-build.jsonl": "7973265dadbe1e8a063d5a99aabcf11fed42bccc05f91fa0970fb97bbd3b2ebc",
+    "before-compatibility-category-build.jsonl": "cd0f8b61dd129bfe3c016fd4e0d49e61af2a62b07fb6ccd0113e32daff0c8bb1",
+    "benchmark-provenance.json": "dff5c9b4592c25dd14b4e1b239a312e47fbc1e2db387f859e9d269c8028ad8ad",
+    "benchmark-samples.jsonl": "1fa002ae26dad5714e2ce1917608572dcf40a5dd722a3ebd5b0f9d935f2c85eb",
+    "benchmark-summary.json": "1f529f0e64d9669db784fd4bd94113849ecdc5f564b9bc367e5c03c9e68e44da",
+    "benchmarks.S": "26c40c56696baa347b59fc17d333c50df5b5d696977cd724a3db9d9c1bcafce1",
+    "category.S": "09de6bcf775003461dfa2e46673f23046b0b52ae26ef10b8ee5bbb45f465b728",
+    "category.cases": "ff8754523314bb3ed0fa3699e58aa56465aa103f5dcc3c72c5ed0789401d5b1b",
+    "category.words": "0838b5ce1b9cfcf30b5b9321f7efc8c42691fea5d7368e4e01a95d0f99f8c703",
+    "clippy-amd64.log": "d59f9bad37e020cad5cd75560e671f35a0d4b91cdb260a564766211a9c96e07a",
+    "clippy-apple.log": "b38338fe1e4ef090dd75287c26da337fc4a6ce07b2988b697b6f44ff94ef1cf2",
+    "clippy-linux.log": "4caa1e2f53a5858514b1cfeae437b5d416a032b59822b4b35f47265b6f0fe409",
+    "debug-linux.log": "a387c3f026a400b718e076806f6e06449d3d5c1e69f0e61699b1181c2a77f0ff",
+    "default-clippy-apple.log": "c17d8caa98dc9ae8f0d21a75c6774c4d8d4377df60c9fa55a23a810b3a65bb39",
+    "jit-apple.log": "9ed457d16c01364d6a18f675306bc158d8c967c0889a78c1b2f21d4337dfd12e",
+    "memory-apple.log": "f3b47ad36c8f172edab0d5b075f803f3955a68ade233a85bf56f054d3538cc47",
+    "memory-linux.log": "e7aa03c53ad1b11074783d2cc324e5630ba8d66456f09c0f4bbccba2b7e82fb9",
+    "negative-apple.log": "1b66cb460102f7c3af90c34e012d5da40295244e9efa68f7ac8928f70b242e93",
+    "negative-linux.log": "27540d1e2c2560eabb85310a3bbf08c240c3cf3d77ce25b56a757a6b2d18c99a",
+    "negative-release-linux.log": "db6396a30f82bfe14313a770dde4e81abcb849800dc9c3de1f6058ea634e47c0",
+    "product-source-audit.json": "1a2598133976799be034598c07ef7f08ba093a4c73249c0479e8daa571b0a489",
+    "release-linux.log": "d5aa11e5d20f11986f6ea74391afed1cc9814324f7326d2d3ad61041cd29fcc2"
+  }
+}

@@ -82,6 +82,16 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   dirty-prefix exits and guest-authorized self-modification. See
   [execution-boundary validation](../validation/jit-execution-boundaries-20261128.md).
 
+- Abstract CpuMemory ordered/atomic category: all existing LDAR/STLR,
+  LDAPR/LDAPUR/STLUR and signed forms, CAS/CASP, LSE RMW/store aliases and
+  host-admitted LSE128/LOR now use real native fragments through the original
+  read/write/atomic-update/fence authority, without interpreter entry. Cold
+  compilation keeps abstract ordered accesses at their callback boundary even
+  when aliases are offered. Product Memory/View retains its existing direct
+  hardware/fused path. The independent LLVM matrix has 795 encodings; full
+  callback/state/fault/reservation acceptance and absent-host rejection are
+  recorded in [validation](../validation/jit-abstract-memory-20261128.md).
+
 LSE128 is exposed only when the process host provides it. LS64 and full hardware
 PAC/BTI/MTE remain unadvertised without their required shared-CPU/memory ownership.
 This does not change the interpreter-only backend's compatibility policy. New
@@ -97,12 +107,12 @@ This is not a claim of every host ISA extension or every future encoding.
    CPU/context/memory ABI ownership. LS64 needs its Device-memory contract and
    SETG needs allocation-tag ownership. These capabilities remain unadvertised;
    do not substitute software extension state or interpret them as simpler ops.
-2. Unknown embeddings without hardware memory-order ownership retain their
-   conservative ordered/atomic path. Product Memory/View exposes that ownership.
-   The generic one-instruction interpreter entry also remains for encodings not
+2. The generic one-instruction interpreter entry remains for encodings not
    recognized by the native compiler; it can report an instruction fault rather
    than successfully execute an instruction. This is not full host-ISA coverage.
    Changed execution epochs now retry/yield natively, not through that fallback.
+   Abstract ordered/atomic embeddings now retain their own fence/transaction
+   semantics through native fragments, rather than interpreter stepping.
 3. Positive extension hardware, Option-B MOPS/migration and real Android app-UID,
    ART interaction and large-page devices remain acceptance work. Linux native,
    independent ISA-model execution and Windows APK compilation are distinct.

@@ -1,0 +1,22 @@
+UTC 2026-11-28T10:09:40.691402+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-android-core']
+   Compiling trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-android-source/runtime/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-android-source/runtime/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-android-source/runtime/crates/trames-interpreter)
+   Compiling trames-android-core v0.1.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-android-source/crates/trames-android-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.60s
+     Running unittests src/lib.rs (/Users/main/dev/trames/target/jit-abstract-macos/debug/build/trames-android-core/056567190bb9c313/out/trames_android_core-056567190bb9c313)
+
+running 1 test
+test tests::guest_cpu_probe_keeps_original_instructions_and_exact_exit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trames_android_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 2.954023458

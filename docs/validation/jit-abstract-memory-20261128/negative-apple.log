@@ -1,0 +1,13 @@
+UTC 2026-11-28T10:10:45.266920+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', '--test', 'differential', 'missing_host_extensions_fault_before_abstract_provider_data_callbacks']
+   Compiling trames-jit v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-source/crates/trames-jit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.29s
+     Running tests/differential.rs (/Users/main/dev/trames/target/jit-abstract-macos/debug/build/trames-jit/58ad60b240b6e82c/out/differential-58ad60b240b6e82c)
+
+running 1 test
+test abstract_memory_category::missing_host_extensions_fault_before_abstract_provider_data_callbacks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 1.768441542

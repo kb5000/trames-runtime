@@ -1,0 +1,42 @@
+UTC 2026-11-28T10:10:28.376022+00:00
+COMMAND ['cargo', 'test', '--locked', '--release', '-p', 'trames-jit', '--features', 'native-aarch64', '--test', 'differential', 'abstract_memory_category::all_llvm_abstract_ordered_and_atomic_forms_preserve_canonical_callbacks_without_fallback', '--', '--exact', '--nocapture']
+   Compiling libc v0.2.190
+   Compiling parking_lot_core v0.9.12
+   Compiling cfg-if v1.0.5
+   Compiling smallvec v1.16.3
+   Compiling rustix v1.1.5
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.12.1
+   Compiling getrandom v0.3.4
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-host-compute)
+   Compiling parking_lot v0.12.5
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-abstract-baseline-source/crates/trames-jit)
+    Finished `release` profile [optimized] target(s) in 9.99s
+     Running tests/differential.rs (/mnt/trames-output/jit-abstract-baseline-target/release/build/trames-jit/de3dcead58910df6/out/differential-de3dcead58910df6)
+
+running 1 test
+
+thread 'abstract_memory_category::all_llvm_abstract_ordered_and_atomic_forms_preserve_canonical_callbacks_without_fallback' (357854) panicked at crates/trames-jit/tests/support/abstract_memory_category.rs:308:5:
+assertion `left == right` failed: 8dffc20
+  left: 2
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test abstract_memory_category::all_llvm_abstract_ordered_and_atomic_forms_preserve_canonical_callbacks_without_fallback ... FAILED
+
+failures:
+
+failures:
+    abstract_memory_category::all_llvm_abstract_ordered_and_atomic_forms_preserve_canonical_callbacks_without_fallback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trames-jit --test differential`
+
+EXIT 101 ELAPSED 10.023316901002545

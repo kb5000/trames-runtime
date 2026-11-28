@@ -1,0 +1,6 @@
+UTC 2026-11-28T10:10:47.057692+00:00
+COMMAND ['cargo', 'clippy', '--locked', '-p', 'trames-jit', '-p', 'trames-memory', '--features', 'trames-jit/native-aarch64', '--all-targets', '--', '-D', 'warnings']
+    Checking trames-jit v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-source/crates/trames-jit)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
+
+EXIT 0 ELAPSED 0.43273933400000003

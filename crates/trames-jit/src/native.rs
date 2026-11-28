@@ -3072,6 +3072,12 @@ fn compile_body(
             let Some(op) = crate::memory_ops::Operation::compile(memory, pc)? else {
                 break;
             };
+            // Abstract providers own ordering at their canonical callbacks,
+            // not at a temporary native operand. Keep these operations at the
+            // existing single-operation boundary; product RAM still fuses.
+            if (op.ordered || op.atomic.is_some()) && !memory.cpu_hardware_ordering() {
+                break;
+            }
             if op.vector && !code.floating && !memory_ops.is_empty() {
                 return compile_body(
                     memory,

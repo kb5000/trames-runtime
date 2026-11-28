@@ -1,0 +1,23 @@
+UTC 2026-11-28T10:09:39.342734+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-android-core', '--features', 'jit']
+   Compiling trames-android-core v0.1.0 (/Users/main/dev/trames/target/local-ci/io/jit-abstract-android-source/crates/trames-android-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running unittests src/lib.rs (/Users/main/dev/trames/target/jit-abstract-macos/debug/build/trames-android-core/bb076c84394975e4/out/trames_android_core-bb076c84394975e4)
+
+running 5 tests
+test tests::compatibility_probe_preserves_the_existing_profile_without_interpreter_fallback ... ok
+test tests::execution_boundaries_revalidate_only_guest_authorized_code_changes ... ok
+test tests::abstract_ordered_memory_keeps_original_fence_callbacks_without_fallback ... ok
+test tests::special_memory_probe_uses_only_host_admitted_native_stages ... ok
+test tests::guest_cpu_probe_keeps_original_instructions_and_exact_exit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trames_android_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 1.3222385829999999

@@ -418,9 +418,6 @@ impl Operation {
         let cas = word & 0x3fa07c00 == 0x08a07c00;
         let rmw = word & 0x3f200c00 == 0x38200000 && word & 0x3ffffc00 != 0x38bfc000;
         if cas_pair || cas || rmw {
-            if !memory.cpu_hardware_ordering() {
-                return Ok(None);
-            }
             let source = ((word >> 16) & 31) as usize;
             if cas_pair && (source % 2 != 0 || rt % 2 != 0) || rmw && (word >> 12) & 15 > 8 {
                 return Ok(None);
@@ -457,9 +454,6 @@ impl Operation {
             .map(Some);
         }
         if matches!(word & 0xff20fc00, 0x19208000 | 0x19201000 | 0x19203000) {
-            if !memory.cpu_hardware_ordering() {
-                return Ok(None);
-            }
             let second = ((word >> 16) & 31) as usize;
             if rt == 31 || second == 31 || rt == second {
                 return Ok(None);
@@ -524,9 +518,6 @@ impl Operation {
             .map(Some);
         }
         if word & 0x3ffffc00 == 0x38bfc000 || word & 0x3f200c00 == 0x19000000 {
-            if !memory.cpu_hardware_ordering() {
-                return Ok(None);
-            }
             let unscaled = word & 0x3f200c00 == 0x19000000;
             let size = 1usize << (word >> 30);
             let opc = if unscaled { (word >> 22) & 3 } else { 1 };
@@ -564,9 +555,6 @@ impl Operation {
             word & 0x3ffffc00,
             0x08dffc00 | 0x089ffc00 | 0x08df7c00 | 0x089f7c00
         ) {
-            if !memory.cpu_hardware_ordering() {
-                return Ok(None);
-            }
             let load = word & (1 << 22) != 0;
             return Self {
                 pc,
@@ -1172,6 +1160,102 @@ impl Operation {
 mod special_memory_tests {
     use super::*;
     use trames_memory::{Memory, Permissions};
+    #[test]
+    fn independent_ordered_atomic_matrix_compiles_opaque_callbacks_without_data_access() {
+        // Only compilation queries are implemented. The abstract provider does
+        // not expose hardware ordering or native aliases and cannot touch data.
+        struct Opaque<'a>(&'a Memory);
+        impl CpuMemory for Opaque<'_> {
+            fn mapped_at_or_after(&self, a: u64) -> bool {
+                self.0.mapped_at_or_after(a)
+            }
+            fn read(&self, _a: u64, _bytes: &mut [u8]) -> Result<(), trames_memory::MemoryError> {
+                panic!("cold data read")
+            }
+            fn write(&mut self, _a: u64, _bytes: &[u8]) -> Result<(), trames_memory::MemoryError> {
+                panic!("cold data write")
+            }
+            fn check(
+                &self,
+                _a: u64,
+                _len: usize,
+                _access: trames_memory::Access,
+            ) -> Result<(), trames_memory::MemoryError> {
+                panic!("cold data check")
+            }
+            fn check_translation(&self, _a: u64) -> Result<(), trames_memory::MemoryError> {
+                panic!("cold data translation")
+            }
+            fn fetch_u32(&self, a: u64) -> Result<u32, trames_memory::MemoryError> {
+                self.0.fetch_u32(a)
+            }
+            fn instruction_identity(&self) -> (u64, u64, u64) {
+                self.0.instruction_identity()
+            }
+            fn instruction_page_identity(
+                &self,
+                a: u64,
+            ) -> Result<(u64, u64, u64), trames_memory::MemoryError> {
+                self.0.instruction_page_identity(a)
+            }
+            fn atomic_update<T>(
+                &mut self,
+                _a: u64,
+                _len: usize,
+                _f: impl FnOnce(&mut [u8]) -> (T, bool),
+            ) -> Result<T, trames_memory::MemoryError> {
+                panic!("cold transaction")
+            }
+            fn exclusive_read(
+                &mut self,
+                _a: u64,
+                _bytes: &mut [u8],
+            ) -> Result<u128, trames_memory::MemoryError> {
+                panic!("cold exclusive read")
+            }
+            fn exclusive_write(
+                &mut self,
+                _a: u64,
+                _bytes: &[u8],
+                _token: Option<u128>,
+            ) -> Result<bool, trames_memory::MemoryError> {
+                panic!("cold exclusive write")
+            }
+        }
+        let fixture =
+            include_str!("../../../docs/validation/jit-abstract-memory-20261128/category.words");
+        let all = trames_execution::Features {
+            hwcap: u64::MAX,
+            hwcap2: u64::MAX,
+        };
+        let mut m = Memory::default();
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut compiled = 0;
+        for word in fixture.lines().map(|w| u32::from_str_radix(w, 16).unwrap()) {
+            m.write_array(0x1000, word.to_le_bytes()).unwrap();
+            m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let operation = Operation::compile_for_features(&Opaque(&m), 0x1000, all).unwrap();
+            if matches!(word & 0x3ffffc00, 0x08df7c00 | 0x089f7c00)
+                && !crate::features::profile().lor
+            {
+                assert!(operation.is_none());
+            } else {
+                let operation = operation.unwrap();
+                assert!(operation.ordered || operation.atomic.is_some());
+                assert!(operation.code.is_some());
+                compiled += 1;
+            }
+            m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        }
+        assert_eq!(
+            compiled,
+            if crate::features::profile().lor {
+                795
+            } else {
+                771
+            }
+        );
+    }
     #[test]
     fn llvm_lse128_fixture_keeps_two_independent_inout_registers_and_real_opcodes() {
         let fixture =

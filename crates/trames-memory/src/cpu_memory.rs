@@ -96,7 +96,7 @@ pub(crate) unsafe fn native_span<M: CpuMemory + ?Sized>(
 
 pub trait CpuMemory {
     /// Cold embedding capability: RAM and publication obey the host memory model.
-    /// Unknown embeddings retain their existing abstract fence/interpreter path.
+    /// Unknown embeddings retain their existing abstract fence/transaction path.
     #[cfg(feature = "native-code")]
     fn cpu_hardware_ordering(&self) -> bool {
         false
@@ -127,7 +127,8 @@ pub trait CpuMemory {
         }
         let mut bytes = crate::ordered::Operand([0; 8]);
         self.read(address, &mut bytes.0[..len])?;
-        std::sync::atomic::fence(Ordering::Acquire);
+        // The embedding orders its canonical read, not only the temporary.
+        self.fence(Ordering::Acquire);
         Ok((operation(&bytes.0[..len]), false))
     }
     #[cfg(feature = "native-code")]
@@ -140,10 +141,10 @@ pub trait CpuMemory {
         if !crate::ordered::valid(len) || len as u64 > PAGE_SIZE - address % PAGE_SIZE {
             return Err(MemoryError::InvalidRange);
         }
-        self.check(address, len, Access::Write)?;
         let mut bytes = crate::ordered::Operand([0; 8]);
         let result = operation(&mut bytes.0[..len]);
-        std::sync::atomic::fence(Ordering::Release);
+        // Original publication/fault authority stays with write; no preflight.
+        self.fence(Ordering::Release);
         self.write(address, &bytes.0[..len])?;
         Ok((result, false))
     }

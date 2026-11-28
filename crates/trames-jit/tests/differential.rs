@@ -4,6 +4,9 @@ use trames_execution::{Aarch64State, Registers};
 use trames_jit::{Cpu, Engine, NATIVE_COMPILED};
 use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
 
+#[path = "support/abstract_memory_category.rs"]
+mod abstract_memory_category;
+
 fn memory(words: &[u32]) -> Memory {
     let mut memory = Memory::default();
     memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
