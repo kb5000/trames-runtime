@@ -47,7 +47,7 @@ impl Capabilities {
                 .any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name })
         };
         let mut result = Self {
-            bits: descriptors::BATCH_CAPABILITY | (1 << 15),
+            bits: descriptors::BATCH_CAPABILITY | command_batch::CAPABILITY | (1 << 15),
             compute: compute::Capabilities::query(instance, physical, &ext),
             ..Self::default()
         };

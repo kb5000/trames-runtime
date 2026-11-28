@@ -11,7 +11,7 @@ use trames_vfs::{Vfs, AT_FDCWD, O_CLOEXEC, O_NONBLOCK};
 // Monitor mode prevents ash's asynchronous children inheriting ignored SIGINT.
 // The private console enables normal job control. setsid then opens the slave
 // in its own session. Retry interrupted reads when a launcher child exits.
-pub const INIT: &str = "set -m; trap '' CHLD; while :; do if IFS= read -r tty <&3; then setsid /bin/sh -c 'exec /bin/sh -il <\"$1\" >\"$1\" 2>&1' sh \"$tty\" 3<&- & fi; done";
+pub const INIT: &str = "set -m; trap '' CHLD; while :; do if IFS= read -r tty <&3; then setsid /bin/sh -c 'u=root; h=; s=; if [ -r /etc/passwd ]; then while IFS=: read -r n _ _ _ _ d sh; do if [ \"$n\" = \"$u\" ]; then h=\"$d\"; s=\"$sh\"; break; fi; done < /etc/passwd; fi; case \"$s\" in \"\"|*/nologin|*/false) s=/bin/sh ;; /*) [ -x \"$s\" ] || s=/bin/sh ;; *) s=/bin/sh ;; esac; if [ -z \"$h\" ] || [ ! -d \"$h\" ]; then if [ -d /root ]; then h=/root; else h=/; fi; fi; export USER=\"$u\" LOGNAME=\"$u\" HOME=\"$h\" SHELL=\"$s\"; cd \"$h\" 2>/dev/null || cd /; exec \"$s\" -l <\"$1\" >\"$1\" 2>&1' sh \"$tty\" 3<&- & fi; done";
 pub const LIMIT: usize = 32;
 pub struct Channel {
     pub input: VecDeque<u8>,
@@ -209,6 +209,13 @@ pub fn launcher(command: &[String]) -> String {
     launcher_at(command, None)
 }
 pub fn launcher_at(command: &[String], cwd: Option<&str>) -> String {
+    if command.is_empty() {
+        return launcher_for_session(&crate::environment::Session {
+            user: "root".into(),
+            shell: Vec::new(),
+            cwd: cwd.unwrap_or("").into(),
+        });
+    }
     fn quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
@@ -218,6 +225,7 @@ pub fn launcher_at(command: &[String], cwd: Option<&str>) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let prefix = cwd
+        .filter(|c| !c.is_empty())
         .map(|cwd| format!("cd {} && ", quote(cwd)))
         .unwrap_or_default();
     let child = format!("{prefix}exec {command} <\"$1\" >\"$1\" 2>&1");

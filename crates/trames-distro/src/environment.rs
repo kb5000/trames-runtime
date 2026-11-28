@@ -473,6 +473,9 @@ impl Manifest {
             vec!["/bin/sh".into(), "-l".into()]
         }
     }
+    pub fn resolve_login(&self, vfs: &mut trames_vfs::Vfs) -> ResolvedLogin {
+        resolve_login(vfs, &self.session)
+    }
     pub fn parse(text: &str) -> Result<Self> {
         let value: Self = decode(text)?;
         value.validate()?;

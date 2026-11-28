@@ -18,6 +18,7 @@ mod coherent;
 mod completion;
 mod compute;
 mod core_commands;
+mod command_batch;
 mod core_features;
 mod descriptors;
 mod external;
@@ -1166,7 +1167,10 @@ impl Backend {
             eprintln!("trames-vulkan op={operation} args={a:x?}");
         }
         // Synchronous original-image host access needs no unrelated GPU poll.
-        if !core_commands::records_only(operation) && !(259..=263).contains(&operation) {
+        if !core_commands::records_only(operation)
+            && operation != command_batch::OPERATION
+            && !(259..=263).contains(&operation)
+        {
             self.collect();
         }
         if operation == 17
@@ -2083,6 +2087,7 @@ impl Backend {
         let dev = self.device.as_ref().unwrap().clone();
         let d = &dev.native;
         match op {
+            command_batch::OPERATION => self.command_batch(m, a)?,
             240..=242 => self.image_fd_call(m, op, a)?,
             275 => self.android_image_layout(a)?,
             253..=254 => self.dynamic_rendering(m, op, a)?,
