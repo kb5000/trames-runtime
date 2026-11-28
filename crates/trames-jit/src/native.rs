@@ -1165,7 +1165,7 @@ struct Binding {
 
 #[derive(Clone)]
 struct Vectors {
-    bindings: [Option<Binding>; 16],
+    bindings: [Option<Binding>; 24],
     hosts: [u8; 32],
     clock: u32,
     used: bool,
@@ -1173,10 +1173,24 @@ struct Vectors {
 impl Vectors {
     fn new() -> Self {
         Self {
-            bindings: [None; 16],
+            bindings: [None; 24],
             hosts: [u8::MAX; 32],
             clock: 0,
             used: false,
+        }
+    }
+    const fn host(slot: usize) -> u32 {
+        if slot < 16 {
+            slot as u32 + 16
+        } else {
+            slot as u32 - 16
+        }
+    }
+    const fn slot(host: u32) -> usize {
+        if host >= 16 {
+            host as usize - 16
+        } else {
+            host as usize + 16
         }
     }
     fn bind(
@@ -1187,21 +1201,41 @@ impl Vectors {
         avoid: u32,
         read: bool,
     ) -> u32 {
+        self.bind_in(words, traffic, guest, avoid, read, false)
+    }
+    fn bind_in(
+        &mut self,
+        words: &mut Vec<u32>,
+        traffic: &mut CompilationStats,
+        guest: u32,
+        avoid: u32,
+        read: bool,
+        low: bool,
+    ) -> u32 {
         self.used = true;
         self.clock += 1;
         let old = self.hosts[guest as usize];
-        let slot = if old != u8::MAX {
+        let relocate = old != u8::MAX && low && Self::host(old as usize) >= 16;
+        let previous = if relocate {
+            self.bindings[old as usize].take()
+        } else {
+            None
+        };
+        let slot = if old != u8::MAX && !relocate {
             old as usize
         } else {
+            let eligible =
+                |i: usize| (!low || Self::host(i) < 16) && avoid & (1 << Self::host(i)) == 0;
             let slot = self
                 .bindings
                 .iter()
-                .position(Option::is_none)
+                .enumerate()
+                .find_map(|(i, b)| (b.is_none() && eligible(i)).then_some(i))
                 .unwrap_or_else(|| {
                     self.bindings
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| avoid & (1 << (i + 16)) == 0)
+                        .filter(|(i, _)| eligible(*i))
                         .min_by_key(|(_, b)| b.unwrap().used)
                         .unwrap()
                         .0
@@ -1209,20 +1243,26 @@ impl Vectors {
             if let Some(binding) = self.bindings[slot] {
                 if binding.dirty {
                     load(words, 17, 16, 96);
-                    words.push(0x3d800000 | (binding.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                    words.push(0x3d800000 | (binding.guest << 10) | (17 << 5) | Self::host(slot));
                     traffic.register_stores += 1;
                 }
                 self.hosts[binding.guest as usize] = u8::MAX;
             }
             if read {
-                load(words, 17, 16, 96);
-                words.push(0x3dc00000 | (guest << 10) | (17 << 5) | (slot as u32 + 16));
-                traffic.register_loads += 1;
+                if previous.is_some() {
+                    let src = Self::host(old as usize);
+                    let dest = Self::host(slot);
+                    words.push(0x4ea01c00 | (src << 16) | (src << 5) | dest);
+                } else {
+                    load(words, 17, 16, 96);
+                    words.push(0x3dc00000 | (guest << 10) | (17 << 5) | Self::host(slot));
+                    traffic.register_loads += 1;
+                }
             }
             self.hosts[guest as usize] = slot as u8;
             self.bindings[slot] = Some(Binding {
                 guest,
-                dirty: false,
+                dirty: previous.is_some_and(|b| b.dirty),
                 used: self.clock,
             });
             slot
@@ -1230,7 +1270,7 @@ impl Vectors {
         let b = self.bindings[slot].as_mut().unwrap();
         b.dirty |= !read;
         b.used = self.clock;
-        slot as u32 + 16
+        Self::host(slot)
     }
     fn reserve(
         &mut self,
@@ -1242,7 +1282,10 @@ impl Vectors {
         let old = self.hosts[guest as usize];
         let dirty = old != u8::MAX && self.bindings[old as usize].unwrap().dirty;
         let host = self.bind(words, traffic, guest, avoid, false);
-        self.bindings[(host - 16) as usize].as_mut().unwrap().dirty = dirty;
+        self.bindings[self.hosts[guest as usize] as usize]
+            .as_mut()
+            .unwrap()
+            .dirty = dirty;
         host
     }
     fn group(
@@ -1257,12 +1300,17 @@ impl Vectors {
         self.clock += 1;
         let aligned = self.hosts[guest];
         let start = if aligned != u8::MAX
-            && aligned as usize + count <= 16
+            && aligned as usize + count <= 24
+            && Self::host(aligned as usize + count - 1)
+                == Self::host(aligned as usize) + count as u32 - 1
             && (0..count).all(|i| self.hosts[(guest + i) & 31] as usize == aligned as usize + i)
         {
             aligned as usize
         } else {
-            (0..=16 - count)
+            (0..=24 - count)
+                .filter(|start| {
+                    Self::host(*start + count - 1) == Self::host(*start) + count as u32 - 1
+                })
                 .min_by_key(|start| {
                     let mut cost = 0;
                     let mut age = 0u64;
@@ -1284,7 +1332,7 @@ impl Vectors {
         // including cycles and guest lists wrapping V31 -> V0. An already packed
         // group emits no moves, loads or stores here on subsequent instructions.
         let mut pointer = false;
-        for slot in 0..16 {
+        for slot in 0..24 {
             let Some(b) = self.bindings[slot] else {
                 continue;
             };
@@ -1299,7 +1347,7 @@ impl Vectors {
                         load(words, 17, 16, 96);
                         pointer = true;
                     }
-                    words.push(0x3d800000 | (b.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                    words.push(0x3d800000 | (b.guest << 10) | (17 << 5) | Self::host(slot));
                     traffic.register_stores += 1;
                 }
                 self.hosts[b.guest as usize] = u8::MAX;
@@ -1315,7 +1363,7 @@ impl Vectors {
                         load(words, 17, 16, 96);
                         pointer = true;
                     }
-                    words.push(0x3dc00000 | ((reg as u32) << 10) | (17 << 5) | (slot as u32 + 16));
+                    words.push(0x3dc00000 | ((reg as u32) << 10) | (17 << 5) | Self::host(slot));
                     traffic.register_loads += 1;
                 }
                 self.bindings[slot] = Some(Binding {
@@ -1327,7 +1375,7 @@ impl Vectors {
             }
             self.bindings[slot].as_mut().unwrap().used = self.clock;
         }
-        start as u32 + 16
+        Self::host(start)
     }
     fn reload(&self, words: &mut Vec<u32>, traffic: &mut CompilationStats) {
         if self.bindings.iter().any(Option::is_some) {
@@ -1335,7 +1383,7 @@ impl Vectors {
         }
         for (slot, b) in self.bindings.iter().enumerate() {
             if let Some(b) = b {
-                words.push(0x3dc00000 | (b.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                words.push(0x3dc00000 | (b.guest << 10) | (17 << 5) | Self::host(slot));
                 traffic.register_loads += 1;
             }
         }
@@ -1346,7 +1394,7 @@ impl Vectors {
         }
         for (slot, b) in self.bindings.iter().enumerate() {
             if let Some(b) = b.filter(|b| b.dirty) {
-                words.push(0x3d800000 | (b.guest << 10) | (11 << 5) | (slot as u32 + 16));
+                words.push(0x3d800000 | (b.guest << 10) | (11 << 5) | Self::host(slot));
                 traffic.register_stores += 1;
             }
         }
@@ -1551,6 +1599,15 @@ impl Assembler {
         let rn = (word >> 5) & 31;
         let rm = (word >> 16) & 31;
         let ra = (word >> 10) & 31;
+        let indexed_m = if let Form::Indexed { low, .. } = op.form {
+            let guest = if low { rm & 15 } else { rm };
+            Some(
+                self.vectors
+                    .bind_in(&mut self.words, &mut self.traffic, guest, 0, true, low),
+            )
+        } else {
+            None
+        };
         let n = match op.form {
             Form::Immediate | Form::ModifiedImmediate { .. } => 31,
             Form::Table { registers, .. } => self.vectors.group(
@@ -1561,9 +1618,13 @@ impl Assembler {
                 true,
             ),
             Form::FromGpr { .. } => self.read(rn, 0),
-            _ => self
-                .vectors
-                .bind(&mut self.words, &mut self.traffic, rn, 0, true),
+            _ => self.vectors.bind(
+                &mut self.words,
+                &mut self.traffic,
+                rn,
+                indexed_m.map_or(0, |m| 1 << m),
+                true,
+            ),
         };
         let n_mask = if matches!(
             op.form,
@@ -1579,6 +1640,7 @@ impl Assembler {
             0
         };
         let m = match op.form {
+            Form::Indexed { .. } => indexed_m.unwrap(),
             Form::Binary { .. }
             | Form::Table { .. }
             | Form::Ternary
@@ -1595,6 +1657,7 @@ impl Assembler {
         let m_mask = if matches!(
             op.form,
             Form::Binary { .. }
+                | Form::Indexed { .. }
                 | Form::Table { .. }
                 | Form::Ternary
                 | Form::Select
@@ -1622,7 +1685,10 @@ impl Assembler {
         };
         if matches!(
             op.form,
-            Form::Binary { accumulate: true }
+            Form::Indexed {
+                accumulate: true,
+                ..
+            } | Form::Binary { accumulate: true }
                 | Form::FromGpr { merge: true }
                 | Form::MergeUnary
                 | Form::ModifiedImmediate { merge: true }
@@ -1648,7 +1714,7 @@ impl Assembler {
         }
         let dest = match op.form {
             Form::Compare { .. } => rd,
-            Form::ToGpr => self.output(rd, 0),
+            Form::ToGpr | Form::ToGprFlags => self.output(rd, 0),
             _ => self.vectors.bind(
                 &mut self.words,
                 &mut self.traffic,
@@ -1659,11 +1725,16 @@ impl Assembler {
         };
         let emitted = match op.form {
             Form::Immediate | Form::ModifiedImmediate { .. } => (word & !31) | dest,
-            Form::Unary | Form::MergeUnary | Form::ToGpr | Form::FromGpr { .. } => {
-                (word & !0x3ff) | (n << 5) | dest
-            }
+            Form::Unary
+            | Form::MergeUnary
+            | Form::ToGpr
+            | Form::ToGprFlags
+            | Form::FromGpr { .. } => (word & !0x3ff) | (n << 5) | dest,
             Form::Binary { .. } | Form::Table { .. } | Form::Select => {
                 (word & !0x1f03ff) | (m << 16) | (n << 5) | dest
+            }
+            Form::Indexed { low, .. } => {
+                (word & !(if low { 0x0f03ff } else { 0x1f03ff })) | (m << 16) | (n << 5) | dest
             }
             Form::Ternary => (word & !0x1f7fff) | (m << 16) | (a << 10) | (n << 5) | dest,
             Form::Compare { zero, .. } => {
@@ -1671,7 +1742,7 @@ impl Assembler {
             }
         };
         self.words.push(emitted);
-        if matches!(op.form, Form::Compare { .. }) {
+        if matches!(op.form, Form::Compare { .. } | Form::ToGprFlags) {
             self.flags_written();
         }
     }
@@ -2073,7 +2144,7 @@ impl Assembler {
             if op.load {
                 if let Some(group) = op.structure {
                     for i in 0..group.registers {
-                        self.vectors.bindings[(vector_target.unwrap() - 16) as usize + i]
+                        self.vectors.bindings[Vectors::slot(vector_target.unwrap()) + i]
                             .as_mut()
                             .unwrap()
                             .dirty = true;
@@ -3090,19 +3161,26 @@ mod tests {
         assert!((16..=28).contains(&host));
         assert!(words.is_empty()); // Full loads do not read old destinations.
         for i in 0..4 {
-            v.bindings[(host - 16) as usize + i].as_mut().unwrap().dirty = true;
+            v.bindings[Vectors::slot(host) + i].as_mut().unwrap().dirty = true;
         }
         assert_eq!(v.group(&mut words, &mut traffic, 31, 4, true), host);
         assert!(words.is_empty()); // A following store/lane read uses live values.
         assert_eq!((traffic.register_loads, traffic.register_stores), (0, 0));
         for i in 0..4 {
-            assert_eq!(v.hosts[(31 + i) & 31] as u32 + 16, host + i as u32);
+            assert_eq!(
+                Vectors::host(v.hosts[(31 + i) & 31] as usize),
+                host + i as u32
+            );
         }
     }
 
     #[test]
     fn fp_blocks_preserve_aapcs64_callee_vector_registers() {
-        let m = memory(&[0x1e622820, 0xd4000001]);
+        let mut words: Vec<_> = (0..32)
+            .map(|r| 0x4ea01c00 | (r << 16) | (r << 5) | r)
+            .collect();
+        words.extend_from_slice(&[0x1e622820, 0xd4000001]);
+        let m = memory(&words);
         let b = compile(&m, 0x1000, 64, 0, 8).unwrap().unwrap();
         assert!(b.block.has_vector);
         let links = [0usize; CACHE_LIMIT];
@@ -3132,7 +3210,7 @@ mod tests {
         }
         assert_eq!(after, before);
         assert_eq!(vectors[0], 5f64.to_bits() as u128);
-        assert_eq!((f.frame.remaining, f.frame.syscall), (62, 1));
+        assert_eq!((f.frame.remaining, f.frame.syscall), (30, 1));
     }
 
     #[test]

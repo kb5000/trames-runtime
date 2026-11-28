@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Cold A64 FP/AdvSIMD operand classification. Execution uses original opcodes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Form {
     Unary,
     Binary { accumulate: bool },
@@ -12,13 +12,37 @@ pub(super) enum Form {
     Compare { zero: bool, conditional: bool },
     Select,
     ToGpr,
+    ToGprFlags,
+    Indexed { low: bool, accumulate: bool },
     FromGpr { merge: bool },
 }
 #[derive(Clone, Copy)]
 pub(super) struct Operation {
     pub form: Form,
-    pub capability: u8,
+    pub required: trames_execution::Features,
 }
+impl Operation {
+    pub(super) const fn new(form: Form, capability: u8) -> Self {
+        Self {
+            form,
+            required: trames_execution::Features {
+                hwcap: 1 << capability,
+                hwcap2: 0,
+            },
+        }
+    }
+    pub(super) const fn second(form: Form, capability: u8) -> Self {
+        Self {
+            form,
+            required: trames_execution::Features {
+                hwcap: 0,
+                hwcap2: 1 << capability,
+            },
+        }
+    }
+}
+#[path = "arithmetic_ops.rs"]
+mod arithmetic;
 pub(super) fn decode(word: u32) -> Option<Operation> {
     use Form::*;
     if let Some(op) = movement(word) {
@@ -27,12 +51,7 @@ pub(super) fn decode(word: u32) -> Option<Operation> {
     if let Some(op) = crypto(word) {
         return Some(op);
     }
-    let scalar = |form, half| {
-        Some(Operation {
-            form,
-            capability: if half { 9 } else { 0 },
-        })
-    };
+    let scalar = |form, half| Some(Operation::new(form, if half { 9 } else { 0 }));
     if word & 0xfffffc00 == 0x9eae0000 {
         return scalar(ToGpr, false);
     }
@@ -91,7 +110,7 @@ pub(super) fn decode(word: u32) -> Option<Operation> {
             if matches!(op, 2 | 3) {
                 return scalar(FromGpr { merge: false }, half);
             }
-            if matches!(op, 6 | 7) && (kind == 1) == (word >> 31 != 0) {
+            if matches!(op, 6 | 7) && (kind == 3 || (kind == 1) == (word >> 31 != 0)) {
                 return scalar(
                     if op == 6 {
                         ToGpr
@@ -112,12 +131,7 @@ pub(super) fn decode(word: u32) -> Option<Operation> {
             }
         }
     }
-    let vector = |form| {
-        Some(Operation {
-            form,
-            capability: 1,
-        })
-    };
+    let vector = |form| Some(Operation::new(form, 1));
     let q = word & (1 << 30) != 0;
     let size = (word >> 22) & 3;
     let logical = word & 0xbfe0fc00;
@@ -232,19 +246,14 @@ pub(super) fn decode(word: u32) -> Option<Operation> {
     {
         return vector(Unary);
     }
-    None
+    arithmetic::decode(word)
 }
 
 /// Complete baseline SIMD copy, immediate and permute classes. Register and
 /// arrangement validation belongs to translation, never the emitted hot path.
 fn movement(word: u32) -> Option<Operation> {
     use Form::*;
-    let op = |form| {
-        Some(Operation {
-            form,
-            capability: 1,
-        })
-    };
+    let op = |form| Some(Operation::new(form, 1));
     let q = word & (1 << 30) != 0;
     let imm5 = (word >> 16) & 31;
     let power = imm5.trailing_zeros();
@@ -296,10 +305,7 @@ fn movement(word: u32) -> Option<Operation> {
         let half = word & (1 << 11) != 0;
         if half {
             if mode == 15 && !invert {
-                return Some(Operation {
-                    form: ModifiedImmediate { merge: false },
-                    capability: 10,
-                });
+                return Some(Operation::new(ModifiedImmediate { merge: false }, 10));
             }
         } else if mode != 15 || !invert || q {
             return op(ModifiedImmediate {
@@ -314,7 +320,7 @@ fn movement(word: u32) -> Option<Operation> {
 /// the shared CPU. Optional instructions keep their process-host ISA gate.
 fn crypto(word: u32) -> Option<Operation> {
     use Form::*;
-    let op = |form, capability| Some(Operation { form, capability });
+    let op = |form, capability| Some(Operation::new(form, capability));
     match word & 0xfffffc00 {
         0x4e284800 | 0x4e285800 => return op(MergeUnary, 3),
         0x4e286800 | 0x4e287800 => return op(Unary, 3),
@@ -356,4 +362,114 @@ fn crypto(word: u32) -> Option<Operation> {
         return op(Binary { accumulate: false }, 17);
     }
     None
+}
+
+#[cfg(test)]
+mod arithmetic_audit {
+    use super::*;
+    #[test]
+    fn every_frozen_arithmetic_form_requires_all_of_its_cold_host_capabilities() {
+        for line in include_str!("../tests/data/arithmetic-encodings.txt")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+        {
+            let mut f = line.split_whitespace();
+            let word = u32::from_str_radix(f.next().unwrap(), 16).unwrap();
+            let h = u64::from_str_radix(f.next().unwrap(), 16).unwrap();
+            let h2 = u64::from_str_radix(f.next().unwrap(), 16).unwrap();
+            let op = decode(word).unwrap();
+            assert_eq!(
+                (op.required.hwcap, op.required.hwcap2),
+                (h, h2),
+                "{word:08x}"
+            );
+            let all = trames_execution::Features {
+                hwcap: u64::MAX,
+                hwcap2: u64::MAX,
+            };
+            assert!(crate::features::permits(all, word));
+            for bit in 0..64 {
+                for second in [false, true] {
+                    if (if second { h2 } else { h }) & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let mut absent = all;
+                    if second {
+                        absent.hwcap2 &= !(1 << bit);
+                    } else {
+                        absent.hwcap &= !(1 << bit);
+                    }
+                    assert!(
+                        !crate::features::permits(absent, word),
+                        "{word:08x}, second={second}, bit={bit}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn cold_encoding_admission_can_be_audited_without_executing_guest_words() {
+        use std::io::Write;
+        let mut out = std::env::var_os("TRAMES_JIT_ENCODING_AUDIT")
+            .map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
+        let mut admitted = 0;
+        for prefix in [
+            0x0e000000, 0x2e000000, 0x4e000000, 0x6e000000, 0x5e000000, 0x7e000000, 0x0f000000,
+            0x2f000000, 0x4f000000, 0x6f000000, 0x5f000000, 0x7f000000, 0x1e000000, 0x9e000000,
+            0x1f000000,
+        ] {
+            for middle in 0..16384u32 {
+                let word = prefix | (middle << 10) | (1 << 5);
+                if let Some(op) = decode(word) {
+                    admitted += 1;
+                    if let Some(out) = out.as_mut() {
+                        writeln!(
+                            out,
+                            "{word:08x} {:x} {:x} {:?}",
+                            op.required.hwcap, op.required.hwcap2, op.form
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        assert!(admitted > 5000);
+        if let Some(path) = std::env::var_os("TRAMES_JIT_REFERENCE_AUDIT") {
+            let mut m = trames_memory::Memory::default();
+            m.map(
+                0x1000,
+                trames_memory::PAGE_SIZE,
+                trames_memory::Permissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .unwrap();
+            let mut missing = Vec::new();
+            for line in std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                let word =
+                    u32::from_str_radix(line.split_whitespace().next().unwrap(), 16).unwrap();
+                assert!(
+                    decode(word).is_none(),
+                    "oracle admission set is stale: {word:08x}"
+                );
+                m.write_array(0x1000, word.to_le_bytes()).unwrap();
+                let mut r = trames_interpreter::Cpu::new(0x1000, 0);
+                if r.step(&mut m).is_ok() {
+                    missing.push(line.to_owned());
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "LLVM-valid reference instructions still untranslated: {}\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
+    }
 }

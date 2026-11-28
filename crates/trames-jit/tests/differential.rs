@@ -4233,3 +4233,6 @@ fn affine_runs_join_only_adjacent_admitted_pages_and_never_bridge_holes() {
     assert_eq!(cpu.fault_retired(), 2);
     assert_eq!(cpu.pc(), 0x1008);
 }
+
+#[path = "arithmetic/category.rs"]
+mod arithmetic_category;

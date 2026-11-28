@@ -1,0 +1,22 @@
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-jit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.02s
+     Running unittests src/lib.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-jit/24b6517ab8a40b53/out/trames_jit-24b6517ab8a40b53)
+
+running 15 tests
+test features::tests::extension_gates_are_cold_and_do_not_gain_emulated_support ... ok
+test features::tests::untranslated_extensions_cannot_escape_host_isa_gates ... ok
+test features::tests::process_profile_never_advertises_software_only_or_unowned_state ... ok
+test native::tests::fp_blocks_preserve_aapcs64_callee_vector_registers ... ok
+test native::tests::guarded_entries_reject_changed_epochs_without_retirement_or_host_svc ... ok
+test native::tests::hardware_admission_preserves_scalar_syscall_tail_cells ... ok
+test native::tests::eviction_revokes_native_edges_before_rx_unmap_and_generations_reject_reuse ... ok
+test native::tests::direct_entries_preserve_native_callee_registers_on_every_return ... ok
+test native::tests::lse_and_rcpc_lower_to_one_original_hardware_instruction ... ok
+test native::tests::memory_edges_remain_metadata_only_and_reject_evicted_generations ... ok
+test native::tests::relaxed_counter_reads_do_not_acquire_implicit_instruction_barriers ... ok
+test native::tests::structure_register_groups_reuse_packed_bindings_without_emitted_traffic ... ok
+test native::tests::vector_register_bindings_are_reused_inside_the_compiled_block ... ok
+test native::tests::pair_ordered_and_barrier_lowerings_preserve_hardware_opcodes ... ok
+test vector_ops::arithmetic_audit::cold_encoding_admission_can_be_audited_without_executing_guest_words ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

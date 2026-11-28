@@ -24,8 +24,8 @@ Scalar, paired and ordered memory, LSE CAS/CASP/RMW and RCpc accesses now use
 native memory paths as described below.
 Common scalar FP and NEON arithmetic and scalar/paired vector memory also execute
 natively, including structure/lane/replicate transfers and mixed memory/arithmetic
-blocks. Exclusive reservations, traps
-and remaining untranslated families still retain
+blocks. The complete fixed-width arithmetic category is described below.
+Exclusive reservations, special memory and compatibility families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
 
@@ -346,7 +346,7 @@ capability profile. H<->S/D precision conversion is baseline FP, separately from
 FP16 arithmetic. No per-instruction capability query or software arithmetic
 replacement runs in these generated bodies.
 
-A cold LRU allocator binds the existing 32 guest vectors to host v16..v31. Loads,
+A cold LRU allocator binds the existing 32 guest vectors to host v16..v31 plus v0..v7. Loads,
 dirty evictions and final stores address the existing interpreter vector bank;
 V31 is a real vector, independent of XZR. Sources/accumulators are pinned before
 destination allocation. Callee-saved d8..d15, host x18/TLS and host callee GPRs are
@@ -417,7 +417,7 @@ post-index selection run during compilation. Operands range from 1 to 64 bytes;
 base-only, immediate post-index and X-register post-index use the same guest
 address/writeback model as scalar vector transfers. V31-to-V0 lists wrap normally.
 
-The cold vector allocator reserves a contiguous host group within v16..v31,
+The cold vector allocator reserves a contiguous host group within v16..v31 or v0..v7,
 reuses an already packed group without emitted traffic, and spills displaced
 dirty values before loading relocated members. Full loads reserve outputs without
 reading old CPU values. Lane loads bind the old full vectors to preserve every
@@ -460,8 +460,9 @@ The existing CPU vector bank and host FP scope suffice; no extension state is
 added. Each optional family has an explicit host gate, including P64 PMULL's
 separate feature from baseline P8 polynomial multiplication.
 
-Untranslated optional JSCVT/BF16/FHM/FCMA/DotProd/I8MM/RDM/FP16/FRINT and SB forms
-are gated in the cold compiler before interpreter entry as well. FCMA half forms
+Optional JSCVT/BF16/FHM/FCMA/DotProd/I8MM/RDM/FP16/FRINT and SB forms
+are gated in the cold compiler. Their arithmetic lowerings are now complete
+for the current fixed-width shared-CPU profile. FCMA half forms
 require both FCMA and AdvSIMD FP16. LS64 does not acquire the unrelated LSE gate
 or the interpreter's software transaction: the current profile does not expose
 its HWCAP3/device-memory contract. Shared interpreter-only compatibility remains
@@ -533,3 +534,44 @@ the existing optional node storage, so ordinary nodes/entries do not grow.
 [Category verification and frozen CPU measurements](../validation/jit-system-20261128.md)
 cover exact slice budgets, live-bank pressure, callback restoration, permissions,
 cache-line footprint, aliases, invalidation and precise traps.
+
+
+## Complete fixed-width SIMD/FP arithmetic
+
+Cold arithmetic classification closes scalar SIMD, widening/narrowing and
+saturation, immediate/variable shifts and inserts, indexed multiply/add,
+pairwise/across-lane reductions, reciprocal estimate/step families, precision
+and scaled conversions, FP16, BF16, DotProd, I8MM, RDM, FCMA, FHM, JSCVT and
+FRINT32/64. Form metadata owns both HWCAP words and compound requirements;
+all host admission and encoding decisions remain in compilation. Immediate,
+rotation and lane fields survive operand remapping; arithmetic executes as the
+original instruction using existing vectors, FPCR/FPSR and NZCV.
+
+Indexed half-element operations have a four-bit Rm field: its adjacent M bit
+belongs to the lane selector. Their source is allocated into caller-saved
+v0..v7; other forms may use v16..v31 or v0..v7. The existing cold LRU metadata
+therefore has 24 slots. A cached high-register value migrates using a native
+register move, retaining its dirty status without a CPU-bank store/reload.
+The restricted source is allocated before Rn so source aliases follow the new
+binding, and pinned operands cannot be selected even from empty slots. Repeated
+uses of an existing low binding need no additional moves. Callee-saved d8..d15
+remain untouched. Packed table/structure groups stay within one contiguous
+allowed run, and memory load publication maps physical registers back to their
+metadata slots. Native frames, CPU banks, scalar ABI and memory contracts do
+not grow; the larger allocator exists only while compiling.
+
+Narrowing upper-half and destructive operations read the old destination;
+independent destinations do not. FJCVTZS publishes the hardware NZCV as well as
+the GPR result and sticky FP status. There is no JNI/helper entry for arithmetic,
+software lane loop, per-instruction host probe, extra FP state, global lock or
+guest-text rewrite. Existing FP callback suspension and precise protected-alias
+recovery apply to the newly covered operations.
+
+An offline oracle checks all middle encoding fields of the declared scalar/
+AdvSIMD classes with independent LLVM decoding, and checks for valid forms
+outside native admission. The frozen suite contains 10,640 distinct arrangement/
+lane forms and 7,129 independently assembled register-alias programs. LLVM is
+not a production dependency. The interpreter oracle also fixes scalar SSHR's
+early dispatch and adds scalar S/D floating mask comparisons, retaining its
+existing architectural banks. Apple/iPad keep the interpreter build graph.
+[Full verification and measurements](../validation/jit-arithmetic-20261128.md).

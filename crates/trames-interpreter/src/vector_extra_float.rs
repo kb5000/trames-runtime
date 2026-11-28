@@ -373,6 +373,29 @@ impl Cpu {
                 };
                 result |= (value as u128) << (i * bits);
             }
+        } else if scalar
+            && matches!(
+                binary,
+                0x0e20e400 | 0x2e20e400 | 0x2ea0e400 | 0x2e20ec00 | 0x2ea0ec00
+            )
+        {
+            let mut x = fmt.unpack(a as u64, fpcr, &mut flags);
+            let mut y = fmt.unpack(b as u64, fpcr, &mut flags);
+            if matches!(binary, 0x2e20ec00 | 0x2ea0ec00) {
+                x.sign = false;
+                y.sign = false;
+                x.raw &= !fmt.sign_bit();
+                y.raw &= !fmt.sign_bit();
+            }
+            let cmp = fmt.compare(x, y, binary != 0x0e20e400, &mut flags);
+            let yes = match binary {
+                0x0e20e400 => cmp == 6,
+                0x2ea0e400 | 0x2ea0ec00 => cmp == 2,
+                _ => cmp == 2 || cmp == 6,
+            };
+            if yes {
+                result = mask(bits) as u128;
+            }
         } else if !scalar && matches!(binary, 0x2e20f400 | 0x2ea0f400 | 0x2e20c400 | 0x2ea0c400)
             || scalar && matches!(unary, 0x2e30f800 | 0x2eb0f800 | 0x2e30c800 | 0x2eb0c800)
         {

@@ -1,0 +1,28 @@
+    Updating crates.io index
+     Locking 36 packages to highest compatible versions
+      Adding libc v0.2.190 (available: v0.2.191)
+      Adding rustix v1.1.5 (available: v1.1.6)
+      Adding serde_json v1.0.151 (available: v1.0.154)
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-execution)
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-shared)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-host-compute)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-arithmetic-base/crates/trames-jit)
+   Compiling jit-arithmetic-old v0.1.0 (/mnt/trames-output/jit-arithmetic-old)
+    Finished `release` profile [optimized] target(s) in 5.95s
+    Updating crates.io index
+     Locking 36 packages to highest compatible versions
+      Adding libc v0.2.190 (available: v0.2.191)
+      Adding rustix v1.1.5 (available: v1.1.6)
+      Adding serde_json v1.0.151 (available: v1.0.154)
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-execution)
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-shared)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-host-compute)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-arithmetic-source/crates/trames-jit)
+   Compiling jit-arithmetic-new v0.1.0 (/mnt/trames-output/jit-arithmetic-new)
+    Finished `release` profile [optimized] target(s) in 5.87s

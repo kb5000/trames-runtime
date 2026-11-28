@@ -1,0 +1,127 @@
+{
+  "processes": 8,
+  "timed_samples": 240,
+  "warmup_samples": 48,
+  "workloads": {
+    "extension-arithmetic": {
+      "change_percent": -99.87488443581663,
+      "new_median_ns": 173969.0,
+      "old_median_ns": 139046649.5,
+      "process_medians": {
+        "new": [
+          172847,
+          185347,
+          173011,
+          174927
+        ],
+        "old": [
+          138853236,
+          139123360,
+          138969939,
+          139330973
+        ]
+      },
+      "speedup": 799.2610723749633
+    },
+    "fp-control": {
+      "change_percent": -1.4097583400185631,
+      "new_median_ns": 929704.5,
+      "old_median_ns": 942998.5,
+      "process_medians": {
+        "new": [
+          943280,
+          926527,
+          929309,
+          930100
+        ],
+        "old": [
+          924614,
+          941649,
+          947812,
+          944348
+        ]
+      },
+      "speedup": 1.0142991671009445
+    },
+    "indexed-arithmetic": {
+      "change_percent": -99.93716470061311,
+      "new_median_ns": 102382.5,
+      "old_median_ns": 162937872.5,
+      "process_medians": {
+        "new": [
+          102133,
+          102716,
+          101673,
+          102632
+        ],
+        "old": [
+          164898692,
+          161940333,
+          163443018,
+          162432727
+        ]
+      },
+      "speedup": 1591.462139525798
+    },
+    "integer-control": {
+      "change_percent": -1.501078568130576,
+      "new_median_ns": 403194.5,
+      "old_median_ns": 409339.0,
+      "process_medians": {
+        "new": [
+          405531,
+          400779,
+          422610,
+          400858
+        ],
+        "old": [
+          400948,
+          409737,
+          415569,
+          408941
+        ]
+      },
+      "speedup": 1.0152395431981338
+    },
+    "reciprocal": {
+      "change_percent": -99.86331636290467,
+      "new_median_ns": 203474.0,
+      "old_median_ns": 148864929.5,
+      "process_medians": {
+        "new": [
+          203474,
+          203474,
+          202472,
+          207138
+        ],
+        "old": [
+          148492106,
+          149638693,
+          149237753,
+          148084272
+        ]
+      },
+      "speedup": 731.6164694260692
+    },
+    "widen-narrow": {
+      "change_percent": -99.94956074469542,
+      "new_median_ns": 101987.0,
+      "old_median_ns": 202197672.0,
+      "process_medians": {
+        "new": [
+          102175,
+          101799,
+          107174,
+          101507
+        ],
+        "old": [
+          203807404,
+          202412121,
+          201983223,
+          200547844
+        ]
+      },
+      "speedup": 1982.5827997685979
+    }
+  }
+}

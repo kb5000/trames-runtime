@@ -81,9 +81,11 @@ pub(crate) fn permits(host: Features, word: u32) -> bool {
         // does not expose. Do not reinterpret it as LSE or software-emulate it.
         return false;
     }
-    let required = if let Some(op) = crate::vector_ops::decode(word) {
-        Some((0, op.capability))
-    } else if matches!(word & 0xbf000000, 0x0c000000 | 0x0d000000) {
+    if let Some(op) = crate::vector_ops::decode(word) {
+        return host.hwcap & op.required.hwcap == op.required.hwcap
+            && host.hwcap2 & op.required.hwcap2 == op.required.hwcap2;
+    }
+    let required = if matches!(word & 0xbf000000, 0x0c000000 | 0x0d000000) {
         Some((0, 1)) // AdvSIMD multiple/single structures and replicate loads
     } else if word & 0x3ffffc00 == 0x38bfc000 {
         Some((0, 15)) // LRCPC: LDAPR/B/H

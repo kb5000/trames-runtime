@@ -31,22 +31,30 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   profile; this does not implement authenticated branches, MTE, SVE or SME.
   See [system-category validation](../validation/jit-system-20261128.md).
 
-Cold gate closure also covers untranslated JSCVT, BF16, FHM, FCMA (including its
-FP16 dependency), DotProd, I8MM, RDM, FP16 and FRINT32/64. Their presence does not
-yet imply full native lowering. LS64 is rejected because this profile does not
-own the HWCAP3/device-memory contract; LSE128 remains unadvertised. This does not
-change the interpreter-only backend's compatibility policy.
+- Remaining fixed-width SIMD/FP arithmetic: scalar SIMD, saturating and
+  widening/narrowing operations, immediate/variable shifts and inserts, indexed
+  multiply/add, pairwise/across-lane reductions, reciprocal families, precision
+  and fixed-point conversions, FP16/BF16/DotProd/I8MM/RDM/FCMA/FHM, JSCVT and
+  FRINT32/64. Cold capability masks include both HWCAP words and compound FCMA
+  half requirements. Low-index operands use the host's real caller-saved vector
+  bank, with no software arithmetic or extension state. The independent LLVM
+  matrix has 68,214 admitted encodings, zero invalid admissions and zero valid
+  unadmitted forms in the declared FP/AdvSIMD matrix. See
+  [arithmetic validation](../validation/jit-arithmetic-20261128.md).
+
+LS64 is rejected because this profile does not own its HWCAP3/device-memory
+contract; LSE128 remains unadvertised. This does not change the interpreter-only
+backend's compatibility policy. New stateful or later ISA features need explicit
+shared-CPU ABI ownership; a closed fixed-width category is not full host-ISA
+coverage.
 
 ## Remaining categories
 
-1. Remaining SIMD/FP arithmetic: scalar SIMD, widening/narrowing, shifts,
-   indexed multiply/add, reductions/pairwise forms, reciprocal families and
-   precision conversions; FP16/BF16/DotProd/I8MM/RDM/FCMA/FHM native forms.
-2. Exclusive reservations: all LDXR/LDAXR/LDXP/LDAXP and STXR/STLXR/STXP/STLXP
+1. Exclusive reservations: all LDXR/LDAXR/LDXP/LDAXP and STXR/STLXR/STXP/STLXP
    widths, CLREX, precise faults and transitions through helpers/slices/workers.
-3. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
+2. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
    contract that can actually execute their hardware semantics.
-4. Existing PAC/BTI/MTE compatibility paths and stateful SVE/SME require explicit
+3. Existing PAC/BTI/MTE compatibility paths and stateful SVE/SME require explicit
    hardware/ABI ownership. Do not substitute new software extension state.
 
 Keep native capability admission and reserved-encoding decisions in compilation.

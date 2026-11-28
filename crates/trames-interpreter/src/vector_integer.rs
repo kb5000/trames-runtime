@@ -754,7 +754,8 @@ impl Cpu {
                 return Ok(false);
             } // Modified immediate, not a shift.
             let op = (ins >> 11) & 31;
-            if !(matches!(op, 12 | 14 | 16..=19) || scalar && matches!(op, 2 | 4 | 6 | 8 | 10)) {
+            if !(matches!(op, 12 | 14 | 16..=19) || scalar && matches!(op, 0 | 2 | 4 | 6 | 8 | 10))
+            {
                 return Ok(false);
             }
             let immediate = (ins >> 16) & 127;
