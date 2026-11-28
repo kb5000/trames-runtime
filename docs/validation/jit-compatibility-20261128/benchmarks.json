@@ -1,0 +1,90 @@
+[
+  {
+    "name": "pointer-arithmetic",
+    "stride": 6,
+    "tail": 1,
+    "words": [
+      "9adf1032",
+      "91813e52",
+      "9add1651",
+      "bac1025e",
+      "f1000442",
+      "54ffff61",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "authenticated-load-pair-store",
+    "stride": 5,
+    "tail": 1,
+    "words": [
+      "f8200432",
+      "91000652",
+      "69007432",
+      "f1000442",
+      "54ffff81",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "tag-zero",
+    "stride": 4,
+    "tail": 1,
+    "words": [
+      "d9e00820",
+      "91000652",
+      "f1000442",
+      "54ffffa1",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "authentication-profile",
+    "stride": 5,
+    "tail": 1,
+    "words": [
+      "dac10032",
+      "dac143f2",
+      "91000652",
+      "f1000442",
+      "54ffff81",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "authenticated-branch",
+    "stride": 4,
+    "tail": 0,
+    "words": [
+      "91000652",
+      "f1000442",
+      "54000040",
+      "d61f0a3f",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "control-integer",
+    "stride": 3,
+    "tail": 1,
+    "words": [
+      "91000652",
+      "f1000442",
+      "54ffffc1",
+      "d4000001"
+    ]
+  },
+  {
+    "name": "control-scalar-memory",
+    "stride": 5,
+    "tail": 1,
+    "words": [
+      "f9400032",
+      "91000652",
+      "f9000032",
+      "f1000442",
+      "54ffff81",
+      "d4000001"
+    ]
+  }
+]

@@ -4,6 +4,8 @@ use crate::{CompilationStats, LinkStats};
 use std::{collections::BTreeMap, marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 use trames_engine::CpuFault;
 use trames_interpreter::Cpu;
+#[path = "compatibility.rs"]
+mod compatibility;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
 #[path = "exclusive.rs"]
@@ -1620,6 +1622,17 @@ impl Assembler {
     fn read(&mut self, guest: u32, avoid: u32) -> u32 {
         self.bind(guest, avoid, true)
     }
+    fn scratch(&mut self, avoid: u32) -> u32 {
+        let slot = (0..13)
+            .filter(|slot| avoid & (1 << (slot + 1)) == 0)
+            .min_by_key(|&slot| self.bindings[slot].map_or(0, |b| b.used + 1))
+            .expect("caller-saved scratch register");
+        if let Some(binding) = self.bindings[slot].take() {
+            self.store(slot, binding);
+            self.hosts[binding.guest as usize] = u8::MAX;
+        }
+        slot as u32 + 1
+    }
     fn output(&mut self, guest: u32, avoid: u32) -> u32 {
         if guest != 31 {
             self.versions[guest as usize] += 1;
@@ -2018,11 +2031,7 @@ impl Assembler {
             _ => Some(OperandKey {
                 address: address_key,
                 base: op.rn,
-                version: self.versions[if op.maintenance.is_some() {
-                    op.rn
-                } else {
-                    sp_register(op.rn as u32) as usize
-                }],
+                version: self.versions[op.base_register() as usize],
                 index_version: if let Address::Register { reg, .. } = address_key {
                     self.versions[reg]
                 } else {
@@ -2037,14 +2046,7 @@ impl Assembler {
         let base = if matches!(op.address, Address::Literal(_)) {
             31
         } else {
-            self.read(
-                if op.maintenance.is_some() {
-                    op.rn as u32
-                } else {
-                    sp_register(op.rn as u32)
-                },
-                scratch,
-            )
+            self.read(op.base_register(), scratch)
         };
         let vector_target = if op.vector {
             Some(if let Some(group) = op.structure {
@@ -2181,6 +2183,13 @@ impl Assembler {
             Address::Post(_) | Address::PostRegister(_) => {
                 self.words.push(0xaa0003f1 | (base << 16))
             }
+            Address::Pointer { offset, mode } => {
+                self.words.push(0xd340bc00 | (base << 5) | 17);
+                if mode != 1 && offset != 0 {
+                    constant(&mut self.words, 10, offset);
+                    self.words.push(0x8b0a0231);
+                }
+            }
         }
         // Shared guest TBI, followed by the existing one-page custody bound.
         self.words.push(0xd3400000 | (55 << 10) | (17 << 5) | 17);
@@ -2223,6 +2232,14 @@ impl Assembler {
         self.words[direct_jump] |= (common - direct_jump) as u32;
         if let Some(at) = reused_jump {
             self.words[at] |= (common - at) as u32;
+        }
+        if op.maintenance == Some(crate::memory_ops::Maintenance::TagZero) {
+            // Only the existing tag-zero profile requires a 16-byte alignment
+            // fault. Plain STP does not enforce MTE granule alignment itself.
+            // Protected aliases preserve the guest's low granule bits.
+            self.words.push(0xf2400e3f); // tst x17,#15
+            misses.push(self.words.len());
+            self.words.push(0x54000001);
         }
         if self.flags_live {
             self.words.push(0xd51b420c);
@@ -2300,9 +2317,12 @@ impl Assembler {
             }
         }
         let fault = self.words.len();
-        if op.maintenance == Some(crate::memory_ops::Maintenance::Zero) {
+        if matches!(
+            op.maintenance,
+            Some(crate::memory_ops::Maintenance::Zero | crate::memory_ops::Maintenance::TagZero)
+        ) {
             self.words
-                .extend_from_slice(&[0xa9007e3f, 0xa9017e3f, 0xa9027e3f, 0xa9037e3f]);
+                .extend((0..op.size / 16).map(|i| 0xa9007e3f | ((i as u32 * 2) << 15)));
         } else {
             self.words.push(match op.atomic {
                 Some(Atomic::RmwPair) => {
@@ -2343,6 +2363,16 @@ impl Assembler {
             self.words
                 .push(0x8b000000 | (index << 16) | (base << 5) | target);
         }
+        if let Address::Pointer {
+            offset,
+            mode: 1 | 3,
+        } = op.address
+        {
+            self.words.push(0xd340bc00 | (base << 5) | 13);
+            constant(&mut self.words, 10, offset);
+            let target = self.output(sp_register(op.rn as u32), scratch | (1 << base));
+            self.words.push(0x8b0a01a0 | target);
+        }
         load(&mut self.words, 10, 11, 0);
         self.words.push(0x9100054a);
         self.words.push(0xf900016a); // increment the selected non-atomic diagnostic
@@ -2357,8 +2387,11 @@ impl Assembler {
         let mut site = slow.memory(op, before);
         site.adjust += slow_start;
         site.stop += slow_start;
-        site.fixups = (0..if op.maintenance == Some(crate::memory_ops::Maintenance::Zero) {
-            4
+        site.fixups = (0..if matches!(
+            op.maintenance,
+            Some(crate::memory_ops::Maintenance::Zero | crate::memory_ops::Maintenance::TagZero)
+        ) {
+            op.size / 16
         } else {
             1
         })
@@ -2706,7 +2739,13 @@ fn compile_body(
                 return Ok(None);
             }
         }
-        if let Some(op) = crate::vector_ops::decode(word) {
+        if let Some(branch) = compatibility::register(&mut code, word, pc) {
+            if branch {
+                flow = Flow::Register;
+                next = pc.wrapping_add(4);
+                terminal = true;
+            }
+        } else if let Some(op) = crate::vector_ops::decode(word) {
             if !code.floating && !memory_ops.is_empty() {
                 return compile_body(
                     memory,

@@ -746,7 +746,9 @@ mod tests {
                 data_only: false,
             },
         ));
-        disk.fail_directory_syncs(2);
+        // Existing-file metadata now appends to the WAL instead of replacing
+        // the manifest/directory. Fail that actual publication after data sync.
+        disk.wal_failures.store(1, Ordering::Relaxed);
         account.wait.finish();
         let FileOutcome::Complete(reply) = work.run() else {
             panic!("resumed synchronous write must finish");
@@ -759,7 +761,7 @@ mod tests {
             file.begin_transaction().unwrap().is_some(),
             "sync never retains the foreground data transaction"
         );
-        disk.fail_directory_syncs(0);
+        assert_eq!(disk.wal_failures.load(Ordering::Relaxed), 0);
         v.sync_fd(fd, false).unwrap();
         assert_eq!(original.0.open.file_position.snapshot(), 3);
         drop(reply);

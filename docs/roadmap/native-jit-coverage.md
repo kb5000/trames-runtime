@@ -62,20 +62,39 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   Android app-UID/large-page acceptance. See
   [special-memory validation](../validation/jit-special-memory-20261128.md).
 
+- Existing non-hint PAC/MTE compatibility profile: every PAC/AUT register and
+  zero-modifier form, XPAC/PACGA, authenticated branches/returns and loads,
+  IRG/GMI/SUBP/SUBPS/ADDG/SUBG, LDG and every STG/STZG/ST2G/STZ2G/STGP addressing
+  form now avoids interpreter entry. Disabled authentication and zero allocation
+  tags remain the existing shared-CPU policy, rather than host PAC keys or new
+  tag state. Register/address/data effects use native baseline instructions;
+  tag-only permissions/translation reuse Memory/View. Actual data transfers
+  fuse into protected native aliases. An independent LLVM fixture contains
+  836 encodings, with whole-state/data/budget/fault and reservation acceptance.
+  See [compatibility validation](../validation/jit-compatibility-20261128.md).
+
 LSE128 is exposed only when the process host provides it. LS64 and full hardware
 PAC/BTI/MTE remain unadvertised without their required shared-CPU/memory ownership.
 This does not change the interpreter-only backend's compatibility policy. New
 stateful/later ISA features still need explicit ABI ownership; a closed fixed-width
 category is not full host-ISA coverage.
 
-## Remaining categories
+## Remaining ownership and execution work
 
-1. Existing non-hint PAC/MTE compatibility paths: authenticated branches/returns,
-   authenticated loads, pointer/tag arithmetic and allocation-tag operations.
-   PAC/BTI hints are already covered; full hardware PAC/BTI/MTE and stateful
-   SVE/SME remain unadvertised pending shared-CPU ABI ownership. Do not substitute
-   new software extension state. Unowned LS64/SETG and absent host extensions
-   fault when reached; they are not interpreter-provided JIT features.
+The previously listed existing shared-CPU instruction categories are covered.
+This is not a claim of every host ISA extension or every future encoding.
+
+1. Full hardware PAC/BTI/MTE and stateful SVE/SME still require explicit shared
+   CPU/context/memory ABI ownership. LS64 needs its Device-memory contract and
+   SETG needs allocation-tag ownership. These capabilities remain unadvertised;
+   do not substitute software extension state or interpret them as simpler ops.
+2. A changed execution epoch can still use the original one-instruction boundary
+   fallback. This is separate from steady-state instruction-category coverage.
+   Unknown embeddings without hardware memory-order ownership retain their
+   conservative atomic/barrier path. Product Memory/View exposes that ownership.
+3. Positive extension hardware, Option-B MOPS/migration and real Android app-UID,
+   ART interaction and large-page devices remain acceptance work. Linux native,
+   independent ISA-model execution and Windows APK compilation are distinct.
 
 Keep native capability admission and reserved-encoding decisions in compilation.
 Do not add guest-text rewrites, hot preflights, stronger ordinary-memory ordering,

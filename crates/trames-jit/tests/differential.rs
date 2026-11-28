@@ -52,6 +52,15 @@ fn compare_memory_sequence(
     budget: u64,
     parallel: bool,
 ) -> Engine {
+    compare_memory_sequence_mode(words, state, budget, if parallel { 2 } else { 0 })
+}
+fn compare_memory_sequence_mode(
+    words: &[u32],
+    state: &Aarch64State,
+    budget: u64,
+    mode: u8,
+) -> Engine {
+    let parallel = mode != 0;
     let mut a = memory(words);
     let mut b = memory(words);
     for m in [&mut a, &mut b] {
@@ -70,7 +79,7 @@ fn compare_memory_sequence(
     let mut rb = trames_memory::parallel::Registry::default();
     let mut va = parallel.then(|| a.parallel_view(&mut ra).unwrap());
     let mut vb = parallel.then(|| b.parallel_view(&mut rb).unwrap());
-    if parallel {
+    if mode == 2 {
         assert!(unsafe {
             trames_memory::parallel::View::try_private_epoch(&mut [va.as_mut().unwrap()])
         });
@@ -4245,3 +4254,6 @@ mod mops_category;
 
 #[path = "support/special_memory_category.rs"]
 mod special_memory_category;
+
+#[path = "support/compatibility_category.rs"]
+mod compatibility_category;

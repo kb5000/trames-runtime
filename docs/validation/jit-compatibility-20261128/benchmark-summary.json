@@ -1,0 +1,79 @@
+{
+  "control-integer": {
+    "speed_ratio": 1.0578585555958593,
+    "pair_ratios": [
+      1.0408074825821387,
+      1.1110170109763515,
+      1.0375493867799648,
+      1.043783720196855
+    ],
+    "before_median_ns_per_round": 47153.60546875,
+    "after_median_ns_per_round": 44058.5078125
+  },
+  "control-scalar-memory": {
+    "speed_ratio": 0.9858587267718766,
+    "pair_ratios": [
+      0.9893934042140826,
+      0.9776932988540001,
+      0.9817284665778834,
+      0.9947082205549196
+    ],
+    "before_median_ns_per_round": 78355.9921875,
+    "after_median_ns_per_round": 79453.7734375
+  },
+  "pointer-arithmetic": {
+    "speed_ratio": 230.26476821407596,
+    "pair_ratios": [
+      240.15486189187178,
+      232.46162718690763,
+      229.83642832736618,
+      219.10306532609548
+    ],
+    "before_median_ns_per_round": 15362652.09375,
+    "after_median_ns_per_round": 66710.09375
+  },
+  "authenticated-load-pair-store": {
+    "speed_ratio": 101.57544777725303,
+    "pair_ratios": [
+      105.61003335450157,
+      99.39788979713568,
+      103.49986979646329,
+      97.97896203413445
+    ],
+    "before_median_ns_per_round": 10201886.21875,
+    "after_median_ns_per_round": 100544.625
+  },
+  "tag-zero": {
+    "speed_ratio": 96.58683845858866,
+    "pair_ratios": [
+      100.75963783441134,
+      93.70262206542097,
+      93.75870718765074,
+      98.31546797549302
+    ],
+    "before_median_ns_per_round": 5647925.4375,
+    "after_median_ns_per_round": 60256.96875
+  },
+  "authentication-profile": {
+    "speed_ratio": 115.31917475590497,
+    "pair_ratios": [
+      100.66527914737945,
+      118.92236988182964,
+      132.98929508081255,
+      111.08263213514341
+    ],
+    "before_median_ns_per_round": 8131187.53125,
+    "after_median_ns_per_round": 72644.15625
+  },
+  "authenticated-branch": {
+    "speed_ratio": 68.77912584680033,
+    "pair_ratios": [
+      68.3312502068157,
+      65.55066096042927,
+      70.31299733727725,
+      71.05498527085633
+    ],
+    "before_median_ns_per_round": 4548027.6875,
+    "after_median_ns_per_round": 65550.5625
+  }
+}

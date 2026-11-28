@@ -1,0 +1,17 @@
+{
+  "encodings": 836,
+  "families": {
+    "identity": 96,
+    "strip": 12,
+    "code": 6,
+    "branch": 50,
+    "irg": 6,
+    "gmi": 6,
+    "subp": 12,
+    "addg": 108,
+    "load": 110,
+    "tag": 350,
+    "stgp": 80
+  },
+  "words_sha256": "0cd8049076bcf2037f0b35581f1af7a1733ca190628ad1f4845aeb1c26390ab9"
+}

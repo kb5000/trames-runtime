@@ -1,0 +1,12 @@
+UTC 2026-11-28T08:41:17.108755+00:00
+COMMAND ['cargo', 'clippy', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', '--all-targets', '--', '-D', 'warnings']
+    Checking trames-execution v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-execution)
+    Checking trames-host-compute v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-host-compute)
+    Checking getrandom v0.3.4
+    Checking trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-memory)
+    Checking trames-engine v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-engine)
+    Checking trames-interpreter v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-interpreter)
+    Checking trames-jit v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-compat-source/crates/trames-jit)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.54s
+
+EXIT 0 ELAPSED 1.607243208

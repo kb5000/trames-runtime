@@ -1,0 +1,836 @@
+identity dac10020 pacia x0, x1
+identity dac10420 pacib x0, x1
+identity dac10820 pacda x0, x1
+identity dac10c20 pacdb x0, x1
+identity dac11020 autia x0, x1
+identity dac11420 autib x0, x1
+identity dac11820 autda x0, x1
+identity dac11c20 autdb x0, x1
+identity dac123e0 paciza x0
+identity dac127e0 pacizb x0
+identity dac12be0 pacdza x0
+identity dac12fe0 pacdzb x0
+identity dac133e0 autiza x0
+identity dac137e0 autizb x0
+identity dac13be0 autdza x0
+identity dac13fe0 autdzb x0
+strip dac143e0 xpaci x0
+strip dac147e0 xpacd x0
+code 9ac23020 pacga x0, x1, x2
+branch d71f0822 braa x1, x2
+branch d71f0c22 brab x1, x2
+branch d73f0822 blraa x1, x2
+branch d73f0c22 blrab x1, x2
+branch d61f083f braaz x1
+branch d61f0c3f brabz x1
+branch d63f083f blraaz x1
+branch d63f0c3f blrabz x1
+irg 9ac21020 irg x0, x1, x2
+gmi 9ac21420 gmi x0, x1, x2
+subp 9ac20020 subp x0, x1, x2
+subp bac20020 subps x0, x1, x2
+addg 91800020 addg x0, x1, #0, #0
+addg 91800420 addg x0, x1, #0, #1
+addg 91803c20 addg x0, x1, #0, #15
+addg 91810020 addg x0, x1, #16, #0
+addg 91810420 addg x0, x1, #16, #1
+addg 91813c20 addg x0, x1, #16, #15
+addg 91bf0020 addg x0, x1, #1008, #0
+addg 91bf0420 addg x0, x1, #1008, #1
+addg 91bf3c20 addg x0, x1, #1008, #15
+addg d1800020 subg x0, x1, #0, #0
+addg d1800420 subg x0, x1, #0, #1
+addg d1803c20 subg x0, x1, #0, #15
+addg d1810020 subg x0, x1, #16, #0
+addg d1810420 subg x0, x1, #16, #1
+addg d1813c20 subg x0, x1, #16, #15
+addg d1bf0020 subg x0, x1, #1008, #0
+addg d1bf0420 subg x0, x1, #1008, #1
+addg d1bf3c20 subg x0, x1, #1008, #15
+identity dac10232 pacia x18, x17
+identity dac10632 pacib x18, x17
+identity dac10a32 pacda x18, x17
+identity dac10e32 pacdb x18, x17
+identity dac11232 autia x18, x17
+identity dac11632 autib x18, x17
+identity dac11a32 autda x18, x17
+identity dac11e32 autdb x18, x17
+identity dac123f2 paciza x18
+identity dac127f2 pacizb x18
+identity dac12bf2 pacdza x18
+identity dac12ff2 pacdzb x18
+identity dac133f2 autiza x18
+identity dac137f2 autizb x18
+identity dac13bf2 autdza x18
+identity dac13ff2 autdzb x18
+strip dac143f2 xpaci x18
+strip dac147f2 xpacd x18
+code 9add3232 pacga x18, x17, x29
+branch d71f0a3d braa x17, x29
+branch d71f0e3d brab x17, x29
+branch d73f0a3d blraa x17, x29
+branch d73f0e3d blrab x17, x29
+branch d61f0a3f braaz x17
+branch d61f0e3f brabz x17
+branch d63f0a3f blraaz x17
+branch d63f0e3f blrabz x17
+irg 9add1232 irg x18, x17, x29
+gmi 9add1632 gmi x18, x17, x29
+subp 9add0232 subp x18, x17, x29
+subp badd0232 subps x18, x17, x29
+addg 91800232 addg x18, x17, #0, #0
+addg 91800632 addg x18, x17, #0, #1
+addg 91803e32 addg x18, x17, #0, #15
+addg 91810232 addg x18, x17, #16, #0
+addg 91810632 addg x18, x17, #16, #1
+addg 91813e32 addg x18, x17, #16, #15
+addg 91bf0232 addg x18, x17, #1008, #0
+addg 91bf0632 addg x18, x17, #1008, #1
+addg 91bf3e32 addg x18, x17, #1008, #15
+addg d1800232 subg x18, x17, #0, #0
+addg d1800632 subg x18, x17, #0, #1
+addg d1803e32 subg x18, x17, #0, #15
+addg d1810232 subg x18, x17, #16, #0
+addg d1810632 subg x18, x17, #16, #1
+addg d1813e32 subg x18, x17, #16, #15
+addg d1bf0232 subg x18, x17, #1008, #0
+addg d1bf0632 subg x18, x17, #1008, #1
+addg d1bf3e32 subg x18, x17, #1008, #15
+identity dac103de pacia x30, x30
+identity dac107de pacib x30, x30
+identity dac10bde pacda x30, x30
+identity dac10fde pacdb x30, x30
+identity dac113de autia x30, x30
+identity dac117de autib x30, x30
+identity dac11bde autda x30, x30
+identity dac11fde autdb x30, x30
+identity dac123fe paciza x30
+identity dac127fe pacizb x30
+identity dac12bfe pacdza x30
+identity dac12ffe pacdzb x30
+identity dac133fe autiza x30
+identity dac137fe autizb x30
+identity dac13bfe autdza x30
+identity dac13ffe autdzb x30
+strip dac143fe xpaci x30
+strip dac147fe xpacd x30
+code 9ade33de pacga x30, x30, x30
+branch d71f0bde braa x30, x30
+branch d71f0fde brab x30, x30
+branch d73f0bde blraa x30, x30
+branch d73f0fde blrab x30, x30
+branch d61f0bdf braaz x30
+branch d61f0fdf brabz x30
+branch d63f0bdf blraaz x30
+branch d63f0fdf blrabz x30
+irg 9ade13de irg x30, x30, x30
+gmi 9ade17de gmi x30, x30, x30
+subp 9ade03de subp x30, x30, x30
+subp bade03de subps x30, x30, x30
+addg 918003de addg x30, x30, #0, #0
+addg 918007de addg x30, x30, #0, #1
+addg 91803fde addg x30, x30, #0, #15
+addg 918103de addg x30, x30, #16, #0
+addg 918107de addg x30, x30, #16, #1
+addg 91813fde addg x30, x30, #16, #15
+addg 91bf03de addg x30, x30, #1008, #0
+addg 91bf07de addg x30, x30, #1008, #1
+addg 91bf3fde addg x30, x30, #1008, #15
+addg d18003de subg x30, x30, #0, #0
+addg d18007de subg x30, x30, #0, #1
+addg d1803fde subg x30, x30, #0, #15
+addg d18103de subg x30, x30, #16, #0
+addg d18107de subg x30, x30, #16, #1
+addg d1813fde subg x30, x30, #16, #15
+addg d1bf03de subg x30, x30, #1008, #0
+addg d1bf07de subg x30, x30, #1008, #1
+addg d1bf3fde subg x30, x30, #1008, #15
+identity dac103ff pacia xzr, sp
+identity dac107ff pacib xzr, sp
+identity dac10bff pacda xzr, sp
+identity dac10fff pacdb xzr, sp
+identity dac113ff autia xzr, sp
+identity dac117ff autib xzr, sp
+identity dac11bff autda xzr, sp
+identity dac11fff autdb xzr, sp
+identity dac123ff paciza xzr
+identity dac127ff pacizb xzr
+identity dac12bff pacdza xzr
+identity dac12fff pacdzb xzr
+identity dac133ff autiza xzr
+identity dac137ff autizb xzr
+identity dac13bff autdza xzr
+identity dac13fff autdzb xzr
+strip dac143ff xpaci xzr
+strip dac147ff xpacd xzr
+code 9adf33ff pacga xzr, xzr, sp
+branch d71f0bff braa xzr, sp
+branch d71f0fff brab xzr, sp
+branch d73f0bff blraa xzr, sp
+branch d73f0fff blrab xzr, sp
+branch d61f0bff braaz xzr
+branch d61f0fff brabz xzr
+branch d63f0bff blraaz xzr
+branch d63f0fff blrabz xzr
+irg 9adf13ff irg sp, sp, xzr
+gmi 9adf17ff gmi xzr, sp, xzr
+subp 9adf03ff subp xzr, sp, sp
+subp badf03ff subps xzr, sp, sp
+addg 918003ff addg sp, sp, #0, #0
+addg 918007ff addg sp, sp, #0, #1
+addg 91803fff addg sp, sp, #0, #15
+addg 918103ff addg sp, sp, #16, #0
+addg 918107ff addg sp, sp, #16, #1
+addg 91813fff addg sp, sp, #16, #15
+addg 91bf03ff addg sp, sp, #1008, #0
+addg 91bf07ff addg sp, sp, #1008, #1
+addg 91bf3fff addg sp, sp, #1008, #15
+addg d18003ff subg sp, sp, #0, #0
+addg d18007ff subg sp, sp, #0, #1
+addg d1803fff subg sp, sp, #0, #15
+addg d18103ff subg sp, sp, #16, #0
+addg d18107ff subg sp, sp, #16, #1
+addg d1813fff subg sp, sp, #16, #15
+addg d1bf03ff subg sp, sp, #1008, #0
+addg d1bf07ff subg sp, sp, #1008, #1
+addg d1bf3fff subg sp, sp, #1008, #15
+identity dac103f1 pacia x17, sp
+identity dac107f1 pacib x17, sp
+identity dac10bf1 pacda x17, sp
+identity dac10ff1 pacdb x17, sp
+identity dac113f1 autia x17, sp
+identity dac117f1 autib x17, sp
+identity dac11bf1 autda x17, sp
+identity dac11ff1 autdb x17, sp
+identity dac123f1 paciza x17
+identity dac127f1 pacizb x17
+identity dac12bf1 pacdza x17
+identity dac12ff1 pacdzb x17
+identity dac133f1 autiza x17
+identity dac137f1 autizb x17
+identity dac13bf1 autdza x17
+identity dac13ff1 autdzb x17
+strip dac143f1 xpaci x17
+strip dac147f1 xpacd x17
+code 9ad233f1 pacga x17, xzr, x18
+branch d71f0bf2 braa xzr, x18
+branch d71f0ff2 brab xzr, x18
+branch d73f0bf2 blraa xzr, x18
+branch d73f0ff2 blrab xzr, x18
+branch d61f0bff braaz xzr
+branch d61f0fff brabz xzr
+branch d63f0bff blraaz xzr
+branch d63f0fff blrabz xzr
+irg 9ad213f1 irg x17, sp, x18
+gmi 9ad217f1 gmi x17, sp, x18
+subp 9ad203f1 subp x17, sp, x18
+subp bad203f1 subps x17, sp, x18
+addg 918003f1 addg x17, sp, #0, #0
+addg 918007f1 addg x17, sp, #0, #1
+addg 91803ff1 addg x17, sp, #0, #15
+addg 918103f1 addg x17, sp, #16, #0
+addg 918107f1 addg x17, sp, #16, #1
+addg 91813ff1 addg x17, sp, #16, #15
+addg 91bf03f1 addg x17, sp, #1008, #0
+addg 91bf07f1 addg x17, sp, #1008, #1
+addg 91bf3ff1 addg x17, sp, #1008, #15
+addg d18003f1 subg x17, sp, #0, #0
+addg d18007f1 subg x17, sp, #0, #1
+addg d1803ff1 subg x17, sp, #0, #15
+addg d18103f1 subg x17, sp, #16, #0
+addg d18107f1 subg x17, sp, #16, #1
+addg d1813ff1 subg x17, sp, #16, #15
+addg d1bf03f1 subg x17, sp, #1008, #0
+addg d1bf07f1 subg x17, sp, #1008, #1
+addg d1bf3ff1 subg x17, sp, #1008, #15
+identity dac10000 pacia x0, x0
+identity dac10400 pacib x0, x0
+identity dac10800 pacda x0, x0
+identity dac10c00 pacdb x0, x0
+identity dac11000 autia x0, x0
+identity dac11400 autib x0, x0
+identity dac11800 autda x0, x0
+identity dac11c00 autdb x0, x0
+identity dac123e0 paciza x0
+identity dac127e0 pacizb x0
+identity dac12be0 pacdza x0
+identity dac12fe0 pacdzb x0
+identity dac133e0 autiza x0
+identity dac137e0 autizb x0
+identity dac13be0 autdza x0
+identity dac13fe0 autdzb x0
+strip dac143e0 xpaci x0
+strip dac147e0 xpacd x0
+code 9ac03000 pacga x0, x0, x0
+branch d71f0800 braa x0, x0
+branch d71f0c00 brab x0, x0
+branch d73f0800 blraa x0, x0
+branch d73f0c00 blrab x0, x0
+branch d61f081f braaz x0
+branch d61f0c1f brabz x0
+branch d63f081f blraaz x0
+branch d63f0c1f blrabz x0
+irg 9ac01000 irg x0, x0, x0
+gmi 9ac01400 gmi x0, x0, x0
+subp 9ac00000 subp x0, x0, x0
+subp bac00000 subps x0, x0, x0
+addg 91800000 addg x0, x0, #0, #0
+addg 91800400 addg x0, x0, #0, #1
+addg 91803c00 addg x0, x0, #0, #15
+addg 91810000 addg x0, x0, #16, #0
+addg 91810400 addg x0, x0, #16, #1
+addg 91813c00 addg x0, x0, #16, #15
+addg 91bf0000 addg x0, x0, #1008, #0
+addg 91bf0400 addg x0, x0, #1008, #1
+addg 91bf3c00 addg x0, x0, #1008, #15
+addg d1800000 subg x0, x0, #0, #0
+addg d1800400 subg x0, x0, #0, #1
+addg d1803c00 subg x0, x0, #0, #15
+addg d1810000 subg x0, x0, #16, #0
+addg d1810400 subg x0, x0, #16, #1
+addg d1813c00 subg x0, x0, #16, #15
+addg d1bf0000 subg x0, x0, #1008, #0
+addg d1bf0400 subg x0, x0, #1008, #1
+addg d1bf3c00 subg x0, x0, #1008, #15
+branch d65f0bff retaa
+branch d65f0fff retab
+load f8600420 ldraa x0, [x1, #-4096]
+load f8600c20 ldraa x0, [x1, #-4096]!
+load f87ff420 ldraa x0, [x1, #-8]
+load f87ffc20 ldraa x0, [x1, #-8]!
+load f8200420 ldraa x0, [x1, #0]
+load f8200c20 ldraa x0, [x1, #0]!
+load f8201420 ldraa x0, [x1, #8]
+load f8201c20 ldraa x0, [x1, #8]!
+load f83ff420 ldraa x0, [x1, #4088]
+load f83ffc20 ldraa x0, [x1, #4088]!
+load f8e00420 ldrab x0, [x1, #-4096]
+load f8e00c20 ldrab x0, [x1, #-4096]!
+load f8fff420 ldrab x0, [x1, #-8]
+load f8fffc20 ldrab x0, [x1, #-8]!
+load f8a00420 ldrab x0, [x1, #0]
+load f8a00c20 ldrab x0, [x1, #0]!
+load f8a01420 ldrab x0, [x1, #8]
+load f8a01c20 ldrab x0, [x1, #8]!
+load f8bff420 ldrab x0, [x1, #4088]
+load f8bffc20 ldrab x0, [x1, #4088]!
+tag d9700020 ldg x0, [x1, #-4096]
+tag d9300820 stg x0, [x1, #-4096]
+tag d9300c20 stg x0, [x1, #-4096]!
+tag d9300420 stg x0, [x1], #-4096
+tag d9700820 stzg x0, [x1, #-4096]
+tag d9700c20 stzg x0, [x1, #-4096]!
+tag d9700420 stzg x0, [x1], #-4096
+tag d9b00820 st2g x0, [x1, #-4096]
+tag d9b00c20 st2g x0, [x1, #-4096]!
+tag d9b00420 st2g x0, [x1], #-4096
+tag d9f00820 stz2g x0, [x1, #-4096]
+tag d9f00c20 stz2g x0, [x1, #-4096]!
+tag d9f00420 stz2g x0, [x1], #-4096
+tag d97ff020 ldg x0, [x1, #-16]
+tag d93ff820 stg x0, [x1, #-16]
+tag d93ffc20 stg x0, [x1, #-16]!
+tag d93ff420 stg x0, [x1], #-16
+tag d97ff820 stzg x0, [x1, #-16]
+tag d97ffc20 stzg x0, [x1, #-16]!
+tag d97ff420 stzg x0, [x1], #-16
+tag d9bff820 st2g x0, [x1, #-16]
+tag d9bffc20 st2g x0, [x1, #-16]!
+tag d9bff420 st2g x0, [x1], #-16
+tag d9fff820 stz2g x0, [x1, #-16]
+tag d9fffc20 stz2g x0, [x1, #-16]!
+tag d9fff420 stz2g x0, [x1], #-16
+tag d9600020 ldg x0, [x1, #0]
+tag d9200820 stg x0, [x1, #0]
+tag d9200c20 stg x0, [x1, #0]!
+tag d9200420 stg x0, [x1], #0
+tag d9600820 stzg x0, [x1, #0]
+tag d9600c20 stzg x0, [x1, #0]!
+tag d9600420 stzg x0, [x1], #0
+tag d9a00820 st2g x0, [x1, #0]
+tag d9a00c20 st2g x0, [x1, #0]!
+tag d9a00420 st2g x0, [x1], #0
+tag d9e00820 stz2g x0, [x1, #0]
+tag d9e00c20 stz2g x0, [x1, #0]!
+tag d9e00420 stz2g x0, [x1], #0
+tag d9601020 ldg x0, [x1, #16]
+tag d9201820 stg x0, [x1, #16]
+tag d9201c20 stg x0, [x1, #16]!
+tag d9201420 stg x0, [x1], #16
+tag d9601820 stzg x0, [x1, #16]
+tag d9601c20 stzg x0, [x1, #16]!
+tag d9601420 stzg x0, [x1], #16
+tag d9a01820 st2g x0, [x1, #16]
+tag d9a01c20 st2g x0, [x1, #16]!
+tag d9a01420 st2g x0, [x1], #16
+tag d9e01820 stz2g x0, [x1, #16]
+tag d9e01c20 stz2g x0, [x1, #16]!
+tag d9e01420 stz2g x0, [x1], #16
+tag d96ff020 ldg x0, [x1, #4080]
+tag d92ff820 stg x0, [x1, #4080]
+tag d92ffc20 stg x0, [x1, #4080]!
+tag d92ff420 stg x0, [x1], #4080
+tag d96ff820 stzg x0, [x1, #4080]
+tag d96ffc20 stzg x0, [x1, #4080]!
+tag d96ff420 stzg x0, [x1], #4080
+tag d9aff820 st2g x0, [x1, #4080]
+tag d9affc20 st2g x0, [x1, #4080]!
+tag d9aff420 st2g x0, [x1], #4080
+tag d9eff820 stz2g x0, [x1, #4080]
+tag d9effc20 stz2g x0, [x1, #4080]!
+tag d9eff420 stz2g x0, [x1], #4080
+stgp 69200820 stgp x0, x2, [x1, #-1024]
+stgp 69a00820 stgp x0, x2, [x1, #-1024]!
+stgp 68a00820 stgp x0, x2, [x1], #-1024
+stgp 693f8820 stgp x0, x2, [x1, #-16]
+stgp 69bf8820 stgp x0, x2, [x1, #-16]!
+stgp 68bf8820 stgp x0, x2, [x1], #-16
+stgp 69000820 stgp x0, x2, [x1, #0]
+stgp 69800820 stgp x0, x2, [x1, #0]!
+stgp 68800820 stgp x0, x2, [x1], #0
+stgp 69008820 stgp x0, x2, [x1, #16]
+stgp 69808820 stgp x0, x2, [x1, #16]!
+stgp 68808820 stgp x0, x2, [x1], #16
+stgp 691f8820 stgp x0, x2, [x1, #1008]
+stgp 699f8820 stgp x0, x2, [x1, #1008]!
+stgp 689f8820 stgp x0, x2, [x1], #1008
+load f8600632 ldraa x18, [x17, #-4096]
+load f8600e32 ldraa x18, [x17, #-4096]!
+load f87ff632 ldraa x18, [x17, #-8]
+load f87ffe32 ldraa x18, [x17, #-8]!
+load f8200632 ldraa x18, [x17, #0]
+load f8200e32 ldraa x18, [x17, #0]!
+load f8201632 ldraa x18, [x17, #8]
+load f8201e32 ldraa x18, [x17, #8]!
+load f83ff632 ldraa x18, [x17, #4088]
+load f83ffe32 ldraa x18, [x17, #4088]!
+load f8e00632 ldrab x18, [x17, #-4096]
+load f8e00e32 ldrab x18, [x17, #-4096]!
+load f8fff632 ldrab x18, [x17, #-8]
+load f8fffe32 ldrab x18, [x17, #-8]!
+load f8a00632 ldrab x18, [x17, #0]
+load f8a00e32 ldrab x18, [x17, #0]!
+load f8a01632 ldrab x18, [x17, #8]
+load f8a01e32 ldrab x18, [x17, #8]!
+load f8bff632 ldrab x18, [x17, #4088]
+load f8bffe32 ldrab x18, [x17, #4088]!
+tag d9700232 ldg x18, [x17, #-4096]
+tag d9300a32 stg x18, [x17, #-4096]
+tag d9300e32 stg x18, [x17, #-4096]!
+tag d9300632 stg x18, [x17], #-4096
+tag d9700a32 stzg x18, [x17, #-4096]
+tag d9700e32 stzg x18, [x17, #-4096]!
+tag d9700632 stzg x18, [x17], #-4096
+tag d9b00a32 st2g x18, [x17, #-4096]
+tag d9b00e32 st2g x18, [x17, #-4096]!
+tag d9b00632 st2g x18, [x17], #-4096
+tag d9f00a32 stz2g x18, [x17, #-4096]
+tag d9f00e32 stz2g x18, [x17, #-4096]!
+tag d9f00632 stz2g x18, [x17], #-4096
+tag d97ff232 ldg x18, [x17, #-16]
+tag d93ffa32 stg x18, [x17, #-16]
+tag d93ffe32 stg x18, [x17, #-16]!
+tag d93ff632 stg x18, [x17], #-16
+tag d97ffa32 stzg x18, [x17, #-16]
+tag d97ffe32 stzg x18, [x17, #-16]!
+tag d97ff632 stzg x18, [x17], #-16
+tag d9bffa32 st2g x18, [x17, #-16]
+tag d9bffe32 st2g x18, [x17, #-16]!
+tag d9bff632 st2g x18, [x17], #-16
+tag d9fffa32 stz2g x18, [x17, #-16]
+tag d9fffe32 stz2g x18, [x17, #-16]!
+tag d9fff632 stz2g x18, [x17], #-16
+tag d9600232 ldg x18, [x17, #0]
+tag d9200a32 stg x18, [x17, #0]
+tag d9200e32 stg x18, [x17, #0]!
+tag d9200632 stg x18, [x17], #0
+tag d9600a32 stzg x18, [x17, #0]
+tag d9600e32 stzg x18, [x17, #0]!
+tag d9600632 stzg x18, [x17], #0
+tag d9a00a32 st2g x18, [x17, #0]
+tag d9a00e32 st2g x18, [x17, #0]!
+tag d9a00632 st2g x18, [x17], #0
+tag d9e00a32 stz2g x18, [x17, #0]
+tag d9e00e32 stz2g x18, [x17, #0]!
+tag d9e00632 stz2g x18, [x17], #0
+tag d9601232 ldg x18, [x17, #16]
+tag d9201a32 stg x18, [x17, #16]
+tag d9201e32 stg x18, [x17, #16]!
+tag d9201632 stg x18, [x17], #16
+tag d9601a32 stzg x18, [x17, #16]
+tag d9601e32 stzg x18, [x17, #16]!
+tag d9601632 stzg x18, [x17], #16
+tag d9a01a32 st2g x18, [x17, #16]
+tag d9a01e32 st2g x18, [x17, #16]!
+tag d9a01632 st2g x18, [x17], #16
+tag d9e01a32 stz2g x18, [x17, #16]
+tag d9e01e32 stz2g x18, [x17, #16]!
+tag d9e01632 stz2g x18, [x17], #16
+tag d96ff232 ldg x18, [x17, #4080]
+tag d92ffa32 stg x18, [x17, #4080]
+tag d92ffe32 stg x18, [x17, #4080]!
+tag d92ff632 stg x18, [x17], #4080
+tag d96ffa32 stzg x18, [x17, #4080]
+tag d96ffe32 stzg x18, [x17, #4080]!
+tag d96ff632 stzg x18, [x17], #4080
+tag d9affa32 st2g x18, [x17, #4080]
+tag d9affe32 st2g x18, [x17, #4080]!
+tag d9aff632 st2g x18, [x17], #4080
+tag d9effa32 stz2g x18, [x17, #4080]
+tag d9effe32 stz2g x18, [x17, #4080]!
+tag d9eff632 stz2g x18, [x17], #4080
+stgp 69207632 stgp x18, x29, [x17, #-1024]
+stgp 69a07632 stgp x18, x29, [x17, #-1024]!
+stgp 68a07632 stgp x18, x29, [x17], #-1024
+stgp 693ff632 stgp x18, x29, [x17, #-16]
+stgp 69bff632 stgp x18, x29, [x17, #-16]!
+stgp 68bff632 stgp x18, x29, [x17], #-16
+stgp 69007632 stgp x18, x29, [x17, #0]
+stgp 69807632 stgp x18, x29, [x17, #0]!
+stgp 68807632 stgp x18, x29, [x17], #0
+stgp 6900f632 stgp x18, x29, [x17, #16]
+stgp 6980f632 stgp x18, x29, [x17, #16]!
+stgp 6880f632 stgp x18, x29, [x17], #16
+stgp 691ff632 stgp x18, x29, [x17, #1008]
+stgp 699ff632 stgp x18, x29, [x17, #1008]!
+stgp 689ff632 stgp x18, x29, [x17], #1008
+load f86007fe ldraa x30, [sp, #-4096]
+load f8600ffe ldraa x30, [sp, #-4096]!
+load f87ff7fe ldraa x30, [sp, #-8]
+load f87ffffe ldraa x30, [sp, #-8]!
+load f82007fe ldraa x30, [sp, #0]
+load f8200ffe ldraa x30, [sp, #0]!
+load f82017fe ldraa x30, [sp, #8]
+load f8201ffe ldraa x30, [sp, #8]!
+load f83ff7fe ldraa x30, [sp, #4088]
+load f83ffffe ldraa x30, [sp, #4088]!
+load f8e007fe ldrab x30, [sp, #-4096]
+load f8e00ffe ldrab x30, [sp, #-4096]!
+load f8fff7fe ldrab x30, [sp, #-8]
+load f8fffffe ldrab x30, [sp, #-8]!
+load f8a007fe ldrab x30, [sp, #0]
+load f8a00ffe ldrab x30, [sp, #0]!
+load f8a017fe ldrab x30, [sp, #8]
+load f8a01ffe ldrab x30, [sp, #8]!
+load f8bff7fe ldrab x30, [sp, #4088]
+load f8bffffe ldrab x30, [sp, #4088]!
+tag d97003fe ldg x30, [sp, #-4096]
+tag d9300bfe stg x30, [sp, #-4096]
+tag d9300ffe stg x30, [sp, #-4096]!
+tag d93007fe stg x30, [sp], #-4096
+tag d9700bfe stzg x30, [sp, #-4096]
+tag d9700ffe stzg x30, [sp, #-4096]!
+tag d97007fe stzg x30, [sp], #-4096
+tag d9b00bfe st2g x30, [sp, #-4096]
+tag d9b00ffe st2g x30, [sp, #-4096]!
+tag d9b007fe st2g x30, [sp], #-4096
+tag d9f00bfe stz2g x30, [sp, #-4096]
+tag d9f00ffe stz2g x30, [sp, #-4096]!
+tag d9f007fe stz2g x30, [sp], #-4096
+tag d97ff3fe ldg x30, [sp, #-16]
+tag d93ffbfe stg x30, [sp, #-16]
+tag d93ffffe stg x30, [sp, #-16]!
+tag d93ff7fe stg x30, [sp], #-16
+tag d97ffbfe stzg x30, [sp, #-16]
+tag d97ffffe stzg x30, [sp, #-16]!
+tag d97ff7fe stzg x30, [sp], #-16
+tag d9bffbfe st2g x30, [sp, #-16]
+tag d9bffffe st2g x30, [sp, #-16]!
+tag d9bff7fe st2g x30, [sp], #-16
+tag d9fffbfe stz2g x30, [sp, #-16]
+tag d9fffffe stz2g x30, [sp, #-16]!
+tag d9fff7fe stz2g x30, [sp], #-16
+tag d96003fe ldg x30, [sp, #0]
+tag d9200bfe stg x30, [sp, #0]
+tag d9200ffe stg x30, [sp, #0]!
+tag d92007fe stg x30, [sp], #0
+tag d9600bfe stzg x30, [sp, #0]
+tag d9600ffe stzg x30, [sp, #0]!
+tag d96007fe stzg x30, [sp], #0
+tag d9a00bfe st2g x30, [sp, #0]
+tag d9a00ffe st2g x30, [sp, #0]!
+tag d9a007fe st2g x30, [sp], #0
+tag d9e00bfe stz2g x30, [sp, #0]
+tag d9e00ffe stz2g x30, [sp, #0]!
+tag d9e007fe stz2g x30, [sp], #0
+tag d96013fe ldg x30, [sp, #16]
+tag d9201bfe stg x30, [sp, #16]
+tag d9201ffe stg x30, [sp, #16]!
+tag d92017fe stg x30, [sp], #16
+tag d9601bfe stzg x30, [sp, #16]
+tag d9601ffe stzg x30, [sp, #16]!
+tag d96017fe stzg x30, [sp], #16
+tag d9a01bfe st2g x30, [sp, #16]
+tag d9a01ffe st2g x30, [sp, #16]!
+tag d9a017fe st2g x30, [sp], #16
+tag d9e01bfe stz2g x30, [sp, #16]
+tag d9e01ffe stz2g x30, [sp, #16]!
+tag d9e017fe stz2g x30, [sp], #16
+tag d96ff3fe ldg x30, [sp, #4080]
+tag d92ffbfe stg x30, [sp, #4080]
+tag d92ffffe stg x30, [sp, #4080]!
+tag d92ff7fe stg x30, [sp], #4080
+tag d96ffbfe stzg x30, [sp, #4080]
+tag d96ffffe stzg x30, [sp, #4080]!
+tag d96ff7fe stzg x30, [sp], #4080
+tag d9affbfe st2g x30, [sp, #4080]
+tag d9affffe st2g x30, [sp, #4080]!
+tag d9aff7fe st2g x30, [sp], #4080
+tag d9effbfe stz2g x30, [sp, #4080]
+tag d9effffe stz2g x30, [sp, #4080]!
+tag d9eff7fe stz2g x30, [sp], #4080
+stgp 69207bfe stgp x30, x30, [sp, #-1024]
+stgp 69a07bfe stgp x30, x30, [sp, #-1024]!
+stgp 68a07bfe stgp x30, x30, [sp], #-1024
+stgp 693ffbfe stgp x30, x30, [sp, #-16]
+stgp 69bffbfe stgp x30, x30, [sp, #-16]!
+stgp 68bffbfe stgp x30, x30, [sp], #-16
+stgp 69007bfe stgp x30, x30, [sp, #0]
+stgp 69807bfe stgp x30, x30, [sp, #0]!
+stgp 68807bfe stgp x30, x30, [sp], #0
+stgp 6900fbfe stgp x30, x30, [sp, #16]
+stgp 6980fbfe stgp x30, x30, [sp, #16]!
+stgp 6880fbfe stgp x30, x30, [sp], #16
+stgp 691ffbfe stgp x30, x30, [sp, #1008]
+stgp 699ffbfe stgp x30, x30, [sp, #1008]!
+stgp 689ffbfe stgp x30, x30, [sp], #1008
+load f86007ff ldraa xzr, [sp, #-4096]
+load f8600fff ldraa xzr, [sp, #-4096]!
+load f87ff7ff ldraa xzr, [sp, #-8]
+load f87fffff ldraa xzr, [sp, #-8]!
+load f82007ff ldraa xzr, [sp, #0]
+load f8200fff ldraa xzr, [sp, #0]!
+load f82017ff ldraa xzr, [sp, #8]
+load f8201fff ldraa xzr, [sp, #8]!
+load f83ff7ff ldraa xzr, [sp, #4088]
+load f83fffff ldraa xzr, [sp, #4088]!
+load f8e007ff ldrab xzr, [sp, #-4096]
+load f8e00fff ldrab xzr, [sp, #-4096]!
+load f8fff7ff ldrab xzr, [sp, #-8]
+load f8ffffff ldrab xzr, [sp, #-8]!
+load f8a007ff ldrab xzr, [sp, #0]
+load f8a00fff ldrab xzr, [sp, #0]!
+load f8a017ff ldrab xzr, [sp, #8]
+load f8a01fff ldrab xzr, [sp, #8]!
+load f8bff7ff ldrab xzr, [sp, #4088]
+load f8bfffff ldrab xzr, [sp, #4088]!
+tag d97003ff ldg xzr, [sp, #-4096]
+tag d9300bff stg sp, [sp, #-4096]
+tag d9300fff stg sp, [sp, #-4096]!
+tag d93007ff stg sp, [sp], #-4096
+tag d9700bff stzg sp, [sp, #-4096]
+tag d9700fff stzg sp, [sp, #-4096]!
+tag d97007ff stzg sp, [sp], #-4096
+tag d9b00bff st2g sp, [sp, #-4096]
+tag d9b00fff st2g sp, [sp, #-4096]!
+tag d9b007ff st2g sp, [sp], #-4096
+tag d9f00bff stz2g sp, [sp, #-4096]
+tag d9f00fff stz2g sp, [sp, #-4096]!
+tag d9f007ff stz2g sp, [sp], #-4096
+tag d97ff3ff ldg xzr, [sp, #-16]
+tag d93ffbff stg sp, [sp, #-16]
+tag d93fffff stg sp, [sp, #-16]!
+tag d93ff7ff stg sp, [sp], #-16
+tag d97ffbff stzg sp, [sp, #-16]
+tag d97fffff stzg sp, [sp, #-16]!
+tag d97ff7ff stzg sp, [sp], #-16
+tag d9bffbff st2g sp, [sp, #-16]
+tag d9bfffff st2g sp, [sp, #-16]!
+tag d9bff7ff st2g sp, [sp], #-16
+tag d9fffbff stz2g sp, [sp, #-16]
+tag d9ffffff stz2g sp, [sp, #-16]!
+tag d9fff7ff stz2g sp, [sp], #-16
+tag d96003ff ldg xzr, [sp, #0]
+tag d9200bff stg sp, [sp, #0]
+tag d9200fff stg sp, [sp, #0]!
+tag d92007ff stg sp, [sp], #0
+tag d9600bff stzg sp, [sp, #0]
+tag d9600fff stzg sp, [sp, #0]!
+tag d96007ff stzg sp, [sp], #0
+tag d9a00bff st2g sp, [sp, #0]
+tag d9a00fff st2g sp, [sp, #0]!
+tag d9a007ff st2g sp, [sp], #0
+tag d9e00bff stz2g sp, [sp, #0]
+tag d9e00fff stz2g sp, [sp, #0]!
+tag d9e007ff stz2g sp, [sp], #0
+tag d96013ff ldg xzr, [sp, #16]
+tag d9201bff stg sp, [sp, #16]
+tag d9201fff stg sp, [sp, #16]!
+tag d92017ff stg sp, [sp], #16
+tag d9601bff stzg sp, [sp, #16]
+tag d9601fff stzg sp, [sp, #16]!
+tag d96017ff stzg sp, [sp], #16
+tag d9a01bff st2g sp, [sp, #16]
+tag d9a01fff st2g sp, [sp, #16]!
+tag d9a017ff st2g sp, [sp], #16
+tag d9e01bff stz2g sp, [sp, #16]
+tag d9e01fff stz2g sp, [sp, #16]!
+tag d9e017ff stz2g sp, [sp], #16
+tag d96ff3ff ldg xzr, [sp, #4080]
+tag d92ffbff stg sp, [sp, #4080]
+tag d92fffff stg sp, [sp, #4080]!
+tag d92ff7ff stg sp, [sp], #4080
+tag d96ffbff stzg sp, [sp, #4080]
+tag d96fffff stzg sp, [sp, #4080]!
+tag d96ff7ff stzg sp, [sp], #4080
+tag d9affbff st2g sp, [sp, #4080]
+tag d9afffff st2g sp, [sp, #4080]!
+tag d9aff7ff st2g sp, [sp], #4080
+tag d9effbff stz2g sp, [sp, #4080]
+tag d9efffff stz2g sp, [sp, #4080]!
+tag d9eff7ff stz2g sp, [sp], #4080
+stgp 69207fff stgp xzr, xzr, [sp, #-1024]
+stgp 69a07fff stgp xzr, xzr, [sp, #-1024]!
+stgp 68a07fff stgp xzr, xzr, [sp], #-1024
+stgp 693fffff stgp xzr, xzr, [sp, #-16]
+stgp 69bfffff stgp xzr, xzr, [sp, #-16]!
+stgp 68bfffff stgp xzr, xzr, [sp], #-16
+stgp 69007fff stgp xzr, xzr, [sp, #0]
+stgp 69807fff stgp xzr, xzr, [sp, #0]!
+stgp 68807fff stgp xzr, xzr, [sp], #0
+stgp 6900ffff stgp xzr, xzr, [sp, #16]
+stgp 6980ffff stgp xzr, xzr, [sp, #16]!
+stgp 6880ffff stgp xzr, xzr, [sp], #16
+stgp 691fffff stgp xzr, xzr, [sp, #1008]
+stgp 699fffff stgp xzr, xzr, [sp, #1008]!
+stgp 689fffff stgp xzr, xzr, [sp], #1008
+load f8600400 ldraa x0, [x0, #-4096]
+load f87ff400 ldraa x0, [x0, #-8]
+load f8200400 ldraa x0, [x0, #0]
+load f8201400 ldraa x0, [x0, #8]
+load f83ff400 ldraa x0, [x0, #4088]
+load f8e00400 ldrab x0, [x0, #-4096]
+load f8fff400 ldrab x0, [x0, #-8]
+load f8a00400 ldrab x0, [x0, #0]
+load f8a01400 ldrab x0, [x0, #8]
+load f8bff400 ldrab x0, [x0, #4088]
+tag d9700000 ldg x0, [x0, #-4096]
+tag d9300800 stg x0, [x0, #-4096]
+tag d9700800 stzg x0, [x0, #-4096]
+tag d9b00800 st2g x0, [x0, #-4096]
+tag d9f00800 stz2g x0, [x0, #-4096]
+tag d97ff000 ldg x0, [x0, #-16]
+tag d93ff800 stg x0, [x0, #-16]
+tag d97ff800 stzg x0, [x0, #-16]
+tag d9bff800 st2g x0, [x0, #-16]
+tag d9fff800 stz2g x0, [x0, #-16]
+tag d9600000 ldg x0, [x0, #0]
+tag d9200800 stg x0, [x0, #0]
+tag d9600800 stzg x0, [x0, #0]
+tag d9a00800 st2g x0, [x0, #0]
+tag d9e00800 stz2g x0, [x0, #0]
+tag d9601000 ldg x0, [x0, #16]
+tag d9201800 stg x0, [x0, #16]
+tag d9601800 stzg x0, [x0, #16]
+tag d9a01800 st2g x0, [x0, #16]
+tag d9e01800 stz2g x0, [x0, #16]
+tag d96ff000 ldg x0, [x0, #4080]
+tag d92ff800 stg x0, [x0, #4080]
+tag d96ff800 stzg x0, [x0, #4080]
+tag d9aff800 st2g x0, [x0, #4080]
+tag d9eff800 stz2g x0, [x0, #4080]
+stgp 69200000 stgp x0, x0, [x0, #-1024]
+stgp 693f8000 stgp x0, x0, [x0, #-16]
+stgp 69000000 stgp x0, x0, [x0, #0]
+stgp 69008000 stgp x0, x0, [x0, #16]
+stgp 691f8000 stgp x0, x0, [x0, #1008]
+load f8600651 ldraa x17, [x18, #-4096]
+load f8600e51 ldraa x17, [x18, #-4096]!
+load f87ff651 ldraa x17, [x18, #-8]
+load f87ffe51 ldraa x17, [x18, #-8]!
+load f8200651 ldraa x17, [x18, #0]
+load f8200e51 ldraa x17, [x18, #0]!
+load f8201651 ldraa x17, [x18, #8]
+load f8201e51 ldraa x17, [x18, #8]!
+load f83ff651 ldraa x17, [x18, #4088]
+load f83ffe51 ldraa x17, [x18, #4088]!
+load f8e00651 ldrab x17, [x18, #-4096]
+load f8e00e51 ldrab x17, [x18, #-4096]!
+load f8fff651 ldrab x17, [x18, #-8]
+load f8fffe51 ldrab x17, [x18, #-8]!
+load f8a00651 ldrab x17, [x18, #0]
+load f8a00e51 ldrab x17, [x18, #0]!
+load f8a01651 ldrab x17, [x18, #8]
+load f8a01e51 ldrab x17, [x18, #8]!
+load f8bff651 ldrab x17, [x18, #4088]
+load f8bffe51 ldrab x17, [x18, #4088]!
+tag d9700251 ldg x17, [x18, #-4096]
+tag d9300a51 stg x17, [x18, #-4096]
+tag d9300e51 stg x17, [x18, #-4096]!
+tag d9300651 stg x17, [x18], #-4096
+tag d9700a51 stzg x17, [x18, #-4096]
+tag d9700e51 stzg x17, [x18, #-4096]!
+tag d9700651 stzg x17, [x18], #-4096
+tag d9b00a51 st2g x17, [x18, #-4096]
+tag d9b00e51 st2g x17, [x18, #-4096]!
+tag d9b00651 st2g x17, [x18], #-4096
+tag d9f00a51 stz2g x17, [x18, #-4096]
+tag d9f00e51 stz2g x17, [x18, #-4096]!
+tag d9f00651 stz2g x17, [x18], #-4096
+tag d97ff251 ldg x17, [x18, #-16]
+tag d93ffa51 stg x17, [x18, #-16]
+tag d93ffe51 stg x17, [x18, #-16]!
+tag d93ff651 stg x17, [x18], #-16
+tag d97ffa51 stzg x17, [x18, #-16]
+tag d97ffe51 stzg x17, [x18, #-16]!
+tag d97ff651 stzg x17, [x18], #-16
+tag d9bffa51 st2g x17, [x18, #-16]
+tag d9bffe51 st2g x17, [x18, #-16]!
+tag d9bff651 st2g x17, [x18], #-16
+tag d9fffa51 stz2g x17, [x18, #-16]
+tag d9fffe51 stz2g x17, [x18, #-16]!
+tag d9fff651 stz2g x17, [x18], #-16
+tag d9600251 ldg x17, [x18, #0]
+tag d9200a51 stg x17, [x18, #0]
+tag d9200e51 stg x17, [x18, #0]!
+tag d9200651 stg x17, [x18], #0
+tag d9600a51 stzg x17, [x18, #0]
+tag d9600e51 stzg x17, [x18, #0]!
+tag d9600651 stzg x17, [x18], #0
+tag d9a00a51 st2g x17, [x18, #0]
+tag d9a00e51 st2g x17, [x18, #0]!
+tag d9a00651 st2g x17, [x18], #0
+tag d9e00a51 stz2g x17, [x18, #0]
+tag d9e00e51 stz2g x17, [x18, #0]!
+tag d9e00651 stz2g x17, [x18], #0
+tag d9601251 ldg x17, [x18, #16]
+tag d9201a51 stg x17, [x18, #16]
+tag d9201e51 stg x17, [x18, #16]!
+tag d9201651 stg x17, [x18], #16
+tag d9601a51 stzg x17, [x18, #16]
+tag d9601e51 stzg x17, [x18, #16]!
+tag d9601651 stzg x17, [x18], #16
+tag d9a01a51 st2g x17, [x18, #16]
+tag d9a01e51 st2g x17, [x18, #16]!
+tag d9a01651 st2g x17, [x18], #16
+tag d9e01a51 stz2g x17, [x18, #16]
+tag d9e01e51 stz2g x17, [x18, #16]!
+tag d9e01651 stz2g x17, [x18], #16
+tag d96ff251 ldg x17, [x18, #4080]
+tag d92ffa51 stg x17, [x18, #4080]
+tag d92ffe51 stg x17, [x18, #4080]!
+tag d92ff651 stg x17, [x18], #4080
+tag d96ffa51 stzg x17, [x18, #4080]
+tag d96ffe51 stzg x17, [x18, #4080]!
+tag d96ff651 stzg x17, [x18], #4080
+tag d9affa51 st2g x17, [x18, #4080]
+tag d9affe51 st2g x17, [x18, #4080]!
+tag d9aff651 st2g x17, [x18], #4080
+tag d9effa51 stz2g x17, [x18, #4080]
+tag d9effe51 stz2g x17, [x18, #4080]!
+tag d9eff651 stz2g x17, [x18], #4080
+stgp 69204651 stgp x17, x17, [x18, #-1024]
+stgp 69a04651 stgp x17, x17, [x18, #-1024]!
+stgp 68a04651 stgp x17, x17, [x18], #-1024
+stgp 693fc651 stgp x17, x17, [x18, #-16]
+stgp 69bfc651 stgp x17, x17, [x18, #-16]!
+stgp 68bfc651 stgp x17, x17, [x18], #-16
+stgp 69004651 stgp x17, x17, [x18, #0]
+stgp 69804651 stgp x17, x17, [x18, #0]!
+stgp 68804651 stgp x17, x17, [x18], #0
+stgp 6900c651 stgp x17, x17, [x18, #16]
+stgp 6980c651 stgp x17, x17, [x18, #16]!
+stgp 6880c651 stgp x17, x17, [x18], #16
+stgp 691fc651 stgp x17, x17, [x18, #1008]
+stgp 699fc651 stgp x17, x17, [x18, #1008]!
+stgp 689fc651 stgp x17, x17, [x18], #1008

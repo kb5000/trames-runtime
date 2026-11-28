@@ -1,0 +1,13 @@
+UTC 2026-11-28T08:47:05.085006+00:00
+COMMAND ['cargo', 'test', '--release', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', '--lib', 'control_codegen_audit::freeze_controls']
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-special-integrated-source/crates/trames-jit)
+    Finished `release` profile [optimized] target(s) in 4.28s
+     Running unittests src/lib.rs (/mnt/trames-output/linux-desktop-target/release/build/trames-jit/8036540d47d34293/out/trames_jit-8036540d47d34293)
+
+running 1 test
+test native::control_codegen_audit::freeze_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 4.3425298370129894

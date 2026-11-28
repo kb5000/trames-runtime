@@ -26,14 +26,27 @@ pub(super) enum Address {
     Pre(u64),
     Post(u64),
     PostRegister(usize),
-    Register { reg: usize, option: u32, shift: u32 },
+    Register {
+        reg: usize,
+        option: u32,
+        shift: u32,
+    },
     Literal(u64),
+    /// Existing disabled-authentication/tag profile strips the base to 48 bits
+    /// before offset arithmetic. Mode 1/3 is post/pre-index; 2 has no writeback.
+    Pointer {
+        offset: u64,
+        mode: u32,
+    },
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Maintenance {
     Zero,
     Translation,
     Fence,
+    TagRead,
+    TagWrite,
+    TagZero,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Structure {
@@ -61,6 +74,107 @@ fn signed(value: u64, bits: u32) -> u64 {
     ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 impl Operation {
+    fn compile_compatibility(word: u32, pc: u64) -> Result<Option<Self>, CpuFault> {
+        let rn = ((word >> 5) & 31) as usize;
+        let rt = (word & 31) as usize;
+        let (address, size, load, second, maintenance, opcode, rt) =
+            if word & 0xff200400 == 0xf8200400 {
+                let writeback = word & 0x800 != 0;
+                if writeback && rn != 31 && rn == rt {
+                    return Ok(None);
+                }
+                let offset = signed((((word >> 12) & 511) | ((word >> 13) & 512)) as u64, 10)
+                    .wrapping_mul(8);
+                (
+                    Address::Pointer {
+                        offset,
+                        mode: if writeback { 3 } else { 2 },
+                    },
+                    8,
+                    true,
+                    None,
+                    None,
+                    Some(0xf9400000),
+                    rt,
+                )
+            } else if word & 0xff200000 == 0xd9200000 {
+                let op = (word >> 22) & 3;
+                let mode = (word >> 10) & 3;
+                if mode == 0 && op != 1 || mode != 0 && mode != 2 && rn != 31 && rn == rt {
+                    return Ok(None);
+                }
+                let address = Address::Pointer {
+                    offset: signed(((word >> 12) & 511) as u64, 9).wrapping_mul(16),
+                    mode: if mode == 0 { 2 } else { mode },
+                };
+                let maintenance = if mode == 0 {
+                    Maintenance::TagRead
+                } else if op & 1 == 0 {
+                    Maintenance::TagWrite
+                } else {
+                    Maintenance::TagZero
+                };
+                (
+                    address,
+                    if op >= 2 { 32 } else { 16 },
+                    false,
+                    None,
+                    Some(maintenance),
+                    (maintenance == Maintenance::TagZero).then_some(0xa9007c1f),
+                    if maintenance == Maintenance::TagRead {
+                        rt
+                    } else {
+                        31
+                    },
+                )
+            } else if word & 0xfe400000 == 0x68000000 {
+                let mode = (word >> 23) & 3;
+                let second = ((word >> 10) & 31) as usize;
+                if mode == 0 || mode != 2 && rn != 31 && (rn == rt || rn == second) {
+                    return Ok(None);
+                }
+                (
+                    Address::Pointer {
+                        offset: signed(((word >> 15) & 127) as u64, 7).wrapping_mul(16),
+                        mode,
+                    },
+                    16,
+                    false,
+                    Some(second),
+                    None,
+                    Some(0xa9000801),
+                    rt,
+                )
+            } else {
+                return Ok(None);
+            };
+        Self {
+            pc,
+            address,
+            rn,
+            rt,
+            size,
+            load,
+            vector: false,
+            structure: None,
+            second,
+            ordered: false,
+            maintenance,
+            atomic: None,
+            exclusive: None,
+            opcode,
+            code: None,
+        }
+        .publish()
+        .map(Some)
+    }
+    pub(super) fn base_register(&self) -> u32 {
+        if self.rn == 31 && self.address != Address::CacheLine {
+            32
+        } else {
+            self.rn as u32
+        }
+    }
     fn compile_structure(word: u32, pc: u64) -> Result<Option<Self>, CpuFault> {
         if crate::features::profile().allowed.hwcap & (1 << 1) == 0 {
             return Ok(None);
@@ -258,6 +372,9 @@ impl Operation {
         let word = memory
             .fetch_u32(pc)
             .map_err(|error| CpuFault::Memory { pc, error })?;
+        if let Some(op) = Self::compile_compatibility(word, pc)? {
+            return Ok(Some(op));
+        }
         let maintenance = match word & !31 {
             0xd50b7420 => Some(Maintenance::Zero),
             0xd50b7b20 | 0xd50b7a20 | 0xd50b7e20 | 0xd50b7520 => Some(Maintenance::Translation),
@@ -639,10 +756,14 @@ impl Operation {
         self.code = self
             .opcode
             .map(|word| {
-                if self.maintenance == Some(Maintenance::Zero) {
-                    Code::publish(&[
-                        0xd503245f, 0xa9007c1f, 0xa9017c1f, 0xa9027c1f, 0xa9037c1f, 0xd65f03c0,
-                    ])
+                if matches!(
+                    self.maintenance,
+                    Some(Maintenance::Zero | Maintenance::TagZero)
+                ) {
+                    let mut words = vec![0xd503245f];
+                    words.extend((0..self.size / 16).map(|i| 0xa9007c1f | ((i as u32 * 2) << 15)));
+                    words.push(0xd65f03c0);
+                    Code::publish(&words)
                 } else if self.vector {
                     let mut words = vec![0xd503245f];
                     let registers = self.vector_registers();
@@ -729,9 +850,7 @@ impl Operation {
         self.code.as_ref().map_or(0, Code::word_count)
     }
     pub(super) fn operand(&self, cpu: &Cpu) -> (u64, Option<u64>) {
-        let base = if self.maintenance.is_some() {
-            cpu.x(self.rn)
-        } else if self.rn == 31 {
+        let base = if self.base_register() == 32 {
             cpu.sp
         } else {
             cpu.x(self.rn)
@@ -746,6 +865,14 @@ impl Operation {
             Address::Post(offset) => (base, Some(base.wrapping_add(offset))),
             Address::PostRegister(reg) => (base, Some(base.wrapping_add(cpu.x(reg)))),
             Address::Literal(address) => (address, None),
+            Address::Pointer { offset, mode } => {
+                let base = base & 0x0000_ffff_ffff_ffff;
+                let next = base.wrapping_add(offset);
+                (
+                    if mode == 1 { base } else { next },
+                    (mode != 2).then_some(next),
+                )
+            }
             Address::Register { reg, option, shift } => {
                 let raw = cpu.x(reg);
                 let index = match option {
@@ -760,7 +887,31 @@ impl Operation {
     pub fn execute(&self, cpu: &mut Cpu, memory: &mut impl CpuMemory) -> Result<bool, CpuFault> {
         let pc = cpu.pc;
         if let Some(operation) = self.maintenance {
-            if operation != Maintenance::Zero {
+            if matches!(
+                operation,
+                Maintenance::TagRead | Maintenance::TagWrite | Maintenance::TagZero
+            ) {
+                let (address, writeback) = self.operand(cpu);
+                let fault = |error| CpuFault::Memory { pc, error };
+                // Required tag-granule fault semantics of the existing CPU
+                // profile. Ordinary native loads/stores gain no preflight.
+                if !address.is_multiple_of(16) {
+                    return Err(fault(trames_memory::MemoryError::Alignment(address)));
+                }
+                if operation != Maintenance::TagZero {
+                    if operation == Maintenance::TagRead {
+                        memory.check_translation(address).map_err(fault)?;
+                        cpu.set_x(self.rt, cpu.x(self.rt) & 0x0000_ffff_ffff_ffff);
+                    } else {
+                        memory
+                            .check(address, self.size, trames_memory::Access::Write)
+                            .map_err(fault)?;
+                    }
+                    self.writeback(cpu, writeback);
+                    cpu.pc = pc.wrapping_add(4);
+                    return Ok(true);
+                }
+            } else if operation != Maintenance::Zero {
                 if operation == Maintenance::Translation {
                     memory
                         .check_translation(cpu.x(self.rn))
@@ -862,7 +1013,26 @@ impl Operation {
             return Err(fault(trames_memory::MemoryError::Alignment(address)));
         }
         let crosses = self.size as u64 > PAGE_SIZE - (address & (PAGE_SIZE - 1));
-        let direct = if self.vector {
+        let direct = if matches!(
+            self.maintenance,
+            Some(Maintenance::Zero | Maintenance::TagZero)
+        ) {
+            if crosses {
+                let mut bytes = [0u8; 64];
+                unsafe {
+                    code.call_memory(bytes.as_mut_ptr(), 0);
+                }
+                memory.write(address, &bytes[..self.size]).map_err(fault)?;
+                false
+            } else {
+                memory
+                    .cpu_store_chunk(address, self.size, |bytes| unsafe {
+                        code.call_memory(bytes.as_mut_ptr(), 0);
+                    })
+                    .map_err(fault)?
+                    .1
+            }
+        } else if self.vector {
             let registers = self.vector_registers();
             let mut values = [0u128; 4];
             if !self.load || self.structure.is_some_and(|s| s.preserve) {
@@ -983,6 +1153,11 @@ impl Operation {
                 .1
             }
         };
+        self.writeback(cpu, writeback);
+        cpu.pc = pc.wrapping_add(4);
+        Ok(direct)
+    }
+    fn writeback(&self, cpu: &mut Cpu, writeback: Option<u64>) {
         if let Some(value) = writeback {
             if self.rn == 31 {
                 cpu.sp = value;
@@ -990,8 +1165,6 @@ impl Operation {
                 cpu.set_x(self.rn, value);
             }
         }
-        cpu.pc = pc.wrapping_add(4);
-        Ok(direct)
     }
 }
 

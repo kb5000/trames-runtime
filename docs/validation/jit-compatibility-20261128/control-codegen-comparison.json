@@ -1,0 +1,7 @@
+{
+  "equal_normalized_instructions": true,
+  "before_layout": "operation=192 block=152 node=264",
+  "after_layout": "operation=192 block=152 node=264",
+  "normalization": "MOVN/MOVZ/MOVK immediate fields only; runtime operand addresses differ",
+  "temporary_test_removed": true
+}

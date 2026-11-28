@@ -1,0 +1,106 @@
+{
+  "created_utc": "2026-11-28T09:00:59.127026+00:00",
+  "baseline_runtime": "be8bfedfe1450c060d2fc5e03ab051605a7b1432",
+  "integration_base": "8842c81c91bdab71b7bdf286db527e6a94dbef40",
+  "baseline_android": "fb54156b1b010a0d461af47ebab9b567921c8d0e",
+  "host": {
+    "architecture": "aarch64",
+    "page_size": 4096,
+    "hwcap": "0xefb3ffff",
+    "hwcap2": "0x2000100326181"
+  },
+  "checks": {
+    "linux_debug": [
+      26,
+      112
+    ],
+    "linux_release": [
+      26,
+      112
+    ],
+    "apple_jit_fallback": 107,
+    "llvm_encodings": 836,
+    "main_matrix_programs": 7524,
+    "category_tests": 7,
+    "android_default": 1,
+    "android_jit": 3,
+    "android_native_probe_forms": 75,
+    "android_native_probe_programs": 150,
+    "clippy_linux_apple": true,
+    "clippy_amd64_cross": true,
+    "actual_ipad_jit_and_native_code_absent": true,
+    "temporary_codegen_test_removed": true,
+    "vfs_sync_linux": 53,
+    "vfs_resumed_sync_apple": 1
+  },
+  "build_isolation": {
+    "final_linux_target": "/mnt/trames-output/jit-compat-linux-target",
+    "final_benchmark_after_target": "/mnt/trames-output/jit-compat-linux-target",
+    "before_target": "/mnt/trames-output/linux-desktop-target",
+    "independent_final_test_counts_verified": true
+  },
+  "source_sha256": {
+    "crates/trames-jit/src/compatibility.rs": "d80406263eef70044ed88103761b1e0f91d282e76dd0275513934fd42e210f1a",
+    "crates/trames-jit/src/native.rs": "19fbd3387fe772ef5cf8b8dad514aa245d93dafa18dcc023b529aa17bda90584",
+    "crates/trames-jit/src/memory_ops.rs": "9d0afaee2b4d1838c76c29c1132a29406ffc492ca58e96b0b8d9e16a54e4578a",
+    "crates/trames-jit/tests/differential.rs": "e473bfb7c06e7d530772d45301f40324bcc424033117d7368ee0cdce23675be2",
+    "crates/trames-jit/tests/support/compatibility_category.rs": "b9a5e62c70cc651133502dc46dd5daebb405e55d123b5ec9538474632c9078d9",
+    "crates/trames-jit/examples/compatibility-category.rs": "cb8f4fd3db9a342fa6b0446fd04741352f73ef6fa6aa2a65e053a7269b5ee080",
+    "scripts/audit-jit-compatibility.py": "0d56d88cadd6853cfbfa97bb8de5337253d58cff0f1706a1ed15d124bddf5a63",
+    "crates/trames-accel/src/compute.rs": "62e3fc331bcb5762868b6ad55f5a2a4ba3d260da1d511164545f992936f75a28",
+    "crates/trames-vfs/src/file_work/write.rs": "3098b943cc18b3dabeb26285bbcef748d167eca3c89ec150c734a0823fac1d7b"
+  },
+  "android_core_sha256": "c418fb3358798f4351cb2058fbcda696a30ef24afbd8e134c15ac70d864f629d",
+  "outstanding": [
+    "hardware PAC/BTI/MTE CPU/context/memory ABI",
+    "SVE/SME context ABI",
+    "LS64/SETG ownership",
+    "extension-positive hardware/Option-B MOPS migration",
+    "Android app-UID/ART/real 16-KiB device",
+    "changed-epoch single-step boundary fallback"
+  ],
+  "artifact_sha256": {
+    "actual-ipad-cpu-tree.txt": "bf8eb4d517debe292e55f79daa2bec8792a2f0673c49ee1bcefc83f4d44d21ca",
+    "benchmark-after-build.jsonl": "c0b4bc28b716f015d628d5377384a4912d89dac71663b1c8b51d26acfc148b49",
+    "benchmark-before-build.jsonl": "537649387d03671802730438f1d5f847b6fdf97385591b758bb4fa7e3401cfb7",
+    "benchmark-provenance.json": "e6dc6d8b444b859d8fc1f06fa1d01c056b089eea922f0b33f79ccc5b2fa01a5f",
+    "benchmark-summary.json": "64bf7129809ff3bc9a972fdc9e1a60ec15306b957f69b640b2c0a19ef62269b8",
+    "benchmarks.S": "75a8336af727ec46c8759bdf30cc9ff958f628d98fe37c720a76a724ed7d672e",
+    "benchmarks.json": "3608d8ee4e3b6435e8007ddd15476f4567362e813ada339d03f78e33017b6db7",
+    "category.S": "fe02f7dd77437b5615953f59c2c81f455503d3dbd8d74aa1aa1cb91c0c2cdb60",
+    "category.cases": "2dbf3d433025ba374cd29b864f2f65d08e2d0d3f6e73716b08e2263adc528f69",
+    "category.json": "d7f2d2f01426ba907f5f023037f18676a1e1c3fc56f50750829757ad3e7633a2",
+    "category.words": "0cd8049076bcf2037f0b35581f1af7a1733ca190628ad1f4845aeb1c26390ab9",
+    "control-codegen-after.txt": "3d48f64ac4fe38065355c7411e65dc82529a3b919e7263fdd8d7d610d227882d",
+    "control-codegen-before.txt": "4fe8199588fde19b5f0d68e7a9a9c13f4f947dfa62d1b7bd5917e007d9e89a17",
+    "control-codegen-comparison.json": "6cbcb08b62fa8058023104cd92d29039cd24149abd25e7405013d3e322508501",
+    "isolated-samples.jsonl": "0d5c1d9f705c141528d8e331518462e365858904ea6b9f7aae29290f82094d28",
+    "jit-compat-android-apple.log": "91b66e73c6eb25c414f0f4b073c002fe79cfae67b74a3c3e4669de14d670cad6",
+    "jit-compat-android-linux.log": "e402227988cb5c8471edb96dab14a656320c3099e0e4353aa87d73b07c0a8182",
+    "jit-compat-clippy-amd64.log": "960fdaa44254074a960776b4ea72932404916d6c6a1cf8af1ab92e5c4a787c47",
+    "jit-compat-clippy-apple.log": "d5034c9f8e043026a8ae3fad34b2923d48dc3746d4168099ec1dee6f606f32f6",
+    "jit-compat-clippy-linux.log": "d1e672ceb4c33a5fa5c1d5eb6790cada3a25bcb76f53ac59c20dc6803803d448",
+    "jit-compat-codegen-after.log": "6e70b18fc3da4b3dee82c9b13839d7063f5e1da2a95ee97d12e544abe0e364e3",
+    "jit-compat-codegen-before.log": "824e08ff7299bae203ba0edea3f82872da2c0f1dfaaa922f163d2e0dbcea6a2f",
+    "jit-compat-debug-linux.log": "37191f4b096af5cf1bf135c7e90817c74eff2fb2fbb5aa41c1b569854b454246",
+    "jit-compat-jit-apple.log": "94aa222c7325c82b10b01dff5a1116b49bf5e99c0d3eecc8e63726f73dc20c64",
+    "jit-compat-release-linux.log": "786ce6a4ccf016924c6fd50996ea1dec68c0d7ddf839f733fef1dfece3ecbece",
+    "jit-compat-vfs-sync-apple.log": "ee2dcd77f32f295f1c88a9a43dfe03ebbab0e6ed9affec1e2e0f4084b833faf0",
+    "jit-compat-vfs-sync-linux.log": "740c88985ec37693acadda5c068e7d97d91c7fe8fa0ab9d22117b32418a93ed2",
+    "preliminary/harness.rs": "fbc837d22254e0d5b78065120b757b9bca6a24b98c279ebf31dc39d2b986ea56",
+    "preliminary/provenance.json": "5119e33fc7f624e89aece6c459359ac73ec5ea674a2e85d9d2c3d7dc9864328c",
+    "preliminary/samples.jsonl": "99cb5b6cad8166b745e29a0051751c6fa8c005f688484b4866e5a34752e02ed6"
+  },
+  "independent_upstream_integration": {
+    "commit": "8842c81c91bdab71b7bdf286db527e6a94dbef40",
+    "paths": [
+      "crates/trames-distro/src/environment.rs",
+      "crates/trames-distro/src/terminals.rs",
+      "crates/trames-vulkan/src/backend.rs",
+      "crates/trames-vulkan/src/backend/command_batch.rs",
+      "crates/trames-vulkan/src/backend/zink.rs",
+      "docs/validation/vulkan-command-batch-20261128.md"
+    ],
+    "cpu_sources_and_dependencies_unchanged": true
+  }
+}

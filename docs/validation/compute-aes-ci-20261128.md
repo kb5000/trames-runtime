@@ -23,3 +23,15 @@ compute test. Their source-unchanged CPU results remain valid. The amd64 negativ
 branch is exercised by the next main CI run; local ARM64 execution does not prove
 that branch. This correction does not require another full CPU/Linux/network/
 graphics acceptance round.
+
+The next run, `46126841124`, passes the previously failing AES stage and reaches
+VFS acceptance. Its resumed synchronous-append test still injects a directory
+flush failure, while existing-file metadata now uses the newly integrated WAL
+path. The test is updated to use the existing test-only WAL publication-failure
+hook and require that it is consumed. Its assertions remain: EIO after data
+completion, all appended bytes retained, original file position restored, no
+pending position/transaction retained, and a later successful sync. Production
+VFS code and the metadata I/O optimization are unchanged.
+The affected resumed-sync test passes on Apple, and all 53 Linux sync-related
+VFS tests pass. Scoped VFS Clippy also passes; existing dependency warnings are
+unrelated. The full workspace checks run at the main integration node.

@@ -1,0 +1,30 @@
+UTC 2026-11-28T08:49:00.271731+00:00
+COMMAND ['cargo', 'test', '--release', '--locked', '-p', 'trames-jit', '--features', 'native-aarch64', '--lib', 'control_codegen_audit::freeze_controls']
+   Compiling libc v0.2.190
+   Compiling parking_lot_core v0.9.12
+   Compiling cfg-if v1.0.5
+   Compiling smallvec v1.16.3
+   Compiling rustix v1.1.5
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.12.1
+   Compiling getrandom v0.3.4
+   Compiling trames-execution v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-execution)
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-host-compute)
+   Compiling parking_lot v0.12.5
+   Compiling trames-shared v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/mnt/trames-output/jit-compat-source/crates/trames-jit)
+    Finished `release` profile [optimized] target(s) in 8.28s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-compat-linux-target/release/build/trames-jit/8036540d47d34293/out/trames_jit-8036540d47d34293)
+
+running 1 test
+test native::control_codegen_audit::freeze_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 8.30824734599446

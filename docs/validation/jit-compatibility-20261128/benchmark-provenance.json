@@ -1,0 +1,40 @@
+{
+  "baseline_runtime": "be8bfedfe1450c060d2fc5e03ab051605a7b1432",
+  "harness_sha256": "cb8f4fd3db9a342fa6b0446fd04741352f73ef6fa6aa2a65e053a7269b5ee080",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "page_size": 4096,
+  "cpu_affinity": 0,
+  "samples": 18,
+  "warmup": 4,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "binaries": {
+    "before": {
+      "sha256": "19341d41c2bd4109a47f1d7ad900d403bd92163ab33e3153bd7ce4ad216c697a",
+      "source": "/mnt/trames-output/jit-special-integrated-source"
+    },
+    "after": {
+      "sha256": "b3257cafe5086c8989a3e367b0666ea12fc9f0add72a6052bedc6c205fd3edd1",
+      "source": "/mnt/trames-output/jit-compat-source"
+    }
+  },
+  "workloads": [
+    "control-integer",
+    "control-scalar-memory",
+    "pointer-arithmetic",
+    "authenticated-load-pair-store",
+    "tag-zero",
+    "authentication-profile",
+    "authenticated-branch"
+  ],
+  "host_hwcap": "0xefb3ffff",
+  "host_hwcap2": "0x2000100326181"
+}

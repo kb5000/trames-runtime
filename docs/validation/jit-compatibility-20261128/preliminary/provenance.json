@@ -1,0 +1,31 @@
+{
+  "baseline_runtime": "be8bfedfe1450c060d2fc5e03ab051605a7b1432",
+  "harness_sha256": "fbc837d22254e0d5b78065120b757b9bca6a24b98c279ebf31dc39d2b986ea56",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "page_size": 4096,
+  "cpu_affinity": 0,
+  "samples": 18,
+  "warmup": 4,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "binaries": {
+    "before": {
+      "sha256": "d8b915383f98373d6080be615e56c35feea8695e28d13a2084b35c88ec193b60",
+      "source": "/mnt/trames-output/jit-special-integrated-source"
+    },
+    "after": {
+      "sha256": "19d1328f29f174617228edb564f93975df41de16b8a83a0fcbb8614611031fde",
+      "source": "/mnt/trames-output/jit-compat-source"
+    }
+  },
+  "host_hwcap": "0xefb3ffff",
+  "host_hwcap2": "0x2000100326181"
+}
