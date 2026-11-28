@@ -4,6 +4,9 @@ use trames_execution::{Aarch64State, Registers};
 use trames_jit::{Cpu, Engine, NATIVE_COMPILED};
 use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
 
+#[path = "support/scalar_category.rs"]
+mod scalar_category;
+
 #[path = "support/abstract_memory_category.rs"]
 mod abstract_memory_category;
 

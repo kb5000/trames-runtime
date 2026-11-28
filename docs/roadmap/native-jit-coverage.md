@@ -92,6 +92,19 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   callback/state/fault/reservation acceptance and absent-host rejection are
   recorded in [validation](../validation/jit-abstract-memory-20261128.md).
 
+- Base scalar integer decoding and error boundaries: all existing move/address,
+  arithmetic/logical/bitfield, conditional/carry, multiply/divide/shift, CRC,
+  CSSC and flag forms share a pure cold decoder. SMULH/UMULH accept every
+  hardware-ignored Ra value in both shared interpreter paths and JIT, without
+  loading that field. A 1,048,576-selector LLVM audit admits 464,344 words
+  including seven special system forms, with no invalid admissions or missing
+  integer forms; 2,216 separate PAC/MTE compatibility words retain their existing
+  lowering. Every untranslated selector in the declared sweep is confirmed to
+  be an original interpreter instruction fault. Those scalar errors now use
+  original cache/page revalidation and direct faults without interpreter entry.
+  Real execution, alias/pressure/budget coverage, generated-code identity and
+  scope limits are recorded in [validation](../validation/jit-scalars-20261128.md).
+
 LSE128 is exposed only when the process host provides it. LS64 and full hardware
 PAC/BTI/MTE remain unadvertised without their required shared-CPU/memory ownership.
 This does not change the interpreter-only backend's compatibility policy. New
@@ -108,8 +121,10 @@ This is not a claim of every host ISA extension or every future encoding.
    SETG needs allocation-tag ownership. These capabilities remain unadvertised;
    do not substitute software extension state or interpret them as simpler ops.
 2. The generic one-instruction interpreter entry remains for encodings not
-   recognized by the native compiler; it can report an instruction fault rather
-   than successfully execute an instruction. This is not full host-ISA coverage.
+   recognized outside the closed scalar primary groups; it can report an
+   instruction fault rather than successfully execute an instruction. Scalar
+   groups 5/8/9/13 now diagnose those errors directly. This is not full host-ISA
+   coverage, and the selector audit does not enumerate all operand/literal bits.
    Changed execution epochs now retry/yield natively, not through that fallback.
    Abstract ordered/atomic embeddings now retain their own fence/transaction
    semantics through native fragments, rather than interpreter stepping.

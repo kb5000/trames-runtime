@@ -1,0 +1,82 @@
+UTC 2026-11-28T10:43:40.463807+00:00
+COMMAND ['cargo', 'test', '--locked', '-p', 'trames-interpreter']
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-scalar-source/crates/trames-interpreter)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.52s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-scalar-linux-target/debug/build/trames-interpreter/d8f1301848ee020a/out/trames_interpreter-d8f1301848ee020a)
+
+running 49 tests
+test cached::tests::independent_spaces_with_equal_epochs_do_not_reuse_decoded_code ... ok
+test cached::tests::page_epoch_wrap_invalidates_stale_words_without_reallocating ... ok
+test cached::tests::reference_fallback_code_stores_invalidate_a_warmed_next_word ... ok
+test cached::tests::budgets_syscalls_and_page_boundary_faults_match_reference ... ok
+test cached::tests::runtime_engine_migration_preserves_fault_accounting_and_rechecks_execute_access ... ok
+test cached::tests::runtime_worker_cache_is_shared_by_tasks_without_retaining_task_working_sets ... ok
+test cached::tests::self_modification_invalidates_the_next_instruction_inside_a_cached_page ... ok
+test cached::tests::unrelated_epochs_keep_decodes_but_exec_remapping_and_collisions_do_not ... ok
+test compatibility::tests::authenticated_loads_have_real_offsets_and_atomic_writeback ... ok
+test compatibility::tests::authentication_is_disabled_but_branches_and_links_are_real ... ok
+test compatibility::tests::disabled_authentication_and_ordering_hints_preserve_values ... ok
+test compatibility::tests::ignored_tags_still_zero_data_and_apply_writeback ... ok
+test execution_state_tests::architectural_handoff_preserves_deferred_flags_tls_simd_and_resume_pc ... ok
+test extended::tests::reserved_pairwise_integer_size_faults_without_changing_registers ... ok
+test cached::tests::page_cache_is_bounded_and_warm_words_do_not_hide_branch_alignment_faults ... ok
+test extended::tests::signed_bitfield_and_bit_reversal_preserve_width_semantics ... ok
+test extended::tests::signed_division_overflow_and_zero_divisors_follow_aarch64 ... ok
+test flags::tests::explicit_writes_replace_pending_state_and_clone_owns_operands ... ok
+test load_store::structure_tests::structure_fault_preserves_all_destination_registers_and_base ... ok
+test load_store::tests::exclusive_stores_track_reservations_and_memory_mutations ... ok
+test flags::tests::deferred_arithmetic_matches_widened_integer_oracle ... ok
+test load_store::tests::faulting_post_index_load_preserves_base_register ... ok
+test load_store::tests::pair_access_faults_do_not_partially_change_memory_or_registers ... ok
+test modern_memory::tests::faulting_mops_can_resume_from_its_partial_progress ... ok
+test load_store::tests::rcpc2_faults_and_reserved_encodings_preserve_state ... ok
+test modern_memory::tests::long_copy_yields_without_retiring_the_main_instruction ... ok
+test modern_memory::tests::ls64_transfers_all_eight_words_and_snapshots_status_aliases ... ok
+test modern_memory::tests::paired_atomic_and_block_faults_preserve_registers_and_bytes ... ok
+test native_tests::audio_opt_in_cannot_enable_other_native_profiles ... ok
+test native_tests::native_exit_gating_pc_and_budget_match_reference ... ok
+test native_tests::video_opt_in_is_independent_of_vulkan_and_pure_memory ... ok
+test native_tests::vulkan_opt_in_does_not_activate_the_pure_memory_profile ... ok
+test cached::tests::transient_values_publish_on_memory_fallback_and_stop_boundaries ... ok
+test tests::arithmetic_flags_cover_carry_and_signed_overflow ... ok
+test tests::branches_syscall_and_budget ... ok
+test tests::failed_atomic_write_preflight_keeps_memory_and_registers ... ok
+test tests::invalid_encodings_and_memory_faults_keep_pc ... ok
+test tests::rcpc_load_does_not_create_an_exclusive_reservation ... ok
+test modern_memory::tests::paired_atomics_snapshot_aliased_address_and_return_both_old_words ... ok
+test tests::reserved_new_encodings_have_no_architectural_effects ... ok
+test tests::serial_exclusive_store_succeeds_after_an_unrelated_stack_spill ... ok
+test tests::stack_pointer_and_zero_register_have_distinct_semantics ... ok
+test tests::virtual_counter_and_cache_maintenance_preserve_guest_state ... ok
+test tests::zero_register_writes_and_w_register_zero_extension ... ok
+test vector_extensions::tests::bfloat_dot_and_matrix_have_functional_optional_host_fallbacks ... ok
+test scalar_ignored_tests::all_high_multiply_ignored_fields_match_independent_wide_products_in_both_engines ... ok
+test cached::tests::decoded_forms_keep_width_and_register_roles ... ok
+test cached::tests::fused_flags_branches_preserve_budgets_conditions_and_invalidations ... ok
+test cached::tests::cached_random_operands_and_reserved_words_match_single_step_oracle ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/register_state.rs (/mnt/trames-output/jit-scalar-linux-target/debug/build/trames-interpreter/396123c207041750/out/register_state-396123c207041750)
+
+running 2 tests
+test public_register_access_keeps_bounds_checks ... ok
+test register_31_distinguishes_zero_stack_and_vector_state_across_slices ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tail_stack.rs (/mnt/trames-output/jit-scalar-linux-target/debug/build/trames-interpreter/01e171ad09db22d2/out/tail_stack-01e171ad09db22d2)
+
+running 1 test
+test millions_of_tail_transitions_fit_in_a_small_host_stack ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+   Doc-tests trames_interpreter
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 2.047472490987275

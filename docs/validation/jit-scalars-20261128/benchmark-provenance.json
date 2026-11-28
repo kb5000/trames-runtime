@@ -1,0 +1,57 @@
+{
+  "baseline_runtime": "dcdf3218cebed423a6466eca59b4a11d118e1eee",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+  "page_size": 4096,
+  "cpu_affinity": 0,
+  "samples": 32,
+  "warmup": 8,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "binaries": {
+    "before": {
+      "compatibility-category": {
+        "sha256": "491ba7d731f0f7a9d955819a5d58440cca2d337fc2455ad0a3e6035b9ce20a3a",
+        "source": "/mnt/trames-output/jit-scalar-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-scalar-baseline-target"
+      },
+      "execution-entry": {
+        "sha256": "61438323b439cf0a5ba3bbecb86b2a401fa442d080fa4f5debb05f65e706ba92",
+        "source": "/mnt/trames-output/jit-scalar-baseline-source",
+        "target_dir": "/mnt/trames-output/jit-scalar-baseline-target"
+      }
+    },
+    "after": {
+      "compatibility-category": {
+        "sha256": "b37454925815a2a9965151916cc7a0dd8c8199628201a79f6f224e801e3ff4a5",
+        "source": "/mnt/trames-output/jit-scalar-source",
+        "target_dir": "/mnt/trames-output/jit-scalar-linux-target"
+      },
+      "execution-entry": {
+        "sha256": "d40df124c360a6c1f638c16cdd5bd820e5a49d74ea47d331eb37928fde62be39",
+        "source": "/mnt/trames-output/jit-scalar-source",
+        "target_dir": "/mnt/trames-output/jit-scalar-linux-target"
+      }
+    }
+  },
+  "harness_sha256": {
+    "compatibility-category": "534e367d4a68222f2516b7454502a3f7f6d1c384edbc744bd5a6ecabb4d1182b",
+    "execution-entry": "2a4bec21fdac2158f4e83542c35063978e202efd62cfeec9ac7d78b19ccebb4d"
+  },
+  "workloads": [
+    "control-integer",
+    "control-scalar-memory",
+    "svc-only",
+    "svc-round-trip",
+    "svc-continuation"
+  ],
+  "hwcap": "0xefb3ffff",
+  "hwcap2": "0x2000100326181"
+}

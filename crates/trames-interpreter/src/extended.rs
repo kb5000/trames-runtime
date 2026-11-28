@@ -288,12 +288,10 @@ impl Cpu {
                     .wrapping_mul(self.x(rm) as u32 as i32 as i64)
                     as u64,
                 5 if wide => (self.x(rn) as u32 as u64) * (self.x(rm) as u32 as u64),
-                2 if wide && !sub && ra == 31 => {
+                2 if wide && !sub => {
                     ((self.x(rn) as i64 as i128 * self.x(rm) as i64 as i128) >> 64) as u64
                 }
-                6 if wide && !sub && ra == 31 => {
-                    ((self.x(rn) as u128 * self.x(rm) as u128) >> 64) as u64
-                }
+                6 if wide && !sub => ((self.x(rn) as u128 * self.x(rm) as u128) >> 64) as u64,
                 _ => return Err(invalid()),
             };
             let value = if opcode == 2 || opcode == 6 {

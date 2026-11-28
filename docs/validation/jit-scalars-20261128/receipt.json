@@ -1,0 +1,134 @@
+{
+  "baseline_runtime": "dcdf3218cebed423a6466eca59b4a11d118e1eee",
+  "baseline_android": "315b75c177a3b3b8962db3bedad7b832db2cbbfb",
+  "runtime_source_sha256": {
+    "crates/trames-jit/src/native.rs": "3cbea5bb2daed777f819ebf4d6e7c595ce5c878a7388569fe99e09c52358c603",
+    "crates/trames-jit/src/scalar_ops.rs": "de1db8a539120e8bdacd583ad7f103ec9ad570c0bb0ba2a39066b4dfc4f2004a",
+    "crates/trames-jit/src/scalar_codegen_tests.rs": "2db1452f44fcc7ad925a49aa677578abfd7dc6bd105522568061ae5492d7fb6e",
+    "crates/trames-jit/tests/differential.rs": "5d85f33b9ffb6717f663ed22876cf3586ac00ac2322e0a3990b21fc16da8c281",
+    "crates/trames-jit/tests/support/scalar_category.rs": "73ffc858f389c63ba5fb5601296315d6851e746a8cd4fac65d5bf182003dae9c",
+    "crates/trames-interpreter/src/lib.rs": "6a3ad9bf2155447dc7087eb68f4b8b18de599530d884b29785bad745f7ca5653",
+    "crates/trames-interpreter/src/cached.rs": "ac3685cbe60c4b741b9439d401f27c515361a2b83c5caea971e1b26dba49f1ae",
+    "crates/trames-interpreter/src/extended.rs": "07d4143e0d842a6250ea943ca865a1cbf56995138bc5b7907acb58355dc969af",
+    "crates/trames-interpreter/src/scalar_ignored_tests.rs": "dc783c6f87201a661caf48226dbf619fa95467a644b0ea50d4b1b15cbd332bf4",
+    "scripts/audit-jit-scalars.py": "32815778858be6d376aa0ec44742c170a4fa150eb8240c1ed1527c534b5217e4"
+  },
+  "android_source_sha256": {
+    "crates/trames-android-core/src/lib.rs": "9c29801c9f4bb71a2497e4dbae8d702f804e9a556a91f0bc5edb3e42da1ea7e9",
+    "crates/trames-android-core/src/scalar_category_probe.rs": "3175fc13849dd14610c2a2bf3abd10e35bb450df38dc3dbdecf6dafcafcdeabd"
+  },
+  "selector_audit": {
+    "candidates": 1048576,
+    "admitted_including_specials": 464344,
+    "separate_compatibility_words": 2216,
+    "original_reference_faults": 582023,
+    "native_execution_selectors": 102472,
+    "two_budget_programs": 204944,
+    "sampled_rejected_words": 9095,
+    "alias_selector_samples": 1057,
+    "alias_layouts": 4,
+    "modes": 3,
+    "budgets": 2,
+    "feature_absent_alias_programs_excluded": true,
+    "missing": 0,
+    "invalid": 0
+  },
+  "acceptance": {
+    "linux_jit_per_profile": [
+      31,
+      127
+    ],
+    "profiles": [
+      "debug",
+      "release"
+    ],
+    "apple_jit": 122,
+    "interpreter_each_host": {
+      "unit": 49,
+      "integration": 3
+    },
+    "android_core": {
+      "jit": 6,
+      "default": 1,
+      "actual_host_valid_probe_programs": 264,
+      "fault_programs_repeated": 5
+    },
+    "fresh_ios_interpreter_check": true
+  },
+  "native_hardware": {
+    "programs": 2304,
+    "ignored_fields": 32,
+    "signed_and_unsigned": true,
+    "source_sha256": "1a6afee5f01597d1f55ba8f6ebc4f29a615622a9e8ab1f507ea7ae513798b257",
+    "binary_sha256": "47280050815adf357554a26a64977bdb916f948bceff6330eba3df5d55ab01dc",
+    "result": "passed in direct tool session; no raw transcript retained"
+  },
+  "independent_interpreter_high_products": {
+    "programs_per_engine": 11520,
+    "engines": [
+      "cached",
+      "stepped"
+    ]
+  },
+  "source_binding_notes": "Native-feature behavior unchanged by later test-only assertion strengthening; final Debug/Release full native suites use strengthened success-exit/native-retirement assertions. Apple native emission is excluded and source-unchanged passing fallback/isolation checks are reused.",
+  "generated_code": {
+    "identical": true,
+    "programs": 838,
+    "layout": "LAYOUT 192 152 264 120",
+    "native_words_sha256": "87fc9c57b620d0fb5040d5ffc2abbd46dc38d76cc010ba45eb20732895cc284f"
+  },
+  "host": {
+    "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+    "page_size": 4096,
+    "hwcap": "0xefb3ffff",
+    "hwcap2": "0x2000100326181",
+    "cpu_affinity": 0
+  },
+  "ipad_graph": "Owner root --locked query requested lock update. Full current workspace manifests were copied and resolved offline in an isolated tree. Owner lock hash unchanged; isolated-ipad-provenance.json and isolated-ipad-cpu-tree.txt identify this check.",
+  "benchmark_rows_including_warmups": 1280,
+  "expected_red_tests": [
+    "baseline-fault.log",
+    "baseline-mulhi.log"
+  ],
+  "artifact_sha256": {
+    "admission-linux.log": "288484d2a5decf7ca12c0bea830627590f1f3ac41894f819c8cd66ea120556c2",
+    "admitted.words.gz": "19225d62681d48b32ba4c42d72f45780ea21ba3254ab42948892a12a7fec473f",
+    "after-compatibility-category-build.jsonl": "666f3999b2be919f584ee5607f58a0f42927e39d83a598376534e744c65ad9ce",
+    "after-execution-entry-build.jsonl": "78d59a7b45249e2b48efaf05ace5923731f518c5ba157e97e58f6838f8535952",
+    "android-apple.log": "3bd3d0f678543a38833d65bf39f51f9cf1708da601ef1a0893fe61e5c6367f99",
+    "android-clippy-apple.log": "fc80b0a68d96509f9bb092c9ec33b16fc2c1dd863ef7bf64c7718dc0bac6c3d1",
+    "android-clippy-linux.log": "7d06224a8207bbecacba96ce7242ace642db375140491f1dcbea57e8c4d785a9",
+    "android-default-apple.log": "eb8fb9821bab45445b46dafc50b99c35e36e898988cc47b586e0493cf37bbf40",
+    "android-default-linux.log": "8bc77a28e71457d4f04bc8eec22febc64f51b942f4dd693d0238788c69cbd40a",
+    "android-linux.log": "05b9904ea926bb61b3b3a9142b618c6ff90d95115e45d5f6f3ec55fc5cc2e794",
+    "baseline-fault.log": "dfe6f5b0f0e5fd85db2ace73faefd32531aaaabfb8749c350073d2140019f549",
+    "baseline-mulhi.log": "f915be77287c4d59e32b17913eb47d4e774aed6348335979f06462af815761d9",
+    "before-compatibility-category-build.jsonl": "eb9983f88a65ef846fb5b50e01496e073364ffbb16e3f2801d3451cf37db01ec",
+    "before-execution-entry-build.jsonl": "e4953b871ae5049e1d44b29406588072dfa8678aae972677aab9c78d7c5c4a09",
+    "benchmark-provenance.json": "1c77de9ef11a7c26a07921a4cae2d619def497cc14f98cad2616b7991f2cc7a4",
+    "benchmark-samples.jsonl": "82fc8d880c80769ae72e30aa0f677552276014f662c0e6d91361d174d7346722",
+    "benchmark-summary.json": "1dc6cad7ce45007cf527b4a020589993c5c0e14567896ed057f5b481c02840ee",
+    "clippy-amd64.log": "71b9c498a8f74dba299706103e31cd01a26630b4ef690e9fdabbc6c93b9d6521",
+    "clippy-apple.log": "3b93700886ce7b59eda644f94e64817eae137f768a723fe562e7c5a66b0fbbef",
+    "clippy-linux.log": "b3e7b81e1b3495f4854f3956dcf2ace35ef073ad5f635934b38a588e88109724",
+    "codegen-after.log": "41974c4b6f5c1d0f09aaa346a16a98424696571e0456a2b2bd76693448805980",
+    "codegen-after.txt.gz": "0d635b8c2fe64d2e67f876428ee4c2113cdb47e413b29ea2e9cd37320a1aade2",
+    "codegen-before.log": "4134df1535ada89c9f548f1b79dbef762a9bccf3e464a1788bd689cb4d2dd9fb",
+    "codegen-before.txt.gz": "0d635b8c2fe64d2e67f876428ee4c2113cdb47e413b29ea2e9cd37320a1aade2",
+    "codegen-summary.json": "f8de89f0c5d0689ed0619d0e1e60b5f011c861016bb816262fc559542357b963",
+    "debug-linux.log": "0c35b33525cd81df7715c55d53002c880cbf426586124fe8f2fed04525e9af9a",
+    "default-clippy-apple.log": "bd555fa25ee8980e13c4e6ee0c1d07dab4bcfb7aa3f2c44cf26d85fdcec20f84",
+    "execution.words": "3f8e2ebb8cbdec57d8761b7b5edd0a0d37cce8428cdaa6f6daa11916ee768a2b",
+    "interpreter-apple.log": "a2f58cf99304dee6b39f5acc2f82527a451b5bf09f2516789d4635820079e720",
+    "interpreter-linux.log": "ef4f4cf0e30cb046e4c13e82ff04aa52b2018ce97ae23335771c9372f7da7b42",
+    "ios-check.log": "ff8f8aa35a713849f8a3a6522ffb1e517893f2473e19c870470c7fd0afe12884",
+    "isolated-ipad-cpu-tree.txt": "6c3ca7ef47c6485b6fe3e4369074daf2d85bdee34cf982debbf0a42adc56885e",
+    "isolated-ipad-provenance.json": "e1b39f691bfe7a411a2f07001d6e05055284220ea352c2ada3ecb072c8fc640e",
+    "jit-apple.log": "4157db483bc4ed90d4c1df33daaaa3565a4f31378da46ab65d9e01be13f995ab",
+    "llvm-audit.json": "6be989a1f6b858b6cc3252b5be6cc9247dc801532d4bdd9f7772dff306f8e8e1",
+    "mulhi-hardware.c": "1a6afee5f01597d1f55ba8f6ebc4f29a615622a9e8ab1f507ea7ae513798b257",
+    "reference-closure.log": "8d29a6395763971d7b6cd476dda5683a59fd419b2f3f1a46681b06e8ecd68f6e",
+    "rejected.words": "ae35762b68bc2228035b3f1f361303908d09cf419656f1246b1e21d6a6056330",
+    "release-linux.log": "e32a460ce66ebd8c08a800885600220d4331499dec8a60ae79c3f6d188af81de"
+  }
+}

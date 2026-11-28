@@ -1,0 +1,22 @@
+UTC 2026-11-28T10:42:24.468265+00:00
+COMMAND ['cargo', 'test', '--locked', '--release', '-p', 'trames-jit', '--features', 'native-aarch64', '--test', 'differential', 'scalar_category::original_invalid_scalar_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes', '--', '--exact', '--nocapture']
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running tests/differential.rs (/mnt/trames-output/jit-scalar-baseline-target/release/build/trames-jit/de3dcead58910df6/out/differential-de3dcead58910df6)
+
+running 1 test
+
+thread 'scalar_category::original_invalid_scalar_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes' (360342) panicked at crates/trames-jit/tests/support/scalar_category.rs:229:9:
+extra decoder page query: interpreter fault entry
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test scalar_category::original_invalid_scalar_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes ... FAILED
+
+failures:
+
+failures:
+    scalar_category::original_invalid_scalar_forms_fault_without_interpreter_or_warm_fetches_and_revalidate_code_changes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 126 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trames-jit --test differential`
+
+EXIT 101 ELAPSED 0.11432194799999706

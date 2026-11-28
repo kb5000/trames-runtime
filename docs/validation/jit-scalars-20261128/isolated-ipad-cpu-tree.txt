@@ -1,0 +1,60 @@
+trames-cpu v1.5.4 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/crates/trames-cpu)
+trames-interpreter feature "default"
+trames-interpreter v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-interpreter)
+getrandom feature "default"
+getrandom v0.3.4
+libc v0.2.190
+cfg-if feature "default"
+cfg-if v1.0.5
+trames-engine feature "default"
+trames-engine v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-engine)
+trames-execution feature "default"
+trames-execution v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-execution)
+trames-memory feature "default"
+trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-memory)
+libc feature "default"
+libc v0.2.190
+libc feature "std"
+libc v0.2.190
+parking_lot feature "default"
+parking_lot v0.12.5
+lock_api feature "default"
+lock_api v0.4.14
+scopeguard v1.2.0
+lock_api feature "atomic_usize"
+lock_api v0.4.14 (*)
+parking_lot_core feature "default"
+parking_lot_core v0.9.12
+cfg-if feature "default" (*)
+libc feature "default" (*)
+smallvec feature "default"
+smallvec v1.16.3
+trames-shared feature "default"
+trames-shared v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-shared)
+libc feature "default" (*)
+parking_lot feature "default" (*)
+rustix feature "default"
+rustix v1.1.5
+bitflags v2.13.2
+errno v0.3.14
+libc v0.2.190
+libc v0.2.190
+rustix feature "std"
+rustix v1.1.5 (*)
+libc feature "std" (*)
+rustix feature "alloc"
+rustix v1.1.5 (*)
+bitflags feature "std"
+bitflags v2.13.2
+errno feature "std"
+errno v0.3.14 (*)
+libc feature "std" (*)
+rustix feature "fs"
+rustix v1.1.5 (*)
+rustix feature "net"
+rustix v1.1.5 (*)
+trames-execution feature "default" (*)
+trames-memory feature "default" (*)
+trames-host-compute feature "default"
+trames-host-compute v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-scalar-ipad-graph/runtime/crates/trames-host-compute)
+trames-memory feature "default" (*)

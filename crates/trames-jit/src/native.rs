@@ -8,6 +8,12 @@ use trames_interpreter::Cpu;
 mod compatibility;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
+#[path = "scalar_ops.rs"]
+mod scalar;
+#[cfg(test)]
+#[path = "scalar_codegen_tests.rs"]
+mod scalar_codegen_tests;
+
 #[path = "exclusive.rs"]
 mod exclusive;
 #[path = "mops.rs"]
@@ -77,12 +83,17 @@ enum MemoryOps {
     Boundary(crate::system_ops::Boundary),
     Window(Box<exclusive::Window>),
     Mops(mops::Plan),
+    Instruction(u32),
 }
 impl MemoryOps {
     fn single(&self) -> Option<&crate::memory_ops::Operation> {
         match self {
             Self::Single(op) => Some(op),
-            Self::Fused(_) | Self::Boundary(_) | Self::Window(_) | Self::Mops(_) => None,
+            Self::Fused(_)
+            | Self::Boundary(_)
+            | Self::Window(_)
+            | Self::Mops(_)
+            | Self::Instruction(_) => None,
         }
     }
     fn instructions(&self) -> u64 {
@@ -96,7 +107,7 @@ impl MemoryOps {
         match self {
             Self::Single(op) => op.host_words(),
             Self::Fused(ops) => ops.iter().map(|op| op.host_words()).sum(),
-            Self::Boundary(_) => 0,
+            Self::Boundary(_) | Self::Instruction(_) => 0,
             Self::Window(window) => window.host_words(),
             Self::Mops(plan) => plan.host_words(),
         }
@@ -571,17 +582,25 @@ impl Cache {
         } else if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
             (Some(compiled.block), compiled.memory)
         } else {
+            let word = memory
+                .fetch_u32(pc)
+                .map_err(|error| CpuFault::Memory { pc, error })?;
             (
                 None,
-                if let Some(boundary) = crate::system_ops::Boundary::decode(
-                    memory
-                        .fetch_u32(pc)
-                        .map_err(|error| CpuFault::Memory { pc, error })?,
-                ) {
+                if let Some(boundary) = crate::system_ops::Boundary::decode(word) {
                     Some(Box::new(MemoryOps::Boundary(boundary)))
                 } else {
-                    crate::memory_ops::Operation::compile(memory, pc)?
-                        .map(|op| Box::new(MemoryOps::Single(op)))
+                    let operation = crate::memory_ops::Operation::compile(memory, pc)?
+                        .map(|op| Box::new(MemoryOps::Single(op)));
+                    if operation.is_none() {
+                        if scalar::owns(word) {
+                            Some(Box::new(MemoryOps::Instruction(word)))
+                        } else {
+                            None
+                        }
+                    } else {
+                        operation
+                    }
                 },
             )
         };
@@ -978,6 +997,13 @@ impl Cache {
                 }
                 self.cold.fault_progress = (0, 0);
                 return Err(boundary.fault(pc));
+            }
+            if let Some(MemoryOps::Instruction(instruction)) =
+                self.node(handle).and_then(|n| n.memory.as_deref())
+            {
+                let instruction = *instruction;
+                self.cold.fault_progress = (0, 0);
+                return Err(CpuFault::Instruction { pc, instruction });
             }
             return Ok(None);
         };
@@ -2729,9 +2755,7 @@ fn compile_body(
         }
         let rd = word & 31;
         let rn = (word >> 5) & 31;
-        let rm = (word >> 16) & 31;
         let sf = word >> 31;
-        let flags = word & (1 << 29) != 0;
         let mut terminal = false;
         if let Some(plan) = context.window {
             if count == 0 {
@@ -2808,230 +2832,7 @@ fn compile_body(
             next = pc.wrapping_add(4);
             terminal = true;
         } else if word == 0xd503201f { // NOP
-        } else if word & 0x7fe0e000 == 0x1ac04000 {
-            let bytes = 1 << ((word >> 10) & 3);
-            if (sf != 0) != (bytes == 8) {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-        } else if word & 0x1f800000 == 0x12800000 {
-            let opc = (word >> 29) & 3;
-            if opc == 1 || (sf == 0 && (word >> 21) & 3 >= 2) {
-                break;
-            }
-            if opc == 3 {
-                code.read(rd, 0);
-            }
-            let dest = code.output(rd, 0);
-            code.words.push((word & !31) | dest);
-        } else if word & 0x1f800000 == 0x11000000 {
-            let lhs = code.read(sp_register(rn), 0);
-            let dest = code.output(if flags { rd } else { sp_register(rd) }, 1 << lhs);
-            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
-            if flags {
-                code.flags_written();
-            }
-        } else if word & 0x1f200000 == 0x0b000000 {
-            if (word >> 22) & 3 == 3 || (sf == 0 && (word >> 10) & 63 >= 32) {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-            if flags {
-                code.flags_written();
-            }
-        } else if word & 0x1f200000 == 0x0b200000 {
-            if (word >> 10) & 7 > 4 || word & (3 << 22) != 0 {
-                break;
-            }
-            let lhs = code.read(sp_register(rn), 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(
-                if flags { rd } else { sp_register(rd) },
-                (1 << lhs) | (1 << rhs),
-            );
-            // The reference accepts UXTX/SXTX in a W operation. Its low 32
-            // bits are identical to UXTW/SXTW; use the valid host W encoding.
-            let word = if sf == 0 && (word >> 13) & 3 == 3 {
-                word & !(1 << 13)
-            } else {
-                word
-            };
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-            if flags {
-                code.flags_written();
-            }
-        } else if word & 0x1f000000 == 0x0a000000 {
-            if sf == 0 && (word >> 10) & 63 >= 32 {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-            if (word >> 29) & 3 == 3 {
-                code.flags_written();
-            }
-        } else if word & 0x1f800000 == 0x12000000 {
-            if !logical_mask(
-                (word >> 22) & 1,
-                (word >> 10) & 63,
-                (word >> 16) & 63,
-                sf != 0,
-            ) {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let writes_flags = (word >> 29) & 3 == 3;
-            let dest = code.output(if writes_flags { rd } else { sp_register(rd) }, 1 << lhs);
-            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
-            if writes_flags {
-                code.flags_written();
-            }
-        } else if word & 0x1f800000 == 0x13000000 {
-            let opc = (word >> 29) & 3;
-            let bits = if sf == 0 { 32 } else { 64 };
-            if opc == 3
-                || (word >> 22) & 1 != sf
-                || (word >> 16) & 63 >= bits
-                || (word >> 10) & 63 >= bits
-            {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            if opc == 1 {
-                code.read(rd, 1 << lhs);
-            }
-            let dest = code.output(rd, 1 << lhs);
-            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
-        } else if word & 0x1f800000 == 0x13800000 {
-            if word & 0x60200000 != 0
-                || (word >> 22) & 1 != sf
-                || (sf == 0 && (word >> 10) & 63 >= 32)
-            {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-        } else if word & 0x1fe00800 == 0x1a800000 {
-            if flags {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.flags_read();
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-        } else if word & 0x1fe00410 == 0x1a400000 {
-            if !flags {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = if word & (1 << 11) == 0 {
-                code.read(rm, 1 << lhs)
-            } else {
-                rm
-            };
-            code.flags_read();
-            code.words
-                .push((word & !0x1f03e0) | (rhs << 16) | (lhs << 5));
-            code.flags_written();
-        } else if word & 0x1fe0fc00 == 0x1a000000 {
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.flags_read();
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-            if flags {
-                code.flags_written();
-            }
-        } else if word & 0x1f000000 == 0x1b000000 {
-            let kind = (word >> 21) & 7;
-            let ra = (word >> 10) & 31;
-            if word & 0x60000000 != 0
-                || !(kind == 0
-                    || (sf != 0 && matches!(kind, 1 | 5))
-                    || (sf != 0 && word & (1 << 15) == 0 && ra == 31 && matches!(kind, 2 | 6)))
-            {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let addend = code.read(ra, (1 << lhs) | (1 << rhs));
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs) | (1 << addend));
-            code.words
-                .push((word & !0x1f7fff) | (rhs << 16) | (addend << 10) | (lhs << 5) | dest);
-        } else if word & 0x7fe0f000 == 0x1ac06000 || word & 0x7ff00000 == 0x11c00000 {
-            let immediate = word & 0x7ff00000 == 0x11c00000;
-            let lhs = code.read(rn, 0);
-            let rhs = if immediate {
-                0
-            } else {
-                code.read(rm, 1 << lhs)
-            };
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            let mask = if immediate { 0x3ff } else { 0x1f03ff };
-            code.words
-                .push((word & !mask) | (if immediate { 0 } else { rhs << 16 }) | (lhs << 5) | dest);
-        } else if word & 0x5fe00000 == 0x1ac00000 {
-            if flags || !matches!((word >> 10) & 63, 2 | 3 | 8..=11) {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let rhs = code.read(rm, 1 << lhs);
-            let dest = code.output(rd, (1 << lhs) | (1 << rhs));
-            code.words
-                .push((word & !0x1f03ff) | (rhs << 16) | (lhs << 5) | dest);
-        } else if word & 0x7fe00000 == 0x5ac00000 {
-            let kind = (word >> 10) & 63;
-            if rm != 0 || kind > 8 || (sf == 0 && kind == 3) {
-                break;
-            }
-            let lhs = code.read(rn, 0);
-            let dest = code.output(rd, 1 << lhs);
-            code.words.push((word & !0x3ff) | (lhs << 5) | dest);
-        } else if matches!(word, 0xd500401f | 0xd500403f | 0xd500405f) {
-            code.flags_read();
-            code.words.push(word);
-            code.flags_written();
-        } else if word & 0xffe07c10 == 0xba000400 || word & 0xffffbc1f == 0x3a00080d {
-            let source = code.read(rn, 0);
-            code.flags_read();
-            code.words.push((word & !0x3e0) | (source << 5));
-            code.flags_written();
-        } else if word & 0xffffffe0 == 0xd53b4200 {
-            let dest = code.output(rd, 0);
-            code.flags_read();
-            code.words.push(0xd53b4200 | dest);
-        } else if word & 0xffffffe0 == 0xd51b4200 {
-            let value = code.read(rd, 0);
-            code.words.push(0xd51b4200 | value);
-            code.flags_written();
-        } else if word & 0x1f000000 == 0x10000000 {
-            let imm = signed(
-                (((word >> 5) & 0x7ffff) as u64) << 2 | ((word >> 29) & 3) as u64,
-                21,
-            );
-            let value = if sf == 1 {
-                (pc & !0xfff).wrapping_add(imm << 12)
-            } else {
-                pc.wrapping_add(imm)
-            };
-            code.constant(rd, value);
+        } else if scalar::emit(&mut code, word, pc) {
         } else if word & 0x7c000000 == 0x14000000 {
             if sf == 1 {
                 code.constant(30, pc.wrapping_add(4));

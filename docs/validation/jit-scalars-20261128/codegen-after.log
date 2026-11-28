@@ -1,0 +1,19 @@
+UTC 2026-11-28T10:45:28.118879+00:00
+COMMAND ['cargo', 'test', '--locked', '--release', '-p', 'trames-jit', '--features', 'native-aarch64', 'native::scalar_codegen_tests::scalar_generated_code_receipt', '--', '--exact', '--nocapture']
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-scalar-linux-target/release/build/trames-jit/8036540d47d34293/out/trames_jit-8036540d47d34293)
+
+running 1 test
+Scalar native-code receipt: 838 compiled programs across 21 forms
+test native::scalar_codegen_tests::scalar_generated_code_receipt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.04s
+
+     Running tests/differential.rs (/mnt/trames-output/jit-scalar-linux-target/release/build/trames-jit/de3dcead58910df6/out/differential-de3dcead58910df6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 0.00s
+
+
+EXIT 0 ELAPSED 0.15357973100617528

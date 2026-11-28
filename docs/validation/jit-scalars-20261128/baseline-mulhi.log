@@ -1,0 +1,26 @@
+UTC 2026-11-28T10:42:24.714548+00:00
+COMMAND ['cargo', 'test', '--locked', '--release', '-p', 'trames-interpreter', 'all_high_multiply_ignored_fields_match_independent_wide_products_in_both_engines', '--', '--nocapture']
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-scalar-baseline-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/mnt/trames-output/jit-scalar-baseline-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/mnt/trames-output/jit-scalar-baseline-source/crates/trames-interpreter)
+    Finished `release` profile [optimized] target(s) in 9.81s
+     Running unittests src/lib.rs (/mnt/trames-output/jit-scalar-baseline-target/release/build/trames-interpreter/6f957e7cf9bd8777/out/trames_interpreter-6f957e7cf9bd8777)
+
+running 1 test
+
+thread 'scalar_ignored_tests::all_high_multiply_ignored_fields_match_independent_wide_products_in_both_engines' (360688) panicked at crates/trames-interpreter/src/scalar_ignored_tests.rs:64:25:
+assertion failed: matches!(cached.run_slice(&mut memory, 1), SliceOutcome::Yield
+    { instructions: 1 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test scalar_ignored_tests::all_high_multiply_ignored_fields_match_independent_wide_products_in_both_engines ... FAILED
+
+failures:
+
+failures:
+    scalar_ignored_tests::all_high_multiply_ignored_fields_match_independent_wide_products_in_both_engines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trames-interpreter --lib`
+
+EXIT 101 ELAPSED 9.843860972992843

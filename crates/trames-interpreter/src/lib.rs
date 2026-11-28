@@ -1107,3 +1107,6 @@ impl trames_engine::Cpu for Cpu {
         self.run_with_engine(engine, memory, budget)
     }
 }
+
+#[cfg(test)]
+mod scalar_ignored_tests;

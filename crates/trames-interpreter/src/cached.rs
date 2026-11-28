@@ -310,7 +310,7 @@ impl Instruction {
             let sub = word & (1 << 15) != 0;
             if kind == 0
                 || (wide && matches!(kind, 1 | 5))
-                || (wide && !sub && ra == 31 && matches!(kind, 2 | 6))
+                || (wide && !sub && matches!(kind, 2 | 6))
             {
                 Op::Multiply {
                     kind,

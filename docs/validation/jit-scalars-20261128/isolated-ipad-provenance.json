@@ -1,0 +1,10 @@
+{
+  "owner_lock_sha256": "ddcce133bc8d2ab489d855ef165272c42cd4ff7237e7c178a90ce8a41d269dbd",
+  "owner_manifest_sha256": {
+    "crates/trames-cpu/Cargo.toml": "cc9244aad6244253729bb6d688a88d94e2a374b91dd4a60776077b651efa28e2",
+    "crates/trames-core/Cargo.toml": "f82a23d76c5d64d21b364b9e515730c1a2610209cfd7dcdf2cb335da8366a9db",
+    "crates/trames-cli/Cargo.toml": "7c470318ab35db1bd236464d3d2433a8400afb695d60b704de12eb46a0dd162a",
+    "crates/trames-ffi/Cargo.toml": "1439b4600037175b9414e5ec220874ec10743128afb4ebbc7d388f2141d2ef4f",
+    "crates/trames-compute/Cargo.toml": "77c93429363a625a7d3876d0fec88c9f87c09e5f030fd981e87cb78e6ec4993c"
+  }
+}
