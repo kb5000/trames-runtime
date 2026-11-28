@@ -434,3 +434,37 @@ instruction's ordering and atomicity, without a new aggregate lock or fence.
 [Structure/lane/replicate validation and measurements](../validation/jit-structures-20261128.md)
 record all arrangements, lane indices, wrapped lists, register-group pressure,
 provider stores, fault recovery and Android CPU probes.
+
+
+### SIMD movement and stateless crypto categories
+
+The native decoder covers the complete copy/immediate/permute category:
+scalar/vector DUP, GPR/vector INS, UMOV/SMOV, MOVI/MVNI and ORR/BIC immediate,
+vector FMOV immediate, EXT, TBL/TBX, ZIP/UZP/TRN and REV16/32/64. Existing MOV/MVN,
+RBIT/NOT and scalar FMOV paths complete the category. Half vector immediates
+require the process-host AdvSIMD FP16 capability. Ignored INS source-index bits
+remain ignored in both native and interpreter backends.
+
+TBL/TBX use the existing cold consecutive-group allocator for one to four table
+registers, wrapping V31 to V0. The whole table group and index are pinned while
+binding the destination; TBX and insertion/logical-immediate forms also read the
+old destination. Operand pin masks include only real vector operands, so an
+unused operand or GPR XZR does not unnecessarily reserve host v31. All layout,
+lookup and lane operations are original hardware instructions, without software
+permutation or an interpreter bridge in the native block.
+
+AESE/AESD/AESMC/AESIMC, PMULL/PMULL2, SHA1/SHA256/SHA512, SHA3 EOR3/BCAX/RAX1/XAR,
+SM3 and SM4 also emit original instructions. Cold forms distinguish destructive
+accumulators from independent destinations and preserve indexed/immediate fields.
+The existing CPU vector bank and host FP scope suffice; no extension state is
+added. Each optional family has an explicit host gate, including P64 PMULL's
+separate feature from baseline P8 polynomial multiplication.
+
+Untranslated optional JSCVT/BF16/FHM/FCMA/DotProd/I8MM/RDM/FP16/FRINT and SB forms
+are gated in the cold compiler before interpreter entry as well. FCMA half forms
+require both FCMA and AdvSIMD FP16. LS64 does not acquire the unrelated LSE gate
+or the interpreter's software transaction: the current profile does not expose
+its HWCAP3/device-memory contract. Shared interpreter-only compatibility remains
+unchanged. [Validation and measurements](../validation/jit-move-crypto-20261128.md)
+and the [remaining category plan](../roadmap/native-jit-coverage.md) distinguish
+native execution, available-host coverage and outstanding categories.

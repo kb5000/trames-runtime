@@ -1,0 +1,15 @@
+[package]
+name="jit-isa-new"
+version="0.1.0"
+edition="2021"
+[workspace]
+[dependencies]
+trames-interpreter={path="../jit-isa-source/crates/trames-interpreter"}
+trames-execution={path="../jit-isa-source/crates/trames-execution"}
+trames-engine={path="../jit-isa-source/crates/trames-engine"}
+trames-memory={path="../jit-isa-source/crates/trames-memory"}
+trames-jit={path="../jit-isa-source/crates/trames-jit",features=["native-aarch64"]}
+serde_json="=1.0.151"
+[profile.release]
+overflow-checks=true
+lto="thin"

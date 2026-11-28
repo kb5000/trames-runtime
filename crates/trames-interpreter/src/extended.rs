@@ -925,9 +925,7 @@ impl Cpu {
             let element_bits = 8u32 << power;
             let destination = imm5 >> (power + 1);
             let imm4 = (ins >> 11) & 15;
-            if imm4 & ((1 << power) - 1) != 0 {
-                return Err(invalid());
-            }
+            // Bits below the element-size selector are architecturally ignored.
             let source = imm4 >> power;
             let lane_mask = (1u128 << element_bits) - 1;
             let value = (self.vectors[rn] >> (source * element_bits)) & lane_mask;

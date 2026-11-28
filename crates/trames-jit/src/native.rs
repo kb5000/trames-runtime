@@ -1509,42 +1509,87 @@ impl Assembler {
         let rm = (word >> 16) & 31;
         let ra = (word >> 10) & 31;
         let n = match op.form {
-            Form::Immediate => 31,
+            Form::Immediate | Form::ModifiedImmediate { .. } => 31,
+            Form::Table { registers, .. } => self.vectors.group(
+                &mut self.words,
+                &mut self.traffic,
+                rn as usize,
+                registers,
+                true,
+            ),
             Form::FromGpr { .. } => self.read(rn, 0),
             _ => self
                 .vectors
                 .bind(&mut self.words, &mut self.traffic, rn, 0, true),
         };
+        let n_mask = if matches!(
+            op.form,
+            Form::Immediate | Form::ModifiedImmediate { .. } | Form::FromGpr { .. }
+        ) {
+            0
+        } else {
+            1 << n
+        };
+        let table_mask = if let Form::Table { registers, .. } = op.form {
+            ((1u32 << registers) - 1) << n
+        } else {
+            0
+        };
         let m = match op.form {
             Form::Binary { .. }
+            | Form::Table { .. }
             | Form::Ternary
             | Form::Select
-            | Form::Compare { zero: false, .. } => {
-                self.vectors
-                    .bind(&mut self.words, &mut self.traffic, rm, 1 << n, true)
-            }
+            | Form::Compare { zero: false, .. } => self.vectors.bind(
+                &mut self.words,
+                &mut self.traffic,
+                rm,
+                (1 << n) | table_mask,
+                true,
+            ),
             _ => 31,
+        };
+        let m_mask = if matches!(
+            op.form,
+            Form::Binary { .. }
+                | Form::Table { .. }
+                | Form::Ternary
+                | Form::Select
+                | Form::Compare { zero: false, .. }
+        ) {
+            1 << m
+        } else {
+            0
         };
         let a = if matches!(op.form, Form::Ternary) {
             self.vectors.bind(
                 &mut self.words,
                 &mut self.traffic,
                 ra,
-                (1 << n) | (1 << m),
+                n_mask | m_mask,
                 true,
             )
         } else {
             31
         };
+        let a_mask = if matches!(op.form, Form::Ternary) {
+            1 << a
+        } else {
+            0
+        };
         if matches!(
             op.form,
-            Form::Binary { accumulate: true } | Form::FromGpr { merge: true }
+            Form::Binary { accumulate: true }
+                | Form::FromGpr { merge: true }
+                | Form::MergeUnary
+                | Form::ModifiedImmediate { merge: true }
+                | Form::Table { merge: true, .. }
         ) {
             self.vectors.bind(
                 &mut self.words,
                 &mut self.traffic,
                 rd,
-                (1 << n) | (1 << m) | (1 << a),
+                n_mask | m_mask | a_mask | table_mask,
                 true,
             );
         }
@@ -1565,14 +1610,18 @@ impl Assembler {
                 &mut self.words,
                 &mut self.traffic,
                 rd,
-                (1 << n) | (1 << m) | (1 << a),
+                n_mask | m_mask | a_mask | table_mask,
                 false,
             ),
         };
         let emitted = match op.form {
-            Form::Immediate => (word & !31) | dest,
-            Form::Unary | Form::ToGpr | Form::FromGpr { .. } => (word & !0x3ff) | (n << 5) | dest,
-            Form::Binary { .. } | Form::Select => (word & !0x1f03ff) | (m << 16) | (n << 5) | dest,
+            Form::Immediate | Form::ModifiedImmediate { .. } => (word & !31) | dest,
+            Form::Unary | Form::MergeUnary | Form::ToGpr | Form::FromGpr { .. } => {
+                (word & !0x3ff) | (n << 5) | dest
+            }
+            Form::Binary { .. } | Form::Table { .. } | Form::Select => {
+                (word & !0x1f03ff) | (m << 16) | (n << 5) | dest
+            }
             Form::Ternary => (word & !0x1f7fff) | (m << 16) | (a << 10) | (n << 5) | dest,
             Form::Compare { zero, .. } => {
                 (word & !0x1f03e0) | (if zero { 0 } else { m << 16 }) | (n << 5)

@@ -365,6 +365,280 @@ fn compare_fp_word(word: u32, state: &Aarch64State) {
 }
 
 #[test]
+fn simd_copy_permute_and_immediate_category_matches_reference() {
+    if !host_capability(1) {
+        return;
+    }
+    let mut words = Vec::new();
+    for q in 0..2u32 {
+        for imm in 1..32u32 {
+            let power = imm.trailing_zeros();
+            if power > 3 {
+                continue;
+            }
+            for base in [0x0e000400, 0x0e000c00] {
+                if power != 3 || q != 0 {
+                    words.push(base | (q << 30) | (imm << 16));
+                }
+            }
+            if (q != 0) == (power == 3) {
+                words.push(0x0e003c00 | (q << 30) | (imm << 16));
+            }
+            if power < if q != 0 { 3 } else { 2 } {
+                words.push(0x0e002c00 | (q << 30) | (imm << 16));
+            }
+            words.push(0x5e000400 | (imm << 16));
+            words.push(0x4e001c00 | (imm << 16));
+            for src in 0..16 {
+                words.push(0x6e000400 | (imm << 16) | (src << 11));
+            }
+        }
+        for op in [
+            0x0e001800, 0x0e005800, 0x0e002800, 0x0e006800, 0x0e003800, 0x0e007800,
+        ] {
+            for size in 0..4 {
+                if size < 3 || q != 0 {
+                    words.push(op | (q << 30) | (size << 22));
+                }
+            }
+        }
+        for (op, max_size) in [(0x0e201800, 0), (0x2e200800, 1), (0x0e200800, 2)] {
+            for size in 0..=max_size {
+                words.push(op | (q << 30) | (size << 22));
+            }
+        }
+        for byte in 0..(8 << q) {
+            words.push(0x2e000000 | (q << 30) | (byte << 11));
+        }
+        for mode in 0..16 {
+            for invert in 0..2 {
+                if mode == 15 && invert != 0 && q == 0 {
+                    continue;
+                }
+                for imm in [0, 1, 0x55, 0x80, 0xff] {
+                    words.push(
+                        0x0f000400
+                            | (q << 30)
+                            | (invert << 29)
+                            | (mode << 12)
+                            | ((imm >> 5) << 16)
+                            | ((imm & 31) << 5),
+                    );
+                }
+            }
+        }
+        if host_capability(10) {
+            for imm in [0, 1, 0x55, 0x80, 0xff] {
+                words.push(0x0f00fc00 | (q << 30) | ((imm >> 5) << 16) | ((imm & 31) << 5));
+            }
+        }
+    }
+    for word in words {
+        // Immediate and lane selectors share fields with ordinary register
+        // encodings: change only the actual Rn/Rd fields for this family.
+        let immediate = word & 0x9ff80400 == 0x0f000400;
+        for (rd, rn, rm) in [(0, 1, 2), (31, 31, 31), (1, 1, 1), (0, 31, 0)] {
+            let word = if immediate {
+                (word & !31) | rd
+            } else {
+                (word & !0x3ff) | (rn << 5) | rd
+            };
+            let word = if matches!(word & 0xbfe08400, 0x2e000000)
+                || matches!(
+                    word & 0xbf20fc00,
+                    0x0e001800 | 0x0e005800 | 0x0e002800 | 0x0e006800 | 0x0e003800 | 0x0e007800
+                ) {
+                (word & !0x1f0000) | (rm << 16)
+            } else {
+                word
+            };
+            compare_fp_word(word, &initial());
+        }
+    }
+}
+
+#[test]
+fn table_lookup_category_keeps_all_table_registers_and_aliases_live() {
+    if !host_capability(1) {
+        return;
+    }
+    for q in 0..2 {
+        for count in 1..=4 {
+            for merge in 0..2 {
+                for rn in [0, 14, 29, 30, 31] {
+                    for (rd, rm) in [(0, 7), (31, 31), (rn, rn), ((rn + 1) & 31, (rn + 2) & 31)] {
+                        let word = 0x0e000000
+                            | (q << 30)
+                            | ((count - 1) << 13)
+                            | (merge << 12)
+                            | (rm << 16)
+                            | (rn << 5)
+                            | rd;
+                        for pattern in [0u128, u128::MAX, 0x3f302f201f100f000102030405060708] {
+                            let mut state = initial();
+                            state.vectors[rm as usize] = pattern;
+                            for budget in [1, 64] {
+                                let e = compare_memory_sequence(
+                                    &[word, 0xd4000001],
+                                    &state,
+                                    budget,
+                                    budget == 64,
+                                );
+                                if NATIVE_COMPILED {
+                                    assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_crypto_category_preserves_accumulators_aliases_and_exact_boundaries() {
+    let mut cases = vec![
+        (0x4e284800, 3, false),
+        (0x4e285800, 3, false),
+        (0x4e286800, 3, false),
+        (0x4e287800, 3, false),
+        (0x5e280800, 5, false),
+        (0x5e281800, 5, false),
+        (0x5e282800, 6, false),
+        (0x5e000000, 5, true),
+        (0x5e001000, 5, true),
+        (0x5e002000, 5, true),
+        (0x5e003000, 5, true),
+        (0x5e004000, 6, true),
+        (0x5e005000, 6, true),
+        (0x5e006000, 6, true),
+        (0x0e20e000, 1, true),
+        (0x4e20e000, 1, true),
+        (0x0ee0e000, 4, true),
+        (0x4ee0e000, 4, true),
+        (0xcec08000, 21, false),
+        (0xcec08400, 19, false),
+        (0xce608000, 21, true),
+        (0xce608400, 21, true),
+        (0xce608800, 21, true),
+        (0xce608c00, 17, true),
+        (0xce60c000, 18, true),
+        (0xce60c400, 18, true),
+        (0xce60c800, 19, true),
+        (0xce000000, 17, true),
+        (0xce200000, 17, true),
+        (0xce400000, 18, true),
+    ];
+    for opcode in [0xce408000, 0xce408400, 0xce408800, 0xce408c00] {
+        for imm in 0..4 {
+            cases.push((opcode | (imm << 12), 18, true));
+        }
+    }
+    for imm in 0..64 {
+        cases.push((0xce800000 | (imm << 10), 17, true));
+    }
+    for (word, cap, binary) in cases {
+        if !host_capability(cap) {
+            continue;
+        }
+        for (rd, rn, rm, ra) in [
+            (0, 1, 2, 3),
+            (31, 31, 31, 31),
+            (1, 1, 2, 1),
+            (2, 1, 2, 2),
+            (3, 2, 1, 3),
+        ] {
+            let mut word = word | (rn << 5) | rd;
+            if binary {
+                word |= rm << 16;
+            }
+            if matches!(word & 0xffe08000, 0xce000000 | 0xce200000 | 0xce400000) {
+                word |= ra << 10;
+            }
+            for pattern in [0, u128::MAX, 0x000102030405060708090a0b0c0d0e0f] {
+                let mut state = initial();
+                state.vectors[rd as usize] = pattern;
+                compare_fp_word(word, &state);
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_move_and_crypto_blocks_preserve_pressure_helpers_and_dynamic_pc() {
+    if !host_capability(1) {
+        return;
+    }
+    for (rn, rm, rd) in [(31, 0, 31), (29, 31, 0), (0, 0, 2)] {
+        let mut words = Vec::new();
+        for reg in (0..23).map(|r| (r * 13) & 31) {
+            words.push(0x4ea08400 | (reg << 16) | (reg << 5) | reg);
+        }
+        words.extend_from_slice(&[
+            0x4e006000 | (rn << 5) | (rm << 16) | rd, // TBL four registers
+            0x4e007000 | (rn << 5) | (rm << 16) | rd, // TBX with destination dependency
+            0x6e180400 | (rd << 5) | 31,              // INS v31.d[1],vd.d[0]
+            0x4e183c00 | (31 << 5) | 4,               // UMOV x4,v31.d[1]
+            0x4e083c00 | (rd << 5) | 5,               // UMOV x5,vd.d[0]
+            0x3dc00026, // LDR q6,[x1]: Rust callback can clobber all caller vectors
+        ]);
+        if host_capability(3) {
+            words.extend_from_slice(&[0x4e284820, 0x4e286800]);
+        }
+        words.extend_from_slice(&[0x4e0073e0, 0xd61f00a0]); // TBX + BR x5
+        let mut state = initial();
+        state.registers[1] = 0x10ff7;
+        // Table/index/destination overlap. Both engines must publish the same
+        // computed branch target, including an unmapped target after the helper.
+        state.vectors.fill(0x00000000000010100000000000001010);
+        state.vectors[rm as usize] = u128::MAX;
+        for budget in [1, 8, 64] {
+            let e = compare_memory_sequence(&words, &state, budget, budget == 64);
+            if NATIVE_COMPILED {
+                assert_eq!(e.stats.fallback_instructions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn unavailable_crypto_extensions_fault_before_any_interpreter_implementation() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    for (word, cap) in [
+        (0x4e284820, 3),
+        (0x0ee2e020, 4),
+        (0x5e020020, 5),
+        (0x5e024020, 6),
+        (0xce020c20, 17),
+        (0xce42ac20, 18),
+        (0xcec08420, 19),
+        (0xce628020, 21),
+    ] {
+        if host_capability(cap) {
+            continue;
+        }
+        let mut m = memory(&[0x91000400, word, 0xd4000001]);
+        let mut c = Cpu::new(0x1000, 0);
+        let before = c.architectural_state().vectors;
+        let mut e = Engine::default();
+        let out = c.run_slice(&mut e, &mut m, 64);
+        assert!(
+            matches!(
+                out,
+                SliceOutcome::Fault(trames_engine::CpuFault::Instruction { pc: 0x1004, .. })
+            ),
+            "{word:08x}: {out:?}"
+        );
+        assert_eq!((c.pc(), c.x(0), c.fault_retired()), (0x1004, 1, 1));
+        assert_eq!(c.architectural_state().vectors, before);
+        assert_eq!(e.stats.fallback_instructions, 0);
+    }
+}
+
+#[test]
 fn vector_memory_widths_address_modes_and_register_namespaces_match_reference() {
     for (size, opc) in [
         (0, 0),
