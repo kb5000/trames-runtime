@@ -96,7 +96,8 @@ pub(crate) fn execute(
     args: [u64; 3],
     metrics: &mut Metrics,
 ) -> Result<Return, Error> {
-    if (14..=18).contains(&function) && !cfg!(target_arch = "aarch64") {
+    #[cfg(not(target_arch = "aarch64"))]
+    if (14..=18).contains(&function) {
         return Ok(fallback());
     }
     let frame = memory.native_read_array::<72>(args[0])?;
@@ -609,7 +610,7 @@ mod tests {
         execute(m, f, [0x2000, 0, 0], &mut Metrics::default()).unwrap()
     }
     #[test]
-    fn checksum_hash_and_aes_known_vectors_and_in_place_roundtrip() {
+    fn checksum_hash_known_vectors_and_null_output_fallback() {
         let mut m = memory();
         m.write(0x3000, b"123456789").unwrap();
         assert_eq!(call(&mut m, 1, &[0, 0x3000, 9]).value, 0xcbf43926);
@@ -627,12 +628,20 @@ mod tests {
             ]
         );
         assert!(call(&mut m, 12, &[0x3000, 3, 0]).fallback);
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aes_known_vector_and_in_place_roundtrip_uses_the_admitted_host_abi() {
+        let mut m = memory();
         let key: [u8; 16] = std::array::from_fn(|i| i as u8);
         let plain: [u8; 16] = std::array::from_fn(|i| (i * 17) as u8);
         m.write(0x3000, &key).unwrap();
         m.write(0x4000, &plain).unwrap();
-        assert_eq!(call(&mut m, 14, &[0x3000, 128, 0x2200]).value, 0);
-        call(&mut m, 16, &[0x4000, 0x4000, 0x2200]);
+        let result = call(&mut m, 14, &[0x3000, 128, 0x2200]);
+        assert!(!result.fallback);
+        assert_eq!(result.value, 0);
+        assert_eq!(m.read_array::<4>(0x22f0).unwrap(), 10i32.to_le_bytes());
+        assert!(!call(&mut m, 16, &[0x4000, 0x4000, 0x2200]).fallback);
         assert_eq!(
             m.read_array::<16>(0x4000).unwrap(),
             [
@@ -640,9 +649,23 @@ mod tests {
                 0xc5, 0x5a
             ]
         );
-        call(&mut m, 15, &[0x3000, 128, 0x2200]);
-        call(&mut m, 17, &[0x4000, 0x4000, 0x2200]);
+        assert!(!call(&mut m, 15, &[0x3000, 128, 0x2200]).fallback);
+        assert!(!call(&mut m, 17, &[0x4000, 0x4000, 0x2200]).fallback);
         assert_eq!(m.read_array::<16>(0x4000).unwrap(), plain);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn aes_unowned_host_abi_declines_before_frame_or_output_access() {
+        let mut memory = Memory::default();
+        let mut metrics = Metrics::default();
+        for function in 14..=18 {
+            assert!(
+                execute(&mut memory, function, [0; 3], &mut metrics)
+                    .unwrap()
+                    .fallback
+            );
+        }
+        assert_eq!((metrics.bytes_read, metrics.bytes_written), (0, 0));
     }
     #[test]
     fn public_hash_contexts_stream_in_guest_memory_and_reject_bad_indices() {
