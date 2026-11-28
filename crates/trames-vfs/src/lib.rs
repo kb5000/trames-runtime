@@ -16,6 +16,7 @@ pub use cgroup::{
     CpuShare,
 };
 mod fs_context;
+mod path_cache;
 mod path_position;
 mod path_queries;
 pub mod poll_mask;
@@ -809,7 +810,7 @@ struct PathWalk {
 }
 struct Filesystem {
     shared_budget: trames_shared::SharedBudget,
-    paths: BTreeMap<Vec<u8>, NodeRef>,
+    paths: path_cache::Index,
     inodes: Vec<std::sync::Weak<Inode>>,
     next_inode: u64,
     limits: StorageLimits,
@@ -1211,7 +1212,7 @@ impl Default for Vfs {
     fn default() -> Self {
         let mut v = Self::empty(FsHandle::new(Filesystem {
             shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-            paths: BTreeMap::new(),
+            paths: BTreeMap::new().into(),
             inodes: Vec::new(),
             next_inode: 1,
             limits: StorageLimits::memory(),
@@ -1932,8 +1933,8 @@ impl Vfs {
         }
         let filesystem = path.mount().map_or(&self.fs, |m| &m.fs);
         let fs = filesystem.borrow();
-        if let Some(node) = fs.paths.get(key) {
-            return Ok(node.clone());
+        if let Some(node) = fs.paths.cached(key) {
+            return Ok(node);
         }
         let overlay = fs.overlay.clone();
         drop(fs);

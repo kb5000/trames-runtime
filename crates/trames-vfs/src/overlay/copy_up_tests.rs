@@ -332,9 +332,7 @@ fn copy_up_keeps_completed_data_and_capability_stages_across_separate_budget_wav
     assert_eq!(stat(&mut v, "a", "wios="), 3);
     assert_eq!(
         stat(&mut v, "a", "wbytes="),
-        original.len() as u64
-            + caps.len() as u64
-            + std::fs::metadata(store.0.join("manifest")).unwrap().len()
+        original.len() as u64 + caps.len() as u64 + crate::storage::test_record_bytes(&store.0)
     );
     assert_eq!(v.pread(fd, original.len(), 0).unwrap(), original);
 }

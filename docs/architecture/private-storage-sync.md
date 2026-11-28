@@ -1,90 +1,91 @@
 # Private store synchronization
 
-The private store retains the version 4 manifest and independent inode objects.
-No new journal, on-disk record, service thread or execution coordinator is needed
-for this optimization. Mac and iPad use the same implementation.
+The shared private store uses the existing version 4 `manifest` as a checkpoint
+and `manifest.wal` for incremental publications. Apple and Linux hosts share the
+same format and durability path. RAM filesystems and host filesystem mounts do
+not acquire a private journal. No coordinator, timer, service thread or UI setting
+is added.
 
-## Data-only synchronization
+## Publication and checkpoints
 
-The manifest persists inode identity, permissions, timestamps, attributes and
-namespace topology. It does not encode regular-file length: reopening obtains
-length from the original host object. A regular private `fdatasync` therefore
-flushes that object, including its host length metadata, without replacing the
-manifest solely to publish timestamps.
+A namespace/metadata transaction remains under the original per-store checkpoint
+mutex. It prepares the next v4 image, then appends a delta against the last
+accepted image instead of replacing the complete manifest. Unchanged spans refer
+to the previous image; changed bytes are inline. Insertions/deletions can
+resynchronize at exact byte anchors. The anchor index is bounded to 65,536 slots;
+small contiguous edits bypass it. Snapshot construction and checksumming still
+have CPU cost proportional to the image: this change removes disk write
+amplification, rather than claiming an incremental in-memory namespace serializer.
 
-Both original descriptor execution and retained asynchronous disk jobs use this
-rule. Mapped files flush their shared pages before the underlying data sync.
-Overlay copy-up retains its checkpoint path, directories retain namespace sync,
-and anonymous/unlinked files retain their original data-only lifetime behavior.
-Actual host I/O errors are still returned.
+Before synchronizing a record, any newly created/removed object directory entries
+are synchronized. A complete record followed by successful `File::sync_all` is
+the namespace commit point. Its first creation also makes the store directory
+generation dirty. Later appends reuse the existing directory entry and need no
+new directory flush. A failed post-commit directory flush remains pending for an
+explicit sync; it does not roll back an already accepted namespace.
 
-On Apple platforms the existing Rust `File::sync_data` remains a full device
-flush. This change does not weaken the established file-data barrier. It also
-does not promise native macOS `fdatasync` performance, whose host operation is
-less expensive. Optimizing that policy requires an explicit durability design.
+A failed append/sync truncates and synchronizes the unaccepted tail before the
+caller rolls back its original metadata. If that repair itself fails, the store
+rejects further metadata publication until recovery. Actual I/O errors remain
+visible. Native writes retain the original cgroup admission and actual-byte
+accounting; opening a blocked journal refunds unissued credit.
 
-## Namespace durability generations
+After 4 MiB of records or 1,024 publications, the next transaction first checkpoints
+the **previously accepted** image. Explicit filesystem synchronization and startup
+are also maintenance boundaries. The existing protocol writes/synchronizes
+`manifest.new`, synchronizes changed object entries, renames the checkpoint and
+synchronizes its directory. Only after that succeeds may the WAL be truncated and
+synchronized. Current-transaction admission can wait after this maintenance: its
+namespace is still unpublished and can roll back normally. A checkpoint and its
+following delta are separate real I/O requests.
 
-Each store tracks object-directory changes and manifest publication generations.
-Creating or finally removing a private object changes the object generation;
-recovery also marks orphan cleanup. A successful object-directory flush covers
-only the generation observed before it. An unchanged object directory needs no
-additional flush for a timestamp-only manifest update.
+## Journal format and recovery
 
-Manifest publication still writes and fully synchronizes `manifest.new`,
-synchronizes any changed object directory, atomically renames the manifest, then
-fully synchronizes the store directory. The last successful directory generation
-allows an explicit `fsync` or shutdown to reuse that completed durability step.
-A failed post-rename flush does not advance it: subsequent explicit sync retries
-and reports a persistent failure without rolling back a committed namespace.
-Completion uses a monotonic maximum, so it cannot acknowledge a later concurrent
-mutation or overwrite another completion with an older generation.
+All integers are little endian. A frame is:
 
-Generation bookkeeping is confined to namespace publication and private-object
-creation/destruction. Ordinary byte reads and writes gain no generation counter,
-permission check, barrier, message or lock. Relaxed atomics track scalar flush
-coverage; existing filesystem and checkpoint ownership still protects the data.
+- `TRMWAL01` (8 bytes), payload length (`u64`), payload, payload FNV-1a-64 checksum.
+- Payload: previous whole-image FNV-1a-64, resulting whole-image FNV-1a-64,
+  resulting image length (`u64` each), followed by operations.
+- Operation 0: source offset and length (`u64` each) in the previous image.
+- Operation 1: inline length (`u64`) followed by those bytes.
 
-## File-specific manifest preparation
+The resulting image retains its independent v4 manifest checksum. Lengths,
+operations, source ranges and the declared checksum chain are validated before
+the VFS decodes nodes or cleans up orphan objects. Recovery carries immutable
+byte spans through the delta chain, then materializes and checksums the final
+image once. This avoids copying and hashing the whole namespace for every small
+record during startup or File Provider reads. Span metadata is bounded, with a
+flattened prefix fallback for excessive fragmentation. An incomplete final frame is ignored;
+a malformed complete frame is rejected. These are corruption checks, not a
+cryptographic authentication protocol.
 
-Each store retains the last accepted serialized manifest and a compact sorted
-inode/offset vector under the existing checkpoint mutex. A regular file fsync
-uses the original retained inode, updates only its fixed-width v4 metadata
-header, and recalculates the existing whole-manifest checksum. It does not walk
-paths, reconstruct the namespace/attribute tables or borrow unrelated inodes.
-Metadata that already matches the accepted snapshot needs no new publication;
-the original file-data synchronization and any pending directory retry remain.
+A crash can leave the new checkpoint alongside an older, not-yet-truncated WAL.
+Recovery finds the already-covered prefix by its resulting image checksum, then
+requires every remaining frame to continue the accepted chain. Startup publishes
+a fresh checkpoint before accepting guest mutations. Existing v3/v4 checkpoints
+are supported and upgraded through the normal writer. A store containing a WAL
+requires a journal-aware reader; older Runtime allowlists reject the sidecar
+instead of silently opening stale metadata.
 
-Namespace and attribute transactions still construct a complete snapshot and
-replace its offset index on success. Consequently hard links, replacement,
-rename and variable-size attribute records cannot leave stale positions behind.
-The cache is private to the original store, so equal inode numbers from different
-stores do not share an index. Unlinked retained objects do not update a new inode
-that happens to occupy their former pathname.
+The iPad read-only File Provider replays the same format without acquiring the
+writer lock, running recovery or modifying objects. It retries a checkpoint/WAL
+pair when concurrent publication makes their chain inconsistent. Both its cache
+signature and app-side change polling include the WAL, so a metadata append is
+visible even while `manifest` keeps its inode and contents. Rust-generated Swift
+fixtures cover a real record, an incomplete tail, an already-covered checkpoint,
+hard links, cache signatures and corruption rejection.
 
-If publication fails before rename, both the cached 64-byte header and checksum
-are restored. After rename, the cache describes the newly committed manifest;
-directory-generation retry handles any remaining durability failure. Concurrent
-file syncs merge into the latest snapshot through the original commit mutex.
-Tests also hold an unrelated inode's metadata locked while completing target
-file sync, ensuring whole-namespace traversal cannot return through this path.
+## File and concurrency behavior
 
-This is CPU-side incremental preparation. The on-disk v4 file, checksum and
-atomic-replacement protocol remain unchanged: each dirty metadata publication
-still writes a complete manifest. The retained buffer is proportional to actual
-manifest bytes and inode count, with no new work on ordinary byte reads/writes.
+File bytes remain independent inode objects. `fdatasync` still synchronizes those
+bytes (including host length metadata) without publishing timestamp-only metadata.
+Mapped writeback, retained descriptors, unlinked objects, overlay projection,
+capability sidecars and directory-generation retry retain their existing owners.
+Apple keeps the existing `File::sync_data` durability policy.
 
-## Validation and remaining costs
-
-Regressions exercise both descriptor/worker paths, hard links, file growth,
-mapped writeback, unchanged manifests, namespace failure, post-rename durability
-retry, and process exit without VFS shutdown. The complete Runtime workflow runs
-locally on macOS; VFS also compiles for the physical iPad target.
-
-Mac fio measurements and limitations are recorded in the product repository:
-[storage synchronization acceptance](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-storage-sync-20261115.md).
-Data-only synchronization improves substantially. File-specific preparation also
-reduces full-sync cost, while full file synchronization still replaces the whole
-manifest with distinct data/manifest/directory barriers. Reducing those costs
-further needs incremental on-disk metadata or a proven ordered barrier batch,
-rather than silently removing durability steps.
+Regular-file `fsync` uses the retained inode and its indexed fixed-width metadata
+header. Its accepted image is updated only after journal publication. A new image
+or checkpoint never changes which inode an existing open description refers to.
+Plain byte I/O adds no generation counter, extra permission policy or new lock.
+The record byte/count counters are advisory relaxed scalars, under the original
+publication ownership.

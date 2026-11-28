@@ -1,0 +1,14 @@
+# Exact original AArch64 library images. Unknown/custom/upgraded images stay original.
+# SHA256 library fixture-family original-file
+0261e625d796007a4688f12b5bea20ca8af9d6767d645286501245a0f0187699	libzstd.so.1	alpine322	libzstd.so.1.5.7
+1279c4edfbfb08878b5b7fb40d392c1bdc9b30100d9b7a019d4aefaf10d2046c	libzstd.so.1	debian13-iproute2	libzstd.so.1
+1dfd2166dd6124fbd4cbba54ea3d5b2de60e308c252de39d1369e71d301ddea4	libz.so.1	alpine322	libz.so.1.3.2
+50e9207a39bea9767f8ceaf464655953622ac3bac7ac5d24433f207f810cbd80	liblzma.so.5	ubuntu24	liblzma.so.5
+52a1d5c0cbffb3596c7f0636cb1af8e131e00eb77ff92d1353057d5161d420d3	libz.so.1	ubuntu24	libz.so.1
+684bf2cbc78ba9e8956818b02a07cc0c1f6ef1738bb0d6b2bf59a72d5aff0b94	liblzma.so.5	alpine322	liblzma.so.5.8.4
+6fe00acadf8119ff245855e5dcc7f26c6c0ffaf4bfa2baa88feab58f23727d65	libz.so.1	debian13-iproute2	libz.so.1
+809909371a1db7d2b9cac4c2fa2eff63eb6169d5979416d94155955a7ad32516	libcrypto.so.3	debian13	libcrypto.so.3
+911da5b5135cec3a520d294e56aefae5d753c9e1ed45aeabe8093d3ba986c284	libcrypto.so.3	alpine322	libcrypto.so.3
+abc92a2b9322d612f7a7f418b25965361098d0a534c5527fc692f2f0c33d0f9f	liblzma.so.5	debian13	liblzma.so.5.8.1
+b27a2396652ee28629c94d59d667c417dbffdf2dee84e5bf140bd17d3eedb7d9	libcrypto.so.3	ubuntu24	libcrypto.so.3
+fe726238b170b83aa83bf1f8a79109b8b61b9eb45234304511d093bbe5f5fb20	libzstd.so.1	ubuntu24	libzstd.so.1

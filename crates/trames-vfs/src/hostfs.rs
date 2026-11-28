@@ -1270,7 +1270,7 @@ impl Vfs {
         )?;
         let mut filesystem = FsHandle::new(Filesystem {
             shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-            paths: BTreeMap::new(),
+            paths: BTreeMap::new().into(),
             inodes: Vec::new(),
             next_inode: 1,
             limits: StorageLimits {

@@ -3,6 +3,8 @@
 pub mod allocator;
 pub mod bionic;
 pub mod callbacks;
+pub mod compute;
+pub mod compute_elf;
 pub mod glibc;
 pub mod integer;
 pub mod native;

@@ -1913,7 +1913,7 @@ impl Vfs {
             }));
             let fs = FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-                paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
+                paths: BTreeMap::from([(b"/".to_vec(), root.clone())]).into(),
                 inodes: vec![Arc::downgrade(&root)],
                 next_inode: handle.id() + 1,
                 limits: StorageLimits::memory(),
@@ -2541,7 +2541,7 @@ pub(super) fn ram_filesystem(
     let fs = FsHandle::with_page_accounting(
         Filesystem {
             shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-            paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
+            paths: BTreeMap::from([(b"/".to_vec(), root.clone())]).into(),
             inodes: vec![Arc::downgrade(&root)],
             next_inode: inode + 1,
             limits: StorageLimits {

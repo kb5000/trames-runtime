@@ -92,7 +92,7 @@ fn an_xattr_manifest_wait_rolls_back_until_the_original_inode_can_commit() {
         let store = Store::new();
         let (mut v, fd, node) = fixture(&store);
         let original_time = node.borrow().times;
-        let original_manifest = std::fs::read(store.0.join("manifest")).unwrap();
+        let original_manifest = crate::storage::test_image(&store.0);
         write(&mut v, b"/sys/fs/cgroup/a/io.max", b"253:1 wbps=1");
         let task = v.cgroup_task(1).unwrap();
         let scope = task.resource_scope();
@@ -103,10 +103,7 @@ fn an_xattr_manifest_wait_rolls_back_until_the_original_inode_can_commit() {
             );
         assert!(!node.borrow().xattrs.contains_key(b"user.test".as_slice()));
         assert_eq!(node.borrow().times, original_time);
-        assert_eq!(
-            std::fs::read(store.0.join("manifest")).unwrap(),
-            original_manifest
-        );
+        assert_eq!(crate::storage::test_image(&store.0), original_manifest);
         assert!(!store.0.join("manifest.new").exists());
         assert_eq!(stat(&mut v, "a", "wios="), 0);
         drop(scope);
@@ -137,7 +134,7 @@ fn an_xattr_manifest_wait_rolls_back_until_the_original_inode_can_commit() {
             assert_eq!(stat(&mut v, "a", "wios="), 1);
             assert_eq!(
                 stat(&mut v, "a", "wbytes="),
-                std::fs::metadata(store.0.join("manifest")).unwrap().len()
+                crate::storage::test_record_bytes(&store.0)
             );
         }
         assert_eq!(stat(&mut v, "b", "wios="), 0);
@@ -149,7 +146,7 @@ fn a_manifest_open_failure_refunds_unissued_credit_and_preserves_the_existing_te
     let store = Store::new();
     let (mut v, fd, node) = fixture(&store);
     write(&mut v, b"/sys/fs/cgroup/a/io.max", b"253:1 wiops=1");
-    std::fs::write(store.0.join("manifest.new"), b"occupied").unwrap();
+    crate::storage::block_publication(&store.0).unwrap();
     let task = v.cgroup_task(1).unwrap();
     let _scope = task.resource_scope();
     assert_eq!(
@@ -157,15 +154,12 @@ fn a_manifest_open_failure_refunds_unissued_credit_and_preserves_the_existing_te
             v.path_queries()
                 .namespace_work(xattr(fd, b"user.test", b"first".to_vec(), 1))
         ),
-        Err(Errno(17))
+        Err(Errno(22))
     );
     assert!(!node.borrow().xattrs.contains_key(b"user.test".as_slice()));
-    assert_eq!(
-        std::fs::read(store.0.join("manifest.new")).unwrap(),
-        b"occupied"
-    );
+    assert!(store.0.join("manifest.wal").is_dir());
     assert_eq!(stat(&mut v, "a", "wios="), 0);
-    std::fs::remove_file(store.0.join("manifest.new")).unwrap();
+    crate::storage::unblock_publication(&store.0).unwrap();
     // No timer advance or quota reset: the first request issued no write.
     assert_eq!(
         finish(
@@ -284,6 +278,7 @@ fn a_capability_rollback_wait_retains_the_original_error_and_does_not_republish_
     let inode = node.borrow().inode;
     let sidecar = store.0.join("objects").join(format!("{inode:016x}.cap"));
     let old_sidecar = std::fs::read(&sidecar).unwrap();
+    crate::storage::force_checkpoint_for_test(&v, &store.0);
     let manifest = store.0.join("manifest");
     let saved = store.0.join("manifest.saved");
     // A real native rename error occurs after the replacement manifest was
