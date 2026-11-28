@@ -120,6 +120,397 @@ fn host_capability(bit: u32) -> bool {
     !NATIVE_COMPILED || trames_jit::host_features().unwrap().hwcap & (1 << bit) != 0
 }
 
+fn compare_fp_word(word: u32, state: &Aarch64State) {
+    for budget in [1, 64] {
+        let e = compare_memory_sequence(&[word, 0xd4000001], state, budget, budget == 64);
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+            assert_eq!(e.memory_stats().instructions, 0);
+        }
+    }
+}
+
+#[test]
+fn native_scalar_fp_arithmetic_flags_conversions_and_aliases_match_reference() {
+    for kind in [0, 1, 3] {
+        if kind == 3 && !host_capability(9) {
+            continue;
+        }
+        for (rd, rn, rm) in [(0, 1, 2), (1, 1, 2), (2, 1, 2), (31, 31, 31)] {
+            for control in [0, 1 << 22, (2 << 22) | (1 << 24) | (1 << 25)] {
+                let mut state = initial();
+                state.fpcr = control;
+                for op in 0..=8 {
+                    compare_fp_word(
+                        0x1e200800 | (kind << 22) | (op << 12) | (rm << 16) | (rn << 5) | rd,
+                        &state,
+                    );
+                }
+                for op in [0, 1, 2, 3, 8, 9, 10, 11, 12, 14, 15] {
+                    compare_fp_word(
+                        0x1e204000 | (kind << 22) | (op << 15) | (rn << 5) | rd,
+                        &state,
+                    );
+                }
+                for sign in 0..4 {
+                    compare_fp_word(
+                        0x1f000000
+                            | (kind << 22)
+                            | ((sign >> 1) << 21)
+                            | ((sign & 1) << 15)
+                            | (rm << 16)
+                            | (3 << 10)
+                            | (rn << 5)
+                            | rd,
+                        &state,
+                    );
+                }
+                for condition in [0, 1, 6, 14, 15] {
+                    compare_fp_word(
+                        0x1e200c00 | (kind << 22) | (rm << 16) | (condition << 12) | (rn << 5) | rd,
+                        &state,
+                    );
+                    compare_fp_word(
+                        0x1e200400
+                            | (kind << 22)
+                            | (rm << 16)
+                            | (condition << 12)
+                            | (rn << 5)
+                            | 0xb,
+                        &state,
+                    );
+                }
+                for zero in [false, true] {
+                    for signal in [false, true] {
+                        compare_fp_word(
+                            0x1e202000
+                                | (kind << 22)
+                                | (if zero { 8 } else { rm << 16 })
+                                | ((signal as u32) << 4)
+                                | (rn << 5),
+                            &state,
+                        );
+                    }
+                }
+                compare_fp_word(0x1e201000 | (kind << 22) | (0x70 << 13) | rd, &state);
+            }
+        }
+        for sf in 0..2 {
+            for op in [0, 1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 25] {
+                compare_fp_word(
+                    (sf << 31) | 0x1e200000 | (kind << 22) | (op << 16) | (1 << 5),
+                    &initial(),
+                );
+            }
+        }
+    }
+    for word in [
+        0x1e260020, 0x1e270020, 0x9e660020, 0x9e670020, 0x9eae0020, 0x9eaf0020,
+    ] {
+        compare_fp_word(word, &initial());
+    }
+}
+
+#[test]
+fn native_neon_integer_float_accumulators_and_qc_match_reference() {
+    let logical = [
+        0x0e201c00, 0x0ea01c00, 0x2e201c00, 0x0e601c00, 0x0ee01c00, 0x2e601c00, 0x2ea01c00,
+        0x2ee01c00,
+    ];
+    let integer = [
+        0x0e208400, 0x2e208400, 0x0e20bc00, 0x0e208c00, 0x2e208c00, 0x0e203400, 0x2e203400,
+        0x0e203c00, 0x2e203c00, 0x0e200c00, 0x2e200c00, 0x0e202c00, 0x2e202c00, 0x0e204400,
+        0x2e204400, 0x0e204c00, 0x2e204c00, 0x0e205400, 0x2e205400, 0x0e205c00, 0x2e205c00,
+    ];
+    let small = [
+        0x0e209c00, 0x0e209400, 0x2e209400, 0x0e206400, 0x2e206400, 0x0e206c00, 0x2e206c00,
+    ];
+    let float = [
+        0x0e20d400, 0x0ea0d400, 0x2e20d400, 0x2e20dc00, 0x2e20fc00, 0x0e20cc00, 0x0ea0cc00,
+        0x0e20f400, 0x0ea0f400, 0x0e20c400, 0x0ea0c400, 0x0e20e400, 0x2e20e400, 0x2ea0e400,
+        0x2e20ec00, 0x2ea0ec00,
+    ];
+    for q in 0..2 {
+        for (rd, rn, rm) in [(0, 1, 2), (1, 1, 2), (2, 1, 2), (31, 31, 31)] {
+            for op in logical {
+                compare_fp_word(op | (q << 30) | (rm << 16) | (rn << 5) | rd, &initial());
+            }
+            for size in 0..4 {
+                if size == 3 && q == 0 {
+                    continue;
+                }
+                for op in integer
+                    .into_iter()
+                    .chain(small.into_iter().filter(|_| size < 3))
+                {
+                    compare_fp_word(
+                        op | (q << 30) | (size << 22) | (rm << 16) | (rn << 5) | rd,
+                        &initial(),
+                    );
+                }
+            }
+            for size in 0..2 {
+                if size == 1 && q == 0 {
+                    continue;
+                }
+                for op in float {
+                    compare_fp_word(
+                        op | (q << 30) | (size << 22) | (rm << 16) | (rn << 5) | rd,
+                        &initial(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_vectors_evict_dirty_registers_and_preserve_v31_and_dynamic_pc() {
+    let mut words: Vec<_> = (0..32).map(|rd| 0x4e221c00 | (1 << 5) | rd).collect();
+    words.extend((0..24).map(|rd| 0x4e228400 | (rd << 5) | rd));
+    words.extend_from_slice(&[0x9e6603e0, 0xd61f00c0]); // FMOV x0,d31; BR x6
+    let mut state = initial();
+    state.registers[6] = 0x1000 + 4 * words.len() as u64;
+    words.push(0xd4000001);
+    for budget in [1, 3, 64] {
+        let e = compare_memory_sequence(&words, &state, budget, false);
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0);
+        }
+    }
+}
+
+#[test]
+fn fp_vector_blocks_return_cleanly_to_existing_memory_and_system_boundaries() {
+    let mut state = initial();
+    state.registers[1] = 0x10000;
+    let words = [
+        0x3dc00020, 0x4e20d400, 0x3d800020, 0xd53b4423, 0x1e622804, 0xf9400020, 0x4e221c9f,
+        0xd4000001,
+    ];
+    for budget in [1, 64] {
+        let e = compare_memory_sequence(&words, &state, budget, budget == 64);
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 3);
+        }
+    }
+}
+
+#[test]
+fn native_fp_special_values_rounding_and_sticky_status_match_reference() {
+    for (kind, values) in [
+        (
+            0,
+            vec![
+                0u64, 0x80000000, 1, 0x00800000, 0x3f800000, 0x7f7fffff, 0x7f800000, 0xff800000,
+                0x7fc12345, 0x7f812345,
+            ],
+        ),
+        (
+            1,
+            vec![
+                0,
+                0x8000000000000000,
+                1,
+                0x0010000000000000,
+                0x3ff0000000000000,
+                0x7fefffffffffffff,
+                0x7ff0000000000000,
+                0xfff0000000000000,
+                0x7ff8123456789abc,
+                0x7ff0123456789abc,
+            ],
+        ),
+        (
+            3,
+            vec![
+                0, 0x8000, 1, 0x400, 0x3c00, 0x7bff, 0x7c00, 0xfc00, 0x7e01, 0x7c01,
+            ],
+        ),
+    ] {
+        if kind == 3 && !host_capability(9) {
+            continue;
+        }
+        for (i, &value) in values.iter().enumerate() {
+            for control in [
+                0,
+                1 << 22,
+                2 << 22,
+                3 << 22,
+                (1 << 24) | (1 << 25) | (1 << 19),
+            ] {
+                let mut state = initial();
+                state.fpcr = control;
+                state.fpsr = 0x08000010;
+                state.vectors[1] = value as u128;
+                state.vectors[2] = values[(i + 3) % values.len()] as u128;
+                state.vectors[3] = values[(i + 7) % values.len()] as u128;
+                for op in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+                    compare_fp_word(
+                        0x1e200800 | (kind << 22) | (2 << 16) | (op << 12) | (1 << 5),
+                        &state,
+                    );
+                }
+                compare_fp_word(0x1f020c20 | (kind << 22), &state);
+                compare_fp_word(0x1e222020 | (kind << 22), &state);
+            }
+        }
+    }
+}
+
+#[test]
+fn baseline_precision_conversions_preserve_alternative_half_and_flush_rules() {
+    for word in [
+        0x1e23c020, 0x1e63c020, 0x1ee24020, 0x1ee2c020, 0x1e22c020, 0x1e624020,
+    ] {
+        for control in [0, 1 << 26, 1 << 19, (1 << 26) | (1 << 19) | (1 << 25)] {
+            for value in [
+                1u64,
+                0x7c01,
+                0x7e01,
+                0x3ff0000000000000,
+                0x3f800000,
+                u64::MAX,
+            ] {
+                let mut state = initial();
+                state.fpcr = control;
+                state.vectors[1] = value as u128;
+                compare_fp_word(word, &state);
+            }
+        }
+    }
+}
+
+#[test]
+fn fp_neon_hot_loops_keep_exact_budgets_without_per_instruction_entry() {
+    for word in [0x1e612800, 0x4e21d400, 0x4ea18400] {
+        let mut state = initial();
+        state.registers[2] = 32;
+        state.vectors[0] = 0;
+        state.vectors[1] = match word {
+            0x1e612800 => 1f64.to_bits() as u128,
+            0x4e21d400 => (1f32.to_bits() as u128) * 0x00000001000000010000000100000001,
+            _ => 0x00000001000000010000000100000001,
+        };
+        let words = [word, word, 0xf1000442, 0x54ffffa1, 0x9e660000, 0xd4000001];
+        for budget in [3, 17, 256] {
+            let e = compare_memory_sequence(&words, &state, budget, false);
+            if NATIVE_COMPILED {
+                assert_eq!(e.stats.fallback_instructions, 0);
+                if budget == 256 {
+                    assert!(e.link_stats().entries <= 2);
+                }
+                assert_eq!(e.memory_stats().fused_entries, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn fp_cached_code_and_status_are_revalidated_after_instruction_replacement() {
+    let mut m = memory(&[0x1e622820, 0xd4000001]);
+    let mut c = Cpu::new(0x1000, 0);
+    let mut e = Engine::default();
+    let mut state = initial();
+    state.vectors[1] = 2f64.to_bits() as u128;
+    state.vectors[2] = 3f64.to_bits() as u128;
+    c.restore_architectural_state(&state);
+    c.run_slice(&mut e, &mut m, 64);
+    assert_eq!(c.architectural_state().vectors[0], 5f64.to_bits() as u128);
+    m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    m.write_array(0x1000, 0x1e620820u32.to_le_bytes()).unwrap();
+    m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+    c.restore_architectural_state(&state);
+    c.run_slice(&mut e, &mut m, 64);
+    assert_eq!(c.architectural_state().vectors[0], 6f64.to_bits() as u128);
+}
+
+#[test]
+fn a_running_fp_loop_observes_parallel_code_publication_at_its_block_guard() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    let mut m = memory(&[0x1e612800, 0x91000400, 0x17fffffe]);
+    m.protect(
+        0x1000,
+        PAGE_SIZE,
+        Permissions {
+            read: true,
+            write: true,
+            execute: true,
+        },
+    )
+    .unwrap();
+    let mut registry = trames_memory::parallel::Registry::default();
+    let mut reader = m.parallel_view(&mut registry).unwrap();
+    let mut writer = reader.clone();
+    let mut c = Cpu::new(0x1000, 0);
+    let mut s = initial();
+    s.vectors[0] = 0;
+    s.vectors[1] = 1f64.to_bits() as u128;
+    s.registers[0] = 0;
+    c.restore_architectural_state(&s);
+    let mut e = Engine::default();
+    c.run_parallel(&mut e, &mut reader, 96);
+    c.restore_architectural_state(&s);
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let peer = start.clone();
+    let task = std::thread::spawn(move || {
+        peer.wait();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        writer
+            .write_array(0x1000, 0xd4000001u32.to_le_bytes())
+            .unwrap();
+    });
+    start.wait();
+    let result = c.run_parallel(&mut e, &mut reader, 100_000_000);
+    task.join().unwrap();
+    let SliceOutcome::Syscall { instructions } = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(instructions, c.x(0) * 3 + 1);
+    assert_eq!(c.pc(), 0x1004);
+    assert_eq!(
+        c.architectural_state().vectors[0],
+        (c.x(0) as f64).to_bits() as u128
+    );
+    assert_eq!(e.stats.fallback_instructions, 0);
+}
+
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+#[test]
+fn fp_entries_preserve_host_environment_on_yield_syscall_and_guest_fault() {
+    fn environment() -> (u64, u64) {
+        let (c, s);
+        unsafe {
+            std::arch::asm!("mrs {c},fpcr","mrs {s},fpsr",c=out(reg)c,s=out(reg)s,options(nostack,preserves_flags));
+        }
+        (c, s)
+    }
+    let before = environment();
+    for word in [0xd4000001, 0, 0xf9400020] {
+        let mut m = memory(&[0x1e221820, word]); // FDIV s0,s1,s2
+        for budget in [1, 64] {
+            let mut c = Cpu::new(0x1000, 0);
+            let mut state = initial();
+            state.fpcr = 1 << 22;
+            state.fpsr = 0;
+            state.vectors[1] = 1f32.to_bits() as u128;
+            state.vectors[2] = 0;
+            state.registers[1] = 0xdead0000;
+            c.restore_architectural_state(&state);
+            let mut e = Engine::default();
+            let _ = c.run_slice(&mut e, &mut m, budget);
+            assert_eq!(environment(), before);
+            assert_ne!(c.architectural_state().fpsr & 2, 0);
+        }
+    }
+}
+
 #[test]
 fn lse_rmw_widths_ordering_and_register_aliases_match_reference() {
     if !host_capability(8) {

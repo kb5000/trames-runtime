@@ -9,13 +9,14 @@ repository.workspace = true
 [features]
 default = []
 # Explicit product opt-in. This is never enabled by trames-interpreter/iPad.
-native-aarch64 = ["trames-memory/native-code"]
+native-aarch64 = ["trames-memory/native-code", "dep:trames-host-compute"]
 
 [dependencies]
 trames-interpreter = { path = "../trames-interpreter" }
 trames-engine = { path = "../trames-engine" }
 trames-execution = { path = "../trames-execution" }
 trames-memory = { path = "../trames-memory" }
+trames-host-compute = { path = "../trames-host-compute", optional = true }
 libc = "=0.2.190"
 
 [lints]

@@ -39,6 +39,7 @@ impl Node {
 struct Block {
     code: Code,
     has_memory: bool,
+    has_vector: bool,
     has_hardware: bool,
     read_only_memory: bool,
     memory_width: usize,
@@ -172,6 +173,16 @@ struct MemoryFrame<M> {
     fault: Option<CpuFault>,
     stats: crate::MemoryStats,
 }
+/// Only FP/SIMD entries carry this pointer; the 120-byte scalar/SVC frame and
+/// existing memory-frame offsets remain unchanged.
+#[repr(C)]
+struct VectorFrame {
+    frame: Frame,
+    vectors: *mut u128,
+}
+const _: () = {
+    assert!(std::mem::offset_of!(VectorFrame, vectors) == 120);
+};
 /// A connected union of already exported pages, never an assertion about holes.
 /// `last` is the final legal start offset for the block's widest memory operand.
 #[repr(C)]
@@ -840,6 +851,9 @@ impl Cache {
         // Epoch references are borrowed from this live Memory/View. Native jumps
         // use only installed same-page entries, never a guest-provided pointer.
         if block.has_memory {
+            if block.has_vector {
+                return self.execute_vector_block(cpu, budget, handle, frame);
+            }
             return self.execute_memory_block(cpu, memory, budget, handle, frame);
         }
         if block.syscall || self.links[handle.slot] == 0 {
@@ -884,6 +898,47 @@ impl Cache {
             instructions: budget - frame.remaining,
             blocks: frame.blocks,
             syscall: frame.syscall != 0,
+        }))
+    }
+    #[inline(never)]
+    fn execute_vector_block(
+        &mut self,
+        cpu: &mut Cpu,
+        budget: u64,
+        handle: Handle,
+        frame: Frame,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let block = self.node(handle).unwrap().block.as_ref().unwrap();
+        // Existing host control/status scope, once per native entry, never per
+        // instruction. No Rust/provider callback runs in this native FP block.
+        let scope = trames_host_compute::Scope::new(cpu.fpcr, cpu.fpsr);
+        let (registers, vectors) = cpu.native_register_banks_mut();
+        let mut vector_frame = VectorFrame {
+            frame,
+            vectors: vectors.as_mut_ptr(),
+        };
+        unsafe {
+            block
+                .code
+                .call_vectors(registers.as_mut_ptr(), &mut vector_frame);
+        }
+        cpu.fpsr |= trames_host_compute::status();
+        drop(scope);
+        self.links_stats.entries += 1;
+        self.links_stats.linked_blocks += vector_frame.frame.blocks.saturating_sub(1);
+        cpu.pc = vector_frame.frame.pc;
+        cpu.sp = vector_frame.frame.sp;
+        cpu.set_nzcv((vector_frame.frame.nzcv >> 28) as u32);
+        if vector_frame.frame.last_slot < NO_SLOT {
+            self.last = Some(self.handle(vector_frame.frame.last_slot as usize));
+        }
+        if vector_frame.frame.blocks == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Executed {
+            instructions: budget - vector_frame.frame.remaining,
+            blocks: vector_frame.frame.blocks,
+            syscall: vector_frame.frame.syscall != 0,
         }))
     }
     // Keep the larger typed helper frame out of scalar/SVC native entries.
@@ -967,6 +1022,90 @@ struct Binding {
     dirty: bool,
     used: u32,
 }
+
+#[derive(Clone)]
+struct Vectors {
+    bindings: [Option<Binding>; 16],
+    hosts: [u8; 32],
+    clock: u32,
+    used: bool,
+}
+impl Vectors {
+    fn new() -> Self {
+        Self {
+            bindings: [None; 16],
+            hosts: [u8::MAX; 32],
+            clock: 0,
+            used: false,
+        }
+    }
+    fn bind(
+        &mut self,
+        words: &mut Vec<u32>,
+        traffic: &mut CompilationStats,
+        guest: u32,
+        avoid: u32,
+        read: bool,
+    ) -> u32 {
+        self.used = true;
+        self.clock += 1;
+        let old = self.hosts[guest as usize];
+        let slot = if old != u8::MAX {
+            old as usize
+        } else {
+            let slot = self
+                .bindings
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or_else(|| {
+                    self.bindings
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| avoid & (1 << (i + 16)) == 0)
+                        .min_by_key(|(_, b)| b.unwrap().used)
+                        .unwrap()
+                        .0
+                });
+            if let Some(binding) = self.bindings[slot] {
+                if binding.dirty {
+                    load(words, 17, 16, 120);
+                    words.push(0x3d800000 | (binding.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                    traffic.register_stores += 1;
+                }
+                self.hosts[binding.guest as usize] = u8::MAX;
+            }
+            if read {
+                load(words, 17, 16, 120);
+                words.push(0x3dc00000 | (guest << 10) | (17 << 5) | (slot as u32 + 16));
+                traffic.register_loads += 1;
+            }
+            self.hosts[guest as usize] = slot as u8;
+            self.bindings[slot] = Some(Binding {
+                guest,
+                dirty: false,
+                used: self.clock,
+            });
+            slot
+        };
+        let b = self.bindings[slot].as_mut().unwrap();
+        b.dirty |= !read;
+        b.used = self.clock;
+        slot as u32 + 16
+    }
+    fn flush(&mut self, words: &mut Vec<u32>, traffic: &mut CompilationStats) {
+        if self.bindings.iter().flatten().any(|b| b.dirty) {
+            load(words, 11, 16, 120);
+        }
+        for (slot, b) in self.bindings.iter().enumerate() {
+            if let Some(b) = b.filter(|b| b.dirty) {
+                words.push(0x3d800000 | (b.guest << 10) | (11 << 5) | (slot as u32 + 16));
+                traffic.register_stores += 1;
+            }
+        }
+        self.bindings.fill(None);
+        self.hosts.fill(u8::MAX);
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OperandKey {
     address: crate::memory_ops::Address,
@@ -1015,6 +1154,7 @@ struct Assembler {
     versions: [u32; 33],
     operand: Option<(OperandKey, usize)>,
     first_operand: Option<LoopOperand>,
+    vectors: Vectors,
 }
 impl Assembler {
     fn new() -> Self {
@@ -1031,6 +1171,7 @@ impl Assembler {
             versions: [0; 33],
             operand: None,
             first_operand: None,
+            vectors: Vectors::new(),
         }
     }
     fn store(&mut self, slot: usize, binding: Binding) {
@@ -1144,11 +1285,96 @@ impl Assembler {
             self.words.push(0xd53b420b); // mrs x11,nzcv
             store(&mut self.words, 11, 112);
         }
+        // x17 may already contain a selected dynamic guest PC. Vector stores
+        // use x11 only after integer bindings/NZCV have been published.
+        self.vectors.flush(&mut self.words, &mut self.traffic);
         self.bindings.fill(None);
         self.hosts.fill(u8::MAX);
         self.flags_live = false;
         self.flags_dirty = false;
         self.operand = None;
+    }
+    fn vector(&mut self, word: u32, op: crate::vector_ops::Operation) {
+        use crate::vector_ops::Form;
+        self.context = true;
+        let rd = word & 31;
+        let rn = (word >> 5) & 31;
+        let rm = (word >> 16) & 31;
+        let ra = (word >> 10) & 31;
+        let n = match op.form {
+            Form::Immediate => 31,
+            Form::FromGpr { .. } => self.read(rn, 0),
+            _ => self
+                .vectors
+                .bind(&mut self.words, &mut self.traffic, rn, 0, true),
+        };
+        let m = match op.form {
+            Form::Binary { .. }
+            | Form::Ternary
+            | Form::Select
+            | Form::Compare { zero: false, .. } => {
+                self.vectors
+                    .bind(&mut self.words, &mut self.traffic, rm, 1 << n, true)
+            }
+            _ => 31,
+        };
+        let a = if matches!(op.form, Form::Ternary) {
+            self.vectors.bind(
+                &mut self.words,
+                &mut self.traffic,
+                ra,
+                (1 << n) | (1 << m),
+                true,
+            )
+        } else {
+            31
+        };
+        if matches!(
+            op.form,
+            Form::Binary { accumulate: true } | Form::FromGpr { merge: true }
+        ) {
+            self.vectors.bind(
+                &mut self.words,
+                &mut self.traffic,
+                rd,
+                (1 << n) | (1 << m) | (1 << a),
+                true,
+            );
+        }
+        if matches!(
+            op.form,
+            Form::Select
+                | Form::Compare {
+                    conditional: true,
+                    ..
+                }
+        ) {
+            self.flags_read();
+        }
+        let dest = match op.form {
+            Form::Compare { .. } => rd,
+            Form::ToGpr => self.output(rd, 0),
+            _ => self.vectors.bind(
+                &mut self.words,
+                &mut self.traffic,
+                rd,
+                (1 << n) | (1 << m) | (1 << a),
+                false,
+            ),
+        };
+        let emitted = match op.form {
+            Form::Immediate => (word & !31) | dest,
+            Form::Unary | Form::ToGpr | Form::FromGpr { .. } => (word & !0x3ff) | (n << 5) | dest,
+            Form::Binary { .. } | Form::Select => (word & !0x1f03ff) | (m << 16) | (n << 5) | dest,
+            Form::Ternary => (word & !0x1f7fff) | (m << 16) | (a << 10) | (n << 5) | dest,
+            Form::Compare { zero, .. } => {
+                (word & !0x1f03e0) | (if zero { 0 } else { m << 16 }) | (n << 5)
+            }
+        };
+        self.words.push(emitted);
+        if matches!(op.form, Form::Compare { .. }) {
+            self.flags_written();
+        }
     }
     fn memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
         self.flush();
@@ -1520,7 +1746,7 @@ fn render(
     count: u64,
     mask: u8,
     flow: Flow,
-    (memory, direct): (&[MemorySite], bool),
+    (memory, direct, vector_loop): (&[MemorySite], bool, bool),
 ) -> (Vec<u32>, usize) {
     let syscall = matches!(flow, Flow::Syscall);
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
@@ -1576,7 +1802,7 @@ fn render(
     if !syscall {
         done.push(words.len());
         words.push(0xb400000f); // cbz budget
-        if !memory.is_empty() {
+        if !memory.is_empty() || vector_loop {
             // Loop back through the existing budget/epoch guards. This keeps a
             // general same-block loop inside one native entry; each memory
             // instruction still takes its own scoped borrow and code check.
@@ -1727,7 +1953,14 @@ fn compile_with_features(
         let sf = word >> 31;
         let flags = word & (1 << 29) != 0;
         let mut terminal = false;
-        if (matches!(word & 0xfffff0ff, 0xd503309f | 0xd50330bf)
+        if let Some(op) = crate::vector_ops::decode(word) {
+            // FP entries have no Rust/provider callbacks. Memory and FP contexts
+            // retain a clean boundary until vector-memory fusion is implemented.
+            if !memory_ops.is_empty() {
+                break;
+            }
+            code.vector(word, op);
+        } else if (matches!(word & 0xfffff0ff, 0xd503309f | 0xd50330bf)
             && matches!(
                 (word >> 8) & 15,
                 1 | 2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 | 13 | 14 | 15
@@ -2007,6 +2240,9 @@ fn compile_with_features(
             flow = Flow::Choice(taken);
             terminal = true;
         } else if mode & 8 != 0 {
+            if code.vectors.used {
+                break;
+            }
             let Some(op) = crate::memory_ops::Operation::compile(memory, pc)? else {
                 break;
             };
@@ -2048,6 +2284,7 @@ fn compile_with_features(
     for site in &memory_sites {
         code.words[site.adjust] |= ((count - site.before) as u32) << 10;
     }
+    let has_vector = code.vectors.used;
     let (body, mut traffic, context) = code.finish();
     let has_hardware = !memory_sites.is_empty() && mode & 16 != 0;
     let read_only_memory = memory_ops.iter().all(|op| op.load || op.opcode.is_none());
@@ -2064,11 +2301,11 @@ fn compile_with_features(
         count,
         mode & 7,
         flow,
-        (&memory_sites, has_hardware),
+        (&memory_sites, has_hardware, has_vector && mode & 8 != 0),
     );
     let fast_offset = words.len() * 4;
     let tail_offset;
-    if memory_sites.is_empty() {
+    if memory_sites.is_empty() && !has_vector {
         words.push(0xd50324df);
         if context {
             words.push(0xaa0103f0);
@@ -2097,7 +2334,8 @@ fn compile_with_features(
         block: Block {
             code: Code::publish_fixups(&words, &fixups)
                 .map_err(|error| CpuFault::Host(format!("JIT code publication: {error}")))?,
-            has_memory: !memory_sites.is_empty(),
+            has_memory: !memory_sites.is_empty() || has_vector,
+            has_vector,
             has_hardware,
             read_only_memory,
             memory_width,
@@ -2187,6 +2425,13 @@ impl Code {
         let function: unsafe extern "C" fn(*mut u64, *mut MemoryFrame<M>) =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(registers, frame) };
+    }
+    unsafe fn call_vectors(&self, registers: *mut u64, frame: *mut VectorFrame) {
+        let function: unsafe extern "C" fn(*mut u64, *mut VectorFrame) =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe {
+            function(registers, frame);
+        }
     }
     pub(super) unsafe fn call_memory(&self, pointer: *mut u8, value: u64) -> u64 {
         // SAFETY: the decoder selects a single baseline LDR/STR with exactly
@@ -2284,6 +2529,54 @@ unsafe fn flush(start: usize, length: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp_blocks_preserve_aapcs64_callee_vector_registers() {
+        let m = memory(&[0x1e622820, 0xd4000001]);
+        let b = compile(&m, 0x1000, 64, 0, 8).unwrap().unwrap();
+        assert!(b.block.has_vector);
+        let links = [0usize; CACHE_LIMIT];
+        let mut vectors = [0u128; 32];
+        vectors[1] = 2f64.to_bits() as u128;
+        vectors[2] = 3f64.to_bits() as u128;
+        let mut f = VectorFrame {
+            frame: frame(&links),
+            vectors: vectors.as_mut_ptr(),
+        };
+        let mut registers = [0u64; 31];
+        let before = [0x8123456789abcdefu64; 8];
+        let mut after = [0u64; 8];
+        let _scope = trames_host_compute::Scope::new(0, 0);
+        // Explicit callee-register inputs survive the generated C call. LLVM
+        // owns saving the host's original d8..d15 around this test's asm.
+        unsafe {
+            std::arch::asm!(
+                "ldp d8,d9,[x23]","ldp d10,d11,[x23,#16]","ldp d12,d13,[x23,#32]","ldp d14,d15,[x23,#48]",
+                "mov x0,x21","mov x1,x22","blr x20",
+                "stp d8,d9,[x24]","stp d10,d11,[x24,#16]","stp d12,d13,[x24,#32]","stp d14,d15,[x24,#48]",
+                in("x20") b.block.code.pointer,in("x21") registers.as_mut_ptr(),in("x22") &mut f,
+                in("x23") before.as_ptr(),in("x24") after.as_mut_ptr(),
+                out("v8") _,out("v9") _,out("v10") _,out("v11") _,out("v12") _,out("v13") _,out("v14") _,out("v15") _,
+                clobber_abi("C"),
+            );
+        }
+        assert_eq!(after, before);
+        assert_eq!(vectors[0], 5f64.to_bits() as u128);
+        assert_eq!((f.frame.remaining, f.frame.syscall), (62, 1));
+    }
+
+    #[test]
+    fn vector_register_bindings_are_reused_inside_the_compiled_block() {
+        let mut words = vec![0x1e612800; 31];
+        words.push(0xd4000001);
+        let m = memory(&words);
+        let c = compile(&m, 0x1000, 64, 0, 8).unwrap().unwrap();
+        assert!(c.block.has_vector);
+        assert!(!c.block.has_hardware);
+        assert_eq!(c.block.traffic.register_loads, 2);
+        assert_eq!(c.block.traffic.register_stores, 1);
+        assert!(c.block.traffic.host_words < 100);
+    }
 
     #[test]
     fn lse_and_rcpc_lower_to_one_original_hardware_instruction() {

@@ -1,0 +1,15 @@
+   Compiling trames-jit v1.3.0 (/Users/main/dev/trames/target/jit-fp-source/crates/trames-jit)
+    Finished `test` profile [unoptimized] target(s) in 0.42s
+     Running unittests src/lib.rs (/Users/main/dev/trames/target/jit-fp-macos/debug/build/trames-jit/b1c5b16e2fd5f06c/out/trames_jit-b1c5b16e2fd5f06c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/differential.rs (/Users/main/dev/trames/target/jit-fp-macos/debug/build/trames-jit/db78c305f860c838/out/differential-db78c305f860c838)
+
+running 1 test
+test baseline_precision_conversions_preserve_alternative_half_and_flush_rules ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.10s
+

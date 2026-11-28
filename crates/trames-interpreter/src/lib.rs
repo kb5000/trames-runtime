@@ -421,6 +421,11 @@ impl Cpu {
     pub fn general_registers_mut(&mut self) -> &mut [u64; 31] {
         &mut self.registers
     }
+    /// Disjoint existing register banks for a translated FP/SIMD entry. Taking
+    /// both at once avoids reborrowing the CPU parent over a live child pointer.
+    pub fn native_register_banks_mut(&mut self) -> (&mut [u64; 31], &mut [u128; 32]) {
+        (&mut self.registers, &mut self.vectors)
+    }
     pub fn run_slice(&mut self, memory: &mut impl CpuMemory, budget: u64) -> SliceOutcome {
         self.run_slice_with_engine(memory, budget, None)
     }

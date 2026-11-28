@@ -73,7 +73,9 @@ pub(crate) fn profile() -> &'static Profile {
 /// Cold translation gate. A missing extension faults when reached, rather than
 /// acquiring the reference interpreter's software implementation.
 pub(crate) fn permits(host: Features, word: u32) -> bool {
-    let required = if word & 0x3ffffc00 == 0x38bfc000 {
+    let required = if let Some(op) = crate::vector_ops::decode(word) {
+        Some((0, op.capability))
+    } else if word & 0x3ffffc00 == 0x38bfc000 {
         Some((0, 15)) // LRCPC: LDAPR/B/H
     } else if word & 0x3f200c00 == 0x19000000 {
         Some((0, 26)) // ILRCPC: LDAPUR/STLUR and sign-extending forms
@@ -133,7 +135,7 @@ mod tests {
         };
         for word in [
             0x1ac24020, 0x5ac01820, 0x1ac26020, 0xd500401f, 0xd500403f, 0xd53b2400, 0x19000400,
-            0x19208000, 0xf8220020, 0xc8a07c22, 0x48207c22, 0xf8bfc020, 0xd9400020,
+            0x19208000, 0xf8220020, 0xc8a07c22, 0x48207c22, 0xf8bfc020, 0xd9400020, 0x1ee22820,
         ] {
             assert!(!permits(base, word), "{word:08x}");
             assert!(permits(
@@ -145,5 +147,13 @@ mod tests {
             ));
         }
         assert!(permits(base, 0x91000400));
+        for word in [
+            0x1e23c020, 0x1e63c020, 0x1ee24020, 0x1ee2c020, 0x1e22c020, 0x1e624020,
+        ] {
+            assert!(
+                permits(base, word),
+                "baseline precision conversion {word:08x}"
+            );
+        }
     }
 }

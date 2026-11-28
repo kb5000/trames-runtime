@@ -23,6 +23,12 @@ mod memory_ops;
     any(target_os = "linux", target_os = "android")
 ))]
 mod native;
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+mod vector_ops;
 
 /// Actual process-host capabilities; absent when native JIT is not compiled.
 pub fn host_features() -> Option<Features> {

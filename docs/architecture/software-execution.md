@@ -22,7 +22,8 @@ actual host instructions only when the process-host HWCAP provides them.
 There are no new software replacements or emulated extension registers.
 Scalar, paired and ordered memory, LSE CAS/CASP/RMW and RCpc accesses now use
 native memory paths as described below.
-FP/SIMD, exclusive reservations, traps and remaining untranslated families still retain
+Common scalar FP and NEON arithmetic also execute natively. Vector memory,
+exclusive reservations, traps and remaining untranslated families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
 
@@ -161,7 +162,7 @@ counts; these are updated only by memory execution. No extension register model,
 algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is added.
 
 The following sections extend this original scalar lowering with paired/ordered
-accesses, LSE and RCpc. SIMD and exclusive-reservation lowering remain pending.
+accesses, LSE and RCpc. Vector memory fusion and exclusive-reservation lowering remain pending.
 
 ### Entry-scoped hardware aliases
 
@@ -331,3 +332,44 @@ RCpc accesses retain their actual opcode and ordering; native hits do not
 substitute the interpreter's stronger abstract fence. Signed/unscaled offsets
 share ordinary address computation. See [LSE/RCpc validation and full matched
 measurement](../validation/jit-lse-rcpc-20261128.md).
+
+### FP/NEON register blocks
+
+The cold decoder classifies scalar FP arithmetic, precision/integer conversion,
+comparisons/selects/FMA/moves and common NEON integer/logical/saturating/FP
+arithmetic. Each operation preserves its original opcode, rounding and fused
+semantics. Baseline FP, AdvSIMD and optional scalar FP16 use the process-host
+capability profile. H<->S/D precision conversion is baseline FP, separately from
+FP16 arithmetic. No per-instruction capability query or software arithmetic
+replacement runs in these generated bodies.
+
+A cold LRU allocator binds the existing 32 guest vectors to host v16..v31. Loads,
+dirty evictions and final stores address the existing interpreter vector bank;
+V31 is a real vector, independent of XZR. Sources/accumulators are pinned before
+destination allocation. Callee-saved d8..d15, host x18/TLS and host callee GPRs are
+untouched. Dirty vector flush uses x11 after GPR/NZCV publication, preserving x17
+when a dynamic guest PC has already been selected. Compiler traffic counters now
+include vector-register loads/stores. A 31-FADD chain needs two vector loads and
+one store, rather than copying a full architectural state around each operation.
+
+FP entries use a separate 128-byte VectorFrame with the original 120-byte Frame
+prefix and one vector-bank pointer. Scalar/SVC and memory-frame layouts stay
+unchanged. The CPU exposes its two existing disjoint register banks in one borrow;
+no reborrow of the CPU parent overlaps a live child pointer. Both raw pointers
+expire at native return and are never retained by the cache. There is no new
+per-task vector or extension-state model.
+
+The existing host-compute Scope installs the established guest FPCR/FPSR policy
+once around a native entry; the final hardware FPSR is merged into existing guest
+status, and host FP environment is restored. There is no call between translated
+FP instructions. Same-block loops reuse the existing budget/epoch guard, and
+FP comparisons share the GPR compiler's live NZCV model. Memory/provider/native
+callbacks and untranslated system instructions terminate the FP block before
+entry into Rust. FP/memory blocks currently use generation-checked metadata edges
+and distinct frame types; vector memory fusion is deliberately still pending.
+This leaves no guest FP environment active across a Rust/provider callback.
+
+[Validation, ABI canaries and matched measurements](../validation/jit-fp-neon-20261128.md)
+cover rounding, NaNs, infinities, denormals, alternative half conversion, FPSR/QC,
+source/destination aliases, spills, dynamic PC, syscall/yield/fault restoration,
+and concurrent code replacement at a running FP loop's existing epoch guard.
