@@ -982,7 +982,7 @@ impl Cpu {
                 value & u64::MAX as u128
             };
         } else if ins & 0xfffff0ff == 0xd503305f {
-            self.exclusive = None;
+            self.clear_exclusive();
         } else if self.execute_memory(ins, memory)? {
         } else {
             return Ok(None);

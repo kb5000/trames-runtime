@@ -1279,3 +1279,50 @@ Other ranges use a call-owned hash index instead of a tree. Physical aliases
 select original native-call fallback before effects; ordinary CPU copy APIs
 retain their source snapshot semantics. Allocation failures are handled before
 guest writes.
+
+
+## Native JIT exclusive reservations (2026-11-28)
+
+The CPU retains one explicit-layout reservation (raw guest address, width and
+original memory token); inactive width zero replaces the former Option layout.
+Native CLREX clears that same width field using a compile-time CPU offset, then
+executes hardware CLREX. No second task state, extension context or coordinator
+is introduced. Native-entry pointers retain the existing whole-CPU grant.
+
+Closed straight-line same-address LL/SC windows of up to 16 instructions use the
+existing integer lowerer and register allocator. Cold compilation proves unchanged
+base/width, valid operand aliases and spill-free allocation; required initial GPR
+and NZCV loads precede LR. Already resident private RW anonymous CPU aliases retain
+ownership until native SC/exit. Unique serial pages, including pages previously
+promoted for software reservations, and proven exclusive worker epochs qualify.
+Original dirty/version publication precedes the loan. No region guard, callback,
+Rust frame traffic or service thread spans the hardware monitor. Exact LR and SC
+fault sites use the existing recovery registry, preserve the host frame and
+publish only the retired guest prefix. Cached window lengths obey every slice
+budget. Ordinary scalar/SVC frames and cache-node layouts do not grow.
+
+Guest natural alignment is admitted once at the window loan boundary in place of
+the two existing per-instruction checks. The test host also accepts misaligned
+exclusive accesses directly, so relying only on its alignment trap would change
+the shared CPU contract. Runtime ownership, residency and permission admission
+remain dynamic memory boundaries; capability/encoding/allocation checks stay in
+cold compilation. The emitted window contains only original LR/SC and native ALU
+instructions between monitor creation and consumption.
+
+Shared pages, helpers, slice exits, callbacks, oversized/register-spilling windows
+and custom providers use native instruction fragments at the existing exclusive
+byte transaction. LR reads canonical bytes and records the original 16-byte token,
+then CLREX closes the hardware monitor before Rust returns. Conditional SC checks
+that token under the original byte guard, then executes a short adjacent native
+LR/SC on canonical storage. Its real failure status publishes neither bytes nor
+versions. Existing COW, backing publication, alias identity, EOF, memory accounting
+and ABA invalidation remain in the original Memory/View implementation. Exceptional
+unaligned host storage/provider staging retains its existing byte transaction,
+with acquire/release around canonical reads/publication. It does not implement an
+RMW algorithm or emulate an extension. Real SC spurious failure remains observable
+and retry loops remain the guest program's responsibility.
+
+See [category validation](../validation/jit-exclusive-20261128.md) for the closed
+instruction list, independent encodings, state/fault/concurrency acceptance and
+matched CPU-only measurements. Stateful extensions and Android device acceptance
+are separate work.

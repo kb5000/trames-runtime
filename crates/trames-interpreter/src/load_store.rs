@@ -330,7 +330,7 @@ impl Cpu {
                     value[..size].copy_from_slice(&bytes[i * size..(i + 1) * size]);
                     self.set_x(reg, u64::from_le_bytes(value));
                 }
-                self.exclusive = Some((address, size * 2, token));
+                self.set_exclusive(address, size * 2, token);
             } else {
                 let token = self
                     .exclusive
@@ -367,7 +367,7 @@ impl Cpu {
                 let token = memory
                     .exclusive_read(address, &mut bytes[..size])
                     .map_err(fault)?;
-                self.exclusive = Some((address, size, token));
+                self.set_exclusive(address, size, token);
             } else {
                 memory.read(address, &mut bytes[..size]).map_err(fault)?;
             }
@@ -666,7 +666,7 @@ mod tests {
             let (mut cpu, mut memory) = state(&[word]);
             cpu.set_x(0, 0x12345678);
             cpu.set_x(1, 0x2fff);
-            cpu.exclusive = Some((0x2000, 8, memory.revision() as u128));
+            cpu.set_exclusive(0x2000, 8, memory.revision() as u128);
             let before = (cpu.registers, cpu.sp, cpu.exclusive, memory.revision());
             assert!(cpu.step(&mut memory).is_err(), "{word:08x}");
             assert_eq!(cpu.pc, 0x1000);

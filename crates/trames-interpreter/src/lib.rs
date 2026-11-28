@@ -77,11 +77,42 @@ pub struct Cpu {
     pub fpcr: u32,
     pub fpsr: u32,
     vectors: [u128; 32],
-    exclusive: Option<(u64, usize, u128)>,
+    exclusive: Reservation,
     decoded: cached::Cache,
     yield_current: bool,
     fault_retired: u64,
 }
+
+/// The existing guest reservation, with an explicit inactive-width sentinel so
+/// native CLREX can clear it without depending on Rust Option's layout.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Reservation {
+    address: u64,
+    size: u64,
+    token: u128,
+}
+impl Reservation {
+    fn get(self) -> Option<(u64, usize, u128)> {
+        (self.size != 0).then_some((self.address, self.size as usize, self.token))
+    }
+    fn take(&mut self) -> Option<(u64, usize, u128)> {
+        let value = self.get();
+        self.size = 0;
+        value
+    }
+}
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+impl PartialEq for Reservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+impl Eq for Reservation {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -204,8 +235,22 @@ impl Cpu {
         }
     }
     /// Exception entry and virtual CPU migration may clear the local monitor.
+    /// Shared reservation domain for interpreted and translated accesses.
+    pub fn set_exclusive(&mut self, address: u64, size: usize, token: u128) {
+        self.exclusive = Reservation {
+            address,
+            size: size as u64,
+            token,
+        };
+    }
+    pub fn take_exclusive(&mut self, address: u64, size: usize) -> Option<u128> {
+        self.exclusive
+            .take()
+            .filter(|r| r.0 == address && r.1 == size)
+            .map(|r| r.2)
+    }
     pub fn clear_exclusive(&mut self) {
-        self.exclusive = None;
+        self.exclusive.size = 0;
     }
     #[inline]
     fn reg(&self, index: usize, sp: bool) -> u64 {
@@ -454,6 +499,10 @@ impl Cpu {
                 std::ptr::addr_of_mut!((*parent).vectors).cast(),
             )
         }
+    }
+    pub const fn native_exclusive_size_offset() -> i64 {
+        (std::mem::offset_of!(Self, exclusive) + std::mem::offset_of!(Reservation, size)) as i64
+            - std::mem::offset_of!(Self, registers) as i64
     }
     pub const fn native_system_offset(register: NativeSystemRegister) -> i64 {
         let offset = match register {

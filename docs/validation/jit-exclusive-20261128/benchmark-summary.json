@@ -1,0 +1,109 @@
+{
+  "baseline": "767b92efb81251861576cefdf676a8bb4f15a4e3",
+  "binary_sha256": {
+    "new": "d08f91f405cc1a72f2cb1cd9ab606ce2e29fb7d284786259c0a3f0291520aed9",
+    "old": "940ca948814366a96296964173804526bf736774a33ae361c2ae7e6c82d76a68"
+  },
+  "control_rounds": 64,
+  "processes": 8,
+  "timed_samples": 200,
+  "trips": 262144,
+  "warmups": 40,
+  "workloads": {
+    "control-integer": {
+      "median_new_ns": 11225902.0,
+      "median_old_ns": 11136018.0,
+      "process_medians_ns": {
+        "new": [
+          10852786,
+          11299005,
+          11192150,
+          11259654
+        ],
+        "old": [
+          11492073,
+          11323506,
+          10934620,
+          10948530
+        ]
+      },
+      "speedup": 0.9919931601041947
+    },
+    "control-scalar-memory": {
+      "median_new_ns": 19836969.0,
+      "median_old_ns": 20034696.5,
+      "process_medians_ns": {
+        "new": [
+          19840365,
+          19786024,
+          19993564,
+          19833573
+        ],
+        "old": [
+          20105817,
+          19963576,
+          20181215,
+          19852995
+        ]
+      },
+      "speedup": 1.0099676266066655
+    },
+    "guarded-ldaxr-stlxr": {
+      "median_new_ns": 29487491.0,
+      "median_old_ns": 36042236.0,
+      "process_medians_ns": {
+        "new": [
+          29615867,
+          29449589,
+          29499476,
+          29475506
+        ],
+        "old": [
+          36167215,
+          36704358,
+          35917257,
+          35818911
+        ]
+      },
+      "speedup": 1.2222890038355587
+    },
+    "private-ldaxp-stlxp": {
+      "median_new_ns": 11753604.5,
+      "median_old_ns": 45226122.5,
+      "process_medians_ns": {
+        "new": [
+          11723350,
+          11891198,
+          11779922,
+          11727287
+        ],
+        "old": [
+          45173254,
+          45657311,
+          44960871,
+          45278991
+        ]
+      },
+      "speedup": 3.847851312335718
+    },
+    "private-ldaxr-stlxr": {
+      "median_new_ns": 11658823.0,
+      "median_old_ns": 44206049.0,
+      "process_medians_ns": {
+        "new": [
+          11645507,
+          11795063,
+          11670451,
+          11647195
+        ],
+        "old": [
+          44586867,
+          44196643,
+          42896982,
+          44215455
+        ]
+      },
+      "speedup": 3.791639087410453
+    }
+  }
+}

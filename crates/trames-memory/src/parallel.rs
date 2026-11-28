@@ -1133,7 +1133,94 @@ impl View {
         Ok(())
     }
 }
+impl View {
+    pub(crate) fn with_exclusive_read<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        _acquire: bool,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, u128, bool), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        let (frame, offset) = self.reached(address, len, Access::Read)?;
+        if let Some(bytes) = &frame.bytes.constant {
+            return Ok((
+                operation(&bytes[offset..offset + len]),
+                (frame.bytes.identity as u128) << 64,
+                true,
+            ));
+        }
+        let guard = self.frame_guard(frame, offset, len);
+        let value = operation(guard.read(offset, len));
+        Ok((
+            value,
+            (frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128,
+            true,
+        ))
+    }
+    pub(crate) fn with_exclusive_write(
+        &mut self,
+        address: u64,
+        len: usize,
+        token: Option<u128>,
+        _release: bool,
+        operation: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(bool, bool), MemoryError> {
+        if token.is_none() {
+            return Ok((false, true));
+        }
+        let address = address & 0x00ffffffffffffff;
+        let (frame, offset) = self.reached(address, len, Access::Write)?;
+        let mut guard = self.frame_guard(frame, offset, len);
+        if token
+            != Some((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
+        {
+            return Ok((false, true));
+        }
+        self.ensure_resident(frame, address)?;
+        if !operation(guard.write(offset, len)) {
+            return Ok((false, true));
+        }
+        self.changed(frame, &mut guard, offset, len);
+        Ok((true, true))
+    }
+}
+
 impl CpuMemory for View {
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_read<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        acquire: bool,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, u128, bool), MemoryError> {
+        let ((value, aligned), token, direct) =
+            self.with_exclusive_read(address, len, acquire, |bytes| {
+                crate::native_exclusive::read(bytes, acquire, operation)
+            })?;
+        Ok((value, token, direct && aligned))
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_write(
+        &mut self,
+        address: u64,
+        len: usize,
+        token: Option<u128>,
+        release: bool,
+        operation: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(bool, bool), MemoryError> {
+        let mut aligned = true;
+        let (written, direct) =
+            self.with_exclusive_write(address, len, token, release, |bytes| {
+                let (result, is_aligned) =
+                    crate::native_exclusive::write(bytes, release, operation);
+                aligned = is_aligned;
+                result
+            })?;
+        Ok((written, direct && aligned))
+    }
+
     #[cfg(feature = "native-code")]
     fn cpu_atomic_chunk<T>(
         &mut self,
@@ -1227,6 +1314,15 @@ impl CpuMemory for View {
             read: if frame.permissions.read { entry.cpu } else { 0 },
             write: if writable { entry.cpu } else { 0 },
         })
+    }
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_exclusive_page(&mut self, address: u64, len: usize) -> Option<crate::NativePage> {
+        if self.private_mode != PrivateMode::Exclusive || !address.is_multiple_of(len as u64) {
+            return None;
+        }
+        // Same frozen private-epoch proof and publication as scalar aliases.
+        // The caller closes the hardware reservation before ending this loan.
+        unsafe { self.cpu_native_page(address, true) }
     }
     #[inline]
     fn userfaults_active(&self) -> bool {
@@ -1522,15 +1618,10 @@ impl CpuMemory for View {
         Ok(value)
     }
     fn exclusive_read(&mut self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError> {
-        let address = address & 0x00ffffffffffffff;
-        let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
-        if let Some(bytes) = &frame.bytes.constant {
-            out.copy_from_slice(&bytes[offset..offset + out.len()]);
-            return Ok((frame.bytes.identity as u128) << 64);
-        }
-        let guard = self.frame_guard(frame, offset, out.len());
-        out.copy_from_slice(guard.read(offset, out.len()));
-        Ok((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
+        self.with_exclusive_read(address, out.len(), false, |bytes| {
+            out.copy_from_slice(bytes)
+        })
+        .map(|(_, token, _)| token)
     }
     fn exclusive_write(
         &mut self,
@@ -1538,21 +1629,11 @@ impl CpuMemory for View {
         bytes: &[u8],
         token: Option<u128>,
     ) -> Result<bool, MemoryError> {
-        if token.is_none() {
-            return Ok(false);
-        }
-        let address = address & 0x00ffffffffffffff;
-        let (frame, offset) = self.reached(address, bytes.len(), Access::Write)?;
-        let mut guard = self.frame_guard(frame, offset, bytes.len());
-        if token
-            != Some((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
-        {
-            return Ok(false);
-        }
-        self.ensure_resident(frame, address)?;
-        guard.write(offset, bytes.len()).copy_from_slice(bytes);
-        self.changed(frame, &mut guard, offset, bytes.len());
-        Ok(true)
+        self.with_exclusive_write(address, bytes.len(), token, false, |out| {
+            out.copy_from_slice(bytes);
+            true
+        })
+        .map(|(written, _)| written)
     }
     fn fence(&self, order: Ordering) {
         std::sync::atomic::fence(order)

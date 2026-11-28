@@ -12,6 +12,12 @@ pub(super) enum Atomic {
     Cas { compare: usize, pair: bool },
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct Exclusive {
+    pub word: u32,
+    pub status: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Address {
     CacheLine,
@@ -46,6 +52,7 @@ pub(super) struct Operation {
     pub(super) ordered: bool,
     pub(super) maintenance: Option<Maintenance>,
     pub(super) atomic: Option<Atomic>,
+    pub(super) exclusive: Option<Exclusive>,
     pub(super) opcode: Option<u32>,
     code: Option<Code>, // PRFM is an architecturally optional hint, no read.
 }
@@ -117,6 +124,7 @@ impl Operation {
             second: None,
             maintenance: None,
             ordered: false,
+            exclusive: None,
             atomic: None,
             // Keep the original operation/arrangement/lane, without writeback.
             opcode: Some(word & !((1 << 23) | (31 << 16) | 0x3ff)),
@@ -230,6 +238,7 @@ impl Operation {
             second,
             maintenance: None,
             ordered: false,
+            exclusive: None,
             atomic: None,
             opcode: Some(opcode),
             code: None,
@@ -264,6 +273,7 @@ impl Operation {
                 second: None,
                 ordered: false,
                 maintenance,
+                exclusive: None,
                 atomic: None,
                 opcode: zero.then_some(0xa9007c1f),
                 code: None,
@@ -306,6 +316,7 @@ impl Operation {
                 second: None,
                 maintenance: None,
                 ordered: false,
+                exclusive: None,
                 atomic: Some(if rmw {
                     Atomic::Rmw { source }
                 } else {
@@ -315,6 +326,45 @@ impl Operation {
                     }
                 }),
                 opcode: Some(word & !0x1f03ff),
+                code: None,
+            }
+            .publish()
+            .map(Some);
+        }
+        let pair_exclusive = matches!(word & 0x3f600000, 0x08600000 | 0x08200000);
+        let single_load = matches!(word & 0x3ffffc00, 0x085f7c00 | 0x085ffc00);
+        let single_store = matches!(word & 0x3fe0fc00, 0x08007c00 | 0x0800fc00);
+        if pair_exclusive || single_load || single_store {
+            let load = word & (1 << 22) != 0;
+            let second = ((word >> 10) & 31) as usize;
+            let status = ((word >> 16) & 31) as usize;
+            if pair_exclusive && (word >> 31 == 0 || word & (1 << 23) != 0 || load && rt == second)
+                || status != 31
+                    && (load || status == rn || status == rt || pair_exclusive && status == second)
+            {
+                return Ok(None);
+            }
+            return Self {
+                pc,
+                address: Address::Offset(0),
+                rn,
+                rt,
+                size: if pair_exclusive {
+                    8usize << ((word >> 30) & 1)
+                } else {
+                    1usize << (word >> 30)
+                },
+                load,
+                vector: false,
+                structure: None,
+                second: pair_exclusive.then_some(second),
+                ordered: word & (1 << 15) != 0,
+                maintenance: None,
+                atomic: None,
+                exclusive: Some(Exclusive { word, status }),
+                // Exclusives join the common reservation boundary, never an
+                // ordinary alias loan that can bypass monitor publication.
+                opcode: None,
                 code: None,
             }
             .publish()
@@ -342,6 +392,7 @@ impl Operation {
                 second: None,
                 maintenance: None,
                 ordered: true,
+                exclusive: None,
                 atomic: None,
                 address: Address::Offset(if unscaled {
                     signed(((word >> 12) & 511) as u64, 9)
@@ -373,6 +424,7 @@ impl Operation {
                 second: None,
                 maintenance: None,
                 ordered: true,
+                exclusive: None,
                 atomic: None,
                 opcode: Some((word & !0x3ff) | u32::from(!load)),
                 code: None,
@@ -427,6 +479,7 @@ impl Operation {
                 second: Some(second),
                 maintenance: None,
                 ordered: false,
+                exclusive: None,
                 atomic: None,
                 opcode: Some(opcode),
                 code: None,
@@ -507,6 +560,7 @@ impl Operation {
             second: None,
             maintenance: None,
             ordered: false,
+            exclusive: None,
             atomic: None,
             opcode,
             code: None,
@@ -515,6 +569,34 @@ impl Operation {
         .map(Some)
     }
     fn publish(mut self) -> Result<Self, CpuFault> {
+        if let Some(exclusive) = self.exclusive {
+            let mut words = vec![0xd503245f];
+            let pair = self.second.is_some();
+            let word = exclusive.word & !0x1f7fff;
+            if self.load {
+                words.push(word | (31 << 16) | ((if pair { 3 } else { 31 }) << 10) | 2);
+                words.push(0xd5033f5f); // no host monitor survives the C return
+                words.extend_from_slice(&[0xaa0203e0, if pair { 0xaa0303e1 } else { 0xaa1f03e1 }]);
+            } else {
+                // The existing reservation token was checked under byte
+                // ownership. Re-arm only this short host LR/SC transaction.
+                words.push(if pair { 0xa9400c22 } else { 0xf9400022 });
+                let load_word = (word & !(1 << 15))
+                    | (1 << 22)
+                    | (31 << 16)
+                    | ((if pair { 5 } else { 31 }) << 10)
+                    | 4;
+                words.push(load_word);
+                words.push(word | (6 << 16) | ((if pair { 3 } else { 31 }) << 10) | 2);
+                words.push(0xaa0603e0);
+            }
+            words.push(0xd65f03c0);
+            self.code = Some(
+                Code::publish(&words)
+                    .map_err(|e| CpuFault::Host(format!("JIT exclusive publication: {e}")))?,
+            );
+            return Ok(self);
+        }
         self.code = self
             .opcode
             .map(|word| {
@@ -640,6 +722,41 @@ impl Operation {
                 cpu.pc = pc.wrapping_add(4);
                 return Ok(true);
             }
+        }
+        if let Some(exclusive) = self.exclusive {
+            let code = self.code.as_ref().expect("compiled exclusive fragment");
+            let (address, _) = self.operand(cpu);
+            let fault = |error| CpuFault::Memory { pc, error };
+            // This is the checked byte-borrow boundary. Closed native windows
+            // use the actual hardware alignment/abort behavior instead.
+            if !address.is_multiple_of(self.size as u64) {
+                return Err(fault(trames_memory::MemoryError::Alignment(address)));
+            }
+            let direct = if self.load {
+                let (values, token, direct) = memory
+                    .cpu_exclusive_read(address, self.size, self.ordered, |bytes| unsafe {
+                        code.call_exclusive_read(bytes.as_ptr())
+                    })
+                    .map_err(fault)?;
+                cpu.set_x(self.rt, values.first);
+                if let Some(second) = self.second {
+                    cpu.set_x(second, values.second);
+                }
+                cpu.set_exclusive(address, self.size, token);
+                direct
+            } else {
+                let inputs = [cpu.x(self.rt), self.second.map_or(0, |r| cpu.x(r)), 0, 0];
+                let token = cpu.take_exclusive(address, self.size);
+                let (written, direct) = memory
+                    .cpu_exclusive_write(address, self.size, token, self.ordered, |bytes| unsafe {
+                        code.call_exclusive_write(bytes.as_mut_ptr(), &inputs) == 0
+                    })
+                    .map_err(fault)?;
+                cpu.set_x(exclusive.status, u64::from(!written));
+                direct
+            };
+            cpu.pc = pc.wrapping_add(4);
+            return Ok(direct);
         }
         let Some(code) = &self.code else {
             cpu.pc = pc.wrapping_add(4);

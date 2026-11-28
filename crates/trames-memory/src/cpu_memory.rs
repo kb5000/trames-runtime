@@ -115,6 +115,49 @@ pub trait CpuMemory {
         self.write(address, &bytes.0[..len])?;
         Ok((result, false))
     }
+    /// Native load at the original exclusive read/monitor boundary. Fixed
+    /// widths are 1/2/4/8/16 bytes; no byte pointer or hardware monitor escapes.
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_read<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        acquire: bool,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, u128, bool), MemoryError> {
+        let mut bytes = crate::native_exclusive::Operand([0; 16]);
+        let token = self.exclusive_read(address, &mut bytes.0[..len])?;
+        if acquire {
+            self.fence(Ordering::Acquire);
+        }
+        Ok((operation(&bytes.0[..len]), token, false))
+    }
+    /// Conditional native store at the same monitor/version transaction.
+    /// The callback reports actual success; failed stores never publish bytes.
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_write(
+        &mut self,
+        address: u64,
+        len: usize,
+        token: Option<u128>,
+        release: bool,
+        operation: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(bool, bool), MemoryError> {
+        if release {
+            self.fence(Ordering::Release);
+        }
+        if token.is_none() {
+            return Ok((false, false));
+        }
+        let mut bytes = crate::native_exclusive::Operand([0; 16]);
+        if !operation(&mut bytes.0[..len]) {
+            return Ok((false, false));
+        }
+        Ok((
+            self.exclusive_write(address, &bytes.0[..len], token)?,
+            false,
+        ))
+    }
     /// Cold entry capability, separate from CPU instruction support. A false
     /// result keeps the existing checked lowering without inline cache probes.
     #[cfg(feature = "native-code")]
@@ -143,6 +186,26 @@ pub trait CpuMemory {
     /// Never retain an export across CPU entries, mapping edits or a syscall.
     #[cfg(feature = "native-code")]
     unsafe fn cpu_native_page(&mut self, _address: u64, _write: bool) -> Option<crate::NativePage> {
+        None
+    }
+    /// Admit one closed, same-address native LL/SC window on already resident
+    /// private RW RAM, preserving the original natural-alignment requirement
+    /// once for the whole window. `len` is the decoded width 1/2/4/8/16.
+    /// No ownership/permission changes or allocation on decline.
+    /// Publication precedes the window; no software monitor is live across it.
+    ///
+    /// # Safety
+    /// Discard all prior loans first. Until this loan ends, access only this
+    /// page through the protected CPU alias, without a CpuMemory call, helper,
+    /// callback, slice exit or escaping hardware reservation. No byte reference
+    /// or concurrent actor may overlap the window. Handle LR/SC faults through
+    /// the existing native-code recovery registry before returning to Rust.
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_exclusive_page(
+        &mut self,
+        _address: u64,
+        _len: usize,
+    ) -> Option<crate::NativePage> {
         None
     }
     /// Optional cold capability for chaining derived executable code. Every
@@ -351,7 +414,237 @@ pub trait CpuMemory {
     fn fence(&self, _order: Ordering) {}
 }
 
+impl Memory {
+    #[cfg(feature = "native-code")]
+    fn export_native_page(
+        &mut self,
+        address: u64,
+        write: bool,
+        exclusive: bool,
+    ) -> Option<crate::NativePage> {
+        if !self.cpu_native_available() {
+            return None;
+        }
+        let base = (address & 0x00ff_ffff_ffff_ffff) & !(PAGE_SIZE - 1);
+        let entry = self.translation(base)?;
+        let page = self.translated_page(entry);
+        // No fork owner, concurrent/native borrower, provider, executable store,
+        // unpaid zero page, userfault or software-only 16K permission group.
+        if entry.cpu == 0
+            || page.backing.is_some()
+            || page.permissions.execute
+            || !page.charge.write_ready()
+            || std::sync::Arc::strong_count(&page.bytes) != 1
+            || page
+                .bytes
+                .shared()
+                .is_some_and(|bytes| !exclusive || std::sync::Arc::strong_count(bytes) != 1)
+            || exclusive && !(page.permissions.read && page.permissions.write)
+        {
+            return None;
+        }
+        let read = if page.permissions.read { entry.cpu } else { 0 };
+        let writable = write && page.permissions.write;
+        if writable {
+            if let Some(storage) = page.bytes.shared() {
+                // Unique serial owner: publish the same 16-byte reservation
+                // domain before the raw window; no region guard spans it.
+                let mut guard = storage.lock(0, PAGE_SIZE as usize);
+                storage.changed(&mut guard, 0, PAGE_SIZE as usize);
+            }
+            let page = self.translated_page_mut(entry);
+            page.data_revision = page.data_revision.wrapping_add(1);
+            self.revision = self.revision.wrapping_add(1);
+            self.note_parallel_write(entry.frame);
+        }
+        Some(crate::NativePage {
+            base,
+            read,
+            write: if writable { entry.cpu } else { 0 },
+        })
+    }
+    pub(crate) fn with_exclusive_read<T>(
+        &mut self,
+        a: u64,
+        len: usize,
+        acquire: bool,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, u128, bool), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared
+                .borrow_mut()
+                .with_exclusive_read(a, len, acquire, operation);
+        }
+        let a = a & 0x00ffffffffffffff;
+        self.check(a, len, Access::Read)?;
+        self.materialize_descriptors(a, len);
+        let page = self.page_for_access(a, len, Access::Read)?;
+        if page
+            .backing
+            .as_ref()
+            .is_none_or(|b| !b.shared && (b.private_copy || page.permissions.write))
+            && (page.bytes.shared().is_none() || std::sync::Arc::strong_count(&page.bytes) > 1)
+        {
+            // Give serial LL/SC the same 16-byte reservation domain as workers.
+            // A global memory revision makes a compiler's unrelated stack spill
+            // between LDAXR/STLXR fail every retry. Only atomic pages are promoted;
+            // non-atomic pages acquire no new monitor bookkeeping.
+            let base = a & !(crate::PAGE_SIZE - 1);
+            let frame = self.frame(base).expect("checked exclusive page");
+            let page = self.frames[frame].as_mut().unwrap();
+            // Private file reads may borrow the page cache; an exclusive store
+            // must instead reserve private COW bytes, never the file's bytes.
+            page.detach_private()?;
+            let old = std::mem::replace(
+                &mut page.bytes,
+                std::sync::Arc::new(crate::mmu::PageBytes::Zero),
+            );
+            let mut owned = std::sync::Arc::try_unwrap(old).unwrap_or_else(|old| {
+                if page.charge.resident() {
+                    (*old).clone()
+                } else {
+                    crate::mmu::PageBytes::Zero
+                }
+            });
+            if owned.is_zero() {
+                if let Some(bytes) = self.mmu.page(base) {
+                    owned = std::sync::Arc::try_unwrap(bytes)
+                        .unwrap_or_else(|_| unreachable!("fresh MMU page"));
+                }
+            }
+            let storage = std::sync::Arc::new(crate::SharedPage::from_owned(owned, None));
+            self.frames[frame].as_mut().unwrap().bytes =
+                std::sync::Arc::new(crate::mmu::PageBytes::Concurrent(storage));
+            if self.parallel_cache.is_some() {
+                self.parallel_mappings.insert(base);
+            }
+            self.revision = self.revision.wrapping_add(1);
+            self.invalidate_translations();
+        }
+        let page = self.page_for_access(a, len, Access::Read)?;
+        if let Some(storage) = page.shared_storage() {
+            let offset = (a % crate::PAGE_SIZE) as usize;
+            let guard = storage.lock(offset, len);
+            let value = operation(guard.read(offset, len));
+            return Ok((
+                value,
+                (storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128,
+                true,
+            ));
+        }
+        let (value, direct) = self.with_read_chunk(a, len, operation)?;
+        if !direct && acquire {
+            self.fence(Ordering::Acquire);
+        }
+        Ok((value, self.revision() as u128, direct))
+    }
+    pub(crate) fn with_exclusive_write(
+        &mut self,
+        a: u64,
+        len: usize,
+        token: Option<u128>,
+        release: bool,
+        operation: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(bool, bool), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared
+                .borrow_mut()
+                .with_exclusive_write(a, len, token, release, operation);
+        }
+        let a = a & 0x00ffffffffffffff;
+        if token.is_none() {
+            return Ok((false, true));
+        }
+        self.check(a, len, Access::Write)?;
+        self.prepare_mmu_write(a, len)?;
+        let page = self.page_for_access(a, len, Access::Write)?;
+        if let Some(storage) = page.shared_write_storage() {
+            let offset = (a % crate::PAGE_SIZE) as usize;
+            let backing = page
+                .backing
+                .as_ref()
+                .filter(|b| b.shared)
+                .map(|b| b.object.clone());
+            let mut guard = storage.lock(offset, len);
+            if token
+                != Some((storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
+            {
+                return Ok((false, true));
+            }
+            if !operation(guard.write(offset, len)) {
+                return Ok((false, true));
+            }
+            storage.changed(&mut guard, offset, len);
+            drop(guard);
+            if let Some(backing) = backing {
+                backing.publish_write(offset, len)?;
+            }
+            let frame = self
+                .frame(a & !(crate::PAGE_SIZE - 1))
+                .expect("checked exclusive");
+            self.mark_native_write(frame);
+            return Ok((true, true));
+        }
+        if token != Some(self.revision() as u128) {
+            return Ok((false, false));
+        }
+        let mut small = [0; 16];
+        let mut large = Vec::new();
+        let bytes = if len <= small.len() {
+            &mut small[..len]
+        } else {
+            large
+                .try_reserve_exact(len)
+                .map_err(|_| MemoryError::Limit)?;
+            large.resize(len, 0);
+            &mut large[..]
+        };
+        if !operation(bytes) {
+            return Ok((false, false));
+        }
+        if release {
+            self.fence(Ordering::Release);
+        }
+        self.write(a, bytes)?;
+        Ok((true, false))
+    }
+}
+
 impl CpuMemory for Memory {
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_read<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        acquire: bool,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, u128, bool), MemoryError> {
+        let ((value, aligned), token, direct) =
+            self.with_exclusive_read(address, len, acquire, |bytes| {
+                crate::native_exclusive::read(bytes, acquire, operation)
+            })?;
+        Ok((value, token, direct && aligned))
+    }
+    #[cfg(feature = "native-code")]
+    fn cpu_exclusive_write(
+        &mut self,
+        address: u64,
+        len: usize,
+        token: Option<u128>,
+        release: bool,
+        operation: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(bool, bool), MemoryError> {
+        let mut aligned = true;
+        let (written, direct) =
+            self.with_exclusive_write(address, len, token, release, |bytes| {
+                let (result, is_aligned) =
+                    crate::native_exclusive::write(bytes, release, operation);
+                aligned = is_aligned;
+                result
+            })?;
+        Ok((written, direct && aligned))
+    }
+
     #[cfg(feature = "native-code")]
     fn cpu_atomic_chunk<T>(
         &mut self,
@@ -413,36 +706,16 @@ impl CpuMemory for Memory {
     }
     #[cfg(feature = "native-code")]
     unsafe fn cpu_native_page(&mut self, address: u64, write: bool) -> Option<crate::NativePage> {
-        if !self.cpu_native_available() {
+        self.export_native_page(address, write, false)
+    }
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_exclusive_page(&mut self, address: u64, len: usize) -> Option<crate::NativePage> {
+        // The existing guest alignment contract is admitted once for both
+        // instructions. Some hosts accept misaligned exclusives in hardware.
+        if !address.is_multiple_of(len as u64) {
             return None;
         }
-        let base = (address & 0x00ff_ffff_ffff_ffff) & !(PAGE_SIZE - 1);
-        let entry = self.translation(base)?;
-        let page = self.translated_page(entry);
-        // No fork owner, concurrent/native borrower, provider, executable store,
-        // unpaid zero page, userfault or software-only 16K permission group.
-        if entry.cpu == 0
-            || page.backing.is_some()
-            || page.permissions.execute
-            || !page.charge.write_ready()
-            || std::sync::Arc::strong_count(&page.bytes) != 1
-            || page.bytes.shared().is_some()
-        {
-            return None;
-        }
-        let read = if page.permissions.read { entry.cpu } else { 0 };
-        let writable = write && page.permissions.write;
-        if writable {
-            let page = self.translated_page_mut(entry);
-            page.data_revision = page.data_revision.wrapping_add(1);
-            self.revision = self.revision.wrapping_add(1);
-            self.note_parallel_write(entry.frame);
-        }
-        Some(crate::NativePage {
-            base,
-            read,
-            write: if writable { entry.cpu } else { 0 },
-        })
+        self.export_native_page(address, true, true)
     }
     #[inline]
     fn userfaults_active(&self) -> bool {
@@ -679,64 +952,8 @@ impl CpuMemory for Memory {
         Ok(result)
     }
     fn exclusive_read(&mut self, a: u64, b: &mut [u8]) -> Result<u128, MemoryError> {
-        if let Some(shared) = &self.shared {
-            return shared.borrow_mut().exclusive_read(a, b);
-        }
-        let a = a & 0x00ffffffffffffff;
-        self.check(a, b.len(), Access::Read)?;
-        self.materialize_descriptors(a, b.len());
-        let page = self.page_for_access(a, b.len(), Access::Read)?;
-        if page
-            .backing
-            .as_ref()
-            .is_none_or(|b| !b.shared && (b.private_copy || page.permissions.write))
-            && (page.bytes.shared().is_none() || std::sync::Arc::strong_count(&page.bytes) > 1)
-        {
-            // Give serial LL/SC the same 16-byte reservation domain as workers.
-            // A global memory revision makes a compiler's unrelated stack spill
-            // between LDAXR/STLXR fail every retry. Only atomic pages are promoted;
-            // non-atomic pages acquire no new monitor bookkeeping.
-            let base = a & !(crate::PAGE_SIZE - 1);
-            let frame = self.frame(base).expect("checked exclusive page");
-            let page = self.frames[frame].as_mut().unwrap();
-            // Private file reads may borrow the page cache; an exclusive store
-            // must instead reserve private COW bytes, never the file's bytes.
-            page.detach_private()?;
-            let old = std::mem::replace(
-                &mut page.bytes,
-                std::sync::Arc::new(crate::mmu::PageBytes::Zero),
-            );
-            let mut owned = std::sync::Arc::try_unwrap(old).unwrap_or_else(|old| {
-                if page.charge.resident() {
-                    (*old).clone()
-                } else {
-                    crate::mmu::PageBytes::Zero
-                }
-            });
-            if owned.is_zero() {
-                if let Some(bytes) = self.mmu.page(base) {
-                    owned = std::sync::Arc::try_unwrap(bytes)
-                        .unwrap_or_else(|_| unreachable!("fresh MMU page"));
-                }
-            }
-            let storage = std::sync::Arc::new(crate::SharedPage::from_owned(owned, None));
-            self.frames[frame].as_mut().unwrap().bytes =
-                std::sync::Arc::new(crate::mmu::PageBytes::Concurrent(storage));
-            if self.parallel_cache.is_some() {
-                self.parallel_mappings.insert(base);
-            }
-            self.revision = self.revision.wrapping_add(1);
-            self.invalidate_translations();
-        }
-        let page = self.page_for_access(a, b.len(), Access::Read)?;
-        if let Some(storage) = page.shared_storage() {
-            let offset = (a % crate::PAGE_SIZE) as usize;
-            let guard = storage.lock(offset, b.len());
-            b.copy_from_slice(guard.read(offset, b.len()));
-            return Ok((storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128);
-        }
-        self.read(a, b)?;
-        Ok(self.revision() as u128)
+        self.with_exclusive_read(a, b.len(), false, |bytes| b.copy_from_slice(bytes))
+            .map(|(_, token, _)| token)
     }
     fn exclusive_write(
         &mut self,
@@ -744,46 +961,11 @@ impl CpuMemory for Memory {
         b: &[u8],
         token: Option<u128>,
     ) -> Result<bool, MemoryError> {
-        if let Some(shared) = &self.shared {
-            return shared.borrow_mut().exclusive_write(a, b, token);
-        }
-        let a = a & 0x00ffffffffffffff;
-        if token.is_none() {
-            return Ok(false);
-        }
-        self.check(a, b.len(), Access::Write)?;
-        self.prepare_mmu_write(a, b.len())?;
-        let page = self.page_for_access(a, b.len(), Access::Write)?;
-        if let Some(storage) = page.shared_write_storage() {
-            let offset = (a % crate::PAGE_SIZE) as usize;
-            let backing = page
-                .backing
-                .as_ref()
-                .filter(|b| b.shared)
-                .map(|b| b.object.clone());
-            let mut guard = storage.lock(offset, b.len());
-            if token
-                != Some((storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
-            {
-                return Ok(false);
-            }
-            guard.write(offset, b.len()).copy_from_slice(b);
-            storage.changed(&mut guard, offset, b.len());
-            drop(guard);
-            if let Some(backing) = backing {
-                backing.publish_write(offset, b.len())?;
-            }
-            let frame = self
-                .frame(a & !(crate::PAGE_SIZE - 1))
-                .expect("checked exclusive");
-            self.mark_native_write(frame);
-            return Ok(true);
-        }
-        if token != Some(self.revision() as u128) {
-            return Ok(false);
-        }
-        self.write(a, b)?;
-        Ok(true)
+        self.with_exclusive_write(a, b.len(), token, false, |bytes| {
+            bytes.copy_from_slice(b);
+            true
+        })
+        .map(|(written, _)| written)
     }
     fn fence(&self, order: Ordering) {
         std::sync::atomic::fence(order);

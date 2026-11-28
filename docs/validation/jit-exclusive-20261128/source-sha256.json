@@ -1,0 +1,27 @@
+{
+  "android": {
+    "crates/trames-android-core/src/lib.rs": "35c8da9f8e557046a4b975ddd964cbb4dc2771df7222ef708308c03a75f380b5"
+  },
+  "baseline": "767b92efb81251861576cefdf676a8bb4f15a4e3",
+  "runtime": {
+    "crates/trames-interpreter/src/extended.rs": "4ef188d99cb62bbeb822b3a33791ad00a8b9de3b075fe700df74401f52935c6f",
+    "crates/trames-interpreter/src/lib.rs": "f7bbff089484a8f5c2fa39cacff2ebe7dfb63da0ed49a5c9efd9ef8e2b3a3918",
+    "crates/trames-interpreter/src/load_store.rs": "3fb05e3f2053d2135186456b40d8c06f37eb595231c7ba66f09e198fd45a8912",
+    "crates/trames-jit/examples/exclusive-category.rs": "5746dbf4a2d8ea26d4a5e96d28b881d4d664e66cde652a2e5aaabc579acc70d1",
+    "crates/trames-jit/src/exclusive.rs": "f27b81a22e3628aa354eb9ef998d843293145e94b65ae19f562720a0472b6e6c",
+    "crates/trames-jit/src/lib.rs": "68d8c8a636aae573ef6a31ef29757d85d04e54760a2b0f6c28b84cacc8a53617",
+    "crates/trames-jit/src/memory_ops.rs": "27156ed0fbe31d036b4ad24ef50597a2779ee3205571a74c11b4cf0166131834",
+    "crates/trames-jit/src/native.rs": "d56873fbe364990f926ff2c7d1ba61cf1244a517e9d4f361c29d1cd3b1a3f616",
+    "crates/trames-jit/src/system_ops.rs": "7801ce2dd209d16c0944701532e6a591c8036fd03b2932a235ecb75b86888735",
+    "crates/trames-jit/tests/differential.rs": "92cea4949f76bc6cce30d82ac29419eaa41f1e8258de450da5c8c6182d520fba",
+    "crates/trames-jit/tests/support/exclusive_category.rs": "edc9157857e10494808b93301b35608672986c17a5f88cb20e5418cbec48c218",
+    "crates/trames-memory/src/cpu_memory.rs": "90310c961e5d501c2422e5047a17ff589f3f21fae30dbc629f4218bda140db15",
+    "crates/trames-memory/src/lib.rs": "15269c5d8cc68356574e1d07e185b6adbdbf044dbb3bb6cdd466c2c2eab9ca40",
+    "crates/trames-memory/src/native_exclusive.rs": "a01bfb16a075aa824690b7f7cfe6b02e64db37e39e1c4f93ff8593f3858fdd6b",
+    "crates/trames-memory/src/parallel.rs": "678e3da574ab50a4d9153ec8532e3f8c8d3aa6458e40a874d0fcca7fab505e9f",
+    "docs/validation/jit-exclusive-20261128/category.S": "f6bd0bb66abc388f05ba6d934433b17c65e8df8ab39be96429c42ccd4cc981a6",
+    "docs/validation/jit-exclusive-20261128/category.words": "c6cd9f81f6af2d1e9a27685e33d427c93c9ea069dcf1e60982ca38c00e0403c2",
+    "docs/validation/jit-exclusive-20261128/run-benchmark.py": "ccf71560b715fef36b77ca6d58fa925cd852dbbc410a8f03fad605fc48bea695",
+    "scripts/audit-jit-exclusives.py": "0457341c8ecf56451e8e44574c239f64b839e381b7c83fc6ba680ccdab7836f0"
+  }
+}

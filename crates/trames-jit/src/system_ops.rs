@@ -10,8 +10,12 @@ pub(super) enum Register {
     Constant(u64),
     Counter { synchronized: bool },
     Random,
+    ClearExclusive,
 }
 pub(super) fn register(word: u32) -> Option<Register> {
+    if word & 0xfffff0ff == 0xd503305f {
+        return Some(Register::ClearExclusive);
+    }
     Some(match word & !31 {
         0xd53bd040 => Register::Read(R::Tls),
         0xd51bd040 => Register::Write(R::Tls),

@@ -3331,8 +3331,8 @@ fn native_store_invalidates_exclusives_and_cached_code_in_memory_and_views() {
             (1, if store == 0xf8220024 { 104 } else { 99 })
         );
         if NATIVE_COMPILED {
-            assert_eq!(e.memory_stats().instructions, 1);
-            assert_eq!(e.stats.fallback_instructions, 2);
+            assert_eq!(e.memory_stats().instructions, 3);
+            assert_eq!(e.stats.fallback_instructions, 0);
         }
         let mut code = memory(&[0xb9000022, 0xd2800020, 0xd4000001]);
         code.protect(
@@ -4236,3 +4236,6 @@ fn affine_runs_join_only_adjacent_admitted_pages_and_never_bridge_holes() {
 
 #[path = "arithmetic/category.rs"]
 mod arithmetic_category;
+
+#[path = "support/exclusive_category.rs"]
+mod exclusive_category;

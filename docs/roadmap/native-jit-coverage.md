@@ -42,6 +42,14 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   unadmitted forms in the declared FP/AdvSIMD matrix. See
   [arithmetic validation](../validation/jit-arithmetic-20261128.md).
 
+- Exclusive reservations: every single-register B/H/W/X LDXR/LDAXR and
+  STXR/STLXR, W/X paired LDXP/LDAXP and STXP/STLXP, plus all CLREX options.
+  Closed private windows retain the hardware monitor across shared native GPR
+  lowering with no helper/frame traffic between LR and SC. Open/shared/sliced
+  sequences execute native fragments through the original reservation domain,
+  preserving ABA invalidation and worker migration. See
+  [exclusive-category validation](../validation/jit-exclusive-20261128.md).
+
 LS64 is rejected because this profile does not own its HWCAP3/device-memory
 contract; LSE128 remains unadvertised. This does not change the interpreter-only
 backend's compatibility policy. New stateful or later ISA features need explicit
@@ -50,12 +58,15 @@ coverage.
 
 ## Remaining categories
 
-1. Exclusive reservations: all LDXR/LDAXR/LDXP/LDAXP and STXR/STLXR/STXP/STLXP
-   widths, CLREX, precise faults and transitions through helpers/slices/workers.
-2. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
-   contract that can actually execute their hardware semantics.
-3. Existing PAC/BTI/MTE compatibility paths and stateful SVE/SME require explicit
-   hardware/ABI ownership. Do not substitute new software extension state.
+1. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
+   contract that can actually execute their hardware semantics. LDLAR/STLLR need
+   explicit FEAT_LOR host admission; do not silently strengthen them to LDAR/STLR.
+2. Existing non-hint PAC/MTE compatibility paths: authenticated branches/returns,
+   authenticated loads, pointer/tag arithmetic and allocation-tag operations.
+   PAC/BTI hints are already covered; full hardware PAC/BTI/MTE and stateful
+   SVE/SME remain unadvertised pending shared-CPU ABI ownership. Do not substitute
+   new software extension state. Unadvertised LSE128/LS64 and absent host
+   extensions fault when reached; they are not interpreter-provided JIT features.
 
 Keep native capability admission and reserved-encoding decisions in compilation.
 Do not add guest-text rewrites, hot preflights, stronger ordinary-memory ordering,

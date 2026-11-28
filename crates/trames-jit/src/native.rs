@@ -6,6 +6,9 @@ use trames_engine::CpuFault;
 use trames_interpreter::Cpu;
 use trames_memory::{CpuMemory, PAGE_SIZE};
 
+#[path = "exclusive.rs"]
+mod exclusive;
+
 type Identity = (u64, u64, u64);
 type Key = (u64, u64, u8);
 const BLOCK_LIMIT: u64 = 64;
@@ -31,9 +34,17 @@ struct Node {
     next: Option<Handle>,
 }
 impl Node {
+    fn instructions(&self) -> u64 {
+        self.block.as_ref().map_or_else(
+            || self.memory.as_deref().map_or(1, MemoryOps::instructions),
+            |block| block.instructions,
+        )
+    }
     fn accepts(&self, pc: u64) -> bool {
         self.block.as_ref().is_some_and(|b| b.accepts(pc))
-            || (self.block.is_none() && self.memory.is_some() && self.key.0.wrapping_add(4) == pc)
+            || (self.block.is_none()
+                && self.memory.is_some()
+                && self.key.0.wrapping_add(self.instructions() * 4) == pc)
     }
 }
 struct Block {
@@ -60,12 +71,19 @@ enum MemoryOps {
     #[allow(clippy::vec_box)]
     Fused(Vec<Box<crate::memory_ops::Operation>>),
     Boundary(crate::system_ops::Boundary),
+    Window(Box<exclusive::Window>),
 }
 impl MemoryOps {
     fn single(&self) -> Option<&crate::memory_ops::Operation> {
         match self {
             Self::Single(op) => Some(op),
-            Self::Fused(_) | Self::Boundary(_) => None,
+            Self::Fused(_) | Self::Boundary(_) | Self::Window(_) => None,
+        }
+    }
+    fn instructions(&self) -> u64 {
+        match self {
+            Self::Window(window) => window.instructions(),
+            _ => 1,
         }
     }
     fn host_words(&self) -> u64 {
@@ -73,6 +91,7 @@ impl MemoryOps {
             Self::Single(op) => op.host_words(),
             Self::Fused(ops) => ops.iter().map(|op| op.host_words()).sum(),
             Self::Boundary(_) => 0,
+            Self::Window(window) => window.host_words(),
         }
     }
 }
@@ -305,7 +324,7 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool, const FP:
     // Any checked call can prepare COW/storage or replace CPU aliases. Discard
     // all earlier loans before reborrowing Memory; only this call's final export
     // survives. Stores also populate the read slot after actual write admission.
-    if HARDWARE && !frame.stable {
+    if HARDWARE && (!frame.stable || op.exclusive.is_some()) {
         frame.pages.fill(OperandPage::EMPTY);
         frame.direct = DirectRegion::EMPTY;
     }
@@ -483,8 +502,7 @@ impl Cache {
         let handle = self.lookup_exact(memory, pc, full, mode, checked)?;
         if self
             .node(handle)
-            .and_then(|node| node.block.as_ref())
-            .is_none_or(|block| block.instructions <= limit)
+            .is_none_or(|node| node.instructions() <= limit)
         {
             return Ok(handle);
         }
@@ -536,23 +554,26 @@ impl Cache {
                 })
         });
         self.remove(slot);
-        let (block, memory_op) = if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
-            (Some(compiled.block), compiled.memory)
-        } else {
-            (
-                None,
-                if let Some(boundary) = crate::system_ops::Boundary::decode(
-                    memory
-                        .fetch_u32(pc)
-                        .map_err(|error| CpuFault::Memory { pc, error })?,
-                ) {
-                    Some(Box::new(MemoryOps::Boundary(boundary)))
-                } else {
-                    crate::memory_ops::Operation::compile(memory, pc)?
-                        .map(|op| Box::new(MemoryOps::Single(op)))
-                },
-            )
-        };
+        let (block, memory_op) =
+            if let Some(window) = exclusive::Window::compile(memory, pc, limit, mode)? {
+                (None, Some(Box::new(MemoryOps::Window(Box::new(window)))))
+            } else if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
+                (Some(compiled.block), compiled.memory)
+            } else {
+                (
+                    None,
+                    if let Some(boundary) = crate::system_ops::Boundary::decode(
+                        memory
+                            .fetch_u32(pc)
+                            .map_err(|error| CpuFault::Memory { pc, error })?,
+                    ) {
+                        Some(Box::new(MemoryOps::Boundary(boundary)))
+                    } else {
+                        crate::memory_ops::Operation::compile(memory, pc)?
+                            .map(|op| Box::new(MemoryOps::Single(op)))
+                    },
+                )
+            };
         if let Some(op) = &memory_op {
             self.cold.compilation.blocks += u64::from(block.is_none());
             self.cold.compilation.host_words += op.host_words();
@@ -834,7 +855,7 @@ impl Cache {
                     n.checked == checked
                         && n.key.0 == pc
                         && n.key.2 == mode
-                        && n.block.as_ref().is_none_or(|b| b.instructions <= budget)
+                        && n.instructions() <= budget
                 })
             });
         let handle = if let Some(target) = resume {
@@ -855,10 +876,7 @@ impl Cache {
                             BLOCK_LIMIT.min((PAGE_SIZE - (pc & (PAGE_SIZE - 1))) / 4),
                             mode,
                         )
-                    && node
-                        .block
-                        .as_ref()
-                        .is_none_or(|block| block.instructions <= budget)
+                    && node.instructions() <= budget
             })
         }) {
             hot
@@ -887,6 +905,29 @@ impl Cache {
                     blocks: 1,
                     exit: Exit::Continue,
                 }));
+            }
+            if let Some(MemoryOps::Window(window)) =
+                self.node(handle).and_then(|n| n.memory.as_deref())
+            {
+                let result = window.execute(cpu, memory, &mut frame);
+                match result {
+                    Ok(run) => {
+                        self.cold.memory.instructions += run.accesses;
+                        self.cold.memory.staged += u64::from(!run.direct);
+                        self.cold.memory.exclusive_windows += u64::from(run.instructions > 1);
+                        self.last = Some(handle);
+                        self.links_stats.entries += 1;
+                        return Ok(Some(Executed {
+                            instructions: run.instructions,
+                            blocks: 1,
+                            exit: Exit::Continue,
+                        }));
+                    }
+                    Err((retired, error)) => {
+                        self.cold.fault_progress = (retired, u64::from(retired != 0));
+                        return Err(error);
+                    }
+                }
             }
             if let Some(MemoryOps::Boundary(boundary)) =
                 self.node(handle).and_then(|n| n.memory.as_deref())
@@ -1452,6 +1493,9 @@ struct Assembler {
     first_operand: Option<LoopOperand>,
     vectors: Vectors,
     floating: bool,
+    monitor: bool,
+    window_spill: bool,
+    preloads: u64,
 }
 impl Assembler {
     fn new() -> Self {
@@ -1470,10 +1514,14 @@ impl Assembler {
             first_operand: None,
             vectors: Vectors::new(),
             floating: false,
+            monitor: false,
+            window_spill: false,
+            preloads: 0,
         }
     }
     fn store(&mut self, slot: usize, binding: Binding) {
         if binding.dirty {
+            self.window_spill |= self.monitor;
             if binding.guest == 32 {
                 store(&mut self.words, slot as u32 + 1, 104);
             } else {
@@ -1511,6 +1559,10 @@ impl Assembler {
                 self.hosts[binding.guest as usize] = u8::MAX;
             }
             if read {
+                if self.monitor {
+                    self.preloads |= 1 << guest;
+                    self.window_spill = true;
+                }
                 if guest == 32 {
                     load(&mut self.words, slot as u32 + 1, 16, 104);
                     self.context = true;
@@ -1561,6 +1613,10 @@ impl Assembler {
     fn flags_read(&mut self) {
         self.context = true;
         if !self.flags_live {
+            if self.monitor {
+                self.preloads |= 1 << 63;
+                self.window_spill = true;
+            }
             load(&mut self.words, 17, 16, 112);
             self.words.push(0xd51b4211); // msr nzcv,x17; never host TLS
             self.flags_live = true;
@@ -1753,7 +1809,9 @@ impl Assembler {
         write: bool,
         wide: bool,
     ) {
-        let offset = Cpu::native_system_offset(register);
+        self.cpu_field_at(rt, Cpu::native_system_offset(register), write, wide);
+    }
+    fn cpu_field_at(&mut self, rt: u32, offset: i64, write: bool, wide: bool) {
         let scale = if wide { 8 } else { 4 };
         let op = match (wide, write) {
             (true, false) => 0xf9400000,
@@ -1777,6 +1835,10 @@ impl Assembler {
         use trames_interpreter::NativeSystemRegister as R;
         let rd = word & 31;
         match op {
+            ClearExclusive => {
+                self.cpu_field_at(31, Cpu::native_exclusive_size_offset(), true, true);
+                self.words.push(word);
+            }
             Constant(value) => self.constant(rd, value),
             Counter { synchronized } => {
                 let dest = self.output(rd, 0);
@@ -2518,7 +2580,21 @@ fn compile_with_features(
     mode: u8,
     host: trames_execution::Features,
 ) -> Result<Option<Compiled>, CpuFault> {
-    compile_body(memory, start, limit, slot, mode, host, false)
+    compile_body(
+        memory,
+        start,
+        limit,
+        slot,
+        mode,
+        host,
+        CompileContext::default(),
+    )
+}
+#[derive(Clone, Copy, Default)]
+struct CompileContext<'a> {
+    floating: bool,
+    window: Option<&'a exclusive::Plan>,
+    preloads: Option<u64>,
 }
 fn compile_body(
     memory: &impl CpuMemory,
@@ -2527,11 +2603,23 @@ fn compile_body(
     slot: usize,
     mode: u8,
     host: trames_execution::Features,
-    floating: bool,
+    context: CompileContext<'_>,
 ) -> Result<Option<Compiled>, CpuFault> {
     let mut code = Assembler::new();
     code.direct = mode & 16 != 0;
-    code.floating = floating;
+    code.floating = context.floating;
+    if let Some(preloads) = context.preloads {
+        for reg in 0..33 {
+            if reg != 31 && preloads & (1 << reg) != 0 {
+                code.read(reg, 0);
+            }
+        }
+        if preloads >> 63 != 0 {
+            code.flags_read();
+        }
+    }
+    let mut window_load = None;
+    let mut window_store = None;
     let mut memory_ops = Vec::new();
     let mut memory_sites = Vec::new();
     let mut count = 0;
@@ -2559,16 +2647,58 @@ fn compile_body(
         let sf = word >> 31;
         let flags = word & (1 << 29) != 0;
         let mut terminal = false;
+        if let Some(plan) = context.window {
+            if count == 0 {
+                window_load = Some(exclusive::load(&mut code, &plan.first));
+                count += 1;
+                next = next.wrapping_add(4);
+                continue;
+            }
+            if count + 1 == plan.count {
+                if code.versions[sp_register(plan.first.rn as u32) as usize] != 0 {
+                    return Ok(None);
+                }
+                window_store = Some(exclusive::store(&mut code, &plan.last));
+                count += 1;
+                next = next.wrapping_add(4);
+                break;
+            }
+            if !exclusive::integer(word) {
+                return Ok(None);
+            }
+        }
         if let Some(op) = crate::vector_ops::decode(word) {
             if !code.floating && !memory_ops.is_empty() {
-                return compile_body(memory, start, limit, slot, mode, host, true);
+                return compile_body(
+                    memory,
+                    start,
+                    limit,
+                    slot,
+                    mode,
+                    host,
+                    CompileContext {
+                        floating: true,
+                        ..context
+                    },
+                );
             }
             code.floating = true;
             code.vector(word, op);
         } else if let Some(op) = crate::system_ops::register(word) {
             if crate::system_ops::floating(op) {
                 if !code.floating && !memory_ops.is_empty() {
-                    return compile_body(memory, start, limit, slot, mode, host, true);
+                    return compile_body(
+                        memory,
+                        start,
+                        limit,
+                        slot,
+                        mode,
+                        host,
+                        CompileContext {
+                            floating: true,
+                            ..context
+                        },
+                    );
                 }
                 code.floating = true;
             }
@@ -2851,7 +2981,18 @@ fn compile_body(
                 break;
             };
             if op.vector && !code.floating && !memory_ops.is_empty() {
-                return compile_body(memory, start, limit, slot, mode, host, true);
+                return compile_body(
+                    memory,
+                    start,
+                    limit,
+                    slot,
+                    mode,
+                    host,
+                    CompileContext {
+                        floating: true,
+                        ..context
+                    },
+                );
             }
             code.floating |= op.vector;
             let op = Box::new(op);
@@ -2872,6 +3013,29 @@ fn compile_body(
     }
     if count == 0 {
         return Ok(None);
+    }
+    if let Some(plan) = context.window {
+        let (Some(load), Some(store)) = (window_load, window_store) else {
+            return Ok(None);
+        };
+        if context.preloads.is_none() && code.preloads != 0 {
+            return compile_body(
+                memory,
+                start,
+                limit,
+                slot,
+                mode,
+                host,
+                CompileContext {
+                    preloads: Some(code.preloads),
+                    ..context
+                },
+            );
+        }
+        if code.window_spill || count != plan.count {
+            return Ok(None);
+        }
+        return exclusive::finish(code, load, store, next, count).map(Some);
     }
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
     if let Some(first) = code.first_operand {
@@ -3030,6 +3194,11 @@ impl Code {
         }
         Ok(mapping)
     }
+    unsafe fn call_window(&self, registers: *mut u64, frame: &mut Frame) -> u64 {
+        let function: unsafe extern "C" fn(*mut u64, *mut Frame) -> u64 =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(registers, frame) }
+    }
     unsafe fn call_memory_block<M: CpuMemory>(
         &self,
         registers: *mut u64,
@@ -3072,6 +3241,16 @@ impl Code {
     }
     pub(super) fn word_count(&self) -> u64 {
         self.words as u64
+    }
+    pub(super) unsafe fn call_exclusive_read(&self, pointer: *const u8) -> PairValues {
+        let function: unsafe extern "C" fn(*const u8) -> PairValues =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(pointer) }
+    }
+    pub(super) unsafe fn call_exclusive_write(&self, pointer: *mut u8, inputs: &[u64; 4]) -> u64 {
+        let function: unsafe extern "C" fn(*mut u8, *const u64) -> u64 =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe { function(pointer, inputs.as_ptr()) }
     }
     pub(super) unsafe fn call_atomic(&self, pointer: *mut u8, inputs: &[u64; 4]) -> PairValues {
         // One native LSE instruction, fixed even pairs for CASP. Canonical

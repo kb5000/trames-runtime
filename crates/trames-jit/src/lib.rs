@@ -107,6 +107,8 @@ pub struct LinkStats {
 /// Diagnostics updated only by native memory fragments, never scalar/SVC exits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryStats {
+    /// Closed private LL/SC windows executed without a Rust helper between them.
+    pub exclusive_windows: u64,
     pub instructions: u64,
     pub staged: u64,
     pub fused_entries: u64,
