@@ -33,8 +33,8 @@ use mmu::PageBytes;
 pub use native_code::{NativeCodeFixups, NativePage};
 mod native_access;
 #[cfg(feature = "native-code")]
-#[cfg(feature = "native-code")]
 mod native_exclusive;
+#[cfg(feature = "native-code")]
 mod ordered;
 pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;

@@ -701,10 +701,35 @@ mod tests {
             .pending
             .is_empty());
         let e = Endpoint::new(service.clone(), false).unwrap();
-        e.send(&query(99, b"localhost", 1)).unwrap();
         let weak = Arc::downgrade(&e);
+        // Model a queued request whose endpoint dies before completion. Sending
+        // a real query races an already-running completion's temporary Arc;
+        // a delivered reply does not mean that callback has returned yet.
+        service
+            .resolver
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .pending
+            .insert(
+                u64::MAX,
+                Pending {
+                    endpoint: weak.clone(),
+                    question: query(99, b"localhost", 1),
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+            );
         drop(e);
         assert!(weak.upgrade().is_none());
+        assert!(service
+            .resolver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pending
+            .contains_key(&u64::MAX));
         service.tick();
         assert!(service
             .resolver
