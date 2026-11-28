@@ -9,6 +9,7 @@ use trames_memory::{CpuMemory, PAGE_SIZE};
 #[derive(Clone, Copy)]
 pub(super) enum Atomic {
     Rmw { source: usize },
+    RmwPair,
     Cas { compare: usize, pair: bool },
 }
 
@@ -247,6 +248,13 @@ impl Operation {
         .map(Some)
     }
     pub fn compile(memory: &impl CpuMemory, pc: u64) -> Result<Option<Self>, CpuFault> {
+        Self::compile_for_features(memory, pc, crate::features::profile().allowed)
+    }
+    fn compile_for_features(
+        memory: &impl CpuMemory,
+        pc: u64,
+        host: trames_execution::Features,
+    ) -> Result<Option<Self>, CpuFault> {
         let word = memory
             .fetch_u32(pc)
             .map_err(|error| CpuFault::Memory { pc, error })?;
@@ -286,7 +294,7 @@ impl Operation {
         }
         let rt = (word & 31) as usize;
         let rn = ((word >> 5) & 31) as usize;
-        if !crate::features::permits(crate::features::profile().allowed, word) {
+        if !crate::features::permits(host, word) {
             return Ok(None);
         }
         let cas_pair = word & 0xbfa07c00 == 0x08207c00;
@@ -325,6 +333,34 @@ impl Operation {
                         pair: cas_pair,
                     }
                 }),
+                opcode: Some(word & !0x1f03ff),
+                code: None,
+            }
+            .publish()
+            .map(Some);
+        }
+        if matches!(word & 0xff20fc00, 0x19208000 | 0x19201000 | 0x19203000) {
+            if !memory.cpu_hardware_ordering() {
+                return Ok(None);
+            }
+            let second = ((word >> 16) & 31) as usize;
+            if rt == 31 || second == 31 || rt == second {
+                return Ok(None);
+            }
+            return Self {
+                pc,
+                address: Address::Offset(0),
+                rn,
+                rt,
+                size: 16,
+                load: false,
+                vector: false,
+                structure: None,
+                second: Some(second),
+                ordered: false,
+                maintenance: None,
+                exclusive: None,
+                atomic: Some(Atomic::RmwPair),
                 opcode: Some(word & !0x1f03ff),
                 code: None,
             }
@@ -407,7 +443,10 @@ impl Operation {
             .publish()
             .map(Some);
         }
-        if matches!(word & 0x3ffffc00, 0x08dffc00 | 0x089ffc00) {
+        if matches!(
+            word & 0x3ffffc00,
+            0x08dffc00 | 0x089ffc00 | 0x08df7c00 | 0x089f7c00
+        ) {
             if !memory.cpu_hardware_ordering() {
                 return Ok(None);
             }
@@ -628,6 +667,16 @@ impl Operation {
                     }
                     words.push(0xd65f03c0);
                     Code::publish(&words)
+                } else if matches!(self.atomic, Some(Atomic::RmwPair)) {
+                    // Two independent in/out registers, not an even CASP pair.
+                    Code::publish(&[
+                        0xd503245f,
+                        0xa9400c22,
+                        word | (3 << 16) | 2,
+                        0xaa0203e0,
+                        0xaa0303e1,
+                        0xd65f03c0,
+                    ])
                 } else if let Some(atomic) = self.atomic {
                     // AAPCS64 x0=borrow, x1=&[compare0,compare1,new0,new1].
                     // Fixed even pairs keep CASP a single real host instruction.
@@ -770,18 +819,19 @@ impl Operation {
             if !address.is_multiple_of(self.size as u64) {
                 return Err(fault(trames_memory::MemoryError::Alignment(address)));
             }
-            let (compare, pair) = match atomic {
-                Atomic::Rmw { source } => (source, false),
-                Atomic::Cas { compare, pair } => (compare, pair),
+            let (compare, second, rmw) = match atomic {
+                Atomic::Rmw { source } => (source, None, true),
+                Atomic::RmwPair => (self.rt, self.second, true),
+                Atomic::Cas { compare, pair } => (compare, pair.then_some(compare + 1), false),
             };
+            let pair = second.is_some();
             let inputs = [
                 cpu.x(compare),
-                if pair { cpu.x(compare + 1) } else { 0 },
+                second.map_or(0, |reg| cpu.x(reg)),
                 cpu.x(self.rt),
-                if pair { cpu.x(self.rt + 1) } else { 0 },
+                if pair && !rmw { cpu.x(self.rt + 1) } else { 0 },
             ];
             let word = self.opcode.unwrap();
-            let rmw = matches!(atomic, Atomic::Rmw { .. });
             let release = word & (1 << if rmw { 22 } else { 15 }) != 0;
             let acquire = word & (1 << if rmw { 23 } else { 22 }) != 0 && (!rmw || self.rt != 31);
             let element = if pair { self.size / 2 } else { self.size };
@@ -800,8 +850,8 @@ impl Operation {
                 })
                 .map_err(fault)?;
             cpu.set_x(if rmw { self.rt } else { compare }, old.first);
-            if pair {
-                cpu.set_x(compare + 1, old.second);
+            if let Some(second) = second {
+                cpu.set_x(second, old.second);
             }
             cpu.pc = pc.wrapping_add(4);
             return Ok(direct);
@@ -942,5 +992,58 @@ impl Operation {
         }
         cpu.pc = pc.wrapping_add(4);
         Ok(direct)
+    }
+}
+
+#[cfg(test)]
+mod special_memory_tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions};
+    #[test]
+    fn llvm_lse128_fixture_keeps_two_independent_inout_registers_and_real_opcodes() {
+        let fixture =
+            include_str!("../../../docs/validation/jit-special-memory-20261128/category.words");
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let all = trames_execution::Features {
+            hwcap: u64::MAX,
+            hwcap2: u64::MAX,
+        };
+        let mut count = 0;
+        for word in fixture
+            .lines()
+            .map(|line| u32::from_str_radix(line, 16).unwrap())
+            .skip(432)
+            .take(72)
+        {
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.write_array(0x1000, word.to_le_bytes()).unwrap();
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let op = Operation::compile_for_features(&memory, 0x1000, all)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(op.atomic, Some(Atomic::RmwPair)));
+            assert_eq!(
+                (op.rt, op.second, op.rn, op.size),
+                (
+                    (word & 31) as usize,
+                    Some(((word >> 16) & 31) as usize),
+                    ((word >> 5) & 31) as usize,
+                    16
+                )
+            );
+            let code = op.code.as_ref().unwrap();
+            let words = code.published_words();
+            assert_eq!(words[2], (word & !0x1f03ff) | (3 << 16) | 2);
+            assert!(!crate::features::permits(
+                trames_execution::Features {
+                    hwcap: 3,
+                    hwcap2: 0
+                },
+                word
+            ));
+            count += 1;
+        }
+        assert_eq!(count, 72);
     }
 }

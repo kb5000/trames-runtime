@@ -1,0 +1,7 @@
+    Checking trames-execution v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-execution)
+    Checking trames-host-compute v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-host-compute)
+   Compiling getrandom v0.3.4
+    Checking trames-engine v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-engine)
+    Checking trames-interpreter v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-interpreter)
+    Checking trames-jit v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-jit)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s

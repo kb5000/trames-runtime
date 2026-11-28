@@ -1,0 +1,14 @@
+[
+  {
+    "label": "before",
+    "sha256": "c217c3b88dea18589502c42bef019881d114b378ac69d2257e0bfe0116e4f0a4",
+    "mops_marker": false,
+    "source": "jit-special-baseline-source"
+  },
+  {
+    "label": "after",
+    "sha256": "e9b3d397043551c0ecc0ad37652e23f77b88b55d1fff116de4ecc95f3d62933d",
+    "mops_marker": true,
+    "source": "jit-special-source"
+  }
+]

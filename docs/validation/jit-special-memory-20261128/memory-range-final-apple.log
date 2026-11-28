@@ -1,0 +1,24 @@
+   Compiling trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-memory)
+    Finished `test` profile [unoptimized] target(s) in 3.31s
+     Running unittests src/lib.rs (/Users/main/dev/trames/target/jit-special-macos/debug/build/trames-memory/d126068319953a4e/out/trames_memory-d126068319953a4e)
+
+running 5 tests
+test mmu::host::native_range::tests::canonical_aliases_and_staging_keep_guards_and_reset_physical_ownership ... ok
+test mmu::host::native_range::tests::variable_operands_share_the_original_budget_and_release_on_failure ... ok
+test anonymous::native_tests::native_range_admission_keeps_strict_quotas_and_existing_pages_authoritative ... ok
+test anonymous::native_tests::native_range_retirement_waits_for_retained_views_and_reuse_is_zero ... ok
+test anonymous::native_tests::native_ranges_share_late_bytes_and_never_charge_unreached_addresses ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 281 filtered out; finished in 0.00s
+
+     Running tests/metadata_allocations.rs (/Users/main/dev/trames/target/jit-special-macos/debug/build/trames-memory/78dbd52b2ebc7dcc/out/metadata_allocations-78dbd52b2ebc7dcc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/translation.rs (/Users/main/dev/trames/target/jit-special-macos/debug/build/trames-memory/4c847c00caa4079e/out/translation-4c847c00caa4079e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s

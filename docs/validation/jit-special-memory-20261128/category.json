@@ -1,0 +1,2203 @@
+{
+  "llvm": "18",
+  "counts": {
+    "mops": 432,
+    "lse128": 72,
+    "lor": 32,
+    "ls64": 12
+  },
+  "encodings": [
+    {
+      "family": "mops",
+      "word": 419497024
+    },
+    {
+      "family": "mops",
+      "word": 423691328
+    },
+    {
+      "family": "mops",
+      "word": 427885632
+    },
+    {
+      "family": "mops",
+      "word": 421398450
+    },
+    {
+      "family": "mops",
+      "word": 425592754
+    },
+    {
+      "family": "mops",
+      "word": 429787058
+    },
+    {
+      "family": "mops",
+      "word": 419432030
+    },
+    {
+      "family": "mops",
+      "word": 423626334
+    },
+    {
+      "family": "mops",
+      "word": 427820638
+    },
+    {
+      "family": "mops",
+      "word": 420676637
+    },
+    {
+      "family": "mops",
+      "word": 424870941
+    },
+    {
+      "family": "mops",
+      "word": 429065245
+    },
+    {
+      "family": "mops",
+      "word": 419501120
+    },
+    {
+      "family": "mops",
+      "word": 423695424
+    },
+    {
+      "family": "mops",
+      "word": 427889728
+    },
+    {
+      "family": "mops",
+      "word": 421402546
+    },
+    {
+      "family": "mops",
+      "word": 425596850
+    },
+    {
+      "family": "mops",
+      "word": 429791154
+    },
+    {
+      "family": "mops",
+      "word": 419436126
+    },
+    {
+      "family": "mops",
+      "word": 423630430
+    },
+    {
+      "family": "mops",
+      "word": 427824734
+    },
+    {
+      "family": "mops",
+      "word": 420680733
+    },
+    {
+      "family": "mops",
+      "word": 424875037
+    },
+    {
+      "family": "mops",
+      "word": 429069341
+    },
+    {
+      "family": "mops",
+      "word": 419505216
+    },
+    {
+      "family": "mops",
+      "word": 423699520
+    },
+    {
+      "family": "mops",
+      "word": 427893824
+    },
+    {
+      "family": "mops",
+      "word": 421406642
+    },
+    {
+      "family": "mops",
+      "word": 425600946
+    },
+    {
+      "family": "mops",
+      "word": 429795250
+    },
+    {
+      "family": "mops",
+      "word": 419440222
+    },
+    {
+      "family": "mops",
+      "word": 423634526
+    },
+    {
+      "family": "mops",
+      "word": 427828830
+    },
+    {
+      "family": "mops",
+      "word": 420684829
+    },
+    {
+      "family": "mops",
+      "word": 424879133
+    },
+    {
+      "family": "mops",
+      "word": 429073437
+    },
+    {
+      "family": "mops",
+      "word": 419509312
+    },
+    {
+      "family": "mops",
+      "word": 423703616
+    },
+    {
+      "family": "mops",
+      "word": 427897920
+    },
+    {
+      "family": "mops",
+      "word": 421410738
+    },
+    {
+      "family": "mops",
+      "word": 425605042
+    },
+    {
+      "family": "mops",
+      "word": 429799346
+    },
+    {
+      "family": "mops",
+      "word": 419444318
+    },
+    {
+      "family": "mops",
+      "word": 423638622
+    },
+    {
+      "family": "mops",
+      "word": 427832926
+    },
+    {
+      "family": "mops",
+      "word": 420688925
+    },
+    {
+      "family": "mops",
+      "word": 424883229
+    },
+    {
+      "family": "mops",
+      "word": 429077533
+    },
+    {
+      "family": "mops",
+      "word": 419513408
+    },
+    {
+      "family": "mops",
+      "word": 423707712
+    },
+    {
+      "family": "mops",
+      "word": 427902016
+    },
+    {
+      "family": "mops",
+      "word": 421414834
+    },
+    {
+      "family": "mops",
+      "word": 425609138
+    },
+    {
+      "family": "mops",
+      "word": 429803442
+    },
+    {
+      "family": "mops",
+      "word": 419448414
+    },
+    {
+      "family": "mops",
+      "word": 423642718
+    },
+    {
+      "family": "mops",
+      "word": 427837022
+    },
+    {
+      "family": "mops",
+      "word": 420693021
+    },
+    {
+      "family": "mops",
+      "word": 424887325
+    },
+    {
+      "family": "mops",
+      "word": 429081629
+    },
+    {
+      "family": "mops",
+      "word": 419517504
+    },
+    {
+      "family": "mops",
+      "word": 423711808
+    },
+    {
+      "family": "mops",
+      "word": 427906112
+    },
+    {
+      "family": "mops",
+      "word": 421418930
+    },
+    {
+      "family": "mops",
+      "word": 425613234
+    },
+    {
+      "family": "mops",
+      "word": 429807538
+    },
+    {
+      "family": "mops",
+      "word": 419452510
+    },
+    {
+      "family": "mops",
+      "word": 423646814
+    },
+    {
+      "family": "mops",
+      "word": 427841118
+    },
+    {
+      "family": "mops",
+      "word": 420697117
+    },
+    {
+      "family": "mops",
+      "word": 424891421
+    },
+    {
+      "family": "mops",
+      "word": 429085725
+    },
+    {
+      "family": "mops",
+      "word": 419521600
+    },
+    {
+      "family": "mops",
+      "word": 423715904
+    },
+    {
+      "family": "mops",
+      "word": 427910208
+    },
+    {
+      "family": "mops",
+      "word": 421423026
+    },
+    {
+      "family": "mops",
+      "word": 425617330
+    },
+    {
+      "family": "mops",
+      "word": 429811634
+    },
+    {
+      "family": "mops",
+      "word": 419456606
+    },
+    {
+      "family": "mops",
+      "word": 423650910
+    },
+    {
+      "family": "mops",
+      "word": 427845214
+    },
+    {
+      "family": "mops",
+      "word": 420701213
+    },
+    {
+      "family": "mops",
+      "word": 424895517
+    },
+    {
+      "family": "mops",
+      "word": 429089821
+    },
+    {
+      "family": "mops",
+      "word": 419525696
+    },
+    {
+      "family": "mops",
+      "word": 423720000
+    },
+    {
+      "family": "mops",
+      "word": 427914304
+    },
+    {
+      "family": "mops",
+      "word": 421427122
+    },
+    {
+      "family": "mops",
+      "word": 425621426
+    },
+    {
+      "family": "mops",
+      "word": 429815730
+    },
+    {
+      "family": "mops",
+      "word": 419460702
+    },
+    {
+      "family": "mops",
+      "word": 423655006
+    },
+    {
+      "family": "mops",
+      "word": 427849310
+    },
+    {
+      "family": "mops",
+      "word": 420705309
+    },
+    {
+      "family": "mops",
+      "word": 424899613
+    },
+    {
+      "family": "mops",
+      "word": 429093917
+    },
+    {
+      "family": "mops",
+      "word": 419529792
+    },
+    {
+      "family": "mops",
+      "word": 423724096
+    },
+    {
+      "family": "mops",
+      "word": 427918400
+    },
+    {
+      "family": "mops",
+      "word": 421431218
+    },
+    {
+      "family": "mops",
+      "word": 425625522
+    },
+    {
+      "family": "mops",
+      "word": 429819826
+    },
+    {
+      "family": "mops",
+      "word": 419464798
+    },
+    {
+      "family": "mops",
+      "word": 423659102
+    },
+    {
+      "family": "mops",
+      "word": 427853406
+    },
+    {
+      "family": "mops",
+      "word": 420709405
+    },
+    {
+      "family": "mops",
+      "word": 424903709
+    },
+    {
+      "family": "mops",
+      "word": 429098013
+    },
+    {
+      "family": "mops",
+      "word": 419533888
+    },
+    {
+      "family": "mops",
+      "word": 423728192
+    },
+    {
+      "family": "mops",
+      "word": 427922496
+    },
+    {
+      "family": "mops",
+      "word": 421435314
+    },
+    {
+      "family": "mops",
+      "word": 425629618
+    },
+    {
+      "family": "mops",
+      "word": 429823922
+    },
+    {
+      "family": "mops",
+      "word": 419468894
+    },
+    {
+      "family": "mops",
+      "word": 423663198
+    },
+    {
+      "family": "mops",
+      "word": 427857502
+    },
+    {
+      "family": "mops",
+      "word": 420713501
+    },
+    {
+      "family": "mops",
+      "word": 424907805
+    },
+    {
+      "family": "mops",
+      "word": 429102109
+    },
+    {
+      "family": "mops",
+      "word": 419537984
+    },
+    {
+      "family": "mops",
+      "word": 423732288
+    },
+    {
+      "family": "mops",
+      "word": 427926592
+    },
+    {
+      "family": "mops",
+      "word": 421439410
+    },
+    {
+      "family": "mops",
+      "word": 425633714
+    },
+    {
+      "family": "mops",
+      "word": 429828018
+    },
+    {
+      "family": "mops",
+      "word": 419472990
+    },
+    {
+      "family": "mops",
+      "word": 423667294
+    },
+    {
+      "family": "mops",
+      "word": 427861598
+    },
+    {
+      "family": "mops",
+      "word": 420717597
+    },
+    {
+      "family": "mops",
+      "word": 424911901
+    },
+    {
+      "family": "mops",
+      "word": 429106205
+    },
+    {
+      "family": "mops",
+      "word": 419542080
+    },
+    {
+      "family": "mops",
+      "word": 423736384
+    },
+    {
+      "family": "mops",
+      "word": 427930688
+    },
+    {
+      "family": "mops",
+      "word": 421443506
+    },
+    {
+      "family": "mops",
+      "word": 425637810
+    },
+    {
+      "family": "mops",
+      "word": 429832114
+    },
+    {
+      "family": "mops",
+      "word": 419477086
+    },
+    {
+      "family": "mops",
+      "word": 423671390
+    },
+    {
+      "family": "mops",
+      "word": 427865694
+    },
+    {
+      "family": "mops",
+      "word": 420721693
+    },
+    {
+      "family": "mops",
+      "word": 424915997
+    },
+    {
+      "family": "mops",
+      "word": 429110301
+    },
+    {
+      "family": "mops",
+      "word": 419546176
+    },
+    {
+      "family": "mops",
+      "word": 423740480
+    },
+    {
+      "family": "mops",
+      "word": 427934784
+    },
+    {
+      "family": "mops",
+      "word": 421447602
+    },
+    {
+      "family": "mops",
+      "word": 425641906
+    },
+    {
+      "family": "mops",
+      "word": 429836210
+    },
+    {
+      "family": "mops",
+      "word": 419481182
+    },
+    {
+      "family": "mops",
+      "word": 423675486
+    },
+    {
+      "family": "mops",
+      "word": 427869790
+    },
+    {
+      "family": "mops",
+      "word": 420725789
+    },
+    {
+      "family": "mops",
+      "word": 424920093
+    },
+    {
+      "family": "mops",
+      "word": 429114397
+    },
+    {
+      "family": "mops",
+      "word": 419550272
+    },
+    {
+      "family": "mops",
+      "word": 423744576
+    },
+    {
+      "family": "mops",
+      "word": 427938880
+    },
+    {
+      "family": "mops",
+      "word": 421451698
+    },
+    {
+      "family": "mops",
+      "word": 425646002
+    },
+    {
+      "family": "mops",
+      "word": 429840306
+    },
+    {
+      "family": "mops",
+      "word": 419485278
+    },
+    {
+      "family": "mops",
+      "word": 423679582
+    },
+    {
+      "family": "mops",
+      "word": 427873886
+    },
+    {
+      "family": "mops",
+      "word": 420729885
+    },
+    {
+      "family": "mops",
+      "word": 424924189
+    },
+    {
+      "family": "mops",
+      "word": 429118493
+    },
+    {
+      "family": "mops",
+      "word": 419554368
+    },
+    {
+      "family": "mops",
+      "word": 423748672
+    },
+    {
+      "family": "mops",
+      "word": 427942976
+    },
+    {
+      "family": "mops",
+      "word": 421455794
+    },
+    {
+      "family": "mops",
+      "word": 425650098
+    },
+    {
+      "family": "mops",
+      "word": 429844402
+    },
+    {
+      "family": "mops",
+      "word": 419489374
+    },
+    {
+      "family": "mops",
+      "word": 423683678
+    },
+    {
+      "family": "mops",
+      "word": 427877982
+    },
+    {
+      "family": "mops",
+      "word": 420733981
+    },
+    {
+      "family": "mops",
+      "word": 424928285
+    },
+    {
+      "family": "mops",
+      "word": 429122589
+    },
+    {
+      "family": "mops",
+      "word": 419558464
+    },
+    {
+      "family": "mops",
+      "word": 423752768
+    },
+    {
+      "family": "mops",
+      "word": 427947072
+    },
+    {
+      "family": "mops",
+      "word": 421459890
+    },
+    {
+      "family": "mops",
+      "word": 425654194
+    },
+    {
+      "family": "mops",
+      "word": 429848498
+    },
+    {
+      "family": "mops",
+      "word": 419493470
+    },
+    {
+      "family": "mops",
+      "word": 423687774
+    },
+    {
+      "family": "mops",
+      "word": 427882078
+    },
+    {
+      "family": "mops",
+      "word": 420738077
+    },
+    {
+      "family": "mops",
+      "word": 424932381
+    },
+    {
+      "family": "mops",
+      "word": 429126685
+    },
+    {
+      "family": "mops",
+      "word": 486605888
+    },
+    {
+      "family": "mops",
+      "word": 490800192
+    },
+    {
+      "family": "mops",
+      "word": 494994496
+    },
+    {
+      "family": "mops",
+      "word": 488507314
+    },
+    {
+      "family": "mops",
+      "word": 492701618
+    },
+    {
+      "family": "mops",
+      "word": 496895922
+    },
+    {
+      "family": "mops",
+      "word": 486540894
+    },
+    {
+      "family": "mops",
+      "word": 490735198
+    },
+    {
+      "family": "mops",
+      "word": 494929502
+    },
+    {
+      "family": "mops",
+      "word": 487785501
+    },
+    {
+      "family": "mops",
+      "word": 491979805
+    },
+    {
+      "family": "mops",
+      "word": 496174109
+    },
+    {
+      "family": "mops",
+      "word": 486609984
+    },
+    {
+      "family": "mops",
+      "word": 490804288
+    },
+    {
+      "family": "mops",
+      "word": 494998592
+    },
+    {
+      "family": "mops",
+      "word": 488511410
+    },
+    {
+      "family": "mops",
+      "word": 492705714
+    },
+    {
+      "family": "mops",
+      "word": 496900018
+    },
+    {
+      "family": "mops",
+      "word": 486544990
+    },
+    {
+      "family": "mops",
+      "word": 490739294
+    },
+    {
+      "family": "mops",
+      "word": 494933598
+    },
+    {
+      "family": "mops",
+      "word": 487789597
+    },
+    {
+      "family": "mops",
+      "word": 491983901
+    },
+    {
+      "family": "mops",
+      "word": 496178205
+    },
+    {
+      "family": "mops",
+      "word": 486614080
+    },
+    {
+      "family": "mops",
+      "word": 490808384
+    },
+    {
+      "family": "mops",
+      "word": 495002688
+    },
+    {
+      "family": "mops",
+      "word": 488515506
+    },
+    {
+      "family": "mops",
+      "word": 492709810
+    },
+    {
+      "family": "mops",
+      "word": 496904114
+    },
+    {
+      "family": "mops",
+      "word": 486549086
+    },
+    {
+      "family": "mops",
+      "word": 490743390
+    },
+    {
+      "family": "mops",
+      "word": 494937694
+    },
+    {
+      "family": "mops",
+      "word": 487793693
+    },
+    {
+      "family": "mops",
+      "word": 491987997
+    },
+    {
+      "family": "mops",
+      "word": 496182301
+    },
+    {
+      "family": "mops",
+      "word": 486618176
+    },
+    {
+      "family": "mops",
+      "word": 490812480
+    },
+    {
+      "family": "mops",
+      "word": 495006784
+    },
+    {
+      "family": "mops",
+      "word": 488519602
+    },
+    {
+      "family": "mops",
+      "word": 492713906
+    },
+    {
+      "family": "mops",
+      "word": 496908210
+    },
+    {
+      "family": "mops",
+      "word": 486553182
+    },
+    {
+      "family": "mops",
+      "word": 490747486
+    },
+    {
+      "family": "mops",
+      "word": 494941790
+    },
+    {
+      "family": "mops",
+      "word": 487797789
+    },
+    {
+      "family": "mops",
+      "word": 491992093
+    },
+    {
+      "family": "mops",
+      "word": 496186397
+    },
+    {
+      "family": "mops",
+      "word": 486622272
+    },
+    {
+      "family": "mops",
+      "word": 490816576
+    },
+    {
+      "family": "mops",
+      "word": 495010880
+    },
+    {
+      "family": "mops",
+      "word": 488523698
+    },
+    {
+      "family": "mops",
+      "word": 492718002
+    },
+    {
+      "family": "mops",
+      "word": 496912306
+    },
+    {
+      "family": "mops",
+      "word": 486557278
+    },
+    {
+      "family": "mops",
+      "word": 490751582
+    },
+    {
+      "family": "mops",
+      "word": 494945886
+    },
+    {
+      "family": "mops",
+      "word": 487801885
+    },
+    {
+      "family": "mops",
+      "word": 491996189
+    },
+    {
+      "family": "mops",
+      "word": 496190493
+    },
+    {
+      "family": "mops",
+      "word": 486626368
+    },
+    {
+      "family": "mops",
+      "word": 490820672
+    },
+    {
+      "family": "mops",
+      "word": 495014976
+    },
+    {
+      "family": "mops",
+      "word": 488527794
+    },
+    {
+      "family": "mops",
+      "word": 492722098
+    },
+    {
+      "family": "mops",
+      "word": 496916402
+    },
+    {
+      "family": "mops",
+      "word": 486561374
+    },
+    {
+      "family": "mops",
+      "word": 490755678
+    },
+    {
+      "family": "mops",
+      "word": 494949982
+    },
+    {
+      "family": "mops",
+      "word": 487805981
+    },
+    {
+      "family": "mops",
+      "word": 492000285
+    },
+    {
+      "family": "mops",
+      "word": 496194589
+    },
+    {
+      "family": "mops",
+      "word": 486630464
+    },
+    {
+      "family": "mops",
+      "word": 490824768
+    },
+    {
+      "family": "mops",
+      "word": 495019072
+    },
+    {
+      "family": "mops",
+      "word": 488531890
+    },
+    {
+      "family": "mops",
+      "word": 492726194
+    },
+    {
+      "family": "mops",
+      "word": 496920498
+    },
+    {
+      "family": "mops",
+      "word": 486565470
+    },
+    {
+      "family": "mops",
+      "word": 490759774
+    },
+    {
+      "family": "mops",
+      "word": 494954078
+    },
+    {
+      "family": "mops",
+      "word": 487810077
+    },
+    {
+      "family": "mops",
+      "word": 492004381
+    },
+    {
+      "family": "mops",
+      "word": 496198685
+    },
+    {
+      "family": "mops",
+      "word": 486634560
+    },
+    {
+      "family": "mops",
+      "word": 490828864
+    },
+    {
+      "family": "mops",
+      "word": 495023168
+    },
+    {
+      "family": "mops",
+      "word": 488535986
+    },
+    {
+      "family": "mops",
+      "word": 492730290
+    },
+    {
+      "family": "mops",
+      "word": 496924594
+    },
+    {
+      "family": "mops",
+      "word": 486569566
+    },
+    {
+      "family": "mops",
+      "word": 490763870
+    },
+    {
+      "family": "mops",
+      "word": 494958174
+    },
+    {
+      "family": "mops",
+      "word": 487814173
+    },
+    {
+      "family": "mops",
+      "word": 492008477
+    },
+    {
+      "family": "mops",
+      "word": 496202781
+    },
+    {
+      "family": "mops",
+      "word": 486638656
+    },
+    {
+      "family": "mops",
+      "word": 490832960
+    },
+    {
+      "family": "mops",
+      "word": 495027264
+    },
+    {
+      "family": "mops",
+      "word": 488540082
+    },
+    {
+      "family": "mops",
+      "word": 492734386
+    },
+    {
+      "family": "mops",
+      "word": 496928690
+    },
+    {
+      "family": "mops",
+      "word": 486573662
+    },
+    {
+      "family": "mops",
+      "word": 490767966
+    },
+    {
+      "family": "mops",
+      "word": 494962270
+    },
+    {
+      "family": "mops",
+      "word": 487818269
+    },
+    {
+      "family": "mops",
+      "word": 492012573
+    },
+    {
+      "family": "mops",
+      "word": 496206877
+    },
+    {
+      "family": "mops",
+      "word": 486642752
+    },
+    {
+      "family": "mops",
+      "word": 490837056
+    },
+    {
+      "family": "mops",
+      "word": 495031360
+    },
+    {
+      "family": "mops",
+      "word": 488544178
+    },
+    {
+      "family": "mops",
+      "word": 492738482
+    },
+    {
+      "family": "mops",
+      "word": 496932786
+    },
+    {
+      "family": "mops",
+      "word": 486577758
+    },
+    {
+      "family": "mops",
+      "word": 490772062
+    },
+    {
+      "family": "mops",
+      "word": 494966366
+    },
+    {
+      "family": "mops",
+      "word": 487822365
+    },
+    {
+      "family": "mops",
+      "word": 492016669
+    },
+    {
+      "family": "mops",
+      "word": 496210973
+    },
+    {
+      "family": "mops",
+      "word": 486646848
+    },
+    {
+      "family": "mops",
+      "word": 490841152
+    },
+    {
+      "family": "mops",
+      "word": 495035456
+    },
+    {
+      "family": "mops",
+      "word": 488548274
+    },
+    {
+      "family": "mops",
+      "word": 492742578
+    },
+    {
+      "family": "mops",
+      "word": 496936882
+    },
+    {
+      "family": "mops",
+      "word": 486581854
+    },
+    {
+      "family": "mops",
+      "word": 490776158
+    },
+    {
+      "family": "mops",
+      "word": 494970462
+    },
+    {
+      "family": "mops",
+      "word": 487826461
+    },
+    {
+      "family": "mops",
+      "word": 492020765
+    },
+    {
+      "family": "mops",
+      "word": 496215069
+    },
+    {
+      "family": "mops",
+      "word": 486650944
+    },
+    {
+      "family": "mops",
+      "word": 490845248
+    },
+    {
+      "family": "mops",
+      "word": 495039552
+    },
+    {
+      "family": "mops",
+      "word": 488552370
+    },
+    {
+      "family": "mops",
+      "word": 492746674
+    },
+    {
+      "family": "mops",
+      "word": 496940978
+    },
+    {
+      "family": "mops",
+      "word": 486585950
+    },
+    {
+      "family": "mops",
+      "word": 490780254
+    },
+    {
+      "family": "mops",
+      "word": 494974558
+    },
+    {
+      "family": "mops",
+      "word": 487830557
+    },
+    {
+      "family": "mops",
+      "word": 492024861
+    },
+    {
+      "family": "mops",
+      "word": 496219165
+    },
+    {
+      "family": "mops",
+      "word": 486655040
+    },
+    {
+      "family": "mops",
+      "word": 490849344
+    },
+    {
+      "family": "mops",
+      "word": 495043648
+    },
+    {
+      "family": "mops",
+      "word": 488556466
+    },
+    {
+      "family": "mops",
+      "word": 492750770
+    },
+    {
+      "family": "mops",
+      "word": 496945074
+    },
+    {
+      "family": "mops",
+      "word": 486590046
+    },
+    {
+      "family": "mops",
+      "word": 490784350
+    },
+    {
+      "family": "mops",
+      "word": 494978654
+    },
+    {
+      "family": "mops",
+      "word": 487834653
+    },
+    {
+      "family": "mops",
+      "word": 492028957
+    },
+    {
+      "family": "mops",
+      "word": 496223261
+    },
+    {
+      "family": "mops",
+      "word": 486659136
+    },
+    {
+      "family": "mops",
+      "word": 490853440
+    },
+    {
+      "family": "mops",
+      "word": 495047744
+    },
+    {
+      "family": "mops",
+      "word": 488560562
+    },
+    {
+      "family": "mops",
+      "word": 492754866
+    },
+    {
+      "family": "mops",
+      "word": 496949170
+    },
+    {
+      "family": "mops",
+      "word": 486594142
+    },
+    {
+      "family": "mops",
+      "word": 490788446
+    },
+    {
+      "family": "mops",
+      "word": 494982750
+    },
+    {
+      "family": "mops",
+      "word": 487838749
+    },
+    {
+      "family": "mops",
+      "word": 492033053
+    },
+    {
+      "family": "mops",
+      "word": 496227357
+    },
+    {
+      "family": "mops",
+      "word": 486663232
+    },
+    {
+      "family": "mops",
+      "word": 490857536
+    },
+    {
+      "family": "mops",
+      "word": 495051840
+    },
+    {
+      "family": "mops",
+      "word": 488564658
+    },
+    {
+      "family": "mops",
+      "word": 492758962
+    },
+    {
+      "family": "mops",
+      "word": 496953266
+    },
+    {
+      "family": "mops",
+      "word": 486598238
+    },
+    {
+      "family": "mops",
+      "word": 490792542
+    },
+    {
+      "family": "mops",
+      "word": 494986846
+    },
+    {
+      "family": "mops",
+      "word": 487842845
+    },
+    {
+      "family": "mops",
+      "word": 492037149
+    },
+    {
+      "family": "mops",
+      "word": 496231453
+    },
+    {
+      "family": "mops",
+      "word": 486667328
+    },
+    {
+      "family": "mops",
+      "word": 490861632
+    },
+    {
+      "family": "mops",
+      "word": 495055936
+    },
+    {
+      "family": "mops",
+      "word": 488568754
+    },
+    {
+      "family": "mops",
+      "word": 492763058
+    },
+    {
+      "family": "mops",
+      "word": 496957362
+    },
+    {
+      "family": "mops",
+      "word": 486602334
+    },
+    {
+      "family": "mops",
+      "word": 490796638
+    },
+    {
+      "family": "mops",
+      "word": 494990942
+    },
+    {
+      "family": "mops",
+      "word": 487846941
+    },
+    {
+      "family": "mops",
+      "word": 492041245
+    },
+    {
+      "family": "mops",
+      "word": 496235549
+    },
+    {
+      "family": "mops",
+      "word": 432079936
+    },
+    {
+      "family": "mops",
+      "word": 432096320
+    },
+    {
+      "family": "mops",
+      "word": 432112704
+    },
+    {
+      "family": "mops",
+      "word": 433981362
+    },
+    {
+      "family": "mops",
+      "word": 433997746
+    },
+    {
+      "family": "mops",
+      "word": 434014130
+    },
+    {
+      "family": "mops",
+      "word": 432014942
+    },
+    {
+      "family": "mops",
+      "word": 432031326
+    },
+    {
+      "family": "mops",
+      "word": 432047710
+    },
+    {
+      "family": "mops",
+      "word": 434045981
+    },
+    {
+      "family": "mops",
+      "word": 434062365
+    },
+    {
+      "family": "mops",
+      "word": 434078749
+    },
+    {
+      "family": "mops",
+      "word": 432084032
+    },
+    {
+      "family": "mops",
+      "word": 432100416
+    },
+    {
+      "family": "mops",
+      "word": 432116800
+    },
+    {
+      "family": "mops",
+      "word": 433985458
+    },
+    {
+      "family": "mops",
+      "word": 434001842
+    },
+    {
+      "family": "mops",
+      "word": 434018226
+    },
+    {
+      "family": "mops",
+      "word": 432019038
+    },
+    {
+      "family": "mops",
+      "word": 432035422
+    },
+    {
+      "family": "mops",
+      "word": 432051806
+    },
+    {
+      "family": "mops",
+      "word": 434050077
+    },
+    {
+      "family": "mops",
+      "word": 434066461
+    },
+    {
+      "family": "mops",
+      "word": 434082845
+    },
+    {
+      "family": "mops",
+      "word": 432088128
+    },
+    {
+      "family": "mops",
+      "word": 432104512
+    },
+    {
+      "family": "mops",
+      "word": 432120896
+    },
+    {
+      "family": "mops",
+      "word": 433989554
+    },
+    {
+      "family": "mops",
+      "word": 434005938
+    },
+    {
+      "family": "mops",
+      "word": 434022322
+    },
+    {
+      "family": "mops",
+      "word": 432023134
+    },
+    {
+      "family": "mops",
+      "word": 432039518
+    },
+    {
+      "family": "mops",
+      "word": 432055902
+    },
+    {
+      "family": "mops",
+      "word": 434054173
+    },
+    {
+      "family": "mops",
+      "word": 434070557
+    },
+    {
+      "family": "mops",
+      "word": 434086941
+    },
+    {
+      "family": "mops",
+      "word": 432092224
+    },
+    {
+      "family": "mops",
+      "word": 432108608
+    },
+    {
+      "family": "mops",
+      "word": 432124992
+    },
+    {
+      "family": "mops",
+      "word": 433993650
+    },
+    {
+      "family": "mops",
+      "word": 434010034
+    },
+    {
+      "family": "mops",
+      "word": 434026418
+    },
+    {
+      "family": "mops",
+      "word": 432027230
+    },
+    {
+      "family": "mops",
+      "word": 432043614
+    },
+    {
+      "family": "mops",
+      "word": 432059998
+    },
+    {
+      "family": "mops",
+      "word": 434058269
+    },
+    {
+      "family": "mops",
+      "word": 434074653
+    },
+    {
+      "family": "mops",
+      "word": 434091037
+    },
+    {
+      "family": "lse128",
+      "word": 421625920
+    },
+    {
+      "family": "lse128",
+      "word": 423527346
+    },
+    {
+      "family": "lse128",
+      "word": 421560926
+    },
+    {
+      "family": "lse128",
+      "word": 421625856
+    },
+    {
+      "family": "lse128",
+      "word": 421625888
+    },
+    {
+      "family": "lse128",
+      "word": 423396349
+    },
+    {
+      "family": "lse128",
+      "word": 425820224
+    },
+    {
+      "family": "lse128",
+      "word": 427721650
+    },
+    {
+      "family": "lse128",
+      "word": 425755230
+    },
+    {
+      "family": "lse128",
+      "word": 425820160
+    },
+    {
+      "family": "lse128",
+      "word": 425820192
+    },
+    {
+      "family": "lse128",
+      "word": 427590653
+    },
+    {
+      "family": "lse128",
+      "word": 430014528
+    },
+    {
+      "family": "lse128",
+      "word": 431915954
+    },
+    {
+      "family": "lse128",
+      "word": 429949534
+    },
+    {
+      "family": "lse128",
+      "word": 430014464
+    },
+    {
+      "family": "lse128",
+      "word": 430014496
+    },
+    {
+      "family": "lse128",
+      "word": 431784957
+    },
+    {
+      "family": "lse128",
+      "word": 434208832
+    },
+    {
+      "family": "lse128",
+      "word": 436110258
+    },
+    {
+      "family": "lse128",
+      "word": 434143838
+    },
+    {
+      "family": "lse128",
+      "word": 434208768
+    },
+    {
+      "family": "lse128",
+      "word": 434208800
+    },
+    {
+      "family": "lse128",
+      "word": 435979261
+    },
+    {
+      "family": "lse128",
+      "word": 421597248
+    },
+    {
+      "family": "lse128",
+      "word": 423498674
+    },
+    {
+      "family": "lse128",
+      "word": 421532254
+    },
+    {
+      "family": "lse128",
+      "word": 421597184
+    },
+    {
+      "family": "lse128",
+      "word": 421597216
+    },
+    {
+      "family": "lse128",
+      "word": 423367677
+    },
+    {
+      "family": "lse128",
+      "word": 425791552
+    },
+    {
+      "family": "lse128",
+      "word": 427692978
+    },
+    {
+      "family": "lse128",
+      "word": 425726558
+    },
+    {
+      "family": "lse128",
+      "word": 425791488
+    },
+    {
+      "family": "lse128",
+      "word": 425791520
+    },
+    {
+      "family": "lse128",
+      "word": 427561981
+    },
+    {
+      "family": "lse128",
+      "word": 429985856
+    },
+    {
+      "family": "lse128",
+      "word": 431887282
+    },
+    {
+      "family": "lse128",
+      "word": 429920862
+    },
+    {
+      "family": "lse128",
+      "word": 429985792
+    },
+    {
+      "family": "lse128",
+      "word": 429985824
+    },
+    {
+      "family": "lse128",
+      "word": 431756285
+    },
+    {
+      "family": "lse128",
+      "word": 434180160
+    },
+    {
+      "family": "lse128",
+      "word": 436081586
+    },
+    {
+      "family": "lse128",
+      "word": 434115166
+    },
+    {
+      "family": "lse128",
+      "word": 434180096
+    },
+    {
+      "family": "lse128",
+      "word": 434180128
+    },
+    {
+      "family": "lse128",
+      "word": 435950589
+    },
+    {
+      "family": "lse128",
+      "word": 421605440
+    },
+    {
+      "family": "lse128",
+      "word": 423506866
+    },
+    {
+      "family": "lse128",
+      "word": 421540446
+    },
+    {
+      "family": "lse128",
+      "word": 421605376
+    },
+    {
+      "family": "lse128",
+      "word": 421605408
+    },
+    {
+      "family": "lse128",
+      "word": 423375869
+    },
+    {
+      "family": "lse128",
+      "word": 425799744
+    },
+    {
+      "family": "lse128",
+      "word": 427701170
+    },
+    {
+      "family": "lse128",
+      "word": 425734750
+    },
+    {
+      "family": "lse128",
+      "word": 425799680
+    },
+    {
+      "family": "lse128",
+      "word": 425799712
+    },
+    {
+      "family": "lse128",
+      "word": 427570173
+    },
+    {
+      "family": "lse128",
+      "word": 429994048
+    },
+    {
+      "family": "lse128",
+      "word": 431895474
+    },
+    {
+      "family": "lse128",
+      "word": 429929054
+    },
+    {
+      "family": "lse128",
+      "word": 429993984
+    },
+    {
+      "family": "lse128",
+      "word": 429994016
+    },
+    {
+      "family": "lse128",
+      "word": 431764477
+    },
+    {
+      "family": "lse128",
+      "word": 434188352
+    },
+    {
+      "family": "lse128",
+      "word": 436089778
+    },
+    {
+      "family": "lse128",
+      "word": 434123358
+    },
+    {
+      "family": "lse128",
+      "word": 434188288
+    },
+    {
+      "family": "lse128",
+      "word": 434188320
+    },
+    {
+      "family": "lse128",
+      "word": 435958781
+    },
+    {
+      "family": "lor",
+      "word": 148864032
+    },
+    {
+      "family": "lor",
+      "word": 148864978
+    },
+    {
+      "family": "lor",
+      "word": 148865023
+    },
+    {
+      "family": "lor",
+      "word": 148864957
+    },
+    {
+      "family": "lor",
+      "word": 1222605856
+    },
+    {
+      "family": "lor",
+      "word": 1222606802
+    },
+    {
+      "family": "lor",
+      "word": 1222606847
+    },
+    {
+      "family": "lor",
+      "word": 1222606781
+    },
+    {
+      "family": "lor",
+      "word": 2296347680
+    },
+    {
+      "family": "lor",
+      "word": 2296348626
+    },
+    {
+      "family": "lor",
+      "word": 2296348671
+    },
+    {
+      "family": "lor",
+      "word": 2296348605
+    },
+    {
+      "family": "lor",
+      "word": 3370089504
+    },
+    {
+      "family": "lor",
+      "word": 3370090450
+    },
+    {
+      "family": "lor",
+      "word": 3370090495
+    },
+    {
+      "family": "lor",
+      "word": 3370090429
+    },
+    {
+      "family": "lor",
+      "word": 144669728
+    },
+    {
+      "family": "lor",
+      "word": 144670674
+    },
+    {
+      "family": "lor",
+      "word": 144670719
+    },
+    {
+      "family": "lor",
+      "word": 144670653
+    },
+    {
+      "family": "lor",
+      "word": 1218411552
+    },
+    {
+      "family": "lor",
+      "word": 1218412498
+    },
+    {
+      "family": "lor",
+      "word": 1218412543
+    },
+    {
+      "family": "lor",
+      "word": 1218412477
+    },
+    {
+      "family": "lor",
+      "word": 2292153376
+    },
+    {
+      "family": "lor",
+      "word": 2292154322
+    },
+    {
+      "family": "lor",
+      "word": 2292154367
+    },
+    {
+      "family": "lor",
+      "word": 2292154301
+    },
+    {
+      "family": "lor",
+      "word": 3365895200
+    },
+    {
+      "family": "lor",
+      "word": 3365896146
+    },
+    {
+      "family": "lor",
+      "word": 3365896191
+    },
+    {
+      "family": "lor",
+      "word": 3365896125
+    },
+    {
+      "family": "ls64",
+      "word": 4164931648
+    },
+    {
+      "family": "ls64",
+      "word": 4164932592
+    },
+    {
+      "family": "ls64",
+      "word": 4164932182
+    },
+    {
+      "family": "ls64",
+      "word": 4164915264
+    },
+    {
+      "family": "ls64",
+      "word": 4164916208
+    },
+    {
+      "family": "ls64",
+      "word": 4164915798
+    },
+    {
+      "family": "ls64",
+      "word": 4163870784
+    },
+    {
+      "family": "ls64",
+      "word": 4163871728
+    },
+    {
+      "family": "ls64",
+      "word": 4163871318
+    },
+    {
+      "family": "ls64",
+      "word": 4163874880
+    },
+    {
+      "family": "ls64",
+      "word": 4163875824
+    },
+    {
+      "family": "ls64",
+      "word": 4163875414
+    }
+  ]
+}

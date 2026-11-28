@@ -77,12 +77,28 @@ extern "C" fn handle(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             if !pc.is_null() {
                 let recovery = super::access::recovery(*pc);
                 #[cfg(feature = "native-code")]
-                let recovery = recovery.or_else(|| crate::native_code::recovery(*pc));
+                let native = if recovery.is_none() {
+                    crate::native_code::recovery(*pc)
+                } else {
+                    None
+                };
+                #[cfg(feature = "native-code")]
+                let recovery = recovery.or_else(|| native.as_ref().map(|site| site.pc));
                 if let Some(recovery) = recovery {
                     if WINDOWS.iter().any(|slot| {
                         let base = slot.load(Ordering::Acquire);
                         base != 0 && address.wrapping_sub(base) < WINDOW
                     }) {
+                        #[cfg(feature = "native-code")]
+                        if let Some(site) = native {
+                            if let Some(register) = site.address {
+                                *context_register(context, register) = address as u64;
+                            }
+                            if let Some(register) = site.access {
+                                *context_register(context, register) =
+                                    context_memory_access(context);
+                            }
+                        }
                         *pc = recovery;
                         return;
                     }
@@ -159,6 +175,78 @@ extern "C" fn handle(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
     }
 }
 
+#[cfg(feature = "native-code")]
+unsafe fn context_register(context: *mut libc::c_void, register: usize) -> *mut u64 {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
+    unsafe {
+        (&raw mut (*context.cast::<libc::ucontext_t>()).uc_mcontext.regs[register]).cast()
+    }
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    unsafe {
+        let context = &mut *context.cast::<DarwinContext>();
+        // context_pc already validated the same machine pointer and size.
+        &raw mut (*context.machine).x[register]
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (context, register);
+        std::ptr::null_mut()
+    }
+}
+
+// Optional kernel ESR metadata is consumed only after an exact registered
+// native PC and owned fault VA match. No TLS, allocation or extension-state copy.
+#[cfg(feature = "native-code")]
+unsafe fn context_memory_access(context: *mut libc::c_void) -> u64 {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
+    unsafe {
+        // Linux UAPI struct sigcontext: 35 u64 fields, then 16-byte alignment
+        // and __reserved[4096]. ESR must be in this first reserved area, never
+        // in an extra-context allocation. Bionic/glibc expose different names.
+        let machine = &raw const (*context.cast::<libc::ucontext_t>()).uc_mcontext;
+        let records = std::slice::from_raw_parts(machine.cast::<u8>().add(288), 4096);
+        esr_access(records)
+    }
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    unsafe {
+        let machine = (*context.cast::<DarwinContext>()).machine;
+        let esr = std::ptr::read_unaligned((*machine).exception.as_ptr().add(8).cast::<u32>());
+        u64::from((esr >> 6) & 1)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = context;
+        2
+    }
+}
+#[cfg(all(
+    feature = "native-code",
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "aarch64", test)
+))]
+fn esr_access(records: &[u8]) -> u64 {
+    let mut offset = 0;
+    while offset + 16 <= records.len() {
+        let magic = u32::from_ne_bytes(records[offset..offset + 4].try_into().unwrap());
+        let size = u32::from_ne_bytes(records[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if size < 16 || !size.is_multiple_of(16) || size > records.len() - offset {
+            break;
+        }
+        if magic == 0x45535201 {
+            let esr = u64::from_ne_bytes(records[offset + 8..offset + 16].try_into().unwrap());
+            return (esr >> 6) & 1;
+        }
+        offset += size;
+    }
+    2
+}
+
 unsafe fn context_mask(context: *mut libc::c_void) -> *const libc::sigset_t {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: same kernel-provided ucontext as context_pc; passing its address
@@ -233,4 +321,29 @@ struct DarwinMachine {
     cs: u64,
     fs: u64,
     gs: u64,
+}
+
+#[cfg(all(
+    test,
+    feature = "native-code",
+    any(target_os = "linux", target_os = "android")
+))]
+mod esr_tests {
+    use super::esr_access;
+    #[test]
+    fn optional_esr_metadata_accepts_real_record_order_and_bounds() {
+        let mut records = [0u8; 64];
+        records[..4].copy_from_slice(&0x46508001u32.to_ne_bytes());
+        records[4..8].copy_from_slice(&32u32.to_ne_bytes());
+        records[32..36].copy_from_slice(&0x45535201u32.to_ne_bytes());
+        records[36..40].copy_from_slice(&16u32.to_ne_bytes());
+        assert_eq!(esr_access(&records), 0);
+        records[40..48].copy_from_slice(&64u64.to_ne_bytes());
+        assert_eq!(esr_access(&records), 1);
+        for size in [0u32, 8, 17, 80, u32::MAX] {
+            records[4..8].copy_from_slice(&size.to_ne_bytes());
+            assert_eq!(esr_access(&records), 2);
+        }
+        assert_eq!(esr_access(&[]), 2);
+    }
 }

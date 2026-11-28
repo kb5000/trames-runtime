@@ -232,19 +232,27 @@ impl Cpu {
                     // guest ALU/branch instructions and fallback execution.
                     engine.stats.native_instructions +=
                         exit.instructions - u64::from(exit.exit == native::Exit::Syscall);
-                    if exit.exit == native::Exit::NativeCall {
-                        return SliceOutcome::NativeCall {
-                            instructions: retired,
-                            pc: self.inner.pc,
-                            module: self.inner.x(16),
-                            function: self.inner.x(17),
-                        };
-                    }
-                    if exit.exit == native::Exit::Syscall {
-                        engine.stats.direct_syscall_exits += 1;
-                        return SliceOutcome::Syscall {
-                            instructions: retired,
-                        };
+                    match exit.exit {
+                        native::Exit::Continue => {}
+                        native::Exit::Yield => {
+                            return SliceOutcome::Yield {
+                                instructions: retired,
+                            }
+                        }
+                        native::Exit::NativeCall => {
+                            return SliceOutcome::NativeCall {
+                                instructions: retired,
+                                pc: self.inner.pc,
+                                module: self.inner.x(16),
+                                function: self.inner.x(17),
+                            }
+                        }
+                        native::Exit::Syscall => {
+                            engine.stats.direct_syscall_exits += 1;
+                            return SliceOutcome::Syscall {
+                                instructions: retired,
+                            };
+                        }
                     }
                     continue;
                 }

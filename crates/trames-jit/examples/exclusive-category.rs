@@ -69,7 +69,9 @@ fn measure(name: &str, words: &[u32], stride: u64, retry: u64, m: &mut impl CpuM
     state.registers[1] = DATA;
     state.registers[2] = TRIPS;
     let rounds = if name.starts_with("control-") { 64 } else { 1 };
-    for sample in 0..6 {
+    let samples = std::env::var("TRAMES_BENCH_SAMPLES").map_or(6, |n| n.parse().unwrap());
+    let warmup = std::env::var("TRAMES_BENCH_WARMUP").map_or(1, |n| n.parse().unwrap());
+    for sample in 0..samples {
         let before = engine.stats;
         let mut retired = 0;
         let mut ns = 0;
@@ -99,7 +101,7 @@ fn measure(name: &str, words: &[u32], stride: u64, retry: u64, m: &mut impl CpuM
         for (i, word) in words.iter().enumerate() {
             assert_eq!(m.fetch_u32(0x1000 + i as u64 * 4).unwrap(), *word);
         }
-        println!("{{\"workload\":\"{name}\",\"sample\":{sample},\"warmup\":{},\"ns\":{ns},\"rounds\":{rounds},\"retired\":{retired},\"extra_retry_instructions\":{extra},\"fallback\":{},\"native\":{}}}", sample == 0, engine.stats.fallback_instructions-before.fallback_instructions,engine.stats.native_instructions-before.native_instructions);
+        println!("{{\"workload\":\"{name}\",\"sample\":{sample},\"warmup\":{},\"ns\":{ns},\"rounds\":{rounds},\"retired\":{retired},\"extra_retry_instructions\":{extra},\"fallback\":{},\"native\":{}}}", sample < warmup, engine.stats.fallback_instructions-before.fallback_instructions,engine.stats.native_instructions-before.native_instructions);
     }
 }
 fn main() {
@@ -107,6 +109,8 @@ fn main() {
         eprintln!("Requires native-aarch64 on an AArch64 Linux/Android host");
         std::process::exit(2);
     }
+    let filter = std::env::var("TRAMES_BENCH_FILTER").ok();
+    let admits = |name: &str| filter.as_ref().is_none_or(|filter| name.contains(filter));
     let single = [
         0xc85ffc20, 0x91000400, 0xc803fc20, 0xb5ffffa3, 0xf1000442, 0x54ffff61, 0xd4000001,
     ];
@@ -124,10 +128,14 @@ fn main() {
         ("control-scalar-memory", scalar.as_slice(), 5, 0),
         ("control-integer", integer.as_slice(), 3, 0),
     ] {
-        measure(name, words, stride, retry, &mut memory(words));
+        if admits(name) {
+            measure(name, words, stride, retry, &mut memory(words));
+        }
     }
     let mut m = memory(&single);
     let mut registry = trames_memory::parallel::Registry::default();
     let mut view = m.parallel_view(&mut registry).unwrap();
-    measure("guarded-ldaxr-stlxr", &single, 6, 4, &mut view);
+    if admits("guarded-ldaxr-stlxr") {
+        measure("guarded-ldaxr-stlxr", &single, 6, 4, &mut view);
+    }
 }

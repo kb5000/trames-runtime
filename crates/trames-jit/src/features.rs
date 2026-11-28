@@ -7,6 +7,7 @@ pub(crate) struct Profile {
     pub raw: Features,
     pub allowed: Features,
     pub names: String,
+    pub lor: bool,
 }
 static PROFILE: OnceLock<Profile> = OnceLock::new();
 const NAMES: &[(usize, u8, &str)] = &[
@@ -41,6 +42,7 @@ const NAMES: &[(usize, u8, &str)] = &[
     (1, 16, "rng"),
     (1, 34, "cssc"),
     (1, 43, "mops"),
+    (1, 47, "lse128"),
 ];
 pub(crate) fn profile() -> &'static Profile {
     PROFILE.get_or_init(|| {
@@ -54,7 +56,7 @@ pub(crate) fn profile() -> &'static Profile {
         // the host. Stateful extensions wait for their real context-save path.
         let allowed = Features {
             hwcap: raw.hwcap & trames_interpreter::HWCAP,
-            hwcap2: raw.hwcap2 & trames_interpreter::HWCAP2,
+            hwcap2: raw.hwcap2 & (trames_interpreter::HWCAP2 | (1 << 47)),
         };
         let words = [allowed.hwcap, allowed.hwcap2];
         let names = NAMES
@@ -63,11 +65,14 @@ pub(crate) fn profile() -> &'static Profile {
             .map(|&(_, _, name)| name)
             .collect::<Vec<_>>()
             .join(" ");
-        Profile {
-            raw,
-            allowed,
-            names,
-        }
+        // Linux's HWCAP_CPUID ABI returns a system-wide safe, sanitized ID
+        // register. Hidden LOR fields remain zero; never probe a physical core.
+        let lor = if raw.hwcap & (1 << 11) != 0 {
+            let id: u64;
+            unsafe { std::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) id, options(nomem, nostack, preserves_flags)); }
+            (id >> 16) & 15 == 1
+        } else { false };
+        Profile { raw, allowed, names, lor }
     })
 }
 /// Cold translation gate. A missing extension faults when reached, rather than
@@ -79,6 +84,14 @@ pub(crate) fn permits(host: Features, word: u32) -> bool {
     ) {
         // LS64 needs the HWCAP3/device-memory contract, which this CPU profile
         // does not expose. Do not reinterpret it as LSE or software-emulate it.
+        return false;
+    }
+    if matches!(word & 0x3ffffc00, 0x08df7c00 | 0x089f7c00) {
+        return profile().lor;
+    }
+    // MOPS SETG also requires real allocation-tag ownership. The current JIT
+    // CPU does not advertise MTE, so no compatibility fill can implement it.
+    if word & 0xffe00c00 == 0x1dc00400 {
         return false;
     }
     if let Some(op) = crate::vector_ops::decode(word) {
@@ -312,6 +325,50 @@ mod tests {
                 },
                 word
             ));
+        }
+    }
+
+    #[test]
+    fn limited_ordering_uses_an_explicit_safe_host_gate_and_ls64_owns_no_device_contract() {
+        use trames_engine::{Cpu as Backend, SliceOutcome};
+        use trames_execution::Registers;
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let fixture =
+            include_str!("../../../docs/validation/jit-special-memory-20261128/category.words");
+        let words: Vec<_> = fixture
+            .lines()
+            .map(|line| u32::from_str_radix(line, 16).unwrap())
+            .collect();
+        let all = Features {
+            hwcap: u64::MAX,
+            hwcap2: u64::MAX,
+        };
+        for &word in &words[504..536] {
+            assert_eq!(permits(all, word), profile().lor);
+            if profile().lor {
+                continue;
+            }
+            let mut memory = Memory::default();
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.write_array(0x1000, word.to_le_bytes()).unwrap();
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let mut cpu = crate::Cpu::new(0x1000, 0x2800);
+            let mut engine = crate::Engine::default();
+            assert!(matches!(
+                cpu.run(&mut engine, &mut memory, 64),
+                SliceOutcome::Fault(_)
+            ));
+            assert_eq!(
+                (
+                    cpu.pc(),
+                    cpu.fault_retired(),
+                    engine.stats.fallback_instructions
+                ),
+                (0x1000, 0, 0)
+            );
+        }
+        for &word in &words[536..] {
+            assert!(!permits(all, word));
         }
     }
 

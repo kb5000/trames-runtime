@@ -8,6 +8,8 @@ use trames_memory::{CpuMemory, PAGE_SIZE};
 
 #[path = "exclusive.rs"]
 mod exclusive;
+#[path = "mops.rs"]
+mod mops;
 
 type Identity = (u64, u64, u64);
 type Key = (u64, u64, u8);
@@ -72,17 +74,19 @@ enum MemoryOps {
     Fused(Vec<Box<crate::memory_ops::Operation>>),
     Boundary(crate::system_ops::Boundary),
     Window(Box<exclusive::Window>),
+    Mops(mops::Plan),
 }
 impl MemoryOps {
     fn single(&self) -> Option<&crate::memory_ops::Operation> {
         match self {
             Self::Single(op) => Some(op),
-            Self::Fused(_) | Self::Boundary(_) | Self::Window(_) => None,
+            Self::Fused(_) | Self::Boundary(_) | Self::Window(_) | Self::Mops(_) => None,
         }
     }
     fn instructions(&self) -> u64 {
         match self {
             Self::Window(window) => window.instructions(),
+            Self::Mops(plan) => plan.instructions(),
             _ => 1,
         }
     }
@@ -92,6 +96,7 @@ impl MemoryOps {
             Self::Fused(ops) => ops.iter().map(|op| op.host_words()).sum(),
             Self::Boundary(_) => 0,
             Self::Window(window) => window.host_words(),
+            Self::Mops(plan) => plan.host_words(),
         }
     }
 }
@@ -146,6 +151,7 @@ pub(super) enum Exit {
     Continue,
     Syscall,
     NativeCall,
+    Yield,
 }
 
 /// One native entry owns this stack frame and its borrowed epoch pointers.
@@ -554,26 +560,27 @@ impl Cache {
                 })
         });
         self.remove(slot);
-        let (block, memory_op) =
-            if let Some(window) = exclusive::Window::compile(memory, pc, limit, mode)? {
-                (None, Some(Box::new(MemoryOps::Window(Box::new(window)))))
-            } else if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
-                (Some(compiled.block), compiled.memory)
-            } else {
-                (
-                    None,
-                    if let Some(boundary) = crate::system_ops::Boundary::decode(
-                        memory
-                            .fetch_u32(pc)
-                            .map_err(|error| CpuFault::Memory { pc, error })?,
-                    ) {
-                        Some(Box::new(MemoryOps::Boundary(boundary)))
-                    } else {
-                        crate::memory_ops::Operation::compile(memory, pc)?
-                            .map(|op| Box::new(MemoryOps::Single(op)))
-                    },
-                )
-            };
+        let (block, memory_op) = if let Some(plan) = mops::Plan::compile(memory, pc, limit)? {
+            (None, Some(Box::new(MemoryOps::Mops(plan))))
+        } else if let Some(window) = exclusive::Window::compile(memory, pc, limit, mode)? {
+            (None, Some(Box::new(MemoryOps::Window(Box::new(window)))))
+        } else if let Some(compiled) = compile(memory, pc, limit, slot, mode)? {
+            (Some(compiled.block), compiled.memory)
+        } else {
+            (
+                None,
+                if let Some(boundary) = crate::system_ops::Boundary::decode(
+                    memory
+                        .fetch_u32(pc)
+                        .map_err(|error| CpuFault::Memory { pc, error })?,
+                ) {
+                    Some(Box::new(MemoryOps::Boundary(boundary)))
+                } else {
+                    crate::memory_ops::Operation::compile(memory, pc)?
+                        .map(|op| Box::new(MemoryOps::Single(op)))
+                },
+            )
+        };
         if let Some(op) = &memory_op {
             self.cold.compilation.blocks += u64::from(block.is_none());
             self.cold.compilation.host_words += op.host_words();
@@ -921,6 +928,30 @@ impl Cache {
                             instructions: run.instructions,
                             blocks: 1,
                             exit: Exit::Continue,
+                        }));
+                    }
+                    Err((retired, error)) => {
+                        self.cold.fault_progress = (retired, u64::from(retired != 0));
+                        return Err(error);
+                    }
+                }
+            }
+            if let Some(MemoryOps::Mops(plan)) = self.node(handle).and_then(|n| n.memory.as_deref())
+            {
+                match plan.execute(cpu, memory) {
+                    Ok(run) => {
+                        self.cold.memory.instructions += run.instructions;
+                        self.cold.memory.staged += u64::from(!run.direct);
+                        self.last = Some(handle);
+                        self.links_stats.entries += 1;
+                        return Ok(Some(Executed {
+                            instructions: run.instructions,
+                            blocks: 1,
+                            exit: if run.yielding {
+                                Exit::Yield
+                            } else {
+                                Exit::Continue
+                            },
                         }));
                     }
                     Err((retired, error)) => {
@@ -2198,7 +2229,7 @@ impl Assembler {
         }
         let output = match op.atomic {
             Some(Atomic::Cas { compare, .. }) => Some(compare),
-            Some(Atomic::Rmw { .. }) => Some(op.rt),
+            Some(Atomic::Rmw { .. } | Atomic::RmwPair) => Some(op.rt),
             None if op.load => Some(op.rt),
             _ => None,
         };
@@ -2235,6 +2266,11 @@ impl Assembler {
                 }
             }
             vector_second
+        } else if matches!(op.atomic, Some(Atomic::RmwPair)) {
+            Some(self.output(
+                op.second.unwrap() as u32,
+                scratch | (1 << base) | (1 << target) | (1 << source),
+            ))
         } else if cas_pair {
             Some(self.output(
                 (output.unwrap() + 1) as u32,
@@ -2269,6 +2305,9 @@ impl Assembler {
                 .extend_from_slice(&[0xa9007e3f, 0xa9017e3f, 0xa9027e3f, 0xa9037e3f]);
         } else {
             self.words.push(match op.atomic {
+                Some(Atomic::RmwPair) => {
+                    op.opcode.unwrap() | (target2.unwrap() << 16) | (17 << 5) | target
+                }
                 Some(Atomic::Rmw { .. }) => {
                     op.opcode.unwrap() | (source << 16) | (17 << 5) | target
                 }
@@ -3238,6 +3277,12 @@ impl Code {
         let function: unsafe extern "C" fn(*mut u8, u64, u64) -> PairValues =
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(pointer, first, second) }
+    }
+    #[cfg(test)]
+    pub(super) fn published_words(&self) -> &[u32] {
+        unsafe {
+            std::slice::from_raw_parts(self.pointer.cast::<u32>(), self.word_count() as usize)
+        }
     }
     pub(super) fn word_count(&self) -> u64 {
         self.words as u64

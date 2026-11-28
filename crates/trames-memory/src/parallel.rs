@@ -1316,6 +1316,10 @@ impl CpuMemory for View {
         })
     }
     #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_span(&mut self, address: u64, len: usize, write: bool) -> Option<usize> {
+        unsafe { crate::cpu_memory::native_span(self, address, len, write) }
+    }
+    #[cfg(feature = "native-code")]
     unsafe fn cpu_exclusive_page(&mut self, address: u64, len: usize) -> Option<crate::NativePage> {
         if self.private_mode != PrivateMode::Exclusive || !address.is_multiple_of(len as u64) {
             return None;

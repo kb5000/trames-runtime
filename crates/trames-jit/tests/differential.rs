@@ -4239,3 +4239,9 @@ mod arithmetic_category;
 
 #[path = "support/exclusive_category.rs"]
 mod exclusive_category;
+
+#[path = "support/mops_category.rs"]
+mod mops_category;
+
+#[path = "support/special_memory_category.rs"]
+mod special_memory_category;

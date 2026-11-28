@@ -1,0 +1,117 @@
+{
+  "created_utc": "2026-11-28T07:43:05.585269+00:00",
+  "baseline_runtime": "f595ae2a78e81a316fb842dd093c8c5c1eee005a",
+  "baseline_android": "cf631789e28e3f819ffdb23f57849d956ca2d232",
+  "native_host": {
+    "architecture": "aarch64",
+    "kernel": "7.0.0-44-generic",
+    "page_size": 4096,
+    "hwcap": "0xefb3ffff",
+    "hwcap2": "0x2000100326181",
+    "mops": false,
+    "lse128": false,
+    "lor": false
+  },
+  "isa_model": {
+    "version": "QEMU 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)",
+    "hwcap": "0xeffffffb",
+    "hwcap2": "0x18007fc77fff",
+    "mops": true,
+    "lse128": false,
+    "lor": false,
+    "algorithm": "Option A",
+    "package_sha256": "c73711af02b97cd5e2667e735d9c06890c57165517110ca4e646c95a7083158d",
+    "binary_sha256": "088500814a5a8e0e0ee3cad0f6c600b5dfa261f77cc0e6460f81b0b616e09509",
+    "package_url": "https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_10.0.13+ds-0+deb13u1_arm64.deb"
+  },
+  "checks": {
+    "linux_jit_debug": [
+      26,
+      105
+    ],
+    "linux_jit_release": [
+      26,
+      105
+    ],
+    "apple_jit_fallback": 100,
+    "memory_unit_existing_ignored": 3,
+    "final_range_units_each_platform": 2,
+    "llvm_fixture": 548,
+    "qemu_mops_unit_selected": 6,
+    "qemu_mops_differential_selected": 7,
+    "qemu_optional_contract_selected": 2,
+    "qemu_android_probe_selected": 1,
+    "android_cpu_default": 1,
+    "android_cpu_jit": 2,
+    "ios_interpreter_jit_absent": true,
+    "actual_ipad_jit_absent": true,
+    "ios_native_code_absent": true,
+    "amd64_memory_and_jit_strict_clippy": true,
+    "compile_time_mops_abi_assertions": true,
+    "apple_final_range_filter_selected": 5,
+    "linux_memory": [
+      287,
+      2,
+      4
+    ],
+    "apple_memory": [
+      283,
+      2,
+      4
+    ],
+    "static_recovery_priority_native_fault_paths": true,
+    "execution_boundaries": true
+  },
+  "controls": {
+    "cpu_affinity": 0,
+    "run_order": [
+      "before",
+      "after",
+      "after",
+      "before",
+      "before",
+      "after",
+      "after",
+      "before"
+    ],
+    "samples_each_workload_per_run": 48,
+    "warmup_each_workload_per_run": 8,
+    "rounds_per_sample": 64,
+    "guest_trips_per_round": 262144,
+    "harness_same_tokens": true,
+    "before_harness_sha256": "b823165414d06b0c9e97d7450c023c482a2263de2888c1b8683c1fbd98697ce4",
+    "after_harness_sha256": "94d0d42fa738a6f1139e08e0aaa5db8a03e40c8110f58b1989ffdb5a699969ee",
+    "reused_after_fault_only_priority_and_compile_time_abi_changes": true
+  },
+  "outstanding_positive_hardware": [
+    "MOPS",
+    "LSE128",
+    "LOR",
+    "Option-B MOPS/migration",
+    "Android app-UID/ART and 16-KiB device"
+  ],
+  "dependency_tree_sha256": {
+    "jit-special-ios-interpreter-tree.txt": "a7df3fa13752dcabc12d3288f161ddeb76008ac7c7d6a3a6aa060f60ce2b78b2",
+    "jit-special-actual-ipad-tree.txt": "6a9e0144a0da817c755a29a036cba4c313d1b0ea2bf545cb2cc80b68b8b3e6a0"
+  },
+  "source_sha256": {
+    "crates/trames-jit/examples/exclusive-category.rs": "94d0d42fa738a6f1139e08e0aaa5db8a03e40c8110f58b1989ffdb5a699969ee",
+    "crates/trames-jit/src/features.rs": "b4b2ca1c0eb098c7403ab59ade18848c6ac12621d902ff1ecfb3f905ac88fb29",
+    "crates/trames-jit/src/lib.rs": "fa970ac3632f068992b2b27cafe6e90ffad3cbd6eb90718dd70a769b7a92f70d",
+    "crates/trames-jit/src/memory_ops.rs": "e457d41b1ac30deab71fbf049c7b8fc29ca387583a575fbd881849902c8fcedf",
+    "crates/trames-jit/src/mops.rs": "652c19ffb5b0f59f4288a3c3d8c7a8802d8058e5bf34fc96c629bcc57bf29b4b",
+    "crates/trames-jit/src/mops_memory.rs": "1633502361cad2b93cca81ab01ed40a22fd101f5d294b8518806cc92e9ab1a15",
+    "crates/trames-jit/src/native.rs": "6bf7605534b0785a256364e58a0b0366135aea9a81ff7b2bad2a8a155145ad71",
+    "crates/trames-jit/tests/differential.rs": "40bafb1111af836cfe7c5146b390ac710c73ae863ba71ab4b2e6ea028f2b5d18",
+    "crates/trames-jit/tests/support/mops_category.rs": "bc2337b1cf80cbedcd32dae37f98babb55beee42843948f3476f02384d71f26c",
+    "crates/trames-jit/tests/support/special_memory_category.rs": "a703dc50c343dce4211b5960942b08d1b9278616f0eacd9fd90b50cd4ccfc7a5",
+    "crates/trames-memory/src/cpu_memory.rs": "d6f634fc36d3ed8ae14a96da1369ccb5b83449f236e1f6436d587d26caa7b05f",
+    "crates/trames-memory/src/lib.rs": "ff60a6af3921f3ecaa1d1a71ebdf772acce1e1413bbc965e3265c35c4e1342e8",
+    "crates/trames-memory/src/mmu/fault.rs": "de68edce68ba1b1ba253b3da68c94f022e1052ba2d694a0f7ee092af25d1729f",
+    "crates/trames-memory/src/mmu/host/native_range.rs": "e0a02c571101de0c7873f6b1c69c1ca498a50c561a06c533b47d48febd66fd16",
+    "crates/trames-memory/src/mmu/host.rs": "ba6f2ed2c908a0ad561682ba0583bab38e90f833375f8f6ea99c1a3922eb9768",
+    "crates/trames-memory/src/native_code.rs": "dcdeba4c7587871c137426b9cdacc05e7ba4c12aef9eea86a83d261ea8b42f71",
+    "crates/trames-memory/src/parallel/native.rs": "c8668cdcc675c64e5560f2a40222230d820741d161d42f11949182283be70a59",
+    "crates/trames-memory/src/parallel.rs": "4cc141a9a1e9c88a30aea8717b8754b16a995a761064dc02df0b5b0f1dc1a473"
+  }
+}

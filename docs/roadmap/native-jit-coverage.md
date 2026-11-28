@@ -50,23 +50,32 @@ Compilation, Linux execution and Android app-UID/device acceptance are distinct.
   preserving ABA invalidation and worker migration. See
   [exclusive-category validation](../validation/jit-exclusive-20261128.md).
 
-LS64 is rejected because this profile does not own its HWCAP3/device-memory
-contract; LSE128 remains unadvertised. This does not change the interpreter-only
-backend's compatibility policy. New stateful or later ISA features need explicit
-shared-CPU ABI ownership; a closed fixed-width category is not full host-ISA
-coverage.
+- Special memory: all CPYF/CPY/SET P/M/E option combinations use real MOPS
+  instructions, protected canonical aliases or the original checked byte
+  transport, and original GPR/NZCV progress. LSE128 SWPP/LDCLRP/LDSETP retain two
+  independent in/out registers, all orderings and the original atomic domain.
+  LDLAR/STLLR retain real opcodes behind safe host admission. Missing/unowned
+  capabilities fault when reached; LS64 and tag-setting MOPS SETG remain rejected
+  without their Device-memory/MTE contracts. The independent LLVM fixture has
+  548 encodings. Actual Linux/Apple checks and MOPS-positive model acceptance
+  are distinguished from outstanding positive MOPS/LSE128/LOR hardware and
+  Android app-UID/large-page acceptance. See
+  [special-memory validation](../validation/jit-special-memory-20261128.md).
+
+LSE128 is exposed only when the process host provides it. LS64 and full hardware
+PAC/BTI/MTE remain unadvertised without their required shared-CPU/memory ownership.
+This does not change the interpreter-only backend's compatibility policy. New
+stateful/later ISA features still need explicit ABI ownership; a closed fixed-width
+category is not full host-ISA coverage.
 
 ## Remaining categories
 
-1. Special memory: MOPS, optional LSE128 and LS64 only with a host ABI and memory
-   contract that can actually execute their hardware semantics. LDLAR/STLLR need
-   explicit FEAT_LOR host admission; do not silently strengthen them to LDAR/STLR.
-2. Existing non-hint PAC/MTE compatibility paths: authenticated branches/returns,
+1. Existing non-hint PAC/MTE compatibility paths: authenticated branches/returns,
    authenticated loads, pointer/tag arithmetic and allocation-tag operations.
    PAC/BTI hints are already covered; full hardware PAC/BTI/MTE and stateful
    SVE/SME remain unadvertised pending shared-CPU ABI ownership. Do not substitute
-   new software extension state. Unadvertised LSE128/LS64 and absent host
-   extensions fault when reached; they are not interpreter-provided JIT features.
+   new software extension state. Unowned LS64/SETG and absent host extensions
+   fault when reached; they are not interpreter-provided JIT features.
 
 Keep native capability admission and reserved-encoding decisions in compilation.
 Do not add guest-text rewrites, hot preflights, stronger ordinary-memory ordering,

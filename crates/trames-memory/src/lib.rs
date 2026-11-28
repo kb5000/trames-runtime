@@ -30,7 +30,7 @@ mod mmu;
 mod native_code;
 use mmu::PageBytes;
 #[cfg(feature = "native-code")]
-pub use native_code::{NativeCodeFixups, NativePage};
+pub use native_code::{NativeCodeFixups, NativeOperand, NativePage};
 mod native_access;
 #[cfg(feature = "native-code")]
 mod native_exclusive;

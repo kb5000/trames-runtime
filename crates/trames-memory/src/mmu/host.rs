@@ -4,7 +4,11 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
+#[cfg(feature = "native-code")]
+mod native_range;
 mod reclaim;
+#[cfg(feature = "native-code")]
+pub(crate) use native_range::NativeRange;
 
 // Sparse Go heaps/libraries and retained fork slots must not reserve 32MiB
 // for every small live range. Still a power of two and >= any host granule.
@@ -202,36 +206,7 @@ impl CpuMapping {
                 .as_ptr()
                 .add(source_offset)
                 .cast::<libc::c_void>();
-            #[cfg(target_os = "linux")]
-            let ok = libc::mremap(
-                source,
-                0,
-                len,
-                libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
-                target,
-            ) == target;
-            #[cfg(target_os = "android")]
-            let ok = android_clone_alias(source, target, len);
-            #[cfg(target_vendor = "apple")]
-            let ok = {
-                let mut address = target as u64;
-                let (mut current, mut maximum) = (0, 0);
-                mach_vm_remap(
-                    mach_task_self_,
-                    &mut address,
-                    len as u64,
-                    0,
-                    0x4000,
-                    mach_task_self_,
-                    source as u64,
-                    0,
-                    &mut current,
-                    &mut maximum,
-                    2,
-                ) == 0
-                    && address == target as u64
-            };
-            ok
+            clone_alias(source, target, len)
         }
     }
     pub fn protect(&self, offset: usize, len: usize, permissions: i32) -> bool {
@@ -250,6 +225,43 @@ impl Drop for CpuMapping {
         }
     }
 }
+/// Clone non-executable retained RAM into an already owned reservation. Both
+/// ordinary CPU windows and variable-sized native operands share this primitive.
+unsafe fn clone_alias(source: *mut libc::c_void, target: *mut libc::c_void, len: usize) -> bool {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let ok = libc::mremap(
+            source,
+            0,
+            len,
+            libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+            target,
+        ) == target;
+        #[cfg(target_os = "android")]
+        let ok = android_clone_alias(source, target, len);
+        #[cfg(target_vendor = "apple")]
+        let ok = {
+            let mut address = target as u64;
+            let (mut current, mut maximum) = (0, 0);
+            mach_vm_remap(
+                mach_task_self_,
+                &mut address,
+                len as u64,
+                0,
+                0x4000,
+                mach_task_self_,
+                source as u64,
+                0,
+                &mut current,
+                &mut maximum,
+                2,
+            ) == 0
+                && address == target as u64
+        };
+        ok
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     static mach_task_self_: libc::mach_port_t;

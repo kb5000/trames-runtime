@@ -1,0 +1,5 @@
+    Checking trames-memory v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-memory)
+    Checking trames-engine v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-engine)
+    Checking trames-interpreter v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-interpreter)
+    Checking trames-jit v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-jit)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.65s

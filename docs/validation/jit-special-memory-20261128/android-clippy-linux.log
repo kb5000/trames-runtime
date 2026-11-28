@@ -1,0 +1,9 @@
+    Checking trames-execution v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-execution)
+    Checking trames-host-compute v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-host-compute)
+    Checking trames-shared v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-shared)
+    Checking trames-memory v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-memory)
+    Checking trames-engine v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-engine)
+    Checking trames-interpreter v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-interpreter)
+    Checking trames-jit v1.3.0 (/mnt/trames-output/jit-special-android-source/runtime/crates/trames-jit)
+    Checking trames-android-core v0.1.0 (/mnt/trames-output/jit-special-android-source/crates/trames-android-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s

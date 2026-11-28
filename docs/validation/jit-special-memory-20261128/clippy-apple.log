@@ -1,0 +1,8 @@
+    Checking trames-execution v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-execution)
+    Checking trames-host-compute v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-host-compute)
+    Checking trames-shared v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-shared)
+    Checking trames-memory v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-memory)
+    Checking trames-engine v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-engine)
+    Checking trames-interpreter v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-interpreter)
+    Checking trames-jit v1.3.0 (/Users/main/dev/trames/target/local-ci/io/jit-special-source/crates/trames-jit)
+    Finished `dev` profile [unoptimized] target(s) in 2.22s

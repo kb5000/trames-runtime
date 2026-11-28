@@ -1,0 +1,11 @@
+
+running 7 tests
+test mops_category::absent_mops_faults_at_reached_pc_without_interpreter_entry ... ok
+test mops_category::entire_mops_copy_move_set_options_preserve_banks_bytes_and_slice_budgets ... ok
+test mops_category::mops_memory_faults_publish_the_real_stage_dirty_prefix_and_original_error ... ok
+test mops_category::mops_overlap_zero_fill_and_long_cooperative_progress_use_real_stages ... ok
+test mops_category::mops_preserves_independent_top_bytes_and_zero_length_ignores_unmapped_operands ... ok
+test mops_category::mops_writes_share_the_original_reservation_domain_without_clearing_read_only_tokens ... ok
+test mops_category::revoked_private_mops_aliases_rejoin_checked_transport_without_interpreter_entry ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 35.27s

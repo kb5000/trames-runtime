@@ -1326,3 +1326,37 @@ See [category validation](../validation/jit-exclusive-20261128.md) for the close
 instruction list, independent encodings, state/fault/concurrency acceptance and
 matched CPU-only measurements. Stateful extensions and Android device acceptance
 are separate work.
+
+
+## Native special-memory operands
+
+MOPS keeps actual D/S/N/NZCV progress in the existing CPU banks. Cold cache
+compilation owns capability/encoding decisions and adjacent P/M/E code entries,
+including prior stages needed by the Linux kernel's mismatch restart. Short
+complete private ranges use their original protected aliases directly. Larger
+operands use variable protected VA that shares the original MMU budget and fault
+registry; it reserves the full remaining range but maps only admitted canonical
+segments or checked staging fragments. Overlap retains a common address bias.
+No task extension model, full CPU copy, global lock, resource thread or guest-text
+rewrite is introduced. Instruction budgets do not retire partially executed stages.
+
+Multi-page export is an explicit Memory/View opt-in: single-page providers do not
+inherit stability accidentally. All aliases end before a provider call or CPU
+entry ends. Reset replaces mappings with inaccessible anonymous VA, releasing
+physical references. Ordinary private copies use neither Rust byte snapshots nor
+new memory fences. Opaque/shared/unrepresentable guest groups keep the original
+per-page read/write and publication model; only actual hardware-completed bytes
+are published. A failed write restores the first unpublished checkpoint. This
+checked transport does not select/emulate a MOPS algorithm or synthesize its flags.
+
+Native fixups optionally deliver actual FAR/ESR access metadata in declared
+AArch64 caller-saved registers. The signal path still requires an exact registered
+PC and owned VA, and uses no TLS, heap allocation or locks. The descriptor
+and range owner compile only with `native-code`; the ESR parser has an ARM64
+production cfg. LSE128 pair RMW instructions use the original atomic byte guard,
+ordering and reservation/ABA domain. LOR uses its own real opcode and safe host
+gate; LS64 and SETG cannot acquire software support through an unowned memory ABI.
+
+See [special-memory validation](../validation/jit-special-memory-20261128.md)
+for exact coverage, platform checks, emulated versus real hardware acceptance,
+4/16/64-KiB guard-layout tests, VA capacity limits and ordinary-path controls.

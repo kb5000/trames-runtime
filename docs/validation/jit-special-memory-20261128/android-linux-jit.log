@@ -1,0 +1,15 @@
+   Compiling trames-android-core v0.1.0 (/mnt/trames-output/jit-special-android-source/crates/trames-android-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running unittests src/lib.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-android-core/d9508bc8ef4a68e3/out/trames_android_core-d9508bc8ef4a68e3)
+
+running 2 tests
+test tests::special_memory_probe_uses_only_host_admitted_native_stages ... ok
+test tests::guest_cpu_probe_keeps_original_instructions_and_exact_exit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests trames_android_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

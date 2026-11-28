@@ -1,0 +1,21 @@
+   Compiling trames-memory v1.3.0 (/mnt/trames-output/jit-special-source/crates/trames-memory)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.06s
+     Running unittests src/lib.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-memory/b3e22a1eb716b2db/out/trames_memory-b3e22a1eb716b2db)
+
+running 2 tests
+test mmu::host::native_range::tests::canonical_aliases_and_staging_keep_guards_and_reset_physical_ownership ... ok
+test mmu::host::native_range::tests::variable_operands_share_the_original_budget_and_release_on_failure ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 288 filtered out; finished in 0.00s
+
+     Running tests/metadata_allocations.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-memory/fa2cc3161328edef/out/metadata_allocations-fa2cc3161328edef)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/translation.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-memory/0e005e11fc59d1a8/out/translation-0e005e11fc59d1a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s

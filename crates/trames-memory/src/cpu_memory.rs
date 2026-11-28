@@ -62,6 +62,38 @@ fn atomic_transport<M: CpuMemory + ?Sized, T>(
     Ok((value, false))
 }
 
+/// Memory/View retain all protected aliases across metadata-only page exports.
+/// # Safety
+/// Caller proves this stability for the original MMU, not arbitrary embeddings.
+#[cfg(feature = "native-code")]
+pub(crate) unsafe fn native_span<M: CpuMemory + ?Sized>(
+    memory: &mut M,
+    address: u64,
+    len: usize,
+    write: bool,
+) -> Option<usize> {
+    let address = address & 0x00ff_ffff_ffff_ffff;
+    let end = address.checked_add(len as u64)?;
+    if len == 0 || end > crate::ADDRESS_LIMIT {
+        return None;
+    }
+    let mut first = None;
+    let mut page = address & !(PAGE_SIZE - 1);
+    while page < end {
+        let exported = unsafe { memory.cpu_native_page(page, write) }?;
+        let pointer = if write { exported.write } else { exported.read };
+        if pointer == 0 || exported.base != page {
+            return None;
+        }
+        let start = *first.get_or_insert(pointer);
+        if pointer != start.checked_add((page - (address & !(PAGE_SIZE - 1))) as usize)? {
+            return None;
+        }
+        page += PAGE_SIZE;
+    }
+    first?.checked_add((address & (PAGE_SIZE - 1)) as usize)
+}
+
 pub trait CpuMemory {
     /// Cold embedding capability: RAM and publication obey the host memory model.
     /// Unknown embeddings retain their existing abstract fence/interpreter path.
@@ -186,6 +218,23 @@ pub trait CpuMemory {
     /// Never retain an export across CPU entries, mapping edits or a syscall.
     #[cfg(feature = "native-code")]
     unsafe fn cpu_native_page(&mut self, _address: u64, _write: bool) -> Option<crate::NativePage> {
+        None
+    }
+    /// Export one contiguous resident protected span. This composes the existing
+    /// page loans without allocation, population, permission changes or callbacks.
+    /// Fragmented/opaque/shared storage declines to the original checked path.
+    ///
+    /// # Safety
+    /// The cpu_native_page loan contract applies to the entire returned span.
+    /// Further exports are permitted; discard all pointers on a decline before
+    /// any checked provider access, mapping change, syscall or slice exit.
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_span(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _write: bool,
+    ) -> Option<usize> {
         None
     }
     /// Admit one closed, same-address native LL/SC window on already resident
@@ -707,6 +756,10 @@ impl CpuMemory for Memory {
     #[cfg(feature = "native-code")]
     unsafe fn cpu_native_page(&mut self, address: u64, write: bool) -> Option<crate::NativePage> {
         self.export_native_page(address, write, false)
+    }
+    #[cfg(feature = "native-code")]
+    unsafe fn cpu_native_span(&mut self, address: u64, len: usize, write: bool) -> Option<usize> {
+        unsafe { native_span(self, address, len, write) }
     }
     #[cfg(feature = "native-code")]
     unsafe fn cpu_exclusive_page(&mut self, address: u64, len: usize) -> Option<crate::NativePage> {

@@ -1,0 +1,10 @@
+
+running 6 tests
+test native::mops::protected_tests::failed_checked_publication_restores_the_first_unpublished_instruction_checkpoint ... ok
+test native::mops::protected_tests::protected_four_kib_fragments_keep_exact_bytes_on_four_sixteen_and_sixty_four_kib_guards ... ok
+test native::mops::recovery_tests::recovery_consumes_real_data_abort_address_and_access_without_tls_or_cpu_copies ... ok
+test native::mops::tests::llvm_mops_fixture_and_resume_entries_keep_consecutive_real_stages ... ok
+test native::mops::tests::memory_translation_reads_both_real_architectural_progress_formats ... ok
+test native::mops::tests::native_mops_stage_fragments_preserve_real_register_and_nzcv_progress ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 2.13s
