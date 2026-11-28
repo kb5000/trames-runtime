@@ -1,0 +1,103 @@
+   Compiling trames-host-compute v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-host-compute)
+   Compiling trames-execution v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-execution)
+   Compiling trames-shared v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-shared)
+   Compiling trames-memory v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-memory)
+   Compiling trames-engine v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-engine)
+   Compiling trames-interpreter v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-interpreter)
+   Compiling trames-jit v1.3.0 (/Users/main/dev/trames/target/jit-vmem-source/crates/trames-jit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.02s
+     Running unittests src/lib.rs (target/debug/build/trames-host-compute/1e29d9ee17502893/out/trames_host_compute-1e29d9ee17502893)
+
+running 4 tests
+test tests::fp16_bit_carriers_and_refinement_special_values ... ok
+test tests::scalar_and_packed_arithmetic_are_native ... ok
+test tests::scope_restores_control_and_status_on_unwind ... ok
+test tests::concurrent_scopes_keep_each_threads_status_and_rounding ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/trames-jit/4f3860579073cee8/out/trames_jit-4f3860579073cee8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/differential.rs (target/debug/build/trames-jit/58ad60b240b6e82c/out/differential-58ad60b240b6e82c)
+
+running 61 tests
+test a_running_fp_loop_observes_parallel_code_publication_at_its_block_guard ... ok
+test affine_address_reuse_rechecks_changed_bases_indices_sp_and_operand_width ... ok
+test affine_runs_join_only_adjacent_admitted_pages_and_never_bridge_holes ... ok
+test adjacent_syscalls_always_return_to_runtime_between_entries ... ok
+test branch_link_fault_accounting_and_page_boundary ... ok
+test fp_cached_code_and_status_are_revalidated_after_instruction_replacement ... ok
+test exclusive_reservation_survives_native_block_and_slice ... ok
+test compiled_syscalls_publish_arguments_once_and_resume_without_replay ... ok
+test cross_page_targets_remain_unlinked ... ok
+test conditional_countdown_links_and_retires_exactly_without_fallback ... ok
+test guest_release_acquire_publishes_canonical_data_between_workers ... ok
+test hardware_alias_loans_end_at_permissions_replacement_fork_and_worker_boundaries ... ok
+test hardware_alias_loop_preserves_state_and_canonical_bytes ... ok
+test fp_vector_blocks_return_cleanly_to_existing_memory_and_system_boundaries ... ok
+test hardware_alias_readonly_and_sparse_pages_share_the_frozen_memory_model ... ok
+test hardware_alias_scalar_forms_keep_live_bindings_flags_and_writeback ... ok
+test host_extensions_are_direct_when_present_and_sigill_when_absent ... ok
+test lse_and_rcpc_alias_loops_stay_native_at_slice_boundaries ... ok
+test integer_blocks_preserve_exact_state_and_budgets ... ok
+test memory_embeddings_without_epoch_capability_never_follow_native_links ... ok
+test invalidation_rechecks_code_permissions_replacements_and_spaces ... ok
+test mixed_vector_loops_reuse_hardware_addresses_without_interpreter_or_bridge_hits ... ok
+test fp_neon_hot_loops_keep_exact_budgets_without_per_instruction_entry ... ok
+test mixed_vector_loads_do_not_publish_a_new_destination_before_a_guest_fault ... ok
+test fused_memory_loops_keep_state_and_retirement_at_every_budget ... ok
+test linked_loop_keeps_exact_budgets_and_avoids_native_reentry ... ok
+test native_full_store_does_not_read_a_staging_only_backing ... ok
+test native_memory_reserves_scratch_registers_even_when_slots_are_free ... ok
+test fused_memory_faults_publish_the_exact_dirty_prefix_and_do_not_replay ... ok
+test native_store_invalidates_exclusives_and_cached_code_in_memory_and_views ... ok
+test native_vectors_evict_dirty_registers_and_preserve_v31_and_dynamic_pc ... ok
+test mixed_vector_memory_evictions_and_helper_reloads_preserve_every_live_bank ... ok
+test dirty_eviction_source_aliases_and_deferred_flags_match_interpreter ... ok
+test conditional_and_register_branches_preserve_flags_links_and_aliases ... ok
+test pairs_and_ordered_loops_use_hardware_aliases_with_exact_budgets ... ok
+test parallel_code_write_breaks_a_running_native_chain_at_its_epoch_guard ... ok
+test parallel_code_write_interrupts_a_running_fused_memory_loop ... ok
+test pending_native_exit_and_parallel_view_keep_dispatch_boundaries ... ok
+test rcpc_loads_signed_unscaled_and_release_stores_match_reference ... ok
+test register_cache_uses_one_load_and_writeback_for_a_chain ... ok
+test baseline_precision_conversions_preserve_alternative_half_and_flush_rules ... ok
+test memory_faults_cross_page_and_writeback_are_precise ... ok
+test ordered_transfers_barriers_and_checked_faults_match_reference ... ok
+test scalar_view_borrows_match_reference_and_preserve_fork_cow ... ok
+test separate_native_load_and_store_do_not_make_guest_rmw_atomic ... ok
+test shared_native_ldadd_is_atomic_without_a_new_synchronization_path ... ok
+test syscall_at_page_end_and_reserved_exception_encodings_keep_precise_faults ... ok
+test syscall_continuations_use_current_arguments_and_revalidate_code_changes ... ok
+test crc_and_flag_extensions_use_native_lowerings_with_exact_nzcv ... ok
+test scalar_flags_sp_and_bit_operations_are_native_and_match_reference ... ok
+test native_cas_and_casp_match_success_failure_pairs_and_alias_pressure ... ok
+test whitelist_encoding_corpus_matches_interpreter ... ok
+test paired_vector_transfers_keep_one_operand_and_precise_writeback ... ok
+test paired_integer_transfers_match_reference_including_aliases_and_writeback ... ok
+test scalar_memory_address_modes_widths_signs_and_register_aliases_match_reference ... ok
+test scalar_alias_pressure_long_products_and_sink_registers_match_reference ... ok
+test lse_rmw_widths_ordering_and_register_aliases_match_reference ... ok
+test native_neon_integer_float_accumulators_and_qc_match_reference ... ok
+test vector_memory_widths_address_modes_and_register_namespaces_match_reference ... ok
+test native_scalar_fp_arithmetic_flags_conversions_and_aliases_match_reference ... ok
+test native_fp_special_values_rounding_and_sticky_status_match_reference ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+   Doc-tests trames_host_compute
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trames_jit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

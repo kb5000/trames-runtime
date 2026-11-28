@@ -1,0 +1,18 @@
+   Compiling trames-host-compute v1.3.0 (/mnt/trames-output/jit-vmem-source/crates/trames-host-compute)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running unittests src/lib.rs (/mnt/trames-output/linux-desktop-target/debug/build/trames-host-compute/3cf24160e1c64275/out/trames_host_compute-3cf24160e1c64275)
+
+running 4 tests
+test tests::fp16_bit_carriers_and_refinement_special_values ... ok
+test tests::scalar_and_packed_arithmetic_are_native ... ok
+test tests::scope_restores_control_and_status_on_unwind ... ok
+test tests::concurrent_scopes_keep_each_threads_status_and_rounding ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests trames_host_compute
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

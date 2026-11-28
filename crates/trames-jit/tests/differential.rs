@@ -131,6 +131,312 @@ fn compare_fp_word(word: u32, state: &Aarch64State) {
 }
 
 #[test]
+fn vector_memory_widths_address_modes_and_register_namespaces_match_reference() {
+    for (size, opc) in [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+        (0, 2),
+        (0, 3),
+    ] {
+        for (rn, rt) in [(1, 0), (1, 1), (31, 31)] {
+            let mut cases =
+                vec![(size << 30) | 0x3d000000 | (opc << 22) | (2 << 10) | (rn << 5) | rt];
+            for mode in [0, 1, 3] {
+                for off in [-16i32, 0, 16] {
+                    cases.push(
+                        (size << 30)
+                            | 0x3c000000
+                            | (opc << 22)
+                            | (((off as u32) & 511) << 12)
+                            | (mode << 10)
+                            | (rn << 5)
+                            | rt,
+                    );
+                }
+            }
+            for option in [2, 3, 6, 7] {
+                for scaled in [0, 1] {
+                    cases.push(
+                        (size << 30)
+                            | 0x3c200800
+                            | (opc << 22)
+                            | (2 << 16)
+                            | (option << 13)
+                            | (scaled << 12)
+                            | (rn << 5)
+                            | rt,
+                    );
+                }
+            }
+            for word in cases {
+                for address in [0xab00_0000_0001_0100, 0xab00_0000_0001_0ff9] {
+                    let mut state = initial();
+                    state.registers[1] = address;
+                    state.registers[2] = 1;
+                    state.sp = address;
+                    for budget in [1, 64] {
+                        let e = compare_memory_sequence(
+                            &[
+                                0x1e6728de, word, 0xb1000463, word, 0x1e612800, word, 0xd4000001,
+                            ],
+                            &state,
+                            budget,
+                            budget == 64,
+                        );
+                        if NATIVE_COMPILED {
+                            assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for opc in 0..3 {
+        let pc = 0x1004;
+        let displacement = (0x10000 - pc) / 4;
+        let word = (opc << 30) | 0x1c000000 | (displacement << 5) | 31;
+        let e =
+            compare_memory_sequence(&[0x1e6728de, word, word, 0xd4000001], &initial(), 64, true);
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0);
+            assert!(e.memory_stats().hardware > 0);
+        }
+    }
+}
+
+#[test]
+fn paired_vector_transfers_keep_one_operand_and_precise_writeback() {
+    for opc in 0..3 {
+        for load in [false, true] {
+            for mode in 0..4 {
+                for (rn, rt, rt2) in [(1, 0, 1), (31, 31, 0), (1, 30, 31)] {
+                    for off in [-2i32, 0, 2] {
+                        let word = (opc << 30)
+                            | 0x2c000000
+                            | (u32::from(load) << 22)
+                            | (mode << 23)
+                            | (((off as u32) & 127) << 15)
+                            | (rt2 << 10)
+                            | (rn << 5)
+                            | rt;
+                        for address in [0xab00_0000_0001_0100, 0xab00_0000_0001_0ff9] {
+                            let mut state = initial();
+                            state.registers[1] = address;
+                            state.sp = address;
+                            for budget in [1, 64] {
+                                let e = compare_memory_sequence(
+                                    &[0xb1000463, 0x1e6728de, word, word, word, 0xd4000001],
+                                    &state,
+                                    budget,
+                                    budget == 64,
+                                );
+                                if NATIVE_COMPILED {
+                                    assert_eq!(e.stats.fallback_instructions, 0, "{word:08x}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_vector_memory_evictions_and_helper_reloads_preserve_every_live_bank() {
+    let mut words = Vec::new();
+    // More than sixteen dirty guest vectors force allocation/eviction before
+    // loads, including a destination's old value at a potential slow exit.
+    for reg in (0..23).chain(std::iter::once(31)) {
+        words.push(0x4ea08400 | (reg << 16) | (reg << 5) | reg);
+    }
+    words.extend_from_slice(&[
+        0xad40143f,                  // ldp q31,q5,[x1]
+        0x4ea58400 | (31 << 5) | 31, // add v31.4s,v31.4s,v5.4s
+        0xad00143f,                  // stp q31,q5,[x1]
+        0xf9400064,                  // ldr x4,[x3]: ends an address proof and uses a helper
+    ]);
+    for reg in (0..23).chain(std::iter::once(31)).rev() {
+        words.push(0x4ea08400 | (reg << 16) | (reg << 5) | reg);
+    }
+    words.push(0xd4000001);
+    for address in [0x10000, 0x10ff0] {
+        // same-page and staged pair
+        let mut state = initial();
+        state.registers[1] = address;
+        state.registers[3] = 0x12000;
+        for parallel in [false, true] {
+            for budget in [1, 8, 128] {
+                let engine = compare_memory_sequence(&words, &state, budget, parallel);
+                if NATIVE_COMPILED {
+                    assert_eq!(engine.stats.fallback_instructions, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_vector_loops_reuse_hardware_addresses_without_interpreter_or_bridge_hits() {
+    if !NATIVE_COMPILED {
+        return;
+    }
+    for pair in [false, true] {
+        let words = if pair {
+            vec![
+                0xad401020, 0x4ea38400, 0xad001020, 0xf1000442, 0x54ffff81, 0xd4000001,
+            ]
+        } else {
+            vec![
+                0x3dc00020, 0x4ea38400, 0x3d800020, 0xf1000442, 0x54ffff81, 0xd4000001,
+            ]
+        };
+        let mut state = initial();
+        state.registers[1] = 0x10000;
+        state.registers[2] = 32;
+        state.vectors[3] = 0x00000001000000010000000100000001;
+        for parallel in [false, true] {
+            let e = compare_memory_sequence(&words, &state, 256, parallel);
+            assert_eq!(e.stats.fallback_instructions, 0);
+            assert_eq!(e.memory_stats().instructions, 64);
+            assert_eq!(e.memory_stats().staged, 0);
+            assert!(e.memory_stats().hardware >= 60, "{:?}", e.memory_stats());
+            assert!(e.memory_stats().direct >= 60);
+            assert_eq!(e.memory_stats().fused_entries, 1);
+            assert!(e.compilation_stats().address_reuses > 0);
+        }
+    }
+}
+
+#[test]
+fn mixed_vector_loads_do_not_publish_a_new_destination_before_a_guest_fault() {
+    let mut state = initial();
+    state.registers[1] = 0x10ff0;
+    let words = [0x4e221c1f, 0x1e221820, 0xad40043f, 0xd4000001];
+    state.registers[1] = 0x10000 + hardware_span() - 16;
+    for budget in [1, 64] {
+        let e = compare_memory_sequence(&words, &state, budget, budget == 64);
+        if NATIVE_COMPILED {
+            assert_eq!(e.stats.fallback_instructions, 0);
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "native-aarch64",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+#[test]
+fn backing_callbacks_see_host_fp_environment_and_cannot_pollute_guest_status() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+    use trames_memory::{MemoryError, PageBacking};
+    fn environment() -> (u64, u64) {
+        let (c, s);
+        unsafe {
+            std::arch::asm!("mrs {c},fpcr","mrs {s},fpsr",c=out(reg)c,s=out(reg)s,options(nostack,preserves_flags));
+        }
+        (c, s)
+    }
+    fn host_noise() {
+        unsafe {
+            std::arch::asm!("fmov s0,#1.0","movi v1.16b,#0","fdiv s0,s0,s1",out("v0") _,out("v1") _,options(nostack,preserves_flags));
+        }
+    }
+    struct Backing {
+        bytes: Mutex<Vec<u8>>,
+        version: AtomicU64,
+        fail: bool,
+    }
+    impl PageBacking for Backing {
+        fn check(&self, _: u64) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+            assert_eq!(environment(), (1 << 22, 0x10));
+            host_noise();
+            if self.fail {
+                return Err(MemoryError::BackingIo(5));
+            }
+            out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
+            Ok(())
+        }
+        fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
+            assert_eq!(environment(), (1 << 22, 0x10));
+            host_noise();
+            self.bytes.lock().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            self.version.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn sync(&self) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        fn version(&self) -> u64 {
+            self.version.load(Ordering::Relaxed)
+        }
+        fn writable(&self) -> bool {
+            true
+        }
+        fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
+            Err(MemoryError::BackingIo(5))
+        }
+    }
+    for fail in [false, true] {
+        let _host = trames_host_compute::Scope::new(1 << 22, 0x10);
+        let mut bytes = vec![0; PAGE_SIZE as usize];
+        for lane in bytes[..16].chunks_exact_mut(4) {
+            lane.copy_from_slice(&1f32.to_le_bytes());
+        }
+        let backing = Arc::new(Backing {
+            bytes: Mutex::new(bytes),
+            version: AtomicU64::new(0),
+            fail,
+        });
+        let prefix = 0x1e201800 | (22 << 16) | (21 << 5) | 20;
+        let mut m = memory(&[prefix, 0x3dc00020, 0x4e21d400, 0x3d800020, 0xd4000001]);
+        m.map_backed(0x10000, vec![backing.clone()], true, Permissions::RW, false)
+            .unwrap();
+        let mut c = Cpu::new(0x1000, 0);
+        let mut s = initial();
+        s.registers[1] = 0x10000;
+        s.fpcr = 2 << 22;
+        s.fpsr = 4;
+        s.vectors[21] = 1f32.to_bits() as u128;
+        s.vectors[22] = 0;
+        s.vectors[1] = (1f32.to_bits() as u128) * 0x00000001000000010000000100000001;
+        c.restore_architectural_state(&s);
+        let mut e = Engine::default();
+        let result = c.run_slice(&mut e, &mut m, 64);
+        assert_eq!(environment(), (1 << 22, 0x10));
+        assert_eq!(c.architectural_state().fpsr, 6);
+        assert_eq!(e.stats.fallback_instructions, 0);
+        if fail {
+            assert!(matches!(result, SliceOutcome::Fault(_)));
+            assert_eq!(c.fault_retired(), 1);
+            assert_eq!(c.pc(), 0x1004);
+            assert_eq!(c.architectural_state().vectors[0], s.vectors[0]);
+        } else {
+            assert_eq!(outcome(&result), ("syscall", 5));
+            assert_eq!(
+                c.architectural_state().vectors[0],
+                (2f32.to_bits() as u128) * 0x00000001000000010000000100000001
+            );
+            assert_eq!(&backing.bytes.lock().unwrap()[..4], &2f32.to_le_bytes());
+            assert_eq!(e.memory_stats().staged, 2);
+        }
+    }
+}
+
+#[test]
 fn native_scalar_fp_arithmetic_flags_conversions_and_aliases_match_reference() {
     for kind in [0, 1, 3] {
         if kind == 3 && !host_capability(9) {
@@ -291,7 +597,7 @@ fn fp_vector_blocks_return_cleanly_to_existing_memory_and_system_boundaries() {
     for budget in [1, 64] {
         let e = compare_memory_sequence(&words, &state, budget, budget == 64);
         if NATIVE_COMPILED {
-            assert_eq!(e.stats.fallback_instructions, 3);
+            assert_eq!(e.stats.fallback_instructions, 1);
         }
     }
 }
@@ -2024,7 +2330,8 @@ fn memory_faults_cross_page_and_writeback_are_precise() {
     for word in [
         0xf8408420, 0xf8008420, 0xf8408c20, 0xf8008c20, 0xb9800020, 0xf9400020, 0xf9000020,
         0xa8c10820, 0xa8810820, 0xa9c10820, 0xa9810820, 0x69400820, 0xc8dffc20, 0xc89ffc20,
-        0xf8240020, 0xc8a27c24, 0x48227c24, 0xf8bfc020, 0xd9400020,
+        0x3dc00020, 0x3d800020, 0xad400420, 0xad000420, 0xad810420, 0xadc10420, 0xf8240020,
+        0xc8a27c24, 0x48227c24, 0xf8bfc020, 0xd9400020,
     ] {
         if ((word == 0xf8240020 || word == 0xc8a27c24 || word == 0x48227c24) && !host_capability(8))
             || (word == 0xf8bfc020 && !host_capability(15))
@@ -2286,7 +2593,7 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
             Err(MemoryError::BackingIo(5))
         }
     }
-    for word in [0xf9000020, 0xa9000820, 0xc89ffc20] {
+    for word in [0xf9000020, 0xa9000820, 0xc89ffc20, 0x3d800020, 0xad000420] {
         let output = Arc::new(Output::default());
         let mut m = memory(&[word]);
         m.unmap(0x2000, PAGE_SIZE).unwrap();
@@ -2305,6 +2612,9 @@ fn native_full_store_does_not_read_a_staging_only_backing() {
         let mut cpu = Cpu::new(0x1000, 0);
         cpu.set_x(0, 0x8877665544332211);
         cpu.set_x(1, 0x2000);
+        let mut state = cpu.architectural_state();
+        state.vectors[0] = 0x8877665544332211;
+        cpu.restore_architectural_state(&state);
         let mut engine = Engine::default();
         assert_eq!(
             outcome(&cpu.run_slice(&mut engine, &mut m, 1)),
@@ -2742,6 +3052,10 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
         (true, 0xc89fffa0),
         (true, 0xf82403a0),
         (true, 0x48287faa),
+        (false, 0x3dc00024),
+        (true, 0x3d8003a4),
+        (false, 0xad401424),
+        (true, 0xad0017a4),
     ] {
         if (word == 0xf82403a0 || word == 0x48287faa) && !host_capability(8) {
             continue;
@@ -2760,6 +3074,8 @@ fn hardware_faults_rejoin_checked_access_with_exact_cpu_state() {
                 0xd4000001,
             ]
         };
+        let mut words = words.to_vec();
+        words.insert(5, 0x1e6728c4); // FADD d4,d6,d7: a dirty vector prefix
         let mut a = memory(&words);
         let mut b = memory(&words);
         for m in [&mut a, &mut b] {

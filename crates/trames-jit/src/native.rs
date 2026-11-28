@@ -178,11 +178,23 @@ struct MemoryFrame<M> {
 #[repr(C)]
 struct VectorFrame {
     frame: Frame,
-    vectors: *mut u128,
 }
 const _: () = {
-    assert!(std::mem::offset_of!(VectorFrame, vectors) == 120);
+    assert!(std::mem::size_of::<VectorFrame>() == 120);
 };
+#[repr(C)]
+struct Floating {
+    guest_control: u64,
+    guest_status: u64,
+    host_control: u64,
+    host_status: u64,
+}
+#[repr(C)]
+struct MixedFrame<M> {
+    memory: MemoryFrame<M>,
+    floating: Floating,
+}
+const FLOATING: u32 = std::mem::offset_of!(MixedFrame<()>, floating) as u32;
 /// A connected union of already exported pages, never an assertion about holes.
 /// `last` is the final legal start offset for the block's widest memory operand.
 #[repr(C)]
@@ -263,7 +275,7 @@ struct MemorySite {
     before: u64,
     fixup: Option<(usize, usize)>,
 }
-unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
+unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool, const FP: bool>(
     pointer: *mut MemoryFrame<M>,
     operation: *const crate::memory_ops::Operation,
     remaining: u64,
@@ -274,6 +286,12 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
     // until return, and the immutable boxed operation outlives native execution.
     let (frame, op) = unsafe { (&mut *pointer, &*operation) };
     let (cpu, memory) = unsafe { (&mut *frame.cpu, &mut *frame.memory) };
+    if FP {
+        // The emitted bridge restored host control/status before Rust entry.
+        let floating =
+            unsafe { &mut *std::ptr::addr_of_mut!((*pointer.cast::<MixedFrame<M>>()).floating) };
+        cpu.fpsr |= floating.guest_status as u32;
+    }
     cpu.pc = op.pc();
     cpu.sp = frame.frame.sp;
     // Any checked call can prepare COW/storage or replace CPU aliases. Discard
@@ -332,7 +350,16 @@ unsafe extern "C" fn memory_access<M: CpuMemory, const HARDWARE: bool>(
     // This mutable CPU reborrow can invalidate an older register sub-borrow.
     // Re-derive it after the helper's last CPU observation; generated code reloads
     // this pointer before touching any guest registers, including after a loop.
-    frame.registers = cpu.general_registers_mut().as_mut_ptr();
+    if FP {
+        let floating =
+            unsafe { &mut *std::ptr::addr_of_mut!((*pointer.cast::<MixedFrame<M>>()).floating) };
+        floating.guest_status = cpu.fpsr as u64;
+        let (registers, vectors) = cpu.native_register_banks_mut();
+        frame.registers = registers.as_mut_ptr();
+        frame.frame.link_pcs = vectors.as_mut_ptr().cast();
+    } else {
+        frame.registers = cpu.general_registers_mut().as_mut_ptr();
+    }
     next
 }
 
@@ -852,6 +879,9 @@ impl Cache {
         // use only installed same-page entries, never a guest-provided pointer.
         if block.has_memory {
             if block.has_vector {
+                if self.node(handle).unwrap().memory.is_some() {
+                    return self.execute_mixed_block(cpu, memory, budget, handle, frame);
+                }
                 return self.execute_vector_block(cpu, budget, handle, frame);
             }
             return self.execute_memory_block(cpu, memory, budget, handle, frame);
@@ -913,10 +943,8 @@ impl Cache {
         // instruction. No Rust/provider callback runs in this native FP block.
         let scope = trames_host_compute::Scope::new(cpu.fpcr, cpu.fpsr);
         let (registers, vectors) = cpu.native_register_banks_mut();
-        let mut vector_frame = VectorFrame {
-            frame,
-            vectors: vectors.as_mut_ptr(),
-        };
+        let mut vector_frame = VectorFrame { frame };
+        vector_frame.frame.link_pcs = vectors.as_mut_ptr().cast();
         unsafe {
             block
                 .code
@@ -941,29 +969,32 @@ impl Cache {
             syscall: vector_frame.frame.syscall != 0,
         }))
     }
-    // Keep the larger typed helper frame out of scalar/SVC native entries.
-    #[inline(never)]
-    fn execute_memory_block<M: CpuMemory>(
-        &mut self,
+    #[inline]
+    fn memory_frame<M: CpuMemory, const FP: bool>(
+        &self,
         cpu: &mut Cpu,
         memory: &mut M,
-        budget: u64,
         handle: Handle,
-        frame: Frame,
-    ) -> Result<Option<Executed>, CpuFault> {
+        mut frame: Frame,
+    ) -> MemoryFrame<M> {
         let checked = self.node(handle).unwrap().checked;
         let block = self.node(handle).unwrap().block.as_ref().unwrap();
         let cpu_pointer = cpu as *mut Cpu;
         // Derive both reborrows from one raw parent, then suspend Rust CPU access
         // until native return. Every helper publishes a fresh register sub-borrow.
-        let registers = unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() };
-        let block_length = block.instructions;
-        let mut fused = MemoryFrame {
+        let registers = if FP {
+            let (registers, vectors) = unsafe { (*cpu_pointer).native_register_banks_mut() };
+            frame.link_pcs = vectors.as_mut_ptr().cast();
+            registers.as_mut_ptr()
+        } else {
+            unsafe { (*cpu_pointer).general_registers_mut().as_mut_ptr() }
+        };
+        MemoryFrame {
             frame,
             helper: if block.has_hardware {
-                memory_access::<M, true> as *const () as usize
+                memory_access::<M, true, FP> as *const () as usize
             } else {
-                memory_access::<M, false> as *const () as usize
+                memory_access::<M, false, FP> as *const () as usize
             },
             cpu: cpu_pointer,
             memory: memory as *mut _,
@@ -978,10 +1009,76 @@ impl Cache {
             checked,
             fault: None,
             stats: crate::MemoryStats::default(),
+        }
+    }
+    // Keep extra frame/control state out of ordinary scalar and memory entries.
+    #[inline(never)]
+    fn execute_memory_block<M: CpuMemory>(
+        &mut self,
+        cpu: &mut Cpu,
+        memory: &mut M,
+        budget: u64,
+        handle: Handle,
+        frame: Frame,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let mut fused = self.memory_frame::<M, false>(cpu, memory, handle, frame);
+        self.run_memory_frame::<M>(budget, handle, &mut fused as *mut _)
+    }
+    #[inline(never)]
+    fn execute_mixed_block<M: CpuMemory>(
+        &mut self,
+        cpu: &mut Cpu,
+        memory: &mut M,
+        budget: u64,
+        handle: Handle,
+        frame: Frame,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let scope = trames_host_compute::Scope::new(cpu.fpcr, cpu.fpsr);
+        let (host_control, host_status) = scope.saved_environment();
+        let mut mixed = MixedFrame {
+            memory: self.memory_frame::<M, true>(cpu, memory, handle, frame),
+            floating: Floating {
+                guest_control: 0,
+                guest_status: 0,
+                host_control,
+                host_status,
+            },
         };
-        // All Rust register references end before entry. The helper temporarily
-        // reborrows this same CPU/mm; no guest lease survives the callback.
-        unsafe { block.code.call_memory_block(registers, &mut fused) };
+        let result =
+            self.run_memory_frame::<M>(budget, handle, (&mut mixed as *mut MixedFrame<M>).cast());
+        cpu.fpsr |= trames_host_compute::status();
+        drop(scope);
+        result
+    }
+    #[inline]
+    fn run_memory_frame<M: CpuMemory>(
+        &mut self,
+        budget: u64,
+        handle: Handle,
+        pointer: *mut MemoryFrame<M>,
+    ) -> Result<Option<Executed>, CpuFault> {
+        let block_length = self
+            .node(handle)
+            .unwrap()
+            .block
+            .as_ref()
+            .unwrap()
+            .instructions;
+        // The mixed pointer derives from the whole allocation, before any
+        // prefix reference. Its tail remains reachable by the typed FP helper.
+        unsafe {
+            self.node(handle)
+                .unwrap()
+                .block
+                .as_ref()
+                .unwrap()
+                .code
+                .call_memory_block((*pointer).registers, pointer)
+        };
+        let fused = unsafe { &mut *pointer };
+        // Reborrow the CPU only after native return. Passing a fresh &mut Cpu
+        // into this runner would invalidate the previously derived bank loans.
+        let cpu = unsafe { &mut *fused.cpu };
         self.cold.memory.instructions += fused.stats.instructions + fused.hits + fused.direct_hits;
         self.cold.memory.hardware += fused.hits + fused.direct_hits;
         self.cold.memory.direct += fused.direct_hits;
@@ -993,7 +1090,7 @@ impl Cache {
         cpu.pc = fused.frame.pc;
         cpu.sp = fused.frame.sp;
         cpu.set_nzcv((fused.frame.nzcv >> 28) as u32);
-        if let Some(error) = fused.fault {
+        if let Some(error) = fused.fault.take() {
             // Consumed only on the wrapper's fault path. The established scalar
             // return ABI and hot counters acquire no memory-specific result tag.
             let instructions = budget - fused.frame.remaining;
@@ -1068,14 +1165,14 @@ impl Vectors {
                 });
             if let Some(binding) = self.bindings[slot] {
                 if binding.dirty {
-                    load(words, 17, 16, 120);
+                    load(words, 17, 16, 96);
                     words.push(0x3d800000 | (binding.guest << 10) | (17 << 5) | (slot as u32 + 16));
                     traffic.register_stores += 1;
                 }
                 self.hosts[binding.guest as usize] = u8::MAX;
             }
             if read {
-                load(words, 17, 16, 120);
+                load(words, 17, 16, 96);
                 words.push(0x3dc00000 | (guest << 10) | (17 << 5) | (slot as u32 + 16));
                 traffic.register_loads += 1;
             }
@@ -1092,9 +1189,33 @@ impl Vectors {
         b.used = self.clock;
         slot as u32 + 16
     }
+    fn reserve(
+        &mut self,
+        words: &mut Vec<u32>,
+        traffic: &mut CompilationStats,
+        guest: u32,
+        avoid: u32,
+    ) -> u32 {
+        let old = self.hosts[guest as usize];
+        let dirty = old != u8::MAX && self.bindings[old as usize].unwrap().dirty;
+        let host = self.bind(words, traffic, guest, avoid, false);
+        self.bindings[(host - 16) as usize].as_mut().unwrap().dirty = dirty;
+        host
+    }
+    fn reload(&self, words: &mut Vec<u32>, traffic: &mut CompilationStats) {
+        if self.bindings.iter().any(Option::is_some) {
+            load(words, 17, 16, 96);
+        }
+        for (slot, b) in self.bindings.iter().enumerate() {
+            if let Some(b) = b {
+                words.push(0x3dc00000 | (b.guest << 10) | (17 << 5) | (slot as u32 + 16));
+                traffic.register_loads += 1;
+            }
+        }
+    }
     fn flush(&mut self, words: &mut Vec<u32>, traffic: &mut CompilationStats) {
         if self.bindings.iter().flatten().any(|b| b.dirty) {
-            load(words, 11, 16, 120);
+            load(words, 11, 16, 96);
         }
         for (slot, b) in self.bindings.iter().enumerate() {
             if let Some(b) = b.filter(|b| b.dirty) {
@@ -1155,6 +1276,7 @@ struct Assembler {
     operand: Option<(OperandKey, usize)>,
     first_operand: Option<LoopOperand>,
     vectors: Vectors,
+    floating: bool,
 }
 impl Assembler {
     fn new() -> Self {
@@ -1172,6 +1294,7 @@ impl Assembler {
             operand: None,
             first_operand: None,
             vectors: Vectors::new(),
+            floating: false,
         }
     }
     fn store(&mut self, slot: usize, binding: Binding) {
@@ -1379,6 +1502,14 @@ impl Assembler {
     fn memory(&mut self, op: &crate::memory_ops::Operation, before: u64) -> MemorySite {
         self.flush();
         self.context = true;
+        if self.floating {
+            self.words.extend_from_slice(&[0xd53b440a, 0xd53b442b]);
+            store(&mut self.words, 10, FLOATING);
+            store(&mut self.words, 11, FLOATING + 8);
+            load(&mut self.words, 10, 16, FLOATING + 16);
+            load(&mut self.words, 11, 16, FLOATING + 24);
+            self.words.extend_from_slice(&[0xd51b440a, 0xd51b442b]);
+        }
         // One AAPCS64 helper boundary. Caller-saved guest bindings were flushed;
         // preserve only native entry context, budget/block counters and host LR.
         self.words
@@ -1395,6 +1526,11 @@ impl Assembler {
             0xa9413fee, 0xf94013fe, 0xa8c343e0,
         ]);
         load(&mut self.words, 0, 16, 144); // refreshed CPU register reborrow
+        if self.floating {
+            load(&mut self.words, 10, 16, FLOATING);
+            load(&mut self.words, 11, 16, FLOATING + 8);
+            self.words.extend_from_slice(&[0xd51b440a, 0xd51b442b]);
+        }
         if self.direct {
             load(&mut self.words, 19, 16, 160);
             load(&mut self.words, 20, 16, 168);
@@ -1457,7 +1593,40 @@ impl Assembler {
         } else {
             self.read(sp_register(op.rn as u32), scratch)
         };
-        let source = if op.load {
+        let vector_target = if op.vector {
+            Some(if op.load {
+                self.vectors
+                    .reserve(&mut self.words, &mut self.traffic, op.rt as u32, 0)
+            } else {
+                self.vectors
+                    .bind(&mut self.words, &mut self.traffic, op.rt as u32, 0, true)
+            })
+        } else {
+            None
+        };
+        let vector_second = if op.vector {
+            op.second.map(|reg| {
+                if op.load {
+                    self.vectors.reserve(
+                        &mut self.words,
+                        &mut self.traffic,
+                        reg as u32,
+                        1 << vector_target.unwrap(),
+                    )
+                } else {
+                    self.vectors.bind(
+                        &mut self.words,
+                        &mut self.traffic,
+                        reg as u32,
+                        1 << vector_target.unwrap(),
+                        true,
+                    )
+                }
+            })
+        } else {
+            None
+        };
+        let source = if op.load || op.vector {
             31
         } else {
             self.read(
@@ -1468,7 +1637,7 @@ impl Assembler {
                 scratch | (1 << base),
             )
         };
-        let source2 = if !op.load {
+        let source2 = if !op.load && !op.vector {
             op.second
                 .or(cas_pair.then_some(op.rt + 1))
                 .map(|reg| self.read(reg as u32, scratch | (1 << base) | (1 << source)))
@@ -1600,12 +1769,31 @@ impl Assembler {
             None if op.load => Some(op.rt),
             _ => None,
         };
-        let target = if let Some(reg) = output {
+        let target = if op.vector {
+            if op.load {
+                self.vectors
+                    .bind(&mut self.words, &mut self.traffic, op.rt as u32, 0, false);
+            }
+            vector_target.unwrap()
+        } else if let Some(reg) = output {
             self.output(reg as u32, scratch | (1 << base) | (1 << source))
         } else {
             source
         };
-        let target2 = if cas_pair {
+        let target2 = if op.vector {
+            if op.load {
+                if let Some(reg) = op.second {
+                    self.vectors.bind(
+                        &mut self.words,
+                        &mut self.traffic,
+                        reg as u32,
+                        1 << target,
+                        false,
+                    );
+                }
+            }
+            vector_second
+        } else if cas_pair {
             Some(self.output(
                 (output.unwrap() + 1) as u32,
                 scratch
@@ -1683,6 +1871,7 @@ impl Assembler {
                 }
             }
         }
+        self.vectors.reload(&mut self.words, &mut self.traffic);
         if self.flags_live {
             load(&mut self.words, 12, 16, 112);
             self.words.push(0xd51b420c);
@@ -1746,7 +1935,7 @@ fn render(
     count: u64,
     mask: u8,
     flow: Flow,
-    (memory, direct, vector_loop): (&[MemorySite], bool, bool),
+    (memory, direct, vector_loop, vector_context): (&[MemorySite], bool, bool, bool),
 ) -> (Vec<u32>, usize) {
     let syscall = matches!(flow, Flow::Syscall);
     let dynamic = matches!(flow, Flow::Choice(_) | Flow::Register);
@@ -1821,18 +2010,20 @@ fn render(
                 _ => {}
             }
         }
-        if dynamic {
+        if dynamic && !vector_context {
             load(&mut words, 11, 16, 96);
             load(&mut words, 11, 11, slot as u32 * 8);
             words.push(0xeb0b023f); // cmp selected guest PC (x17), cached edge PC (x11)
             done.push(words.len());
             words.push(0x54000001); // b.ne actual-PC exit
         }
-        load(&mut words, 17, 16, 40);
-        load(&mut words, 17, 17, slot as u32 * 8);
-        done.push(words.len());
-        words.push(0xb4000011); // cbz link
-        words.push(0xd61f0220); // br x17 (link entry has BTI jc)
+        if !vector_context {
+            load(&mut words, 17, 16, 40);
+            load(&mut words, 17, 17, slot as u32 * 8);
+            done.push(words.len());
+            words.push(0xb4000011);
+            words.push(0xd61f0220);
+        }
     }
     let success = words.len();
     if dynamic {
@@ -1924,8 +2115,20 @@ fn compile_with_features(
     mode: u8,
     host: trames_execution::Features,
 ) -> Result<Option<Compiled>, CpuFault> {
+    compile_body(memory, start, limit, slot, mode, host, false)
+}
+fn compile_body(
+    memory: &impl CpuMemory,
+    start: u64,
+    limit: u64,
+    slot: usize,
+    mode: u8,
+    host: trames_execution::Features,
+    floating: bool,
+) -> Result<Option<Compiled>, CpuFault> {
     let mut code = Assembler::new();
     code.direct = mode & 16 != 0;
+    code.floating = floating;
     let mut memory_ops = Vec::new();
     let mut memory_sites = Vec::new();
     let mut count = 0;
@@ -1954,11 +2157,10 @@ fn compile_with_features(
         let flags = word & (1 << 29) != 0;
         let mut terminal = false;
         if let Some(op) = crate::vector_ops::decode(word) {
-            // FP entries have no Rust/provider callbacks. Memory and FP contexts
-            // retain a clean boundary until vector-memory fusion is implemented.
-            if !memory_ops.is_empty() {
-                break;
+            if !code.floating && !memory_ops.is_empty() {
+                return compile_body(memory, start, limit, slot, mode, host, true);
             }
+            code.floating = true;
             code.vector(word, op);
         } else if (matches!(word & 0xfffff0ff, 0xd503309f | 0xd50330bf)
             && matches!(
@@ -2240,12 +2442,13 @@ fn compile_with_features(
             flow = Flow::Choice(taken);
             terminal = true;
         } else if mode & 8 != 0 {
-            if code.vectors.used {
-                break;
-            }
             let Some(op) = crate::memory_ops::Operation::compile(memory, pc)? else {
                 break;
             };
+            if op.vector && !code.floating && !memory_ops.is_empty() {
+                return compile_body(memory, start, limit, slot, mode, host, true);
+            }
+            code.floating |= op.vector;
             let op = Box::new(op);
             memory_sites.push(if mode & 16 != 0 && op.opcode.is_some() {
                 code.hardware_memory(&op, count)
@@ -2284,7 +2487,7 @@ fn compile_with_features(
     for site in &memory_sites {
         code.words[site.adjust] |= ((count - site.before) as u32) << 10;
     }
-    let has_vector = code.vectors.used;
+    let has_vector = code.floating;
     let (body, mut traffic, context) = code.finish();
     let has_hardware = !memory_sites.is_empty() && mode & 16 != 0;
     let read_only_memory = memory_ops.iter().all(|op| op.load || op.opcode.is_none());
@@ -2301,7 +2504,12 @@ fn compile_with_features(
         count,
         mode & 7,
         flow,
-        (&memory_sites, has_hardware, has_vector && mode & 8 != 0),
+        (
+            &memory_sites,
+            has_hardware,
+            has_vector && mode & 8 != 0,
+            has_vector,
+        ),
     );
     let fast_offset = words.len() * 4;
     let tail_offset;
@@ -2440,6 +2648,15 @@ impl Code {
             unsafe { std::mem::transmute(self.pointer) };
         unsafe { function(pointer, value) }
     }
+    pub(super) unsafe fn call_vector_memory(&self, pointer: *mut u8, values: *mut u128) {
+        // The exact-width original load/store acts inside the existing borrow.
+        // Only caller-saved v0/v1 marshal the two existing CPU vector values.
+        let function: unsafe extern "C" fn(*mut u8, *mut u128) =
+            unsafe { std::mem::transmute(self.pointer) };
+        unsafe {
+            function(pointer, values);
+        }
+    }
     pub(super) unsafe fn call_pair(&self, pointer: *mut u8, first: u64, second: u64) -> PairValues {
         // SAFETY: AAPCS64 passes three scalar arguments in x0/x1/x2 and the
         // two-u64 aggregate result in x0/x1. The exact-width LDP/STP owns only
@@ -2541,8 +2758,8 @@ mod tests {
         vectors[2] = 3f64.to_bits() as u128;
         let mut f = VectorFrame {
             frame: frame(&links),
-            vectors: vectors.as_mut_ptr(),
         };
+        f.frame.link_pcs = vectors.as_mut_ptr().cast();
         let mut registers = [0u64; 31];
         let before = [0x8123456789abcdefu64; 8];
         let mut after = [0u64; 8];
@@ -2691,7 +2908,7 @@ mod tests {
             }
             let mut fused = MemoryFrame {
                 frame: f,
-                helper: memory_access::<Memory, true> as *const () as usize,
+                helper: memory_access::<Memory, true, false> as *const () as usize,
                 cpu: cpu_pointer,
                 memory: &mut m,
                 registers,

@@ -22,8 +22,9 @@ actual host instructions only when the process-host HWCAP provides them.
 There are no new software replacements or emulated extension registers.
 Scalar, paired and ordered memory, LSE CAS/CASP/RMW and RCpc accesses now use
 native memory paths as described below.
-Common scalar FP and NEON arithmetic also execute natively. Vector memory,
-exclusive reservations, traps and remaining untranslated families still retain
+Common scalar FP and NEON arithmetic and scalar/paired vector memory also execute
+natively, including mixed memory/arithmetic blocks. Exclusive reservations, traps
+and remaining untranslated families still retain
 the legacy interpreter path. Full host-ISA native coverage remains in progress;
 this is not yet a claim that every host instruction has a native lowering.
 
@@ -162,7 +163,8 @@ counts; these are updated only by memory execution. No extension register model,
 algorithm lock, coordinator, guest code rewrite or ordinary-memory fence is added.
 
 The following sections extend this original scalar lowering with paired/ordered
-accesses, LSE and RCpc. Vector memory fusion and exclusive-reservation lowering remain pending.
+accesses, LSE and RCpc, plus mixed FP/NEON scalar/paired vector transfers.
+Exclusive-reservation lowering and structure/lane vector transfers remain pending.
 
 ### Entry-scoped hardware aliases
 
@@ -352,22 +354,52 @@ when a dynamic guest PC has already been selected. Compiler traffic counters now
 include vector-register loads/stores. A 31-FADD chain needs two vector loads and
 one store, rather than copying a full architectural state around each operation.
 
-FP entries use a separate 128-byte VectorFrame with the original 120-byte Frame
-prefix and one vector-bank pointer. Scalar/SVC and memory-frame layouts stay
-unchanged. The CPU exposes its two existing disjoint register banks in one borrow;
-no reborrow of the CPU parent overlaps a live child pointer. Both raw pointers
-expire at native return and are never retained by the cache. There is no new
-per-task vector or extension-state model.
+FP entries use the original 120-byte Frame. Its offset-96 pointer carries the
+existing CPU vector bank in these entries; scalar/SVC entries retain the native
+edge-PC table at that offset. FP entries use generation-checked metadata edges
+between blocks, with no native interblock jump that could interpret a vector
+pointer as an edge table. Same-block backedges retain the existing budget/epoch
+guards. There is no new per-task vector or extension-state model.
 
 The existing host-compute Scope installs the established guest FPCR/FPSR policy
 once around a native entry; the final hardware FPSR is merged into existing guest
-status, and host FP environment is restored. There is no call between translated
-FP instructions. Same-block loops reuse the existing budget/epoch guard, and
-FP comparisons share the GPR compiler's live NZCV model. Memory/provider/native
-callbacks and untranslated system instructions terminate the FP block before
-entry into Rust. FP/memory blocks currently use generation-checked metadata edges
-and distinct frame types; vector memory fusion is deliberately still pending.
-This leaves no guest FP environment active across a Rust/provider callback.
+status, and host FP environment is restored. FP comparisons share the GPR
+compiler's live NZCV model. Untranslated system instructions end the block.
+
+Mixed FP/NEON and memory blocks use the unchanged MemoryFrame prefix plus a local
+FP callback tail. Before a checked-memory/provider call, generated code publishes
+live GPR/NZCV/vector values, saves guest FPCR/FPSR, and restores the caller's host
+FP environment. The helper refreshes both existing CPU register-bank pointers;
+return reloads live bindings and guest FPCR/FPSR, including on a precise fault or
+code-invalidation exit. The runner takes a raw whole-frame pointer and reborrows
+the CPU only after native return. No stale CPU sub-borrow crosses Rust access.
+Hardware alias hits skip this bridge entirely. No guest FP environment crosses
+an external Rust/provider callback.
+
+### Mixed vector memory
+
+B/H/S/D/Q LDR/STR support unsigned, unscaled, register-offset and pre/post-indexed
+addressing; literals support S/D/Q. S/D/Q LDP/STP and LDNP/STNP keep each pair as
+one original-width native instruction, including Q pairs with a 32-byte operand.
+Vector and GPR register numbers are independent: V31 is real, and writeback may
+use an X register with the same numeric index as a V register.
+
+The cold vector allocator pins both store sources or reserves both load targets
+before effective-address formation. A reserved load destination is not dirty
+until the hardware instruction succeeds; recovery publishes the correct old
+value when the access faults. Checked helper return reloads all live vector
+bindings, since the Rust ABI may clobber their host registers.
+
+Mixed blocks reuse the existing affine CPU alias, unchanged-address proof,
+one-guest-4-KiB boundary, and exact registered hardware-fault recovery. There is
+no new access preflight, ordinary-memory fence or mapping policy. A cross-page
+operand takes the existing checked staging path and commits vector destinations
+and base writeback only after the complete operand succeeds. Structure, lane,
+replicate, SVE/SME memory and native exclusive-reservation families remain pending.
+
+[Vector-memory validation and paired measurements](../validation/jit-vector-memory-20261128.md)
+cover all widths/address modes, V31, pressure/evictions, checked providers, host FP
+isolation, precise hardware and cross-page faults, and mixed-loop alias reuse.
 
 [Validation, ABI canaries and matched measurements](../validation/jit-fp-neon-20261128.md)
 cover rounding, NaNs, infinities, denormals, alternative half conversion, FPSR/QC,

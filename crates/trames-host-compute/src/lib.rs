@@ -158,6 +158,12 @@ pub struct Scope {
     _thread: PhantomData<Rc<()>>,
 }
 impl Scope {
+    /// Original thread environment for a native entry's local callback bridge.
+    /// Values are opaque host registers; the scope remains thread-affine and
+    /// restores them on drop. This adds no work to ordinary scope construction.
+    pub fn saved_environment(&self) -> (u64, u64) {
+        self.saved
+    }
     pub fn new(control: u32, status: u32) -> Self {
         let saved = host::save();
         set_control(control);

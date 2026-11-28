@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Decoded scalar memory fragments. Native data access stays inside the existing
+//! Decoded scalar and vector memory fragments. Native data access stays inside the existing
 //! Memory/View borrow; no guest pointer, lease or translation survives the call.
 use crate::native::Code;
 use trames_engine::CpuFault;
@@ -27,6 +27,7 @@ pub(super) struct Operation {
     pub(super) rt: usize,
     pub(super) size: usize,
     pub(super) load: bool,
+    pub(super) vector: bool,
     pub(super) second: Option<usize>,
     pub(super) ordered: bool,
     pub(super) atomic: Option<Atomic>,
@@ -37,13 +38,120 @@ fn signed(value: u64, bits: u32) -> u64 {
     ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 impl Operation {
+    fn compile_vector(word: u32, pc: u64) -> Result<Option<Self>, CpuFault> {
+        if crate::features::profile().allowed.hwcap & 1 == 0 {
+            return Ok(None);
+        }
+        let rn = ((word >> 5) & 31) as usize;
+        let rt = (word & 31) as usize;
+        let (address, size, load, second, opcode) = if word & 0x3a000000 == 0x28000000 {
+            let opc = word >> 30;
+            if opc == 3 {
+                return Ok(None);
+            }
+            let element = 4usize << opc;
+            let second = ((word >> 10) & 31) as usize;
+            let mode = (word >> 23) & 3;
+            let load = word & (1 << 22) != 0;
+            if load && rt == second {
+                return Ok(None);
+            }
+            let offset = signed(((word >> 15) & 127) as u64, 7).wrapping_mul(element as u64);
+            let address = match mode {
+                1 => Address::Post(offset),
+                3 => Address::Pre(offset),
+                _ => Address::Offset(offset),
+            };
+            let mut opcode = [0x2d000000, 0x6d000000, 0xad000000][opc as usize]
+                | (u32::from(load) << 22)
+                | (1 << 10);
+            if mode == 0 {
+                opcode &= !(1 << 24);
+            }
+            (address, element * 2, load, Some(second), opcode)
+        } else {
+            let class = word & 0x3b000000;
+            let (address, size, load) = if class == 0x18000000 {
+                let opc = word >> 30;
+                if opc == 3 {
+                    return Ok(None);
+                }
+                (
+                    Address::Literal(
+                        pc.wrapping_add(signed(((word >> 5) & 0x7ffff) as u64, 19) << 2),
+                    ),
+                    4usize << opc,
+                    true,
+                )
+            } else if matches!(class, 0x39000000 | 0x38000000) {
+                let field = word >> 30;
+                let opc = (word >> 22) & 3;
+                if opc >= 2 && field != 0 {
+                    return Ok(None);
+                }
+                let size = if opc >= 2 { 16 } else { 1usize << field };
+                let address = if class == 0x39000000 {
+                    Address::Offset(((word >> 10) & 4095) as u64 * size as u64)
+                } else if word & (1 << 21) != 0 {
+                    let option = (word >> 13) & 7;
+                    if (word >> 10) & 3 != 2 || !matches!(option, 2 | 3 | 6 | 7) {
+                        return Ok(None);
+                    }
+                    Address::Register {
+                        reg: ((word >> 16) & 31) as usize,
+                        option,
+                        shift: if word & (1 << 12) != 0 {
+                            size.trailing_zeros()
+                        } else {
+                            0
+                        },
+                    }
+                } else {
+                    let offset = signed(((word >> 12) & 511) as u64, 9);
+                    match (word >> 10) & 3 {
+                        0 => Address::Offset(offset),
+                        1 => Address::Post(offset),
+                        3 => Address::Pre(offset),
+                        _ => return Ok(None),
+                    }
+                };
+                (address, size, opc & 1 != 0)
+            } else {
+                return Ok(None);
+            };
+            let base = match size {
+                1 => 0x3d000000,
+                2 => 0x7d000000,
+                4 => 0xbd000000,
+                8 => 0xfd000000,
+                _ => 0x3d800000,
+            };
+            (address, size, load, None, base | (u32::from(load) << 22))
+        };
+        Self {
+            pc,
+            address,
+            rn,
+            rt,
+            size,
+            load,
+            vector: true,
+            second,
+            ordered: false,
+            atomic: None,
+            opcode: Some(opcode),
+            code: None,
+        }
+        .publish()
+        .map(Some)
+    }
     pub fn compile(memory: &impl CpuMemory, pc: u64) -> Result<Option<Self>, CpuFault> {
         let word = memory
             .fetch_u32(pc)
             .map_err(|error| CpuFault::Memory { pc, error })?;
         if word & (1 << 26) != 0 {
-            return Ok(None);
-        } // SIMD requires a separate lowering.
+            return Self::compile_vector(word, pc);
+        }
         let rt = (word & 31) as usize;
         let rn = ((word >> 5) & 31) as usize;
         if !crate::features::permits(crate::features::profile().allowed, word) {
@@ -71,6 +179,7 @@ impl Operation {
                     1usize << (word >> 30)
                 },
                 load: false,
+                vector: false,
                 second: None,
                 ordered: false,
                 atomic: Some(if rmw {
@@ -104,6 +213,7 @@ impl Operation {
                 rt,
                 size,
                 load,
+                vector: false,
                 second: None,
                 ordered: true,
                 atomic: None,
@@ -132,6 +242,7 @@ impl Operation {
                 rt,
                 size: 1usize << (word >> 30),
                 load,
+                vector: false,
                 second: None,
                 ordered: true,
                 atomic: None,
@@ -183,6 +294,7 @@ impl Operation {
                 rt,
                 size: element * 2,
                 load,
+                vector: false,
                 second: Some(second),
                 ordered: false,
                 atomic: None,
@@ -260,6 +372,7 @@ impl Operation {
             rt,
             size,
             load,
+            vector: false,
             second: None,
             ordered: false,
             atomic: None,
@@ -273,7 +386,19 @@ impl Operation {
         self.code = self
             .opcode
             .map(|word| {
-                if let Some(atomic) = self.atomic {
+                if self.vector {
+                    let pair = self.second.is_some();
+                    let mut words = vec![0xd503245f];
+                    if !self.load {
+                        words.push(if pair { 0xad400420 } else { 0x3dc00020 });
+                    }
+                    words.push(word);
+                    if self.load {
+                        words.push(if pair { 0xad000420 } else { 0x3d800020 });
+                    }
+                    words.push(0xd65f03c0);
+                    Code::publish(&words)
+                } else if let Some(atomic) = self.atomic {
                     // AAPCS64 x0=borrow, x1=&[compare0,compare1,new0,new1].
                     // Fixed even pairs keep CASP a single real host instruction.
                     let mut words = vec![0xd503245f, 0xa9400c22, 0xa9411424];
@@ -391,7 +516,53 @@ impl Operation {
             return Err(fault(trames_memory::MemoryError::Alignment(address)));
         }
         let crosses = self.size as u64 > PAGE_SIZE - (address & (PAGE_SIZE - 1));
-        let direct = if let Some(second) = self.second {
+        let direct = if self.vector {
+            let mut values = [0u128; 2];
+            if self.load {
+                let direct = if crosses {
+                    let mut bytes = [0u8; 32];
+                    memory
+                        .read(address, &mut bytes[..self.size])
+                        .map_err(fault)?;
+                    unsafe {
+                        code.call_vector_memory(bytes.as_mut_ptr(), values.as_mut_ptr());
+                    }
+                    false
+                } else {
+                    memory
+                        .cpu_read_chunk(address, self.size, |bytes| unsafe {
+                            code.call_vector_memory(bytes.as_ptr().cast_mut(), values.as_mut_ptr())
+                        })
+                        .map_err(fault)?
+                        .1
+                };
+                cpu.set_vector(self.rt, values[0]);
+                if let Some(second) = self.second {
+                    cpu.set_vector(second, values[1]);
+                }
+                direct
+            } else {
+                values[0] = cpu.vector(self.rt);
+                if let Some(second) = self.second {
+                    values[1] = cpu.vector(second);
+                }
+                if crosses {
+                    let mut bytes = [0u8; 32];
+                    unsafe {
+                        code.call_vector_memory(bytes.as_mut_ptr(), values.as_mut_ptr());
+                    }
+                    memory.write(address, &bytes[..self.size]).map_err(fault)?;
+                    false
+                } else {
+                    memory
+                        .cpu_store_chunk(address, self.size, |bytes| unsafe {
+                            code.call_vector_memory(bytes.as_mut_ptr(), values.as_mut_ptr())
+                        })
+                        .map_err(fault)?
+                        .1
+                }
+            }
+        } else if let Some(second) = self.second {
             if self.load {
                 let (values, direct) = if crosses {
                     let mut bytes = [0u8; 16];
